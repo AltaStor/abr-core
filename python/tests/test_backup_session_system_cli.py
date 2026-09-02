@@ -237,7 +237,7 @@ class BackupCommandTests(unittest.TestCase):
         )
 
     @patch("python.cli.api.client.requests.request")
-    def test_verify_uses_extended_timeout(self, request_mock: object) -> None:
+    def test_verify_starts_a_session_and_keeps_the_extended_timeout(self, request_mock: object) -> None:
         request_mock.return_value = _FakeResponse(
             {
                 "id": "backup-1",
@@ -258,11 +258,69 @@ class BackupCommandTests(unittest.TestCase):
             "POST",
             "http://example.test/api/v1/backups/backup-1/verify",
             json=None,
-            params=None,
+            params={"wait": "false"},
             timeout=21600,
             headers={"X-Client-Type": "cli", "X-ABR-API-Version": "1.0"},
             verify=False,
         )
+
+    def test_verify_follows_the_session_progress_and_prints_its_report(self) -> None:
+        report = {
+            "id": "backup-1",
+            "result": "valid",
+            "checked_restore_points": 2,
+            "checked_artifacts": 4,
+            "warnings": [],
+            "errors": [],
+        }
+        args = SimpleNamespace(base_url="http://example.test", output="json", log_level="info", id="backup-1")
+
+        with patch("python.cli.commands.backup_commands.watch_session") as watch_mock:
+            watch_mock.return_value = {"id": "sess-1", "state": "completed", "progress": 100, "verify": report}
+            with patch("python.cli.api.client.requests.request") as request_mock:
+                request_mock.return_value = _FakeResponse(
+                    {"id": "backup-1", "session_id": "sess-1", "state": "running", "result": "running"}
+                )
+                with redirect_stdout(io.StringIO()) as out:
+                    exit_code = BackupCommands().verify(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(watch_mock.call_args.args[1], "sess-1")
+        self.assertEqual(json.loads(out.getvalue()), report)
+
+    def test_verify_reports_a_corrupt_chain_found_by_the_session_as_a_non_zero_exit(self) -> None:
+        report = {
+            "id": "backup-1",
+            "result": "invalid",
+            "checked_restore_points": 1,
+            "checked_artifacts": 1,
+            "warnings": [],
+            "errors": [{"disk_key": 1, "message": "backup is corrupt", "point_id": "p-1"}],
+        }
+        args = SimpleNamespace(base_url="http://example.test", output="json", log_level="info", id="backup-1")
+
+        with patch("python.cli.commands.backup_commands.watch_session") as watch_mock:
+            watch_mock.return_value = {"id": "sess-1", "state": "failed", "progress": 100, "verify": report}
+            with patch("python.cli.api.client.requests.request") as request_mock:
+                request_mock.return_value = _FakeResponse({"id": "backup-1", "session_id": "sess-1"})
+                with redirect_stdout(io.StringIO()) as out:
+                    exit_code = BackupCommands().verify(args)
+
+        self.assertEqual(exit_code, INVALID_STATE)
+        self.assertEqual(json.loads(out.getvalue())["result"], "invalid")
+
+    def test_verify_falls_back_to_the_session_when_it_carries_no_report(self) -> None:
+        args = SimpleNamespace(base_url="http://example.test", output="json", log_level="info", id="backup-1")
+
+        with patch("python.cli.commands.backup_commands.watch_session") as watch_mock:
+            watch_mock.return_value = {"id": "sess-1", "state": "stopped", "progress": 42}
+            with patch("python.cli.api.client.requests.request") as request_mock:
+                request_mock.return_value = _FakeResponse({"id": "backup-1", "session_id": "sess-1"})
+                with redirect_stdout(io.StringIO()) as out:
+                    exit_code = BackupCommands().verify(args)
+
+        self.assertEqual(exit_code, INVALID_STATE)
+        self.assertEqual(json.loads(out.getvalue())["state"], "stopped")
 
     @patch("python.cli.api.client.requests.request")
     def test_verify_reports_an_invalid_chain_as_a_non_zero_exit(self, request_mock: object) -> None:

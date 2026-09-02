@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from .server_defaults import env_int
@@ -22,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 CREDENTIAL_FIELD_NAMES = frozenset({"password", "token", "encryption_key"})
 SECRET_MASK = "********"
 _SAFE_PATH_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+VERIFY_PROGRESS_POLL_SECONDS = 0.25
 
 
 class StorageToolError(RuntimeError):
@@ -324,6 +325,7 @@ def verify_disk_tool_backup(
     backup_name: str,
     *,
     timeout: int | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> None:
     """Block-level integrity check of one stored backup. Raises on damage."""
     run_disk_tool(
@@ -334,6 +336,8 @@ def verify_disk_tool_backup(
             *disk_tool_storage_args(repository, abr_path=abr_path),
         ],
         timeout=timeout,
+        on_progress=on_progress,
+        progress_poll_seconds=VERIFY_PROGRESS_POLL_SECONDS,
     )
 
 
@@ -410,6 +414,8 @@ def run_disk_tool(
     *,
     tool_path: Path | None = None,
     timeout: int | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    progress_poll_seconds: float | None = None,
 ) -> CompletedProcess:
     """Run abr-vmdk-tool; args start with the subcommand, e.g. ["list", ...]."""
     resolved_tool_path = (tool_path or default_disk_tool_path()).expanduser()
@@ -417,12 +423,18 @@ def run_disk_tool(
         raise StorageToolError(f"Backup tool not found: {resolved_tool_path}")
 
     try:
+        progress_options: dict[str, Any] = {}
+        if on_progress is not None:
+            progress_options["on_progress"] = on_progress
+            if progress_poll_seconds is not None:
+                progress_options["progress_poll_seconds"] = progress_poll_seconds
         completed = run_capped(
             [str(resolved_tool_path), *args],
             check=False,
             capture_output=True,
             text=True,
             timeout=timeout,
+            **progress_options,
         )
     except subprocess.TimeoutExpired as exc:
         stderr = (exc.stderr or exc.output or "").strip() if isinstance(exc.stderr, str) else ""

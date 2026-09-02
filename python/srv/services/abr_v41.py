@@ -32,6 +32,7 @@ from python.srv.core.mongo_db_wrapper import (
     JOBS,
     REPOSITORIES,
     RESOURCES_BY_HV,
+    TASK_LOCK,
     TASKS,
     catalog_entries,
     catalog_records,
@@ -3367,6 +3368,8 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
         "errors": error or ([] if not result.get("message") or _session_state(task) == "completed" else [{"message": result.get("message")}]),
         "warnings": task.get("warnings") if isinstance(task.get("warnings"), list) else [],
     }
+    if str(task.get("task_type") or "") == "verify":
+        dto["verify"] = result.get("verify")
     # A session's log is the bulk of its DTO (task_pool appends a line per
     # progress update), so list callers that only need the row can drop it and
     # read GET /sessions/{id}/log on demand instead.
@@ -3887,7 +3890,38 @@ def get_backup_chain(backup_id: str) -> dict[str, Any]:
     return backup_chain_to_dto(points)
 
 
-def verify_backup_chain(backup_id: str) -> dict[str, Any]:
+class _VerifyProgressTracker:
+    def __init__(self, total_items: int, on_change: Callable[[int], None] | None) -> None:
+        self._total = max(int(total_items), 1)
+        self._on_change = on_change
+        self._lock = threading.Lock()
+        self._item_percent: dict[int, int] = {}
+        self._published = 0
+
+    def report(self, item_index: int, percent: int) -> None:
+        bounded = max(0, min(100, int(percent)))
+        with self._lock:
+            if self._item_percent.get(item_index, 0) >= bounded:
+                return
+            self._item_percent[item_index] = bounded
+            overall = min(99, sum(self._item_percent.values()) // self._total)
+            if overall <= self._published:
+                return
+            self._published = overall
+            callback = self._on_change
+        if callback is not None:
+            callback(overall)
+
+    def finish_item(self, item_index: int) -> None:
+        self.report(item_index, 100)
+
+
+def verify_backup_chain(
+    backup_id: str,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     points = grouped_backup_points().get(backup_id)
     if not points:
         raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
@@ -3905,15 +3939,39 @@ def verify_backup_chain(backup_id: str) -> dict[str, Any]:
             if isinstance(disk, dict):
                 work_items.append((point, disk))
 
+    def _emit(progress: int, message: str) -> None:
+        if progress_callback is not None:
+            progress_callback({"progress": progress, "message": message})
+
+    total_items = len(work_items)
     checked_artifacts = 0
+    canceled = False
+    _emit(0, f"Verifying {total_items} backup artifact(s)")
+
     if work_items:
-        with ThreadPoolExecutor(max_workers=min(VERIFY_CONCURRENCY, len(work_items))) as pool:
-            futures = {pool.submit(_verify_disk_artifact, point, disk): point for point, disk in work_items}
+        tracker = _VerifyProgressTracker(
+            total_items,
+            lambda overall: _emit(overall, f"Verifying backup artifacts: {overall}%"),
+        )
+        with ThreadPoolExecutor(max_workers=min(VERIFY_CONCURRENCY, total_items)) as pool:
+            futures = {
+                pool.submit(
+                    _verify_disk_artifact,
+                    point,
+                    disk,
+                    on_progress=_verify_artifact_progress_reporter(tracker, index),
+                ): (point, index)
+                for index, (point, disk) in enumerate(work_items)
+            }
 
             for future in as_completed(futures):
-                point = futures[future]
+                point, index = futures[future]
+                tracker.finish_item(index)
+
+                if future.cancelled():
+                    continue
                 checked_artifacts += 1
-                
+
                 try:
                     result = future.result()
                 except Exception as exc:
@@ -3928,13 +3986,181 @@ def verify_backup_chain(backup_id: str) -> dict[str, Any]:
                         }
                     )
 
-    return {
+                if not canceled and should_cancel is not None and should_cancel():
+                    canceled = True
+                    for pending in futures:
+                        pending.cancel()
+
+    if canceled:
+        result_state = "canceled"
+    elif errors:
+        result_state = "invalid"
+    elif warnings:
+        result_state = "warning"
+    else:
+        result_state = "valid"
+
+    report = {
         "id": backup_id,
-        "result": "invalid" if errors else ("warning" if warnings else "valid"),
+        "result": result_state,
         "warnings": warnings,
         "errors": errors,
         "checked_restore_points": len(points),
         "checked_artifacts": checked_artifacts,
+    }
+    if canceled:
+        report["canceled"] = True
+    _emit(100, _verify_report_summary(report))
+    return report
+
+
+def _verify_report_summary(report: dict[str, Any]) -> str:
+    checked = int(report.get("checked_artifacts") or 0)
+    if report.get("canceled"):
+        return f"Verification stopped after {checked} artifact(s)"
+    errors = report.get("errors") if isinstance(report.get("errors"), list) else []
+    if errors:
+        return f"{len(errors)} of {checked} backup artifact(s) failed verification"
+    warnings = report.get("warnings") if isinstance(report.get("warnings"), list) else []
+    suffix = f" with {len(warnings)} warning(s)" if warnings else ""
+    return f"Verified {checked} backup artifact(s) across {report.get('checked_restore_points')} restore point(s){suffix}"
+
+
+def _verify_artifact_progress_reporter(
+    tracker: _VerifyProgressTracker, item_index: int
+) -> Callable[[int, int], None]:
+    def _report(percent: int, _block_index: int) -> None:
+        tracker.report(item_index, percent)
+
+    return _report
+
+
+def _create_verify_session(backup_id: str, points: list[dict[str, Any]]) -> dict[str, Any]:
+    latest = points[-1] if points else {}
+    task = {
+        "id": str(uuid4()),
+        "job_id": None,
+        "task_type": "verify",
+        "hypervisor_id": None,
+        "resource_type": "virtual_machine",
+        "resource_external_id": latest.get("vm_id"),
+        "status": "running",
+        "parameters": {
+            "backup_id": backup_id,
+            "vm_name": str(latest.get("vm_name") or "").strip() or None,
+            "repository_id": latest.get("repository_id"),
+            "repository_name": latest.get("repository_name"),
+        },
+        "result": {"progress": 0},
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "logs": [],
+    }
+    _append_task_log(task, level="info", message=f"Started verification of backup {backup_id}", component="session")
+    persist_task(task)
+    return task
+
+
+def _update_verify_session(task_id: str, update: dict[str, Any], *, status: str | None = None) -> None:
+    with TASK_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            return
+        if status is not None:
+            task["status"] = status
+        fields = dict(update)
+        as_log_entry = bool(fields.pop("log_entry", True))
+        current_result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        current_result.update(fields)
+        task["result"] = current_result
+        if as_log_entry and fields.get("message"):
+            _append_task_log(task, level="info", message=str(fields["message"]), component="engine")
+        task["updated_at"] = utc_now()
+        try:
+            persist_task(dict(task))
+        except Exception as exc:
+            LOGGER.warning("Failed to persist verify session progress for '%s': %s", task_id, exc)
+
+
+def _verify_session_cancel_requested(task_id: str) -> bool:
+    with TASK_LOCK:
+        task = TASKS.get(task_id)
+        return bool(task and task.get("cancel_requested"))
+
+
+def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
+    try:
+        report = verify_backup_chain(
+            backup_id,
+            progress_callback=lambda update: _update_verify_session(
+                task_id,
+                {**update, "log_entry": False},
+            ),
+            should_cancel=lambda: _verify_session_cancel_requested(task_id),
+        )
+    except ApiError as exc:
+        _update_verify_session(
+            task_id,
+            {"progress": 100, "message": str(exc.message), "finished_at": utc_now()},
+            status="failed",
+        )
+        raise
+    except Exception as exc:
+        LOGGER.exception("Verification of backup '%s' failed", backup_id)
+        _update_verify_session(
+            task_id,
+            {"progress": 100, "message": str(exc), "finished_at": utc_now()},
+            status="failed",
+        )
+        raise
+
+    if report.get("canceled"):
+        status = "stopped"
+    elif report["result"] == "invalid":
+        status = "failed"
+    else:
+        status = "completed"
+    _update_verify_session(
+        task_id,
+        {
+            "progress": 100,
+            "message": _verify_report_summary(report),
+            "verify": report,
+            "finished_at": utc_now(),
+        },
+        status=status,
+    )
+    return report
+
+
+def verify_backup_chain_request(backup_id: str, *, wait: bool = True) -> dict[str, Any]:
+    points = grouped_backup_points().get(backup_id)
+    if not points:
+        raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
+
+    task = _create_verify_session(backup_id, points)
+    task_id = str(task["id"])
+
+    if wait:
+        report = _run_verify_session(backup_id, task_id)
+        return {**report, "session_id": task_id}
+
+    thread = threading.Thread(
+        target=_run_verify_session,
+        args=(backup_id, task_id),
+        name=f"verify-{task_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "id": backup_id,
+        "session_id": task_id,
+        "state": _session_state(task),
+        "result": "running",
+        "checked_restore_points": 0,
+        "checked_artifacts": 0,
+        "warnings": [],
+        "errors": [],
     }
 
 
@@ -5898,7 +6124,12 @@ def import_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     return {"manifest": manifest, "restored": counts, "configuration": configuration}
 
 
-def _verify_disk_artifact(point: dict[str, Any], disk: dict[str, Any]) -> dict[str, Any]:
+def _verify_disk_artifact(
+    point: dict[str, Any],
+    disk: dict[str, Any],
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
     disk_key = disk.get("disk_key") or disk.get("index")
 
     abr_backup_name = str(disk.get("abr_backup_name") or "").strip()
@@ -5936,7 +6167,11 @@ def _verify_disk_artifact(point: dict[str, Any], disk: dict[str, Any]) -> dict[s
 
     try:
         verify_disk_tool_backup(
-            repository, abr_path, abr_backup_name, timeout=VERIFY_ARTIFACT_TIMEOUT_SECONDS
+            repository,
+            abr_path,
+            abr_backup_name,
+            timeout=VERIFY_ARTIFACT_TIMEOUT_SECONDS,
+            on_progress=on_progress,
         )
     except StorageToolError as exc:
         return {"disk_key": disk_key, "status": "failed", "message": str(exc)}

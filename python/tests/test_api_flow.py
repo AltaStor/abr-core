@@ -311,6 +311,23 @@ class BackupServerApiFlowTests(unittest.TestCase):
             self.assertEqual(verify.json()["result"], "valid")
             self.assertEqual(verify.json()["errors"], [])
 
+            verify_session_id = verify.json()["session_id"]
+            verify_session = self.client.get(f"/api/v1/sessions/{verify_session_id}")
+            self.assertEqual(verify_session.status_code, 200)
+            self.assertEqual(verify_session.json()["type"], "verify")
+            self.assertEqual(verify_session.json()["state"], "completed")
+            self.assertEqual(verify_session.json()["progress"], 100)
+            self.assertEqual(verify_session.json()["verify"]["result"], "valid")
+
+            started_verify = self.client.post(
+                f"/api/v1/backups/{backup_chain_id}/verify", params={"wait": "false"}
+            )
+            self.assertEqual(started_verify.status_code, 200)
+            self.assertEqual(started_verify.json()["result"], "running")
+            followed = self._wait_for_session(started_verify.json()["session_id"])
+            self.assertEqual(followed["state"], "completed")
+            self.assertEqual(followed["verify"]["result"], "valid")
+
             deleted = self.client.delete(f"/api/v1/backups/{backup_chain_id}")
             self.assertEqual(deleted.status_code, 200)
             self.assertTrue(deleted.json()["deleted"])

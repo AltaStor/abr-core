@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+from typing import Any
 
 from ..compact_help_formatter import CompactHelpFormatter
 from ..exit_codes import INVALID_STATE
 from ..models.views import human_size
+from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
 
 RESTORE_POINT_COLUMNS = [
@@ -48,6 +50,11 @@ class BackupCommands:
             description = f"{help_text}\n\nExamples:\n  abr backup {name} --id <backup-id>"
             if name == "delete":
                 description += "\n  abr backup delete --id <backup-id> --force"
+            if name == "verify":
+                description += (
+                    "\n\nVerify follows the check to the end, drawing the same live progress "
+                    "bar as `job start --wait`."
+                )
             parser = commands.add_parser(name, help=help_text, description=description, formatter_class=CompactHelpFormatter)
             parser.add_argument("--id", required=True, help="Backup chain ID")
             if name == "delete":
@@ -114,9 +121,25 @@ class BackupCommands:
 
     def verify(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
-        result = deps.context.api_client.post(f"api/v1/backups/{args.id}/verify", timeout=21600)
+        started = deps.context.api_client.post(
+            f"api/v1/backups/{args.id}/verify", params={"wait": "false"}, timeout=21600
+        )
+        session_id = started.get("session_id") if isinstance(started, dict) else None
+        session: dict[str, Any] | None = None
+        if session_id:
+            session = watch_session(deps.context.api_client, str(session_id))
+            result = session.get("verify")
+        else:
+            result = started
+
+        if not isinstance(result, dict):
+            deps.context.print_output(session if session is not None else started)
+            return INVALID_STATE
+
         deps.context.print_output(result, [("id", "ID"), ("result", "RESULT"), ("checked_restore_points", "POINTS"), ("checked_artifacts", "ARTIFACTS"), ("warnings", "WARNINGS"), ("errors", "ERRORS")])
-        if isinstance(result, dict) and result.get("result") != "valid":
+        if result.get("result") != "valid":
+            return INVALID_STATE
+        if session is not None and not session_watch_succeeded(session):
             return INVALID_STATE
         return 0
 

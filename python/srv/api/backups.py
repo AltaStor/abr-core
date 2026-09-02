@@ -35,8 +35,8 @@ def delete_backup(
     return abr_v41.delete_backup_chain(backup_id, segment_id=segment, force=force)
 
 
-def verify_backup(backup_id: str) -> dict[str, Any]:
-    return abr_v41.verify_backup_chain(backup_id)
+def verify_backup(backup_id: str, wait: bool = Query(default=True)) -> dict[str, Any]:
+    return abr_v41.verify_backup_chain_request(backup_id, wait=wait)
 
 
 def import_backup(payload: ImportBackupRequest = Body(default_factory=ImportBackupRequest)) -> BackupChainDTO:
