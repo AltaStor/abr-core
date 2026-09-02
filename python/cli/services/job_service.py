@@ -1,0 +1,380 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright © 2026 Norvitex OÜ
+
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+from ..cli_context import CliContext
+from ..parsing.validators import parse_csv_values, parse_duration, parse_strict_hhmm, parse_weekday_csv
+
+_NEW_SCHEDULE_TYPES = {"daily", "weekly", "monthly", "periodic"}
+
+
+class JobService:
+    def __init__(self, context: CliContext) -> None:
+        self.context = context
+
+    @staticmethod
+    def _is_empty_value(value: Any) -> bool:
+        return value is None or value is False or value == "" or value == []
+
+    @staticmethod
+    def ensure_removed_options_unused(args: Any, removed_options: dict[str, str]) -> None:
+        for option, message in removed_options.items():
+            value = getattr(args, option, None)
+            if not JobService._is_empty_value(value):
+                raise ValueError(message)
+
+    @staticmethod
+    def _coalesce_string(*values: Any) -> str | None:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @staticmethod
+    def _normalize_name(value: Any, *, label: str) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError(f"{label} must not be empty")
+        return normalized
+
+    @staticmethod
+    def _raw_vm_tokens(args: Any) -> list[str]:
+        values: list[str] = []
+
+        vm_flags = getattr(args, "vm", None)
+        if isinstance(vm_flags, list):
+            values.extend(str(item).strip() for item in vm_flags if str(item).strip())
+        elif isinstance(vm_flags, str) and vm_flags.strip():
+            values.append(vm_flags.strip())
+
+        for field_name in ("vms", "objects"):
+            raw = getattr(args, field_name, None)
+            if isinstance(raw, str) and raw.strip():
+                values.extend(parse_csv_values(raw))
+
+        deduped: list[str] = []
+        for value in values:
+            if value not in deduped:
+                deduped.append(value)
+        return deduped
+
+    @staticmethod
+    def _build_task_parameter_updates(args: Any) -> dict[str, Any]:
+        set_encryption = bool(getattr(args, "set_encryption", False))
+        reset_encryption = bool(getattr(args, "reset_encryption", False))
+        encryption_key = getattr(args, "encryption_key", None)
+
+        if encryption_key is not None and not set_encryption:
+            raise ValueError("--encryption-key requires --set-encryption")
+        if set_encryption and not (isinstance(encryption_key, str) and encryption_key.strip()):
+            raise ValueError("--set-encryption requires --encryption-key")
+
+        updates: dict[str, Any] = {}
+        compression_level = getattr(args, "compression_level", None)
+        if compression_level is not None:
+            updates["compression_level"] = int(compression_level)
+
+        if set_encryption:
+            updates["encryption_enabled"] = True
+            updates["encryption_key"] = encryption_key.strip()
+        elif reset_encryption:
+            # None marks these keys for removal when merged against a stored job.
+            updates["encryption_enabled"] = None
+            updates["encryption_key"] = None
+
+        return updates
+
+    @classmethod
+    def _has_vm_selection_input(cls, args: Any) -> bool:
+        return bool(getattr(args, "vm", None) or getattr(args, "vms", None) is not None or getattr(args, "objects", None) is not None)
+
+    @staticmethod
+    def _schedule_detail_fields_present(args: Any) -> bool:
+        return any(
+            not JobService._is_empty_value(getattr(args, field_name, None))
+            for field_name in ("time", "days", "day_of_month", "every")
+        )
+
+    @staticmethod
+    def _schedule_enabled_override(args: Any) -> bool | None:
+        if getattr(args, "enabled", False):
+            return True
+        if getattr(args, "disabled", False):
+            return False
+        return None
+
+    @staticmethod
+    def _gfs_enabled_override(args: Any) -> bool | None:
+        if getattr(args, "gfs_enable", False):
+            return True
+        if getattr(args, "gfs_disable", False):
+            return False
+        return None
+
+    @classmethod
+    def _legacy_schedule_payload(cls, raw: str, *, enabled: bool | None) -> dict[str, Any]:
+        value = str(raw or "").strip()
+        lowered = value.lower()
+
+        def with_enabled(payload: dict[str, Any]) -> dict[str, Any]:
+            if enabled is None:
+                return payload
+            return {**payload, "enabled": enabled}
+
+        if lowered.startswith("daily "):
+            hhmm = parse_strict_hhmm(value[6:].strip())
+            return with_enabled({"type": "daily", "time": hhmm})
+
+        if lowered.startswith("weekly "):
+            parts = value.split()
+            if len(parts) != 3:
+                raise ValueError("Legacy weekly schedules must use `weekly DAY HH:MM`")
+            return with_enabled({"type": "weekly", "days": parse_weekday_csv(parts[1]), "time": parse_strict_hhmm(parts[2])})
+
+        if lowered.startswith("monthly "):
+            parts = value.split()
+            if len(parts) != 3:
+                raise ValueError("Legacy monthly schedules must use `monthly DAY HH:MM`")
+            try:
+                day_of_month = int(parts[1])
+            except ValueError as exc:
+                raise ValueError("Legacy monthly schedules must use a numeric day-of-month") from exc
+            if day_of_month < 1 or day_of_month > 31:
+                raise ValueError("Monthly schedules require --day-of-month from 1 to 31")
+            return with_enabled({"type": "monthly", "day_of_month": day_of_month, "time": parse_strict_hhmm(parts[2])})
+
+        if lowered.startswith("periodic "):
+            parts = value.split()
+            if len(parts) != 2:
+                raise ValueError("Legacy periodic schedules must use `periodic <duration>`")
+            return with_enabled({"type": "periodic", "every": parse_duration(parts[1])})
+
+        cron_fields = value.split()
+        if len(cron_fields) == 5:
+            return with_enabled({"type": "cron", "expression": value})
+
+        raise ValueError("Schedule must use one of: daily, weekly, monthly, periodic, or a legacy cron expression")
+
+    @classmethod
+    def build_schedule_payload(cls, args: Any, *, current_schedule: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        schedule_value = getattr(args, "schedule", None)
+        enabled_override = cls._schedule_enabled_override(args)
+        has_schedule_details = cls._schedule_detail_fields_present(args)
+
+        if schedule_value in {None, ""}:
+            if has_schedule_details:
+                raise ValueError("Schedule details require --schedule")
+            if enabled_override is None:
+                return None
+            if not isinstance(current_schedule, dict):
+                raise ValueError("Schedule enable/disable requires the job to already have a schedule")
+            payload = copy.deepcopy(current_schedule)
+            payload["enabled"] = enabled_override
+            return payload
+
+        schedule_text = str(schedule_value).strip()
+        if not schedule_text:
+            raise ValueError("Schedule must not be empty")
+
+        lowered = schedule_text.lower()
+        if lowered not in _NEW_SCHEDULE_TYPES:
+            if has_schedule_details:
+                raise ValueError("Do not combine legacy schedule text with --time, --days, --day-of-month, or --every")
+            return cls._legacy_schedule_payload(schedule_text, enabled=enabled_override)
+
+        enabled = True if enabled_override is None else enabled_override
+        if lowered == "daily":
+            if getattr(args, "time", None) in {None, ""}:
+                raise ValueError("Daily schedules require --time")
+            if getattr(args, "days", None):
+                raise ValueError("Daily schedules do not accept --days")
+            if getattr(args, "day_of_month", None) is not None:
+                raise ValueError("Daily schedules do not accept --day-of-month")
+            if getattr(args, "every", None):
+                raise ValueError("Daily schedules do not accept --every")
+            return {"type": "daily", "time": parse_strict_hhmm(str(args.time)), "enabled": enabled}
+
+        if lowered == "weekly":
+            days = getattr(args, "days", None)
+            if not days:
+                raise ValueError("Weekly schedules require --days")
+            if getattr(args, "time", None) in {None, ""}:
+                raise ValueError("Weekly schedules require --time")
+            if getattr(args, "day_of_month", None) is not None:
+                raise ValueError("Weekly schedules do not accept --day-of-month")
+            if getattr(args, "every", None):
+                raise ValueError("Weekly schedules do not accept --every")
+            parsed_days = days if isinstance(days, list) else parse_weekday_csv(str(days))
+            return {"type": "weekly", "days": parsed_days, "time": parse_strict_hhmm(str(args.time)), "enabled": enabled}
+
+        if lowered == "monthly":
+            day_of_month = getattr(args, "day_of_month", None)
+            if day_of_month is None:
+                raise ValueError("Monthly schedules require --day-of-month")
+            if getattr(args, "time", None) in {None, ""}:
+                raise ValueError("Monthly schedules require --time")
+            if getattr(args, "days", None):
+                raise ValueError("Monthly schedules do not accept --days")
+            if getattr(args, "every", None):
+                raise ValueError("Monthly schedules do not accept --every")
+            if int(day_of_month) < 1 or int(day_of_month) > 31:
+                raise ValueError("Monthly schedules require --day-of-month from 1 to 31")
+            return {"type": "monthly", "day_of_month": int(day_of_month), "time": parse_strict_hhmm(str(args.time)), "enabled": enabled}
+
+        if getattr(args, "time", None) not in {None, ""}:
+            raise ValueError("Periodic schedules do not accept --time")
+        if getattr(args, "days", None):
+            raise ValueError("Periodic schedules do not accept --days")
+        if getattr(args, "day_of_month", None) is not None:
+            raise ValueError("Periodic schedules do not accept --day-of-month")
+        every = getattr(args, "every", None)
+        if every in {None, ""}:
+            raise ValueError("Periodic schedules require --every")
+        return {"type": "periodic", "every": parse_duration(str(every)), "enabled": enabled}
+
+    def create_backup_job_payload(self, args: Any) -> dict[str, Any]:
+        self.ensure_removed_options_unused(
+            args,
+            {
+                "mode": "`--mode` has been removed from `abr job create`. Backup mode is resolved automatically.",
+                "schedule_daily": "`--schedule-daily` has been removed from `abr job create`. Use `--schedule daily --time HH:MM`.",
+                "gfs_policy": "`--gfs-policy` has been removed from `abr job create`.",
+            },
+        )
+        name = self._normalize_name(getattr(args, "name", None), label="Job name")
+        vm_tokens = self._raw_vm_tokens(args)
+        if not vm_tokens:
+            raise ValueError("job create requires at least one --vm, --vms, or --objects value")
+
+        repository_name = self._coalesce_string(getattr(args, "repository", None), getattr(args, "repo", None))
+        repository_id = self._coalesce_string(getattr(args, "repository_id", None), getattr(args, "repo_id", None))
+        if not repository_name and not repository_id:
+            raise ValueError("job create requires --repository/--repo or --repository-id/--repo-id")
+
+        schedule = self.build_schedule_payload(args)
+        payload: dict[str, Any] = {
+            "name": name,
+            "vms": vm_tokens,
+            "inventory": self._coalesce_string(getattr(args, "inventory", None)),
+            "inventory_id": self._coalesce_string(getattr(args, "inventory_id", None)),
+            "repo": repository_name,
+            "repo_id": repository_id,
+            "retention_days": int(getattr(args, "retention_days", 14)),
+            "gfs": {
+                "weekly": int(getattr(args, "gfs_weekly", 0) or 0),
+                "monthly": int(getattr(args, "gfs_monthly", 0) or 0),
+                "yearly": int(getattr(args, "gfs_yearly", 0) or 0),
+                "enabled": self._gfs_enabled_override(args) is not False,
+            },
+            "active_full_days": getattr(args, "active_full_days", None) or [],
+            "synthetic_full_days": getattr(args, "synthetic_full_days", None) or [],
+        }
+        description = self._coalesce_string(getattr(args, "description", None))
+        if description:
+            payload["description"] = description
+        if schedule is not None:
+            payload["schedule"] = schedule
+        task_parameter_updates = self._build_task_parameter_updates(args)
+        # Nothing exists yet to clear, so drop any None (reset) markers.
+        non_null_updates = {key: value for key, value in task_parameter_updates.items() if value is not None}
+        if non_null_updates:
+            payload["task_parameters"] = non_null_updates
+        return payload
+
+    def create_copy_job_payload(self, args: Any) -> dict[str, Any]:
+        name = self._normalize_name(getattr(args, "name", None), label="Job name")
+        source_name = self._coalesce_string(getattr(args, "source", None), getattr(args, "source_job", None))
+        source_id = self._coalesce_string(getattr(args, "source_id", None), getattr(args, "source_job_id", None))
+        if not source_name and not source_id:
+            raise ValueError("job create-copy requires --source/--source-job or --source-id/--source-job-id")
+
+        repository_name = self._coalesce_string(getattr(args, "repository", None), getattr(args, "repo", None))
+        repository_id = self._coalesce_string(getattr(args, "repository_id", None), getattr(args, "repo_id", None))
+        payload: dict[str, Any] = {
+            "name": name,
+            "source": source_name,
+            "source_id": source_id,
+            "repo": repository_name,
+            "repo_id": repository_id,
+        }
+        if getattr(args, "retention_days", None) is not None:
+            payload["retention_days"] = int(args.retention_days)
+        description = self._coalesce_string(getattr(args, "description", None))
+        if description:
+            payload["description"] = description
+        schedule = self.build_schedule_payload(args)
+        if schedule is not None:
+            payload["schedule"] = schedule
+        else:
+            enabled_override = self._schedule_enabled_override(args)
+            if enabled_override is not None:
+                payload["enabled"] = enabled_override
+        return payload
+
+    def build_edit_payload(self, job: dict[str, Any], args: Any) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+
+        if getattr(args, "new_name", None):
+            payload["name"] = self._normalize_name(args.new_name, label="Job name")
+
+        inventory_name = self._coalesce_string(getattr(args, "inventory", None))
+        inventory_id = self._coalesce_string(getattr(args, "inventory_id", None))
+        if inventory_name or inventory_id:
+            payload["inventory"] = inventory_name
+            payload["inventory_id"] = inventory_id
+
+        repository_name = self._coalesce_string(getattr(args, "repository", None), getattr(args, "repo", None))
+        repository_id = self._coalesce_string(getattr(args, "repository_id", None), getattr(args, "repo_id", None))
+        if repository_name or repository_id:
+            payload["repo"] = repository_name
+            payload["repo_id"] = repository_id
+
+        if self._has_vm_selection_input(args):
+            vm_tokens = self._raw_vm_tokens(args)
+            if not vm_tokens:
+                raise ValueError("job edit requires at least one VM when --vm, --vms, or --objects is provided")
+            payload["vms"] = vm_tokens
+
+        if getattr(args, "retention_days", None) is not None:
+            payload["retention_days"] = int(args.retention_days)
+
+        for source_field, payload_field in (
+            ("gfs_weekly", "gfs_weekly"),
+            ("gfs_monthly", "gfs_monthly"),
+            ("gfs_yearly", "gfs_yearly"),
+        ):
+            if getattr(args, source_field, None) is not None:
+                payload[payload_field] = int(getattr(args, source_field))
+
+        gfs_enabled_override = self._gfs_enabled_override(args)
+        if gfs_enabled_override is not None:
+            payload["gfs_enabled"] = gfs_enabled_override
+
+        if getattr(args, "active_full_days", None) is not None:
+            payload["active_full_days"] = args.active_full_days
+        if getattr(args, "synthetic_full_days", None) is not None:
+            payload["synthetic_full_days"] = args.synthetic_full_days
+
+        description = getattr(args, "description", None)
+        if description is not None:
+            normalized = str(description).strip()
+            payload["description"] = normalized or None
+
+        schedule = self.build_schedule_payload(
+            args,
+            current_schedule=job.get("schedule") if isinstance(job.get("schedule"), dict) else None,
+        )
+        if schedule is not None:
+            payload["schedule"] = schedule
+
+        task_parameter_updates = self._build_task_parameter_updates(args)
+        if task_parameter_updates:
+            payload["task_parameters"] = task_parameter_updates
+
+        if not payload:
+            raise ValueError("job edit requires at least one editable option")
+        return payload

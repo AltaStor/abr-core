@@ -1,0 +1,8 @@
+fastapi
+httpx
+pydantic
+pymongo
+pyvmomi
+requests
+uvicorn
+cryptography

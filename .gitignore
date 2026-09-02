@@ -1,0 +1,40 @@
+.venv/
+
+__pycache__/
+*.py[cod]
+/python/logs
+/python/tls
+
+# Local backup/debug output
+backups/
+build/
+local-build/
+.runtime-main/
+.tmp-build/
+.worktrees/
+
+# Local development tools that are not built here: the MongoDB bundle
+# scripts/check_deps.sh downloads, and a symlink to the abr-vmdk-tool built in
+# the abr-vmdk-tools repository.
+tools/
+
+# Ignore VMDK files
+*.vmdk
+
+# Local MongoDB data directory (dev dbpath), incl. timestamped pre-clear copies
+.mongo-data/
+.mongo-data.*/
+
+# Scratch/debug dumps
+scratch_*.json
+
+# Core dumps and mover runtime scratch
+# (note: avoid a bare "core" rule — it would match the python/srv/core/ dir)
+core.[0-9]*
+*.core
+
+# Claude Code context files — never commit
+CLAUDE.md
+CLAUDE.local.md
+**/CLAUDE.md
+**/CLAUDE.local.md
