@@ -350,10 +350,47 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
                     support_bundle_service._mongodb_log_path(), "/var/log/mongodb/mongod.log"
                 )
 
-    def test_unreadable_mongodb_config_is_warned_not_silently_ignored(self) -> None:
+    def test_mongod_conf_is_collected_into_the_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "mongod.conf"
+            config.write_text(
+                "systemLog:\n  path: /var/log/mongodb/mongod.log\nnet:\n  port: 27017\n",
+                encoding="utf-8",
+            )
+
+            with patch(
+                "python.srv.services.support_bundle_service._mongodb_configuration_file",
+                return_value=config,
+            ):
+                warnings: list[str] = []
+                files = support_bundle_service._collect_mongodb_configuration(warnings)
+
+        self.assertEqual([name for name, _ in files], ["config/mongod.conf"])
+        self.assertIn("port: 27017", dict(files)["config/mongod.conf"].decode("utf-8"))
+        self.assertEqual(warnings, [])
+
+    def test_a_secret_in_mongod_conf_is_redacted_like_any_other_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "mongod.conf"
+            config.write_text(
+                "security:\n  keyFile: /etc/keyfile\n  password: TotallySecretPW123\n",
+                encoding="utf-8",
+            )
+
+            with patch(
+                "python.srv.services.support_bundle_service._mongodb_configuration_file",
+                return_value=config,
+            ):
+                files = support_bundle_service._collect_mongodb_configuration([])
+
+        text = dict(files)["config/mongod.conf"].decode("utf-8")
+        self.assertNotIn("TotallySecretPW123", text)
+
+    def test_unreadable_mongod_conf_is_warned_with_the_owner_and_the_bundle_user(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = pathlib.Path(tmp) / "mongod.conf"
             config.write_text("systemLog:\n  path: /var/log/mongodb/mongod.log\n", encoding="utf-8")
+            config.chmod(0o640)
 
             with patch(
                 "python.srv.services.support_bundle_service._mongodb_configuration_file",
@@ -362,12 +399,27 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
                 support_bundle_service.Path, "read_text", side_effect=PermissionError("denied")
             ):
                 warnings: list[str] = []
-                path = support_bundle_service._mongodb_log_path(warnings)
+                files = support_bundle_service._collect_mongodb_configuration(warnings)
 
-        self.assertEqual(path, support_bundle_service._DEFAULT_MONGODB_LOG_PATH)
-        self.assertTrue(any("failed to read mongodb configuration" in w.lower() for w in warnings))
+        self.assertEqual(files, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("Failed to read MongoDB configuration", warnings[0])
+        self.assertIn("mode 0640", warnings[0])
+        self.assertIn("the support bundle runs as", warnings[0])
 
-    def test_an_unreadable_mongod_conf_is_not_reported_when_the_log_was_collected(self) -> None:
+    def test_a_missing_mongod_conf_is_warned_not_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "python.srv.services.support_bundle_service._mongodb_configuration_file",
+                return_value=pathlib.Path(tmp) / "absent.conf",
+            ):
+                warnings: list[str] = []
+                files = support_bundle_service._collect_mongodb_configuration(warnings)
+
+        self.assertEqual(files, [])
+        self.assertTrue(any("MongoDB configuration file not found" in w for w in warnings))
+
+    def test_the_log_is_still_collected_when_mongod_conf_cannot_be_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = pathlib.Path(tmp)
             mongo_log = tmp_path / "mongod.log"
@@ -391,30 +443,7 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
                 files = support_bundle_service._collect_logs(warnings)
 
         self.assertIn("logs/mongodb/mongod.log", [name for name, _ in files])
-        self.assertFalse([w for w in warnings if "MongoDB configuration" in w])
-
-    def test_an_unreadable_mongod_conf_is_reported_when_the_log_is_missing_too(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = pathlib.Path(tmp)
-            config = tmp_path / "mongod.conf"
-            config.write_text("systemLog:\n  path: /nowhere/mongod.log\n", encoding="utf-8")
-
-            with patch(
-                "python.srv.services.support_bundle_service._resolve_log_dir",
-                return_value=str(tmp_path / "empty-logs"),
-            ), patch(
-                "python.srv.services.support_bundle_service._mongodb_configuration_file",
-                return_value=config,
-            ), patch.object(
-                support_bundle_service.Path, "read_text", side_effect=PermissionError("denied")
-            ), patch.object(
-                support_bundle_service, "_DEFAULT_MONGODB_LOG_PATH", str(tmp_path / "absent.log")
-            ):
-                warnings: list[str] = []
-                support_bundle_service._collect_logs(warnings)
-
-        self.assertTrue([w for w in warnings if "MongoDB log not found" in w])
-        self.assertTrue([w for w in warnings if "MongoDB configuration" in w])
+        self.assertFalse([w for w in warnings if "MongoDB" in w])
 
     def test_unreadable_mongodb_log_warning_names_the_owner_and_the_bundle_user(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

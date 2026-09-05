@@ -92,7 +92,7 @@ def _mongodb_log_path_from_text(text: str) -> str | None:
     return None if saw_system_log else unscoped_path
 
 
-def _mongodb_log_path(warnings: list[str] | None = None) -> str:
+def _mongodb_log_path() -> str:
     candidate = _mongodb_configuration_file()
     try:
         if candidate.is_file():
@@ -101,10 +101,8 @@ def _mongodb_log_path(warnings: list[str] | None = None) -> str:
             )
             if log_path:
                 return log_path
-    except OSError as exc:
-        if warnings is not None:
-            hint = _ownership_hint(candidate) if isinstance(exc, PermissionError) else ""
-            warnings.append(f"Failed to read MongoDB configuration at {candidate}: {exc}{hint}")
+    except OSError:
+        pass
 
     return _DEFAULT_MONGODB_LOG_PATH
 
@@ -170,22 +168,18 @@ def _collect_logs(warnings: list[str]) -> list[tuple[str, bytes]]:
     else:
         warnings.append(f"No CLI logs found under {cli_dir}")
 
-    config_notes: list[str] = []
-    mongodb_log = Path(_mongodb_log_path(config_notes))
+    mongodb_log = Path(_mongodb_log_path())
     try:
         if mongodb_log.is_file():
             files.append((f"logs/mongodb/{mongodb_log.name}", _redact_log_bytes(mongodb_log.read_bytes())))
         else:
             warnings.append(f"MongoDB log not found at {mongodb_log}")
-            warnings.extend(config_notes)
     except PermissionError as exc:
         warnings.append(
             f"Failed to read MongoDB log at {mongodb_log}: {exc}{_ownership_hint(mongodb_log)}"
         )
-        warnings.extend(config_notes)
     except OSError as exc:
         warnings.append(f"Failed to read MongoDB log at {mongodb_log}: {exc}")
-        warnings.extend(config_notes)
 
     return files
 
@@ -211,6 +205,25 @@ def _collect_configuration(warnings: list[str]) -> list[tuple[str, bytes]]:
         warnings.append("Server configuration file not found")
 
     return files
+
+
+def _collect_mongodb_configuration(warnings: list[str]) -> list[tuple[str, bytes]]:
+    candidate = _mongodb_configuration_file()
+    try:
+        if not candidate.is_file():
+            warnings.append(f"MongoDB configuration file not found at {candidate}")
+            return []
+        text = candidate.read_text(encoding="utf-8")
+    except PermissionError as exc:
+        warnings.append(
+            f"Failed to read MongoDB configuration at {candidate}: {exc}{_ownership_hint(candidate)}"
+        )
+        return []
+    except OSError as exc:
+        warnings.append(f"Failed to read MongoDB configuration at {candidate}: {exc}")
+        return []
+
+    return [(f"config/{candidate.name}", _redact_config_text(text).encode("utf-8"))]
 
 
 def _disk_usage_dict(path: str) -> dict[str, Any]:
@@ -271,6 +284,7 @@ def generate_support_bundle() -> dict[str, Any]:
     collected_files = [
         *_collect_logs(warnings),
         *_collect_configuration(warnings),
+        *_collect_mongodb_configuration(warnings),
         *_collect_catalog(warnings),
     ]
     system_info = _collect_system_info()
