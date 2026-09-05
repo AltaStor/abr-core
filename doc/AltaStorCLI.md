@@ -179,6 +179,10 @@ abr repo add --name <name> --type <local|nfs|smb> [--path <path>] [--server <hos
 Example: 
 abr repo add --name MyLocal --type local --path /mnt/backup 
 
+Note: a local path that is world-writable is refused - its directory mode is the 
+only thing keeping other accounts on the host away from the backup data. Restrict 
+it to 750, the mode the product uses for its own storage, and add it again. 
+
 abr repo list 
 
 Description: Show all configured repositories. 

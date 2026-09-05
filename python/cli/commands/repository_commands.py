@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from urllib.parse import urlparse
 
 from ..compact_help_formatter import CompactHelpFormatter
@@ -92,6 +93,13 @@ def _validate_edit_args(current: dict[str, object], args: argparse.Namespace) ->
         parsed = urlparse(endpoint_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("s3 repositories require a valid --endpoint-url")
+
+
+def _print_repository_warnings(result: object) -> None:
+    if not isinstance(result, dict):
+        return
+    for warning in result.get("warnings") or []:
+        print(f"Warning: {warning}", file=sys.stderr)
 
 
 class RepositoryCommands:
@@ -237,6 +245,7 @@ class RepositoryCommands:
             payload["s3"] = _build_s3_payload(args)
         result = deps.context.api_client.post("api/v1/repositories", json=payload)
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("path", "PATH"), ("status", "STATUS")])
+        _print_repository_warnings(result)
         return 0
 
     def list(self, args: argparse.Namespace) -> int:
@@ -272,6 +281,7 @@ class RepositoryCommands:
                 payload["s3"] = s3_payload
         result = deps.context.api_client.patch(f"api/v1/repositories/{repo_id}", json=payload)
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("path", "PATH"), ("status", "STATUS")])
+        _print_repository_warnings(result)
         return 0
 
     def remove(self, args: argparse.Namespace) -> int:
