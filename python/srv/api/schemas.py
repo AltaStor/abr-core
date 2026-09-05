@@ -102,6 +102,7 @@ class RepositoryStorageDTO(_LenientModel):
     free_bytes: int | None = None
     available: bool = False
     error: str | None = None
+    permissions: dict[str, Any] | None = None
 
 
 class RepositoryDTO(_LenientModel):
@@ -133,6 +134,7 @@ class RepositoryDTO(_LenientModel):
     restore_point_count: int = 0
     can_delete: bool = True
     delete_disabled_reason: str | None = None
+    warnings: list[str] = []
 
 
 class RepositoryList(_LenientModel):

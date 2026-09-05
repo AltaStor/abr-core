@@ -14,6 +14,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -158,6 +159,9 @@ PRODUCT_NAME = "AltaStor Backup & Replication"
 PRODUCT_VERSION = "4.1.0"
 
 REPO_TYPES = ("local", "nfs", "smb", "s3")
+
+PRODUCT_STORAGE_MODE = 0o750
+
 EXECUTION_TYPES = ("Incremental", "ActiveFull", "SyntheticFull")
 EXECUTION_REASONS = (
     "FirstRun",
@@ -1686,7 +1690,9 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         "free_bytes": None,
         "available": False,
         "error": None,
+        "permissions": None,
     }
+    warnings: list[str] = []
     if repo_type == "s3":
         # S3 buckets are elastic — there is no fixed capacity/free figure to
         # probe, unlike a local filesystem. "Used" is real, though: it's the
@@ -1697,6 +1703,10 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         storage["used_bytes"] = catalog["used_bytes"]
     else:
         path_value = str(item.get("path") or "").strip()
+        if path_value and repo_type == "local":
+            permissions = _local_path_permissions(Path(path_value))
+            storage["permissions"] = permissions
+            warnings.extend(_local_repository_permission_warnings(Path(path_value), permissions))
         if path_value:
             try:
                 usage = shutil.disk_usage(path_value)
@@ -1716,6 +1726,7 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
             item["status"] = "unavailable"
             item["health"] = "unavailable"
     item["storage"] = storage
+    item["warnings"] = warnings
     item["capacity_bytes"] = storage["capacity_bytes"]
     item["used_bytes"] = storage["used_bytes"]
     item["free_bytes"] = storage["free_bytes"]
@@ -1888,6 +1899,105 @@ def _build_s3_repository_path(config: dict[str, Any]) -> str:
     return build_s3_location(str(config.get("bucket") or "").strip(), config.get("prefix"))
 
 
+def _service_account_name() -> str:
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (AttributeError, ImportError, KeyError, OSError):
+        return str(os.geteuid()) if hasattr(os, "geteuid") else "unknown"
+
+
+def _local_path_permissions(path: Path) -> dict[str, Any] | None:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    owner: Any = info.st_uid
+    group: Any = info.st_gid
+    try:
+        import grp
+        import pwd
+
+        owner = pwd.getpwuid(info.st_uid).pw_name
+        group = grp.getgrgid(info.st_gid).gr_name
+    except (ImportError, KeyError, OSError):
+        pass
+    mode = stat.S_IMODE(info.st_mode)
+    parent_world_writable = False
+    if path.parent != path:
+        try:
+            parent_world_writable = bool(stat.S_IMODE(path.parent.stat().st_mode) & stat.S_IWOTH)
+        except OSError:
+            parent_world_writable = False
+    return {
+        "mode": f"{mode:04o}",
+        "owner": str(owner),
+        "group": str(group),
+        "world_writable": bool(mode & stat.S_IWOTH),
+        "sticky": bool(mode & stat.S_ISVTX),
+        "parent_world_writable": parent_world_writable,
+        "readable": os.access(path, os.R_OK),
+        "writable": os.access(path, os.W_OK),
+    }
+
+
+def _world_writable_repository_message(path: Path, permissions: dict[str, Any]) -> str:
+    exposure = (
+        "any local account can add files to it and fill it (the sticky bit only blocks deletion)"
+        if permissions["sticky"]
+        else "any local account can read, replace or delete the backups in it"
+    )
+    return (
+        f"Repository path {path} is world-writable (mode {permissions['mode']} "
+        f"{permissions['owner']}:{permissions['group']}): {exposure}."
+    )
+
+
+def _tighten_mode_hint(path: Path) -> str:
+    return f"Run: chmod {PRODUCT_STORAGE_MODE:o} {path}"
+
+
+def _local_repository_permission_warnings(path: Path, permissions: dict[str, Any] | None) -> list[str]:
+    if not permissions:
+        return []
+    warnings: list[str] = []
+    if permissions["world_writable"]:
+        warnings.append(f"{_world_writable_repository_message(path, permissions)} {_tighten_mode_hint(path)}")
+    elif permissions["parent_world_writable"]:
+        warnings.append(
+            f"Repository path {path} has a world-writable parent ({path.parent}): any local account "
+            f"can move the repository aside and replace it. Run: chmod o-w {path.parent}"
+        )
+    if not permissions["readable"] or not permissions["writable"]:
+        missing = " or ".join(
+            label
+            for label, granted in (("readable", permissions["readable"]), ("writable", permissions["writable"]))
+            if not granted
+        )
+        warnings.append(
+            f"Repository path {path} is not {missing} by the service account "
+            f"({_service_account_name()}): it is mode {permissions['mode']} "
+            f"{permissions['owner']}:{permissions['group']}, so backups into it will fail."
+        )
+    return warnings
+
+
+def _reject_insecure_local_repository_path(path: Path) -> None:
+    permissions = _local_path_permissions(path)
+    if permissions is None or not permissions["world_writable"]:
+        return
+    raise api_error(
+        422,
+        "insecure_repository_path",
+        f"{_world_writable_repository_message(path, permissions)} {_tighten_mode_hint(path)}",
+        path=str(path),
+        mode=permissions["mode"],
+        owner=permissions["owner"],
+        group=permissions["group"],
+    )
+
+
 def _stat_operator_path(path: Path) -> tuple[bool, bool, str | None]:
     try:
         if not path.exists():
@@ -1935,6 +2045,7 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
             raise api_error(422, "invalid_repository", f"Path is not accessible: {local_path} ({access_error})", path=path)
         _ensure(exists, 422, "invalid_repository", f"Path does not exist: {local_path}", path=path)
         _ensure(is_dir, 422, "invalid_repository", f"Path is not a directory: {local_path}", path=path)
+        _reject_insecure_local_repository_path(local_path)
     elif repo_type == "s3":
         s3_config = _normalize_s3_configuration(payload)
         if description and not s3_config.get("description"):
@@ -2052,6 +2163,8 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
             updated["path"] = local_path
             changed = True
         _ensure(bool(str(updated.get("path") or "").strip()), 422, "invalid_repository", "local repositories require --path")
+        if local_path is not None and local_path != original_path:
+            _reject_insecure_local_repository_path(Path(local_path))
     elif repo_type == "s3":
         current_s3 = extract_s3_config(updated)
         next_s3 = _normalize_s3_configuration(payload, existing=current_s3)
@@ -2175,6 +2288,20 @@ def _verify_local_repository(repository: dict[str, Any]) -> dict[str, Any]:
     checks.append({"name": "writable", "status": "ok" if writable else "failed"})
     if not readable or not writable:
         return {"status": "error", "checks": checks, "message": f"Path is not readable and writable: {path}"}
+    permissions = _local_path_permissions(path)
+    permission_warnings = _local_repository_permission_warnings(path, permissions)
+    checks.append(
+        {
+            "name": "permissions",
+            "status": "warning" if permission_warnings else "ok",
+            "message": " ".join(permission_warnings)
+            or (
+                f"mode {permissions['mode']} {permissions['owner']}:{permissions['group']}"
+                if permissions
+                else "Path mode could not be read"
+            ),
+        }
+    )
     try:
         with NamedTemporaryFile(dir=path, prefix=".abr-probe-", delete=True) as handle:
             handle.write(b"abr probe\n")
@@ -2207,7 +2334,10 @@ def _verify_local_repository(repository: dict[str, Any]) -> dict[str, Any]:
     if backup_health["status"] == "failed":
         return {"status": "error", "checks": checks, "message": f"Backup integrity check failed: {backup_health['message']}"}
     
-    return {"status": "success", "checks": checks, "message": "Repository is available"}
+    message = "Repository is available"
+    if permission_warnings:
+        message = f"{message}. Warning: {' '.join(permission_warnings)}"
+    return {"status": "success", "checks": checks, "message": message}
 
 
 def _verify_remote_repository(repository: dict[str, Any]) -> dict[str, Any]:

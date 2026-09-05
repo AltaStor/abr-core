@@ -918,5 +918,53 @@ class SystemCommandTests(unittest.TestCase):
         self.assertIn("Warning: MongoDB log not found", stream_err.getvalue())
 
 
+class SupportBundleWriteFailureEndToEndTests(unittest.TestCase):
+    @unittest.skipIf(
+        hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions"
+    )
+    @patch("python.cli.api.client.requests.request")
+    def test_an_unwritable_path_prints_one_error_line_and_no_traceback(
+        self, request_mock: object
+    ) -> None:
+        from python.cli import abr_cli
+
+        request_mock.return_value = _FakeResponse(
+            {
+                "manifest": {"files": ["manifest.json"], "warnings": []},
+                "archive_base64": base64.b64encode(b"PK\x03\x04").decode("ascii"),
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            read_only = Path(tmpdir) / "read-only"
+            read_only.mkdir()
+            read_only.chmod(0o500)
+            destination = str(read_only / "bundle.zip")
+
+            stream_err = io.StringIO()
+            try:
+                with redirect_stdout(io.StringIO()), redirect_stderr(stream_err):
+                    with self.assertRaises(SystemExit) as ctx:
+                        abr_cli.main(
+                            [
+                                "--base-url",
+                                "http://example.test",
+                                "system",
+                                "get-support-bundle",
+                                "--file",
+                                destination,
+                            ]
+                        )
+            finally:
+                read_only.chmod(0o700)
+
+        stderr = stream_err.getvalue()
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("Cannot write the support bundle to", stderr)
+        self.assertIn("Permission denied", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertNotIn("system_commands.py", stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,8 @@ from python.cli.core.logger_conf import is_worth_collecting as _is_worth_collect
 from python.cli.core.logger_conf import redact_log_bytes as _redact_log_bytes
 
 from ..cli_context import CliContext
+from ..errors import CliStructuredError
+from ..exit_codes import GENERAL_ERROR
 from .server_defaults_template import render_recovered_server_defaults
 
 _LOCAL_LOG_TAIL_BYTES = 2 * 1024 * 1024
@@ -129,6 +131,18 @@ def _merge_local_diagnostics_into_bundle(
     return buffer.getvalue(), merged_manifest
 
 
+def _write_archive(destination: Path, archive_bytes: bytes, *, what: str) -> None:
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(archive_bytes)
+    except OSError as exc:
+        raise CliStructuredError(
+            code="write_failed",
+            message=f"Cannot write the {what} to {destination}: {exc.strerror or exc}",
+            exit_code=GENERAL_ERROR,
+        ) from exc
+
+
 class SystemService:
     def __init__(self, context: CliContext) -> None:
         self.context = context
@@ -142,8 +156,7 @@ class SystemService:
         )
 
         destination = Path(file) if file else _default_support_bundle_destination()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(archive_bytes)
+        _write_archive(destination, archive_bytes, what="support bundle")
 
         return {
             "file": str(destination.resolve()),
@@ -157,8 +170,9 @@ class SystemService:
         )
 
         destination = Path(file)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(base64.b64decode(result["archive_base64"]))
+        _write_archive(
+            destination, base64.b64decode(result["archive_base64"]), what="catalog export"
+        )
 
         return {"file": str(destination), "manifest": result.get("manifest", {})}
 
