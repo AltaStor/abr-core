@@ -6,12 +6,14 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
+from python.cli.errors import CliStructuredError
 from python.cli.services import system_service
 
 
@@ -238,6 +240,76 @@ class GetSupportBundleMergeTests(unittest.TestCase):
                 content = archive.read("logs/cli-local/cli.log.fault").decode("utf-8")
             self.assertIn("Segmentation fault", content)
             self.assertNotIn("hunter2", content)
+
+
+class ArchiveWriteFailureTests(unittest.TestCase):
+    def _service(self):
+        manifest = {"files": ["manifest.json"], "warnings": []}
+        return system_service.SystemService(
+            _FakeContext(
+                {
+                    "manifest": manifest,
+                    "archive_base64": base64.b64encode(_build_zip(manifest)).decode("ascii"),
+                }
+            )
+        )
+
+    def test_unwritable_destination_raises_a_structured_error_not_a_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as log_dir:
+            destination = str(Path(out_dir) / "bundle.zip")
+
+            with patch(
+                "python.cli.services.system_service._resolve_log_dir", return_value=log_dir
+            ), patch(
+                "python.cli.services.system_service.Path.write_bytes",
+                side_effect=PermissionError(13, "Permission denied"),
+            ), self.assertRaises(CliStructuredError) as caught:
+                self._service().get_support_bundle(file=destination)
+
+        error = caught.exception
+        self.assertEqual(error.exit_code, 1)
+        self.assertNotEqual(error.code, "runtime_error", "runtime_error logs a full traceback")
+        self.assertIn(destination, error.message)
+        self.assertIn("Permission denied", error.message)
+        self.assertNotIn("Traceback", error.message)
+        self.assertNotIn(".py", error.message)
+
+    @unittest.skipIf(
+        hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores directory permissions"
+    )
+    def test_a_real_read_only_directory_is_reported_the_same_way(self) -> None:
+        with tempfile.TemporaryDirectory() as out_dir, tempfile.TemporaryDirectory() as log_dir:
+            read_only = Path(out_dir) / "read-only"
+            read_only.mkdir()
+            read_only.chmod(0o500)
+            try:
+                with patch(
+                    "python.cli.services.system_service._resolve_log_dir", return_value=log_dir
+                ), self.assertRaises(CliStructuredError) as caught:
+                    self._service().get_support_bundle(file=str(read_only / "bundle.zip"))
+            finally:
+                read_only.chmod(0o700)
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertIn("Permission denied", caught.exception.message)
+
+    def test_the_catalog_export_reports_a_write_failure_the_same_way(self) -> None:
+        service = system_service.SystemService(
+            _FakeContext({"archive_base64": base64.b64encode(b"PK").decode("ascii")})
+        )
+
+        with tempfile.TemporaryDirectory() as out_dir:
+            destination = str(Path(out_dir) / "export.enc")
+
+            with patch(
+                "python.cli.services.system_service.Path.write_bytes",
+                side_effect=PermissionError(13, "Permission denied"),
+            ), self.assertRaises(CliStructuredError) as caught:
+                service.export_catalog(file=destination, password="hunter2hunter2")
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertIn("catalog export", caught.exception.message)
+        self.assertNotIn("hunter2", caught.exception.message)
 
 
 if __name__ == "__main__":

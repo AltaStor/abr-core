@@ -22,6 +22,8 @@ from python.srv.core.utils import utc_now
 
 from . import abr_v41
 
+_DEFAULT_MONGODB_LOG_PATH = "/var/log/mongodb/mongod.log"
+
 
 def _server_configuration_file_candidates() -> list[Path]:
     override = os.environ.get(abr_v41.SERVER_DEFAULTS_FILE_ENV_VAR)
@@ -34,22 +36,109 @@ def _server_configuration_file_candidates() -> list[Path]:
     ]
 
 
-def _mongodb_defaults_file_candidates() -> list[Path]:
-    return [
-        Path("/etc/altastor-backup/mongod.conf"),
-        Path("/etc/default/altastor-backup-mongodb"),
-    ]
+def _mongodb_configuration_file() -> Path:
+    return Path("/etc/altastor-backup/mongod.conf")
 
 
-def _mongodb_log_path() -> str:
-    for candidate in _mongodb_defaults_file_candidates():
+def _scalar(value: str) -> str:
+    value = value.strip()
+    quote = value[:1]
+    if quote in ("'", '"'):
+        closing = value.find(quote, 1)
+        if closing != -1:
+            return value[1:closing]
+    for comment in (" #", "\t#"):
+        index = value.find(comment)
+        if index != -1:
+            value = value[:index]
+    return value.strip()
+
+
+def _mongodb_log_path_from_text(text: str) -> str | None:
+    saw_system_log = False
+    system_log_indent: int | None = None
+    unscoped_path: str | None = None
+
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        indent = len(raw_line) - len(raw_line.lstrip(" \t"))
+
+        if ":" not in stripped:
+            continue
+
+        key, _, value = stripped.partition(":")
+        key = key.strip()
+        value = _scalar(value)
+
+        if key == "systemLog":
+            saw_system_log = True
+            system_log_indent = indent
+            continue
+
+        if system_log_indent is not None and indent <= system_log_indent:
+            system_log_indent = None
+
+        if key != "path" or not value:
+            continue
+
+        if system_log_indent is not None:
+            return value
+        if unscoped_path is None:
+            unscoped_path = value
+
+    return None if saw_system_log else unscoped_path
+
+
+def _mongodb_log_path(warnings: list[str] | None = None) -> str:
+    candidate = _mongodb_configuration_file()
+    try:
         if candidate.is_file():
-            values = abr_v41._read_env_defaults_file(candidate)
-            log_path = values.get("MONGO_LOGPATH")
+            log_path = _mongodb_log_path_from_text(
+                candidate.read_text(encoding="utf-8", errors="replace")
+            )
             if log_path:
                 return log_path
-            break
-    return "/var/log/altastor-backup/mongodb/mongod.log"
+    except OSError as exc:
+        if warnings is not None:
+            hint = _ownership_hint(candidate) if isinstance(exc, PermissionError) else ""
+            warnings.append(f"Failed to read MongoDB configuration at {candidate}: {exc}{hint}")
+
+    return _DEFAULT_MONGODB_LOG_PATH
+
+
+def _process_user_name() -> str:
+    try:
+        import pwd
+
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except (ImportError, KeyError, OSError):
+        return str(os.geteuid()) if hasattr(os, "geteuid") else "unknown"
+
+
+def _ownership_hint(path: Path) -> str:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return f"; the support bundle runs as {_process_user_name()}"
+
+    owner: Any = stat_result.st_uid
+    group: Any = stat_result.st_gid
+    try:
+        import grp
+        import pwd
+
+        owner = pwd.getpwuid(stat_result.st_uid).pw_name
+        group = grp.getgrgid(stat_result.st_gid).gr_name
+    except (ImportError, KeyError, OSError):
+        pass
+
+    return (
+        f"; it is mode {stat_result.st_mode & 0o777:04o} {owner}:{group} "
+        f"and the support bundle runs as {_process_user_name()}"
+    )
 
 
 def _collect_logs(warnings: list[str]) -> list[tuple[str, bytes]]:
@@ -81,14 +170,22 @@ def _collect_logs(warnings: list[str]) -> list[tuple[str, bytes]]:
     else:
         warnings.append(f"No CLI logs found under {cli_dir}")
 
-    mongodb_log = Path(_mongodb_log_path())
+    config_notes: list[str] = []
+    mongodb_log = Path(_mongodb_log_path(config_notes))
     try:
         if mongodb_log.is_file():
             files.append((f"logs/mongodb/{mongodb_log.name}", _redact_log_bytes(mongodb_log.read_bytes())))
         else:
             warnings.append(f"MongoDB log not found at {mongodb_log}")
+            warnings.extend(config_notes)
+    except PermissionError as exc:
+        warnings.append(
+            f"Failed to read MongoDB log at {mongodb_log}: {exc}{_ownership_hint(mongodb_log)}"
+        )
+        warnings.extend(config_notes)
     except OSError as exc:
         warnings.append(f"Failed to read MongoDB log at {mongodb_log}: {exc}")
+        warnings.extend(config_notes)
 
     return files
 
@@ -177,7 +274,10 @@ def generate_support_bundle() -> dict[str, Any]:
         *_collect_catalog(warnings),
     ]
     system_info = _collect_system_info()
-    included_files = [arcname for arcname, _ in collected_files] + ["system-info.json"]
+    included_files = [arcname for arcname, _ in collected_files] + [
+        "system-info.json",
+        "manifest.json",
+    ]
 
     manifest = {
         "product": abr_v41.PRODUCT_NAME,
