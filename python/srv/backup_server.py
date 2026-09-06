@@ -480,6 +480,7 @@ if __name__ == "__main__":
         )
     logger.info("MongoDB persistence enabled via %s", os.environ["MONGODB_URI"])
 
+    from python.srv.core.http_redirect import start_redirect_listener
     from python.srv.core.tls_bootstrap import (
         default_cert_paths,
         ensure_self_signed_cert,
@@ -500,5 +501,15 @@ if __name__ == "__main__":
     config.load()
     TLS_RUNTIME = TlsRuntime(cert_path=cert_path, key_path=key_path, ssl_context=config.ssl)
 
+    redirect_listener = start_redirect_listener(
+        host=os.environ["ALTASTOR_BACKUP_HOST"],
+        https_port=env_int("ALTASTOR_BACKUP_PORT"),
+        security_headers=lambda: security_headers_for("http"),
+    )
+
     logger.info("Starting Uvicorn server (HTTPS, cert %s)...", cert_path)
-    uvicorn.Server(config).run()
+    try:
+        uvicorn.Server(config).run()
+    finally:
+        if redirect_listener is not None:
+            redirect_listener.stop()
