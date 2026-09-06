@@ -104,6 +104,28 @@ class TokenStoreTests(_IsolatedConfigDirCase):
         self.assertIsNone(token_store.load_token("http://a.test"))
         self.assertEqual(token_store.load_token("http://b.test"), "tok-b")
 
+    def test_one_server_spelled_differently_shares_one_token(self) -> None:
+        token_store.save_token("https://backup01:443/", "tok-443", "2099-01-01T00:00:00+00:00")
+        self.assertEqual(token_store.load_token("https://backup01"), "tok-443")
+        self.assertEqual(token_store.load_token("https://BACKUP01/"), "tok-443")
+
+        stored = json.loads((Path(self._tmpdir.name) / "credentials.json").read_text())
+        self.assertEqual(list(stored), ["https://backup01"])
+
+        token_store.clear_token("https://backup01:443")
+        self.assertIsNone(token_store.load_token("https://backup01"))
+
+    def test_a_non_default_port_stays_in_the_key(self) -> None:
+        token_store.save_token("https://backup01:8443", "tok-8443", "2099-01-01T00:00:00+00:00")
+        self.assertEqual(token_store.load_token("https://backup01:8443"), "tok-8443")
+        self.assertIsNone(token_store.load_token("https://backup01"))
+
+    def test_a_token_written_before_normalisation_is_still_readable(self) -> None:
+        path = Path(self._tmpdir.name) / "credentials.json"
+        path.write_text(json.dumps({"https://backup01:443": {"token": "legacy", "expires_at": "2099-01-01T00:00:00+00:00"}}))
+        self.assertEqual(token_store.load_token("https://backup01:443"), "legacy")
+        self.assertEqual(token_store.load_token("https://backup01"), "legacy")
+
     def test_credentials_file_is_owner_only(self) -> None:
         token_store.save_token("http://a.test", "tok-123", "2099-01-01T00:00:00+00:00")
         path = Path(self._tmpdir.name) / "credentials.json"
