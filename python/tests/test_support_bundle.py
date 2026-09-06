@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import io
 import json
 import os
@@ -445,6 +446,163 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
         self.assertIn("logs/mongodb/mongod.log", [name for name, _ in files])
         self.assertFalse([w for w in warnings if "MongoDB" in w])
 
+    def test_cli_logs_are_found_when_the_server_log_dir_is_pinned_by_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            server_dir = tmp_path / "server"
+            cli_dir = tmp_path / "cli"
+            server_dir.mkdir()
+            cli_dir.mkdir()
+            (server_dir / "server.log").write_text("server line", encoding="utf-8")
+            (cli_dir / "cli.log").write_text("cli line", encoding="utf-8")
+
+            with patch.dict(os.environ, {"ALTASTOR_LOG_DIR": str(server_dir)}), patch.object(
+                support_bundle_service, "SYSTEM_LOG_DIR", str(tmp_path)
+            ), patch(
+                "python.srv.services.support_bundle_service._resolve_log_dir",
+                return_value=str(server_dir),
+            ), patch(
+                "python.srv.services.support_bundle_service._mongodb_configuration_file",
+                return_value=tmp_path / "absent.conf",
+            ):
+                warnings: list[str] = []
+                files = dict(support_bundle_service._collect_logs(warnings))
+
+        self.assertEqual(files["logs/server/server.log"], b"server line")
+        self.assertEqual(files["logs/cli/cli.log"], b"cli line")
+        self.assertFalse([w for w in warnings if "CLI logs" in w])
+
+    def test_a_missing_cli_log_dir_is_reported_with_every_place_searched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            server_dir = tmp_path / "server"
+            server_dir.mkdir()
+            (server_dir / "server.log").write_text("server line", encoding="utf-8")
+
+            with patch.dict(os.environ, {"ALTASTOR_LOG_DIR": str(server_dir)}), patch.object(
+                support_bundle_service, "SYSTEM_LOG_DIR", str(tmp_path)
+            ), patch(
+                "python.srv.services.support_bundle_service._resolve_log_dir",
+                return_value=str(server_dir),
+            ), patch(
+                "python.srv.services.support_bundle_service._mongodb_configuration_file",
+                return_value=tmp_path / "absent.conf",
+            ):
+                warnings: list[str] = []
+                support_bundle_service._collect_logs(warnings)
+
+        cli_warnings = [w for w in warnings if "CLI logs" in w]
+        self.assertEqual(len(cli_warnings), 1)
+        self.assertIn(str(tmp_path / "cli"), cli_warnings[0])
+
+    def test_rotated_mongodb_logs_are_collected_next_to_the_live_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            mongo_dir = tmp_path / "mongodb"
+            mongo_dir.mkdir()
+            (mongo_dir / "mongod.log").write_text("live line", encoding="utf-8")
+            (mongo_dir / "mongod.log.1").write_text("yesterday line", encoding="utf-8")
+            (mongo_dir / "mongod.log.2.gz").write_bytes(gzip.compress(b"last week line"))
+
+            config = tmp_path / "mongod.conf"
+            config.write_text(
+                f"systemLog:\n  path: {mongo_dir / 'mongod.log'}\n", encoding="utf-8"
+            )
+
+            with patch(
+                "python.srv.services.support_bundle_service._resolve_log_dir",
+                return_value=str(tmp_path / "empty-logs"),
+            ), patch(
+                "python.srv.services.support_bundle_service._mongodb_configuration_file",
+                return_value=config,
+            ):
+                warnings: list[str] = []
+                files = dict(support_bundle_service._collect_logs(warnings))
+
+        self.assertEqual(
+            sorted(name for name in files if name.startswith("logs/mongodb/")),
+            ["logs/mongodb/mongod.log", "logs/mongodb/mongod.log.1", "logs/mongodb/mongod.log.2"],
+        )
+        self.assertEqual(files["logs/mongodb/mongod.log.1"], b"yesterday line")
+        self.assertFalse([w for w in warnings if "MongoDB log not found" in w])
+
+    def test_secrets_inside_a_compressed_rotation_are_redacted(self) -> None:
+        secret_line = b'{"attr":{"command":{"password":"Hunter2","secret_key":"AKIAEXAMPLE"}}}'
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            mongo_dir = tmp_path / "mongodb"
+            mongo_dir.mkdir()
+            (mongo_dir / "mongod.log").write_text("live", encoding="utf-8")
+            (mongo_dir / "mongod.log.1.gz").write_bytes(gzip.compress(secret_line))
+
+            config = tmp_path / "mongod.conf"
+            config.write_text(
+                f"systemLog:\n  path: {mongo_dir / 'mongod.log'}\n", encoding="utf-8"
+            )
+
+            with patch(
+                "python.srv.services.support_bundle_service._resolve_log_dir",
+                return_value=str(tmp_path / "empty-logs"),
+            ), patch(
+                "python.srv.services.support_bundle_service._mongodb_configuration_file",
+                return_value=config,
+            ):
+                files = dict(support_bundle_service._collect_logs([]))
+
+        collected = files["logs/mongodb/mongod.log.1"]
+        self.assertNotIn(b"Hunter2", collected)
+        self.assertNotIn(b"AKIAEXAMPLE", collected)
+        self.assertIn(b"********", collected)
+
+    def test_a_log_larger_than_the_cap_is_tailed_and_the_bundle_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            mongo_dir = tmp_path / "mongodb"
+            mongo_dir.mkdir()
+            huge = mongo_dir / "mongod.log"
+            filler = b"x" * 1024 + b"\n"
+            with huge.open("wb") as handle:
+                while handle.tell() < support_bundle_service._LOG_TAIL_BYTES + 4096:
+                    handle.write(filler)
+                handle.write(b"the newest line\n")
+
+            config = tmp_path / "mongod.conf"
+            config.write_text(f"systemLog:\n  path: {huge}\n", encoding="utf-8")
+
+            with patch(
+                "python.srv.services.support_bundle_service._resolve_log_dir",
+                return_value=str(tmp_path / "empty-logs"),
+            ), patch(
+                "python.srv.services.support_bundle_service._mongodb_configuration_file",
+                return_value=config,
+            ):
+                warnings: list[str] = []
+                files = dict(support_bundle_service._collect_logs(warnings))
+
+        collected = files["logs/mongodb/mongod.log"]
+        self.assertLessEqual(len(collected), support_bundle_service._LOG_TAIL_BYTES)
+        self.assertTrue(collected.endswith(b"the newest line\n"))
+        self.assertTrue(collected.startswith(b"x"))
+        self.assertTrue(any("Collected only the last" in w for w in warnings))
+
+    def test_rotated_server_logs_are_collected_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            (tmp_path / "server.log").write_text("live", encoding="utf-8")
+            (tmp_path / "server.log.1").write_text("older", encoding="utf-8")
+
+            with patch(
+                "python.srv.services.support_bundle_service._resolve_log_dir",
+                return_value=str(tmp_path),
+            ), patch(
+                "python.srv.services.support_bundle_service._mongodb_configuration_file",
+                return_value=tmp_path / "absent.conf",
+            ):
+                files = dict(support_bundle_service._collect_logs([]))
+
+        self.assertIn("logs/server/server.log", files)
+        self.assertIn("logs/server/server.log.1", files)
+
     def test_unreadable_mongodb_log_warning_names_the_owner_and_the_bundle_user(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = pathlib.Path(tmp)
@@ -455,12 +613,12 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
             config = tmp_path / "mongod.conf"
             config.write_text(f"systemLog:\n  path: {mongo_log}\n", encoding="utf-8")
 
-            real_read_bytes = support_bundle_service.Path.read_bytes
+            real_open = support_bundle_service.Path.open
 
-            def deny_only_the_mongo_log(self):
+            def deny_only_the_mongo_log(self, *args, **kwargs):
                 if self == mongo_log:
                     raise PermissionError(13, "Permission denied")
-                return real_read_bytes(self)
+                return real_open(self, *args, **kwargs)
 
             with patch(
                 "python.srv.services.support_bundle_service._resolve_log_dir",
@@ -469,12 +627,12 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
                 "python.srv.services.support_bundle_service._mongodb_configuration_file",
                 return_value=config,
             ), patch.object(
-                support_bundle_service.Path, "read_bytes", deny_only_the_mongo_log
+                support_bundle_service.Path, "open", deny_only_the_mongo_log
             ):
                 warnings: list[str] = []
                 support_bundle_service._collect_logs(warnings)
 
-        mongo_warnings = [w for w in warnings if "MongoDB log" in w]
+        mongo_warnings = [w for w in warnings if str(mongo_log) in w]
         self.assertEqual(len(mongo_warnings), 1)
         self.assertIn("Permission denied", mongo_warnings[0])
         self.assertIn("mode 0600", mongo_warnings[0])

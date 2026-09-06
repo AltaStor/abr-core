@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import io
 import json
 import os
@@ -13,7 +14,12 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from python.srv.core.logger_conf import COMPONENT_LOG_FILENAMES, _resolve_log_dir
+from python.srv.core.logger_conf import (
+    COMPONENT_LOG_FILENAMES,
+    COMPONENT_LOG_SUBDIRS,
+    SYSTEM_LOG_DIR,
+    _resolve_log_dir,
+)
 from python.srv.core.logger_conf import is_worth_collecting as _is_worth_collecting
 from python.srv.core.logger_conf import redact_log_bytes as _redact_log_bytes
 from python.srv.core.logger_conf import redact_text as _redact_config_text
@@ -23,6 +29,7 @@ from python.srv.core.utils import utc_now
 from . import abr_v41
 
 _DEFAULT_MONGODB_LOG_PATH = "/var/log/mongodb/mongod.log"
+_LOG_TAIL_BYTES = 2 * 1024 * 1024
 
 
 def _server_configuration_file_candidates() -> list[Path]:
@@ -139,47 +146,120 @@ def _ownership_hint(path: Path) -> str:
     )
 
 
+def _read_log_tail(path: Path) -> tuple[bytes, bool]:
+    if path.name.endswith(".gz"):
+        tail = b""
+        truncated = False
+        with gzip.open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                tail += chunk
+                if len(tail) > _LOG_TAIL_BYTES:
+                    tail = tail[-_LOG_TAIL_BYTES:]
+                    truncated = True
+    else:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            truncated = size > _LOG_TAIL_BYTES
+            handle.seek(size - _LOG_TAIL_BYTES if truncated else 0)
+            tail = handle.read()
+
+    if truncated:
+        newline = tail.find(b"\n")
+        if newline != -1:
+            tail = tail[newline + 1:]
+
+    return tail, truncated
+
+
+def _collected_log_name(path: Path) -> str:
+    return path.name[: -len(".gz")] if path.name.endswith(".gz") else path.name
+
+
+def _collect_log_file(
+    path: Path, arc_dir: str, files: list[tuple[str, bytes]], warnings: list[str]
+) -> None:
+    try:
+        content, truncated = _read_log_tail(path)
+    except PermissionError as exc:
+        warnings.append(f"Failed to read {path}: {exc}{_ownership_hint(path)}")
+        return
+    except OSError as exc:
+        warnings.append(f"Failed to read {path}: {exc}")
+        return
+
+    files.append((f"{arc_dir}/{_collected_log_name(path)}", _redact_log_bytes(content)))
+    if truncated:
+        warnings.append(
+            f"Collected only the last {_LOG_TAIL_BYTES // (1024 * 1024)} MB of {path}"
+        )
+
+
+def _rotated_siblings(path: Path) -> list[Path]:
+    try:
+        return sorted(p for p in path.parent.glob(path.name + "*") if p.is_file())
+    except OSError:
+        return []
+
+
+def _component_log_dirs(component: str) -> list[Path]:
+    dirs: list[Path] = []
+    if component == "srv":
+        explicit = os.environ.get("ALTASTOR_LOG_DIR")
+        if explicit:
+            dirs.append(Path(explicit))
+    dirs.append(Path(SYSTEM_LOG_DIR) / COMPONENT_LOG_SUBDIRS.get(component, component))
+    dirs.append(Path(_resolve_log_dir(component)))
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for directory in dirs:
+        key = os.path.abspath(directory)
+        if key not in seen:
+            seen.add(key)
+            unique.append(directory)
+    return unique
+
+
+def _component_log_files(component: str) -> tuple[list[Path], list[Path]]:
+    pattern = COMPONENT_LOG_FILENAMES[component] + "*"
+    searched = _component_log_dirs(component)
+    for directory in searched:
+        try:
+            found = sorted(
+                p for p in directory.glob(pattern) if p.is_file() and _is_worth_collecting(p)
+            )
+        except OSError:
+            continue
+        if found:
+            return found, searched
+    return [], searched
+
+
 def _collect_logs(warnings: list[str]) -> list[tuple[str, bytes]]:
     files: list[tuple[str, bytes]] = []
 
-    server_dir = Path(_resolve_log_dir("srv"))
-    server_logs = sorted(
-        p for p in server_dir.glob(COMPONENT_LOG_FILENAMES["srv"] + "*") if _is_worth_collecting(p)
-    )
-    if server_logs:
-        for log_file in server_logs:
-            try:
-                files.append((f"logs/server/{log_file.name}", _redact_log_bytes(log_file.read_bytes())))
-            except OSError as exc:
-                warnings.append(f"Failed to read {log_file}: {exc}")
-    else:
-        warnings.append(f"No server logs found under {server_dir}")
-
-    cli_dir = Path(_resolve_log_dir("cli"))
-    cli_logs = sorted(
-        p for p in cli_dir.glob(COMPONENT_LOG_FILENAMES["cli"] + "*") if _is_worth_collecting(p)
-    )
-    if cli_logs:
-        for log_file in cli_logs:
-            try:
-                files.append((f"logs/cli/{log_file.name}", _redact_log_bytes(log_file.read_bytes())))
-            except OSError as exc:
-                warnings.append(f"Failed to read {log_file}: {exc}")
-    else:
-        warnings.append(f"No CLI logs found under {cli_dir}")
+    for component, arc_dir, label in (("srv", "logs/server", "server"), ("cli", "logs/cli", "CLI")):
+        found, searched = _component_log_files(component)
+        if not found:
+            looked_in = ", ".join(str(d) for d in searched)
+            warnings.append(f"No {label} logs found under {looked_in}")
+            continue
+        for log_file in found:
+            _collect_log_file(log_file, arc_dir, files, warnings)
 
     mongodb_log = Path(_mongodb_log_path())
-    try:
-        if mongodb_log.is_file():
-            files.append((f"logs/mongodb/{mongodb_log.name}", _redact_log_bytes(mongodb_log.read_bytes())))
-        else:
-            warnings.append(f"MongoDB log not found at {mongodb_log}")
-    except PermissionError as exc:
-        warnings.append(
-            f"Failed to read MongoDB log at {mongodb_log}: {exc}{_ownership_hint(mongodb_log)}"
-        )
-    except OSError as exc:
-        warnings.append(f"Failed to read MongoDB log at {mongodb_log}: {exc}")
+    mongodb_logs = _rotated_siblings(mongodb_log)
+    if mongodb_logs:
+        for log_file in mongodb_logs:
+            _collect_log_file(log_file, "logs/mongodb", files, warnings)
+    elif mongodb_log.exists():
+        _collect_log_file(mongodb_log, "logs/mongodb", files, warnings)
+    else:
+        warnings.append(f"MongoDB log not found at {mongodb_log}")
 
     return files
 
