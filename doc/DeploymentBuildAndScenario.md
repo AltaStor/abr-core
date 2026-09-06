@@ -215,19 +215,23 @@ instead it pins the certificate it sees on first connection and refuses to
 proceed if a later connection to the same host:port presents a different one
 (see `python/cli/tls_trust.py`) -- no extra flags needed for normal use.
 
+Log in. Every `/api/v1` call needs a session, so this comes before anything
+else. The shipped `admin`/`admin` is a bootstrap credential -- change it with
+`abr auth change-password` once the environment is up:
+
+```bash
+.venv/bin/python -m python.cli.main auth login --name admin
+```
+
 Check the API:
 
 ```bash
-.venv/bin/python -m python.cli.main health
+.venv/bin/python -m python.cli.main system health
 ```
 
-Expected result:
-
-```json
-{
-  "status": "ok"
-}
-```
+Expected result: a table whose `STATUS` column reads `ok`, with `api`,
+`database`, `scheduler` and `task_pool` all reporting `ok` under `COMPONENTS`.
+Add `--output json` for the machine-readable form.
 
 ## 6. Scenario variables
 
@@ -476,11 +480,12 @@ processes.
 API is not reachable:
 
 ```bash
-.venv/bin/python -m python.cli.main health
+.venv/bin/python -m python.cli.main system health
 ```
 
 If it fails with connection refused, start Terminal 2 or verify
-`BACKUP_SERVER_URL`.
+`BACKUP_SERVER_URL`. If it reports that there is no session, run
+`.venv/bin/python -m python.cli.main auth login --name admin` first.
 
 Inventory is empty:
 
