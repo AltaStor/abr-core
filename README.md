@@ -15,16 +15,23 @@ The Python core of AltaStor Backup & Replication: the BackupServer API and the
 ```bash
 ./scripts/check_deps.sh                 # .venv, Python requirements, local MongoDB bundle
 tools/mongodb/bin/mongod --dbpath /tmp/br-mongo --bind_ip 127.0.0.1 --port 27018 &
-./scripts/run_srv.sh                    # HTTPS on 127.0.0.1:8443
+./scripts/run_srv.sh                    # HTTPS on 127.0.0.1:443, redirect on :80
 ```
 
 Then, in another shell:
 
 ```bash
-export BACKUP_SERVER_URL=https://127.0.0.1:8443
 .venv/bin/python -m python.cli auth login --name admin   # bootstrap admin/admin
 .venv/bin/python -m python.cli system health
 ```
+
+The CLI defaults to `https://127.0.0.1`, so no `BACKUP_SERVER_URL` is needed.
+Ports 443 and 80 are privileged, so `run_srv.sh` asks `sudo` once to lower
+`net.ipv4.ip_unprivileged_port_start`; failing that it falls back to 8443 and
+8080 and prints the `export BACKUP_SERVER_URL=...` line to paste. Port 80 only
+redirects to HTTPS, which is what makes the address work with no scheme typed -
+see `doc/DeploymentBuildAndScenario.md` for the details and for what a real
+install needs instead.
 
 Every `/api/v1` call needs a session, so `auth login` comes first. The shipped
 `admin`/`admin` is a bootstrap credential - change it with

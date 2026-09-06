@@ -21,7 +21,7 @@ from ..commands import (
 )
 from ..compact_help_formatter import CompactHelpFormatter
 
-DEFAULT_BASE_URL = os.getenv("BACKUP_SERVER_URL", "https://127.0.0.1:8443")
+DEFAULT_BASE_URL = os.getenv("BACKUP_SERVER_URL", "https://127.0.0.1")
 CLI_VERSION = "0.1.0"
 PRODUCT_NAME = "AltaStor Backup & Replication"
 
@@ -29,7 +29,7 @@ PRODUCT_NAME = "AltaStor Backup & Replication"
 class AltaStorParserBuilder:
     def build(self) -> argparse.ArgumentParser:
         parser = AltaStorArgumentParser(prog="abr", description="AltaStor CLI", formatter_class=CompactHelpFormatter)
-        parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="AltaStor API base URL (default: BACKUP_SERVER_URL or https://127.0.0.1:8443)")
+        parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="AltaStor API base URL (default: BACKUP_SERVER_URL or https://127.0.0.1)")
         parser.add_argument("--output", choices=("json", "table"), default="table", help="Output format for commands that support tabular display (default: table)")
         parser.add_argument("--log-level", choices=("debug", "info", "warn", "error"), default="info", help="Console log verbosity (default: info)")
         subparsers = parser.add_subparsers(dest="command_group", required=True)

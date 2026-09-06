@@ -149,20 +149,47 @@ the certificate, applies `defaults.env` and pins the TLS 1.2 cipher list
 (`ABR_TLS_CIPHERS`); a bare `uvicorn python.srv.backup_server:app` never runs
 that code, so it comes up with whatever cipher suites the installed OpenSSL
 defaults to. Host and port come from `ALTASTOR_BACKUP_HOST` and
-`ALTASTOR_BACKUP_PORT`.
+`ALTASTOR_BACKUP_PORT`, and the plain-HTTP redirect listener from
+`ABR_HTTP_REDIRECT_PORT`.
 
 The API is ready when it prints:
 
 ```text
+Plain-HTTP redirect listener on 0.0.0.0:80 -> https://<host>:443
 Application startup complete.
-Uvicorn running on https://127.0.0.1:8443
+Uvicorn running on https://0.0.0.0:443
 ```
 
-If port `8443` is already in use, choose another port:
+### Ports and privileges
+
+`defaults.env` ships 443 for HTTPS and 80 for the redirect listener. Both are
+below 1024, so the process needs `CAP_NET_BIND_SERVICE`; the
+`altastor-backup-server` systemd unit grants exactly that and nothing else:
+
+```ini
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+The bounding set line is a restriction, not a grant: it drops every other
+capability the service would otherwise be allowed to hold. Without the ambient
+line the server cannot bind 443 and will not start (`[Errno 13] permission
+denied`). The redirect listener is softer -- a port it cannot bind is a warning
+in the log and HTTPS comes up regardless.
+
+The redirect listener exists because the browser, not the user, chooses the
+scheme when someone types a bare host name: that guess is `http`, it would land
+on a TLS port, and the handshake failure shows as an unexplained browser error.
+Port 80 answers it with a 308 to `https://<the host the client asked for>`. A
+single TCP port cannot serve both TLS and plaintext, so this cannot live on 443.
+
+For a development run, `scripts/run_srv.sh` handles the privilege question on
+its own (see the README). To use a different port instead:
 
 ```bash
 cd /path/to/backup-server
 MONGODB_URI=mongodb://127.0.0.1:27018 ALTASTOR_BACKUP_PORT=8001 \
+  ABR_HTTP_REDIRECT_PORT= \
   .venv/bin/python -m python.srv.backup_server
 ```
 
@@ -176,27 +203,35 @@ export BACKUP_SERVER_URL=https://127.0.0.1:8001
 
 ```bash
 cd /path/to/backup-server
-export BACKUP_SERVER_URL=https://127.0.0.1:8443
+export BACKUP_SERVER_URL=https://127.0.0.1
 ```
+
+`https://127.0.0.1` is the CLI default, so the export is only needed when the
+server runs on a non-default port. Note that `https://host` and
+`https://host:443` are the same endpoint and share one stored session token.
 
 The certificate is self-signed, so the CLI doesn't verify it against a CA;
 instead it pins the certificate it sees on first connection and refuses to
 proceed if a later connection to the same host:port presents a different one
 (see `python/cli/tls_trust.py`) -- no extra flags needed for normal use.
 
+Log in. Every `/api/v1` call needs a session, so this comes before anything
+else. The shipped `admin`/`admin` is a bootstrap credential -- change it with
+`abr auth change-password` once the environment is up:
+
+```bash
+.venv/bin/python -m python.cli.main auth login --name admin
+```
+
 Check the API:
 
 ```bash
-.venv/bin/python -m python.cli.main health
+.venv/bin/python -m python.cli.main system health
 ```
 
-Expected result:
-
-```json
-{
-  "status": "ok"
-}
-```
+Expected result: a table whose `STATUS` column reads `ok`, with `api`,
+`database`, `scheduler` and `task_pool` all reporting `ok` under `COMPONENTS`.
+Add `--output json` for the machine-readable form.
 
 ## 6. Scenario variables
 
@@ -445,11 +480,12 @@ processes.
 API is not reachable:
 
 ```bash
-.venv/bin/python -m python.cli.main health
+.venv/bin/python -m python.cli.main system health
 ```
 
 If it fails with connection refused, start Terminal 2 or verify
-`BACKUP_SERVER_URL`.
+`BACKUP_SERVER_URL`. If it reports that there is no session, run
+`.venv/bin/python -m python.cli.main auth login --name admin` first.
 
 Inventory is empty:
 
@@ -488,6 +524,24 @@ Wrong API port:
 export BACKUP_SERVER_URL=https://127.0.0.1:8001
 ```
 
+Server will not start, `[Errno 13] permission denied` on port 443: the unit is
+missing `AmbientCapabilities=CAP_NET_BIND_SERVICE`, or the run is a development
+one outside `scripts/run_srv.sh`.
+
+Browser reaches HTTPS without ever being redirected: expected. Once 443 answers,
+a browser may try `https://` first and never touch port 80. To exercise the
+redirect, name the scheme: `curl -sS -o /dev/null -w '%{redirect_url}\n'
+http://<host>`.
+
+CLI asks to log in again after an upgrade: the stored session token is keyed by
+server URL, so moving from `https://host:8443` to `https://host` is a different
+key. Run `abr auth login` once.
+
+Upgraded installation still on 8443: a port written into
+`/etc/altastor-backup/server.conf` overrides `defaults.env`, and an upgrade does
+not rewrite it. Change it there deliberately, and update `BACKUP_SERVER_URL` for
+every CLI client at the same time.
+
 
 ## 15. Minimal command checklist
 
@@ -495,7 +549,7 @@ This is the short version once the environment is ready:
 
 ```bash
 cd /path/to/backup-server
-export BACKUP_SERVER_URL=https://127.0.0.1:8443
+export BACKUP_SERVER_URL=https://127.0.0.1
 
 ESXI_HOST=<host_or_ip>
 ESXI_USER=<username>
