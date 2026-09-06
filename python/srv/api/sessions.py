@@ -19,15 +19,27 @@ def list_sessions(
     job: str | None = Query(default=None),
     limit: int | None = Query(default=None, ge=1, le=abr_v41.SESSION_PAGE_LIMIT_MAX),
     offset: int = Query(default=0, ge=0),
+    page: int | None = Query(default=None, ge=1),
+    per_page: int | None = Query(default=None, ge=1, le=abr_v41.SESSION_PAGE_LIMIT_MAX),
+    since: str | None = Query(default=None),
 ) -> SessionList:
     """Newest-first page of sessions.
 
-    ``limit``/``offset`` page the result; omitting ``limit`` still returns the
-    whole list, so existing clients (and `abr session list`) keep working. The
-    envelope always reports ``total``, so a caller that does page knows how far
-    to walk. Items carry no ``logs`` -- GET /sessions/{id}/log serves those.
+    Two spellings of the same slice: ``limit``/``offset``, or ``page``/
+    ``per_page`` for callers that count in pages. Passing ``page`` or
+    ``per_page`` wins over the offset pair; ``since`` (an ISO timestamp) narrows
+    the match set to runs started at or after it, which is how a client asks for
+    only the window it renders instead of walking the whole history.
+
+    Omitting all of them still returns the whole list, so existing clients (and
+    `abr session list`) keep working. The envelope always reports ``total`` plus
+    ``page``/``pages`` and ``next``/``prev`` links. Items carry no ``logs`` --
+    GET /sessions/{id}/log serves those.
     """
-    return abr_v41.list_sessions_page(job_name=job, limit=limit, offset=offset)
+    if page is not None or per_page is not None:
+        limit = per_page or limit or abr_v41.SESSION_PAGE_DEFAULT
+        offset = ((page or 1) - 1) * limit
+    return abr_v41.list_sessions_page(job_name=job, limit=limit, offset=offset, since=since)
 
 
 def get_session(session_id: str) -> SessionDTO:

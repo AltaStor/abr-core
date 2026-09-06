@@ -4,8 +4,11 @@
 """GET /api/v1/sessions paging.
 
 A thousand sessions in one response ran to ~1.8 MB, which the console re-polls
-every few seconds. These cover the two things that shrank it: `limit`/`offset`
-slicing with an honest `total`, and list rows no longer carrying their logs.
+every few seconds. These cover what shrank it: `limit`/`offset` slicing (and its
+`page`/`per_page` spelling) with an honest `total`, a `since` filter that narrows
+the match set so a client can ask for just the window it renders, an envelope
+that locates the page and links its neighbours, and list rows no longer carrying
+their logs.
 """
 
 from __future__ import annotations
@@ -129,6 +132,68 @@ class SessionPaginationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422, response.text)
         self.assertEqual(self.client.get("/api/v1/sessions", params={"limit": 0}).status_code, 422)
         self.assertEqual(self.client.get("/api/v1/sessions", params={"offset": -1}).status_code, 422)
+
+    def test_envelope_locates_the_page_and_links_the_neighbours(self) -> None:
+        body = self._list(limit=10, offset=10)
+        self.assertEqual(body["page"], 2)
+        self.assertEqual(body["per_page"], 10)
+        self.assertEqual(body["pages"], 3)  # 25 sessions, 10 to a page
+        self.assertTrue(body["has_next"])
+        self.assertTrue(body["has_prev"])
+        self.assertEqual(body["next"], "/api/v1/sessions?limit=10&offset=20")
+        self.assertEqual(body["prev"], "/api/v1/sessions?limit=10&offset=0")
+
+    def test_links_are_null_at_each_end(self) -> None:
+        first = self._list(limit=10)
+        self.assertIsNone(first["prev"])
+        self.assertFalse(first["has_prev"])
+        self.assertEqual(first["next"], "/api/v1/sessions?limit=10&offset=10")
+
+        last = self._list(limit=10, offset=20)
+        self.assertIsNone(last["next"])
+        self.assertFalse(last["has_next"])
+        self.assertEqual(last["page"], 3)
+
+    def test_unpaged_response_is_one_page_with_no_links(self) -> None:
+        body = self._list()
+        self.assertEqual((body["page"], body["pages"]), (1, 1))
+        self.assertEqual(body["per_page"], SESSION_COUNT)
+        self.assertIsNone(body["next"])
+        self.assertIsNone(body["prev"])
+
+    def test_page_and_per_page_select_the_same_slice_as_limit_and_offset(self) -> None:
+        by_page = self._list(page=2, per_page=10)
+        by_offset = self._list(limit=10, offset=10)
+        self.assertEqual([i["id"] for i in by_page["items"]], [i["id"] for i in by_offset["items"]])
+        self.assertEqual(by_page["page"], 2)
+
+    def test_page_without_per_page_uses_the_default_page_size(self) -> None:
+        body = self._list(page=1)
+        self.assertEqual(body["per_page"], abr_v41.SESSION_PAGE_DEFAULT)
+        # 25 sessions all fit in the first default-sized page.
+        self.assertEqual(len(body["items"]), SESSION_COUNT)
+        self.assertIsNone(body["next"])
+
+    def test_since_narrows_the_match_set_not_just_the_page(self) -> None:
+        # Sessions start on 2026-01-01 .. 2026-01-25 (one per day).
+        body = self._list(since="2026-01-20T00:00:00Z")
+        self.assertEqual(body["total"], 6)  # the 20th through the 25th
+        self.assertEqual(
+            [item["id"] for item in body["items"]],
+            [f"sess-{i:03d}" for i in range(24, 18, -1)],
+        )
+
+    def test_since_is_carried_into_the_paging_links(self) -> None:
+        body = self._list(since="2026-01-20T00:00:00Z", limit=2)
+        self.assertEqual(body["total"], 6)
+        self.assertEqual(body["pages"], 3)
+        self.assertEqual(body["next"], "/api/v1/sessions?since=2026-01-20T00%3A00%3A00Z&limit=2&offset=2")
+
+    def test_since_matching_nothing_is_an_empty_page_not_an_error(self) -> None:
+        body = self._list(since="2030-01-01T00:00:00Z")
+        self.assertEqual(body["items"], [])
+        self.assertEqual(body["total"], 0)
+        self.assertEqual(body["pages"], 1)
 
     def test_support_bundle_still_gets_logs_from_the_service_list(self) -> None:
         # The support bundle dumps sessions to JSON and wants their logs; only

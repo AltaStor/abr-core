@@ -203,11 +203,21 @@ class SessionDTO(_LenientModel):
 class SessionList(_LenientModel):
     items: list[SessionDTO]
     # Pagination envelope. `total` is the match count before limit/offset, so a
-    # client can page until it has them all; `limit` is null when the caller
-    # asked for everything.
+    # client knows the size of what it asked for without fetching it; `limit` is
+    # null when the caller asked for everything.
     total: int = 0
     limit: int | None = None
     offset: int = 0
+    # Page-shaped view of the same slice, for clients that think in pages rather
+    # than offsets. `next`/`prev` are ready-to-follow URLs, null at either end
+    # (and whenever no `limit` was given, since then there is only one page).
+    page: int = 1
+    per_page: int | None = None
+    pages: int = 1
+    has_next: bool = False
+    has_prev: bool = False
+    next: str | None = None
+    prev: str | None = None
 
 
 class PublicUserDTO(_LenientModel):

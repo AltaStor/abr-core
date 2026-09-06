@@ -8,6 +8,7 @@ import binascii
 import calendar
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -22,7 +23,7 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterable
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -191,6 +192,8 @@ SESSION_STATES = (
 # list every few seconds, so the endpoint refuses to serve an unbounded slice
 # above this -- callers walk the rest with `offset`.
 SESSION_PAGE_LIMIT_MAX = 500
+# Page size assumed for a `page=`-style request that names no `per_page`.
+SESSION_PAGE_DEFAULT = 100
 
 DAY_ORDER = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 DAY_TO_INDEX = {name: index for index, name in enumerate(DAY_ORDER)}
@@ -3522,24 +3525,82 @@ def list_sessions(*, job_name: str | None = None, include_logs: bool = True) -> 
     return sessions
 
 
+SESSIONS_PATH = "/api/v1/sessions"
+
+
+def _sessions_link(path_params: dict[str, Any], limit: int, offset: int) -> str:
+    """A ready-to-follow URL for another page of the same query."""
+    query = {key: value for key, value in path_params.items() if value not in (None, "")}
+    query["limit"] = limit
+    query["offset"] = offset
+    return f"{SESSIONS_PATH}?{urlencode(query)}"
+
+
+def _started_after(session: dict[str, Any], cutoff: datetime) -> bool:
+    """Whether a session row starts at or after ``cutoff``.
+
+    A row whose timestamp cannot be parsed is kept: a ``since`` filter is there
+    to shrink a response, and silently dropping records the console would
+    otherwise show is the one failure mode worse than sending too many.
+    """
+    try:
+        return _parse_dt(session.get("started_at")) >= cutoff
+    except (TypeError, ValueError):
+        return True
+
+
 def list_sessions_page(
     *,
     job_name: str | None = None,
     limit: int | None = None,
     offset: int = 0,
+    since: str | None = None,
 ) -> dict[str, Any]:
     """One newest-first page of the session list, with the unpaged match count.
 
     The whole task catalog lives in memory (see mongo_db_wrapper.TASKS), so the
     page is a slice, not a query -- what it saves is the response body, which
     had grown to ~1.8 MB at a thousand sessions. Items here carry no ``logs``
-    (GET /sessions/{id}/log serves those per session), and ``total`` lets a
-    client page through without guessing when it is done.
+    (GET /sessions/{id}/log serves those per session).
+
+    The envelope is what lets a client fetch only what it needs rather than
+    walking the whole history in chunks: ``total`` is the unpaged match count,
+    ``page``/``pages`` locate this slice, and ``next``/``prev`` are ready-made
+    URLs for the neighbouring pages (null at either end). ``since`` narrows the
+    match set itself -- the console asks for the window it actually renders
+    instead of paging back through years of runs to build a 14-day chart.
     """
     sessions = list_sessions(job_name=job_name, include_logs=False)
+    if since:
+        cutoff = _parse_dt(since)
+        sessions = [session for session in sessions if _started_after(session, cutoff)]
+
+    total = len(sessions)
     start = max(0, offset)
     items = sessions[start:] if limit is None else sessions[start : start + limit]
-    return {"items": items, "total": len(sessions), "limit": limit, "offset": start}
+
+    # With no limit the whole match set is one page -- saying "page 1 of 1" is
+    # truer than reporting a page size the caller never asked for.
+    per_page = limit if limit is not None else total
+    pages = 1 if not limit else max(1, math.ceil(total / limit))
+    page = 1 if not limit else (start // limit) + 1
+    has_next = start + len(items) < total
+    has_prev = start > 0
+
+    link_params = {"job": job_name, "since": since}
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": start,
+        "page": page,
+        "per_page": per_page,
+        "pages": pages,
+        "has_next": has_next,
+        "has_prev": has_prev,
+        "next": _sessions_link(link_params, limit, start + len(items)) if (has_next and limit) else None,
+        "prev": _sessions_link(link_params, limit, max(0, start - limit)) if (has_prev and limit) else None,
+    }
 
 
 def get_session(session_id: str) -> dict[str, Any]:

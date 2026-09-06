@@ -25,13 +25,17 @@ class SessionCommands:
                 "  abr session list\n"
                 '  abr session list --job "Job-SQL-Server"\n'
                 "  abr session list --limit 50\n"
-                "  abr session list --limit 50 --offset 50"
+                "  abr session list --limit 50 --offset 50\n"
+                "  abr session list --since 2026-01-01"
             ),
             formatter_class=CompactHelpFormatter,
         )
         list_parser.add_argument("--job", help="Filter by job name")
         list_parser.add_argument("--limit", type=int, help="Return at most this many sessions (server caps at 500)")
         list_parser.add_argument("--offset", type=int, help="Skip this many sessions first; page with --limit")
+        # Narrows what is being paged, rather than paging through everything to
+        # reach it -- the cheap way to ask for "this week's runs".
+        list_parser.add_argument("--since", help="Only sessions started at or after this ISO timestamp (e.g. 2026-01-01)")
         list_parser.set_defaults(handler=self.list)
 
         for name, help_text, handler in (
@@ -76,7 +80,12 @@ class SessionCommands:
 
     def list(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
-        supplied = (("job", args.job), ("limit", getattr(args, "limit", None)), ("offset", getattr(args, "offset", None)))
+        supplied = (
+            ("job", args.job),
+            ("limit", getattr(args, "limit", None)),
+            ("offset", getattr(args, "offset", None)),
+            ("since", getattr(args, "since", None)),
+        )
         params = {name: value for name, value in supplied if value is not None} or None
         deps.context.print_output(deps.context.api_client.get("api/v1/sessions", params=params), self._columns())
         return 0
