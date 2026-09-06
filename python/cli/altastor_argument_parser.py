@@ -11,7 +11,7 @@ from .exit_codes import INVALID_USAGE
 
 
 GLOBAL_HELP_SECTION = """Global options:
-  --base-url BASE_URL            AltaStor API base URL (default: BACKUP_SERVER_URL or https://127.0.0.1:8443)
+  --base-url BASE_URL            AltaStor API base URL (default: BACKUP_SERVER_URL or https://127.0.0.1)
   --output {json,table}          Output format (default: table)
   --log-level {debug,info,warn,error}
                                  Console log verbosity (default: info)
