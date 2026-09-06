@@ -186,9 +186,7 @@ def start_redirect_listener(
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     dualstack = family == socket.AF_INET6 and socket.has_dualstack_ipv6()
     try:
-        sock = socket.create_server(
-            (host, port), family=family, backlog=128, dualstack_ipv6=dualstack
-        )
+        sock = socket.create_server((host, port), family=family, dualstack_ipv6=dualstack)
     except OSError as exc:
         logger.warning(
             "Could not bind the plain-HTTP redirect listener on %s:%s (%s). HTTPS "
