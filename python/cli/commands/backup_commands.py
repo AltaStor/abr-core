@@ -115,6 +115,7 @@ class BackupCommands:
                 ("restore_point_count", "POINTS"),
                 ("artifacts_removed", "ARTIFACTS_REMOVED"),
                 ("gfs_protection_overridden", "GFS_OVERRIDDEN"),
+                ("message", "MESSAGE"),
             ],
         )
         return 0

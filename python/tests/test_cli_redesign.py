@@ -14,7 +14,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
-os.environ.setdefault("ABR_ENABLE_MOCK_INVENTORY", "1")
+os.environ["ABR_ENABLE_MOCK_INVENTORY"] = "1"
 
 try:
     from fastapi.testclient import TestClient
@@ -292,16 +292,18 @@ class CliRedesignTests(unittest.TestCase):
                         command_cls._resolve_id(deps, SimpleNamespace(name="Unknown", id=None))
                     self.assertIn("not found", str(not_found.exception).lower())
 
-    def test_repo_add_and_edit_help_omit_immutable_flags(self) -> None:
+    def test_repo_add_and_edit_help_expose_immutability_flags(self) -> None:
         parser = build_parser()
 
         add_help = self._parse_help(parser, ["repo", "add", "--help"])
         edit_help = self._parse_help(parser, ["repo", "edit", "--help"])
         repo_help = self._parse_help(parser, ["repo", "--help"])
 
-        self.assertNotIn("--immutable", add_help)
-        self.assertNotIn("--immutable", edit_help)
-        self.assertNotIn("--mutable", edit_help)
+        self.assertIn("--immutable {none,governance,compliance}", add_help)
+        self.assertIn("--immutability-days", add_help)
+        self.assertIn("--immutable {none,governance,compliance}", edit_help)
+        self.assertIn("--immutability-days", edit_help)
+        self.assertIn("verify-immutability", repo_help)
         self.assertIn("remove", repo_help)
         self.assertIn("--username", add_help)
         self.assertIn("--password", add_help)
