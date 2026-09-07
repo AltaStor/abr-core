@@ -174,14 +174,27 @@ abr repo add
 
 Description: Create a backup repository. 
 
-abr repo add --name <name> --type <local|nfs|smb> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password <pass>] [--description <text>] 
+abr repo add --name <name> --type <local|nfs|smb|s3> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password <pass>] [--description <text>] 
+
+For --type s3: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] 
 
 Example: 
 abr repo add --name MyLocal --type local --path /mnt/backup 
+abr repo add --name MyWorm --type s3 --bucket altastor-objectlock --region us-east-1 --endpoint-url http://minio.local:9000 --path-style --access-key AKIA... --secret-key ... --immutable governance --immutability-days 30 
 
 Note: a local path that is world-writable is refused - its directory mode is the 
 only thing keeping other accounts on the host away from the backup data. Restrict 
 it to 750, the mode the product uses for its own storage, and add it again. 
+
+S3 OBJECT STORAGE IMMUTABILITY 
+
+--immutable and --immutability-days hold every new backup under S3 Object Lock; both are required together. governance can be lifted with the BypassGovernanceRetention permission, compliance by nobody at all until it expires. 
+
+Object Lock can only be enabled when a bucket is created - never added later, and never on a bucket AltaStor provisions itself. Enabling immutability on a bucket that cannot deliver it is refused, naming the failing check. 
+
+The lock written is longer than --immutability-days: a full must outlive the last incremental chained onto it, so AltaStor adds one full-backup cycle - the widest gap between the job's full days, or ALTASTOR_S3_IMMUTABILITY_GENERATION_DAYS when the job schedules none. --immutability-days 30 on a weekly-full job writes a 37-day lock. 
+
+The period runs from each backup's own creation, and stored restore points keep the lock they were written with - repo apply-immutability puts them under the current setting. Retention can be lengthened, never shortened or removed. Keep the job's --retention-days at or above --immutability-days, or operational retention keeps failing until locks expire; repo add/edit warn when it is shorter. 
 
 abr repo list 
 
@@ -201,6 +214,14 @@ Description: Update repository settings.
 
 abr repo edit --name <name> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password <pass>] [--description <text>] 
 
+For an s3 repository: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] 
+
+Example: 
+abr repo edit --name MyWorm --immutability-days 60 
+abr repo edit --name MyWorm --immutable none 
+
+--immutability-days alone changes the period; --immutable alone switches mode and keeps the period; --immutable none turns it off. A repository holding non-immutable backups can be switched at any time - existing restore points stay unprotected until repo apply-immutability. 
+
 abr repo remove 
 
 Description: Remove a repository reference from management. Rule: repo remove NEVER deletes physical data, it only unlinks it from ABR. 
@@ -218,6 +239,20 @@ abr repo verify
 Description: Validate filesystem availability, permissions, and block consistency. Runs as a single synchronous server call (no percentage progress channel), so when the console is an interactive terminal the CLI shows an elapsed-time indicator ("Verifying repository... Ns elapsed") automatically while it waits -- no flag needed, and it's silent when output isn't a terminal (redirected/CI). Exits non-zero when the verdict is not a clean pass, so `abr repo verify --name r1 || alert ...` reacts to it. 
 
 abr repo verify --name <name> [--id <id>] 
+
+For an immutable s3 repository, verify also reports Object Lock state without writing anything. 
+
+abr repo verify-immutability 
+
+Description: Validate that an s3 repository can hold immutable backups - Object Lock, versioning and the required permissions - proven by writing a small locked test backup and confirming the storage refuses to delete it. Each check is reported by name, with the storage's own message on failure; exits non-zero unless the verdict is clean. The test backup sits under .abr-immutability-probe, locked for a day; the next run clears expired ones. 
+
+abr repo verify-immutability --name <name> [--id <id>] 
+
+abr repo apply-immutability 
+
+Description: Put stored restore points under the repository's current immutability setting, counted from now. Object Lock cannot be shortened or lifted, so this cannot be undone; a storage that refuses a change is reported per restore point (MinIO refuses any mode change on a held object). Exits non-zero if any point was refused. 
+
+abr repo apply-immutability --name <name> [--id <id>] 
 
 INVENTORY COMMANDS 
 
