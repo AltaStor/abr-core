@@ -18,17 +18,21 @@ from ...core.server_defaults import env_int
 from ...core.task_executor import TaskStopRequested
 from ...core.storage_tool import (
     StorageToolError,
+    apply_repository_immutability,
     default_disk_tool_path,
+    disk_tool_immutability_args,
     disk_tool_storage_args,
+    extract_s3_config,
     is_s3_repository,
     join_s3_prefix,
     redact_disk_tool_command,
     repository_cache_root,
     run_disk_tool,
+    with_immutability_retention_days,
     safe_path_component,
 )
 from ...core.utils import utc_now
-from ...services.backup_mode import resolve_job_backup_mode
+from ...services.backup_mode import object_lock_actual_retention_days, resolve_job_backup_mode
 
 logger = logging.getLogger(__name__)
 
@@ -105,11 +109,27 @@ def _resolve_repository_backup_root(task: dict[str, Any]) -> Path | None:
     return None
 
 
+def _immutability_generation_days() -> int:
+    return env_int("ALTASTOR_S3_IMMUTABILITY_GENERATION_DAYS")
+
+
 def _resolve_repository(task: dict[str, Any]) -> dict[str, Any] | None:
     for repository_id in _resolve_repository_ids(task):
         repository = REPOSITORIES.get(repository_id)
-        if isinstance(repository, dict):
+        if not isinstance(repository, dict):
+            continue
+        if not is_s3_repository(repository):
             return repository
+        job_id = task.get("job_id")
+        job = JOBS.get(str(job_id)) if isinstance(job_id, str) else None
+        actual_days = object_lock_actual_retention_days(
+            job if isinstance(job, dict) else None,
+            extract_s3_config(repository).get("immutability") or {},
+            default_generation_days=_immutability_generation_days(),
+        )
+        if actual_days < 1:
+            return repository
+        return with_immutability_retention_days(repository, actual_days)
     return None
 
 
@@ -455,7 +475,11 @@ def _resolve_backup_storage_layout(
         else:
             destination_root = repository_cache_root(_default_backup_root(), repository).resolve()
         task_root = destination_root / vm_path_component / str(task["id"])
-        abr_path = join_s3_prefix(vm_path_component, str(task["id"]))
+        abr_path = join_s3_prefix(
+            extract_s3_config(repository).get("prefix"),
+            vm_path_component,
+            str(task["id"]),
+        )
         return destination_root, task_root, abr_path
 
     if configured_destination:
@@ -553,6 +577,7 @@ def _build_backup_command(
         "--name",
         backup_name,
         *disk_tool_storage_args(repository, abr_path=abr_path, create_folder=True),
+        *disk_tool_immutability_args(repository),
         "--compression",
         str(compression_level),
     ]
@@ -2398,6 +2423,7 @@ def run_vcenter_backup(
                     tool_path=tool_path,
                     timeout=60,
                 )
+                apply_repository_immutability(repository, repository_abr_path, "manifest", timeout=120)
             except StorageToolError:
                 logger.debug("Ignoring manifest metadata mirror failure for %s", manifest_path, exc_info=True)
 

@@ -1005,5 +1005,26 @@ class DiskToolTimeoutTests(unittest.TestCase):
         self.assertIn("timed out", str(ctx.exception))
 
 
+class S3BackupStorageLayoutTests(unittest.TestCase):
+    def _abr_path(self, prefix: object) -> str:
+        from python.srv.plugins.vcenter.vcenter_backup import _resolve_backup_storage_layout
+
+        repository = {"type": "s3", "id": "repo-1", "s3": {"bucket": "altastor-backups", "prefix": prefix}}
+        _, _, abr_path = _resolve_backup_storage_layout(
+            task={"id": "task-1"}, vm_name="web01", parameters={}, repository=repository
+        )
+        return abr_path
+
+    def test_backup_is_stored_under_the_repository_prefix(self) -> None:
+        self.assertEqual(self._abr_path("lab/vm-backups"), "lab/vm-backups/web01/task-1")
+
+    def test_repository_without_a_prefix_stores_at_the_bucket_root(self) -> None:
+        self.assertEqual(self._abr_path(""), "web01/task-1")
+        self.assertEqual(self._abr_path(None), "web01/task-1")
+
+    def test_two_repositories_in_one_bucket_do_not_share_a_location(self) -> None:
+        self.assertNotEqual(self._abr_path("team-a"), self._abr_path("team-b"))
+
+
 if __name__ == "__main__":
     unittest.main()
