@@ -119,6 +119,7 @@ class RepositoryDTO(_LenientModel):
     endpoint_url: str | None = None
     path_style: bool | None = None
     verify_tls: bool | None = None
+    immutability: dict[str, Any] | None = None
     path: str | None = None
     location: str | None = None
     description: str | None = None
@@ -308,6 +309,7 @@ class CreateRepositoryRequest(_LenientModel):
     profile: LaxStr | None = None
     path_style: LaxBool | None = None
     verify_tls: LaxBool | None = None
+    immutability: dict[str, Any] | None = None
 
 
 class UpdateRepositoryRequest(_LenientModel):
@@ -329,6 +331,7 @@ class UpdateRepositoryRequest(_LenientModel):
     profile: LaxStr | None = None
     path_style: LaxBool | None = None
     verify_tls: LaxBool | None = None
+    immutability: dict[str, Any] | None = None
 
 
 class CreateJobRequest(_LenientModel):

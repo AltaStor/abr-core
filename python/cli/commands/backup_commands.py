@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from typing import Any
 
 from ..compact_help_formatter import CompactHelpFormatter
@@ -11,6 +12,12 @@ from ..exit_codes import INVALID_STATE
 from ..models.views import human_size
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
+
+BACKUP_DELETE_TIMEOUT_SECONDS = 21600
+
+
+def _announce_session(session_id: object) -> None:
+    print(f"Session: {session_id}", file=sys.stderr)
 
 RESTORE_POINT_COLUMNS = [
     ("id", "ID"),
@@ -105,8 +112,20 @@ class BackupCommands:
 
     def delete(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
-        params = {"force": True} if getattr(args, "force", False) else None
-        payload = deps.context.api_client.delete(f"api/v1/backups/{args.id}", params=params)
+        params: dict[str, Any] = {"wait": "false"}
+        if getattr(args, "force", False):
+            params["force"] = True
+        started = deps.context.api_client.delete(
+            f"api/v1/backups/{args.id}", params=params, timeout=BACKUP_DELETE_TIMEOUT_SECONDS
+        )
+        session_id = started.get("session_id") if isinstance(started, dict) else None
+        session: dict[str, Any] | None = None
+        if session_id:
+            _announce_session(session_id)
+            session = watch_session(deps.context.api_client, str(session_id))
+            payload = session.get("delete") if isinstance(session.get("delete"), dict) else session
+        else:
+            payload = started
         deps.context.print_output(
             payload,
             [
@@ -115,8 +134,13 @@ class BackupCommands:
                 ("restore_point_count", "POINTS"),
                 ("artifacts_removed", "ARTIFACTS_REMOVED"),
                 ("gfs_protection_overridden", "GFS_OVERRIDDEN"),
+                ("message", "MESSAGE"),
             ],
         )
+        if isinstance(payload, dict) and payload.get("deleted") is False:
+            return INVALID_STATE
+        if session is not None and not session_watch_succeeded(session):
+            return INVALID_STATE
         return 0
 
     def verify(self, args: argparse.Namespace) -> int:
@@ -127,6 +151,7 @@ class BackupCommands:
         session_id = started.get("session_id") if isinstance(started, dict) else None
         session: dict[str, Any] | None = None
         if session_id:
+            _announce_session(session_id)
             session = watch_session(deps.context.api_client, str(session_id))
             result = session.get("verify")
         else:

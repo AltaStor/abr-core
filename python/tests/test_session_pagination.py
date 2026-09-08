@@ -19,7 +19,7 @@ import sys
 from typing import Any
 import unittest
 
-os.environ.setdefault("ABR_ENABLE_MOCK_INVENTORY", "1")
+os.environ["ABR_ENABLE_MOCK_INVENTORY"] = "1"
 
 try:
     from fastapi.testclient import TestClient

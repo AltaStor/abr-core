@@ -61,13 +61,24 @@ from python.srv.core.secure_archive import (
     encrypt_payload,
 )
 from python.srv.core.storage_tool import (
+    IMMUTABILITY_MODES,
     StorageToolError,
+    apply_repository_immutability,
     build_s3_location,
+    condense_disk_tool_message,
     extract_s3_config,
     hydrate_manifest_via_disk_tool,
+    immutability_is_enabled,
+    immutability_rank,
+    is_s3_repository,
     list_disk_tool_backups,
     mask_credential_fields,
+    normalize_immutability_config,
+    normalize_immutability_mode,
+    normalize_s3_prefix,
     probe_repository_access,
+    probe_repository_immutability,
+    read_storage_folder_info,
     remove_disk_tool_backup,
     s3_endpoint_connect_error,
     sanitize_s3_config,
@@ -87,6 +98,7 @@ from python.srv.services.inventory_management import (
     inventory_type_from_record,
     normalize_inventory_type,
 )
+from python.srv.services.backup_mode import object_lock_actual_retention_days
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL
 
 from .api_errors import ApiError, api_error
@@ -255,6 +267,7 @@ NO_CONTROL_CHARS_PATTERN = re.compile(r"^[^\x00-\x1f\x7f]*$")
 MAX_NAME_LENGTH = 125
 MAX_TEXT_LENGTH = 255
 MAX_LONG_TEXT_LENGTH = 1024
+MAX_IMMUTABILITY_RETENTION_DAYS = 36500
 NFS_PATTERN = re.compile(r"^[^:/]+:.+$")
 SMB_PATTERN = re.compile(r"^(//|\\\\)[^/\\\\]+[/\\\\].+$")
 ZONEINFO_ROOT = Path("/usr/share/zoneinfo")
@@ -1680,9 +1693,11 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         item["path_style"] = s3_config.get("path_style")
         item["verify_tls"] = s3_config.get("verify_tls")
         item["description"] = s3_config.get("description")
+        item["immutability"] = s3_config.get("immutability")
         item["path"] = s3_config.get("location")
         item["location"] = item.get("path")
     else:
+        item["immutability"] = None
         item["location"] = item.get("path") or metadata.get("address")
     mask_credential_fields(metadata)
     item["metadata"] = metadata
@@ -1736,6 +1751,7 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
     item["free_bytes"] = storage["free_bytes"]
     item["capabilities"] = {
         "supports_synthetic_full": repository_supports_synthetic(item),
+        "supports_immutability": repo_type == "s3",
     }
     item["catalog"] = catalog
     referenced_jobs = _jobs_referencing_repository_id(repository_id)
@@ -1850,6 +1866,18 @@ def _normalize_s3_configuration(payload: dict[str, Any], *, existing: dict[str, 
     else:
         current["description"] = str(current.get("description") or "").strip() or None
 
+    merged_immutability = normalize_immutability_config(current.get("immutability"))
+    if "immutability" in raw or "immutability" in payload:
+        requested = _pick("immutability")
+        requested = requested if isinstance(requested, dict) else {}
+        if "mode" in requested:
+            merged_immutability["mode"] = normalize_immutability_mode(requested.get("mode"))
+            if merged_immutability["mode"] == "none" and "retention_days" not in requested:
+                merged_immutability["retention_days"] = 0
+        if "retention_days" in requested:
+            merged_immutability["retention_days"] = requested.get("retention_days")
+    current["immutability"] = normalize_immutability_config(merged_immutability)
+
     return current
 
 
@@ -1896,6 +1924,37 @@ def _validate_s3_configuration(config: dict[str, Any]) -> None:
             422,
             "invalid_repository",
             "S3 access_key and secret_key must either both be provided or both be omitted",
+        )
+
+    immutability = normalize_immutability_config(config.get("immutability"))
+    mode = immutability["mode"]
+    retention_days = immutability["retention_days"]
+    _ensure(
+        mode in IMMUTABILITY_MODES,
+        422,
+        "invalid_repository",
+        "S3 immutability mode must be one of: " + ", ".join(IMMUTABILITY_MODES),
+        immutability_mode=mode,
+    )
+    if mode == "none":
+        _ensure(
+            retention_days == 0,
+            422,
+            "invalid_repository",
+            "S3 immutability retention period requires an immutability mode of governance or compliance",
+        )
+    else:
+        _ensure(
+            retention_days >= 1,
+            422,
+            "invalid_repository",
+            f"S3 immutability mode '{mode}' requires a retention period of at least 1 day",
+        )
+        _ensure(
+            retention_days <= MAX_IMMUTABILITY_RETENTION_DAYS,
+            422,
+            "invalid_repository",
+            f"S3 immutability retention period must not exceed {MAX_IMMUTABILITY_RETENTION_DAYS} days",
         )
 
 
@@ -2081,6 +2140,8 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
                 conflicting_repository=conflict.get("name"),
                 path=path,
             )
+    if repo_type == "s3" and immutability_is_enabled(s3_config.get("immutability")):
+        _assert_immutability_is_usable(s3_config)
     now = utc_now()
     record = {
         "id": str(uuid4()),
@@ -2104,6 +2165,7 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
                     "profile": s3_config["profile"],
                     "path_style": s3_config["path_style"],
                     "verify_tls": s3_config["verify_tls"],
+                    "immutability": s3_config["immutability"],
                     "description": description,
                 },
             }
@@ -2120,7 +2182,14 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
         ),
     }
     persist_repository(record)
-    return normalize_repository_record(record)
+    created = normalize_repository_record(record)
+    if repo_type == "s3":
+        created["immutability_effect"] = _immutability_effect_report(
+            str(record["id"]),
+            previous={"mode": "none", "retention_days": 0},
+            current=s3_config.get("immutability"),
+        )
+    return created
 
 
 def _reject_storage_location_change_if_repository_has_backups(
@@ -2144,6 +2213,9 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
     _validate_text_fields(payload, REPOSITORY_TEXT_FIELDS, code="invalid_repository")
     updated = _json_clone(record)
     changed = False
+    previous_immutability: dict[str, Any] | None = None
+    next_immutability: dict[str, Any] | None = None
+    next_s3_config: dict[str, Any] | None = None
     if "name" in payload and payload["name"] is not None:
         new_name = str(payload["name"]).strip()
         _ensure(bool(new_name), 422, "invalid_repository", "Repository name must not be empty")
@@ -2173,6 +2245,9 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         current_s3 = extract_s3_config(updated)
         next_s3 = _normalize_s3_configuration(payload, existing=current_s3)
         _validate_s3_configuration(next_s3)
+        previous_immutability = normalize_immutability_config(current_s3.get("immutability"))
+        next_immutability = normalize_immutability_config(next_s3.get("immutability"))
+        next_s3_config = next_s3
         description = str(next_s3.get("description") or "").strip() or None
         next_metadata = dict(metadata)
         next_metadata["description"] = description
@@ -2186,13 +2261,19 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
             "profile": next_s3.get("profile"),
             "path_style": next_s3.get("path_style"),
             "verify_tls": next_s3.get("verify_tls"),
+            "immutability": normalize_immutability_config(next_s3.get("immutability")),
             "description": description,
         }
         next_path = _build_s3_repository_path(next_s3)
         _reject_storage_location_change_if_repository_has_backups(
             record_id, original_path=original_path, new_path=next_path
         )
-        if next_path != updated.get("path") or next_metadata != metadata:
+        comparable_metadata = dict(metadata)
+        if isinstance(comparable_metadata.get("s3"), dict):
+            comparable_s3 = dict(comparable_metadata["s3"])
+            comparable_s3["immutability"] = normalize_immutability_config(comparable_s3.get("immutability"))
+            comparable_metadata["s3"] = comparable_s3
+        if next_path != updated.get("path") or next_metadata != comparable_metadata:
             changed = True
         updated["path"] = next_path
         updated["metadata"] = next_metadata
@@ -2242,9 +2323,20 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
                     path=updated.get("path"),
                 )
     _ensure(changed, 422, "invalid_repository", "repo edit requires at least one editable option")
+    if (
+        next_s3_config is not None
+        and next_immutability != previous_immutability
+        and immutability_is_enabled(next_immutability)
+    ):
+        _assert_immutability_is_usable(next_s3_config)
     updated["updated_at"] = utc_now()
     persist_repository(updated)
-    return normalize_repository_record(updated)
+    edited = normalize_repository_record(updated)
+    if next_immutability is not None:
+        edited["immutability_effect"] = _immutability_effect_report(
+            record_id, previous=previous_immutability or {}, current=next_immutability
+        )
+    return edited
 
 
 def _repository_storage_location_mismatch(repository: dict[str, Any]) -> str | None:
@@ -2376,15 +2468,9 @@ def _verify_remote_repository(repository: dict[str, Any]) -> dict[str, Any]:
     return {"status": "success", "checks": checks, "message": "Repository address and connectivity checks passed"}
 
 
-def _s3_connectivity_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
-    """Format checks plus a real storage-tool probe against an S3 config —
-    shared by the post-create `/verify` endpoint and the pre-create connection
-    test, so both report the exact same real checks. Returns the accumulated
-    `checks` list and, if a check failed, the error message to report (checks
-    already reflects the failure in that case)."""
+def _s3_format_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
     checks: list[dict[str, Any]] = []
     bucket = str(config.get("bucket") or "").strip()
-    prefix = str(config.get("prefix") or "").strip()
     region = str(config.get("region") or "").strip()
     endpoint_url = str(config.get("endpoint_url") or "").strip()
 
@@ -2410,12 +2496,21 @@ def _s3_connectivity_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]
             return checks, f"S3 endpoint is not reachable: {unreachable}"
         checks.append({"name": "endpoint_reachable", "status": "ok", "message": endpoint_url})
 
+    return checks, None
+
+
+def _s3_connectivity_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    checks, error = _s3_format_checks(config)
+    if error is not None:
+        return checks, error
+    prefix = str(config.get("prefix") or "").strip()
+
     try:
         probe_repository_access(
             {"type": "s3", "s3": config},
             abr_path=prefix,
             backup_name=f"repo-probe-{uuid4().hex[:12]}",
-            timeout=120,
+            timeout=_s3_probe_timeout(),
         )
     except StorageToolError as exc:
         checks.append({"name": "connectivity", "status": "failed", "message": str(exc)})
@@ -2431,6 +2526,26 @@ def _verify_s3_repository(repository: dict[str, Any]) -> dict[str, Any]:
     if error is not None:
         return {"status": "error", "checks": checks, "message": error}
 
+    immutability = normalize_immutability_config(config.get("immutability"))
+    if immutability_is_enabled(immutability):
+        immutability_checks, immutability_error = _s3_immutability_checks(
+            config,
+            mode=immutability["mode"],
+            retention_days=immutability["retention_days"],
+            write_probe=False,
+        )
+        checks.extend(immutability_checks)
+        if immutability_error is not None:
+            return {"status": "error", "checks": checks, "message": immutability_error}
+    else:
+        checks.append(
+            {
+                "name": "immutability",
+                "status": "skipped",
+                "message": "Repository immutability is disabled; backups are written without Object Lock retention",
+            }
+        )
+
     backup_health = _verify_repository_backup_health(str(repository.get("id") or ""))
     checks.append(
         {
@@ -2443,7 +2558,499 @@ def _verify_s3_repository(repository: dict[str, Any]) -> dict[str, Any]:
     if backup_health["status"] == "failed":
         return {"status": "error", "checks": checks, "message": f"Backup integrity check failed: {backup_health['message']}"}
 
-    return {"status": "success", "checks": checks, "message": "S3 repository is available"}
+    return {
+        "status": "success",
+        "checks": checks,
+        "message": f"S3 repository is available; immutability: {_immutability_summary(immutability)}",
+    }
+
+
+def _s3_probe_timeout() -> int:
+    return env_int("ALTASTOR_S3_PROBE_TIMEOUT_SECONDS")
+
+
+def _s3_immutability_info_timeout() -> int:
+    return env_int("ALTASTOR_S3_IMMUTABILITY_INFO_TIMEOUT_SECONDS")
+
+
+def _s3_immutability_probe_timeout() -> int:
+    return env_int("ALTASTOR_S3_IMMUTABILITY_PROBE_TIMEOUT_SECONDS")
+
+
+def _s3_immutability_generation_days() -> int:
+    return env_int("ALTASTOR_S3_IMMUTABILITY_GENERATION_DAYS")
+
+
+def repository_actual_retention_days(job: dict[str, Any] | None, immutability: dict[str, Any]) -> int:
+    return object_lock_actual_retention_days(
+        job, immutability, default_generation_days=_s3_immutability_generation_days()
+    )
+
+
+OBJECT_LOCK_UNAVAILABLE_HINT = (
+    "Either this storage does not implement Object Lock at all, or the bucket was created without it - "
+    "Object Lock can only be turned on when a bucket is created, never afterwards - or the credentials "
+    "are not allowed to read the bucket's Object Lock configuration."
+)
+
+
+def _s3_object_lock_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+    folder = read_storage_folder_info(
+        {"type": "s3", "s3": config},
+        normalize_s3_prefix(config.get("prefix")),
+        timeout=_s3_immutability_info_timeout(),
+    )
+    return {
+        "supported_mode": normalize_immutability_mode(folder.get("immutability_supported")),
+        "default_mode": normalize_immutability_mode(folder.get("immutability")),
+        "default_retention_days": int(folder.get("retention_days") or 0),
+    }
+
+
+def _bucket_default_rule_text(default_mode: str, default_days: int) -> str:
+    if default_mode == "none" or default_days <= 0:
+        return "the bucket has no default retention rule"
+    return f"the bucket default retention rule is {default_mode} for {default_days} day(s)"
+
+
+def _s3_immutability_checks(
+    config: dict[str, Any],
+    *,
+    mode: str,
+    retention_days: int,
+    write_probe: bool = True,
+) -> tuple[list[dict[str, Any]], str | None]:
+    checks: list[dict[str, Any]] = []
+    bucket = str(config.get("bucket") or "").strip()
+    mode = normalize_immutability_mode(mode)
+    retention_days = int(retention_days or 0)
+
+    try:
+        snapshot = _s3_object_lock_snapshot(config)
+    except StorageToolError as exc:
+        detail = condense_disk_tool_message(exc)
+        checks.append({"name": "object_lock", "status": "failed", "message": detail})
+        return checks, f"Could not read the Object Lock configuration of S3 bucket '{bucket}': {detail}"
+
+    supported_mode = snapshot["supported_mode"]
+    default_mode = snapshot["default_mode"]
+    default_days = snapshot["default_retention_days"]
+    default_rule = _bucket_default_rule_text(default_mode, default_days)
+
+    if immutability_rank(supported_mode) <= 0:
+        checks.append(
+            {
+                "name": "object_lock",
+                "status": "failed",
+                "message": f"S3 bucket '{bucket}' reports no Object Lock configuration. {OBJECT_LOCK_UNAVAILABLE_HINT}",
+            }
+        )
+        return checks, f"S3 bucket '{bucket}' does not support Object Lock, so it cannot hold immutable backups"
+    checks.append(
+        {
+            "name": "object_lock",
+            "status": "ok",
+            "message": f"Object Lock is enabled, up to '{supported_mode}' mode; {default_rule}",
+        }
+    )
+    versioning_check = {
+        "name": "versioning",
+        "status": "skipped",
+        "message": (
+            "Not read directly: the storage tool does not report a bucket's versioning state. Object Lock needs a "
+            "versioned bucket and S3 does not allow versioning to be suspended while Object Lock is on, so "
+            "versioning is implied here rather than checked. The write probe confirms it by behaviour."
+        ),
+    }
+    checks.append(versioning_check)
+
+    if mode == "none":
+        checks.append(
+            {
+                "name": "immutability_mode",
+                "status": "skipped",
+                "message": "Repository immutability is disabled; the bucket would support it if it is enabled",
+            }
+        )
+        return checks, None
+
+    if immutability_rank(supported_mode) < immutability_rank(mode):
+        checks.append(
+            {
+                "name": "immutability_mode",
+                "status": "failed",
+                "message": f"S3 bucket '{bucket}' supports at most '{supported_mode}' immutability, but '{mode}' was requested",
+            }
+        )
+        return checks, f"S3 bucket '{bucket}' does not support {mode} immutability"
+
+    if immutability_rank(default_mode) > immutability_rank(mode):
+        checks.append(
+            {
+                "name": "immutability_mode",
+                "status": "failed",
+                "message": (
+                    f"S3 bucket '{bucket}' applies {default_mode} immutability to new objects through its default "
+                    f"retention rule, which is stronger than the requested {mode}. Request {default_mode} instead, "
+                    "or relax the bucket's default retention rule."
+                ),
+            }
+        )
+        return checks, f"S3 bucket '{bucket}' applies {default_mode} immutability, stronger than the requested {mode}"
+    checks.append({"name": "immutability_mode", "status": "ok", "message": f"{mode} is available on this bucket"})
+
+    if default_days > retention_days:
+        checks.append(
+            {
+                "name": "retention_period",
+                "status": "failed",
+                "message": (
+                    f"S3 bucket '{bucket}' retains new objects for {default_days} day(s) through its default retention "
+                    f"rule, longer than the requested {retention_days} day(s). Set the repository retention to at least "
+                    f"{default_days} day(s), or relax the bucket's default retention rule."
+                ),
+            }
+        )
+        return checks, (
+            f"S3 bucket '{bucket}' retains new objects for {default_days} day(s), "
+            f"longer than the requested {retention_days} day(s)"
+        )
+    checks.append(
+        {
+            "name": "retention_period",
+            "status": "ok",
+            "message": f"{retention_days} day(s) requested; {default_rule}",
+        }
+    )
+
+    if not write_probe:
+        return checks, None
+
+    try:
+        probe = probe_repository_immutability(
+            {"type": "s3", "s3": config},
+            prefix=config.get("prefix"),
+            mode=mode,
+            retention_days=max(default_days, 1),
+            timeout=_s3_immutability_probe_timeout(),
+        )
+    except StorageToolError as exc:
+        detail = condense_disk_tool_message(exc)
+        checks.append({"name": "write_retention", "status": "failed", "message": detail})
+        return checks, f"S3 bucket '{bucket}' rejected a test backup written under {mode} Object Lock: {detail}"
+    checks.append(
+        {
+            "name": "write_retention",
+            "status": "ok",
+            "message": f"A test backup was written under {mode} Object Lock retention",
+        }
+    )
+
+    if immutability_rank(probe["mode"]) < immutability_rank(mode):
+        checks.append(
+            {
+                "name": "retention_readback",
+                "status": "failed",
+                "message": (
+                    f"The test backup reads back as '{probe['mode']}' retention instead of the requested '{mode}'"
+                ),
+            }
+        )
+        return checks, f"S3 bucket '{bucket}' did not apply the requested {mode} Object Lock retention"
+    checks.append(
+        {
+            "name": "retention_readback",
+            "status": "ok",
+            "message": f"Stored retention reads back as {probe['mode']} for {probe['retention_days']} day(s)",
+        }
+    )
+
+    if not probe["delete_rejected"]:
+        checks.append(
+            {
+                "name": "worm_enforcement",
+                "status": "failed",
+                "message": "The locked test backup could be deleted, so Object Lock is not enforced on this bucket",
+            }
+        )
+        return checks, f"S3 bucket '{bucket}' did not enforce Object Lock on a locked test backup"
+    checks.append(
+        {
+            "name": "worm_enforcement",
+            "status": "ok",
+            "message": f"Deleting the locked test backup was refused by the storage: {probe['delete_error']}",
+        }
+    )
+    versioning_check["status"] = "ok"
+    versioning_check["message"] = (
+        "Confirmed by behaviour: the storage refused to delete the locked test backup, which only a versioned "
+        "bucket enforcing Object Lock can do"
+    )
+    return checks, None
+
+
+def _immutability_summary(immutability: dict[str, Any]) -> str:
+    if not immutability_is_enabled(immutability):
+        return "disabled, backups stay deletable"
+    return f"{immutability['mode']} for {immutability['retention_days']} day(s)"
+
+
+def validate_s3_immutability_config(config: dict[str, Any], *, write_probe: bool = True) -> dict[str, Any]:
+    checks, error = _s3_format_checks(config)
+    if error is not None:
+        return {"status": "error", "checks": checks, "message": error}
+
+    immutability = normalize_immutability_config(config.get("immutability"))
+    immutability_checks, error = _s3_immutability_checks(
+        config,
+        mode=immutability["mode"],
+        retention_days=immutability["retention_days"],
+        write_probe=write_probe,
+    )
+    checks.extend(immutability_checks)
+    if error is not None:
+        return {"status": "error", "checks": checks, "message": error}
+    if not immutability_is_enabled(immutability):
+        return {
+            "status": "success",
+            "checks": checks,
+            "message": "S3 bucket supports immutable backups; repository immutability is currently disabled",
+        }
+    return {
+        "status": "success",
+        "checks": checks,
+        "message": f"S3 repository is validated for immutable backups: {_immutability_summary(immutability)}",
+    }
+
+
+def _immutability_job_retention_warnings(repository_id: str, immutability: dict[str, Any]) -> list[str]:
+    if not immutability_is_enabled(immutability):
+        return []
+    warnings: list[str] = []
+    for job in normalized_job_records():
+        if str(job.get("repo_id") or "") != repository_id:
+            continue
+        job_days = int(job.get("retention_days") or 0)
+        if job_days <= 0:
+            continue
+        lock_days = repository_actual_retention_days(job, immutability)
+        if job_days < lock_days:
+            warnings.append(
+                f"Job '{job.get('name')}' keeps restore points for {job_days} day(s), but backups written to this "
+                f"repository stay locked for {lock_days} day(s); retention cannot delete them until the lock expires."
+            )
+        elif lock_days < job_days:
+            warnings.append(
+                f"Job '{job.get('name')}' keeps restore points for {job_days} day(s), but they are locked for only "
+                f"{lock_days} day(s); from day {lock_days} to day {job_days} its backups are still needed but can be "
+                "deleted. Raise the immutability period to cover the whole retention."
+            )
+    return warnings
+
+
+def _immutability_effect_report(
+    repository_id: str,
+    *,
+    previous: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    previous = normalize_immutability_config(previous)
+    current = normalize_immutability_config(current)
+    existing_points = len(
+        [point for point in normalized_backup_points() if str(point.get("repository_id") or "") == repository_id]
+    )
+
+    effect: list[str] = []
+    limitations: list[str] = []
+
+    if immutability_is_enabled(current):
+        effect.append(
+            f"Backups created from now on are written under {current['mode']} Object Lock retention and cannot be "
+            f"deleted or overwritten for {current['retention_days']} day(s), counted from each backup's own creation time."
+        )
+    else:
+        effect.append("Immutability is disabled: new backups are written without Object Lock retention and stay deletable.")
+
+    if existing_points:
+        limitations.append(
+            f"{existing_points} restore point(s) are already stored in this repository. Changing this setting does "
+            "not touch them; run 'repo apply-immutability' to put them under the current one."
+        )
+        if immutability_is_enabled(previous):
+            limitations.append(
+                f"Each keeps the retention it was written with: {previous['mode']} for "
+                f"{previous['retention_days']} day(s) from its own creation for those written under that setting, "
+                "none for any written before immutability was enabled. AltaStor does not track this per restore point."
+            )
+        else:
+            limitations.append(
+                "They were written without Object Lock, so they stay deletable and are not protected by this configuration."
+            )
+
+    weaker_mode = immutability_rank(current["mode"]) < immutability_rank(previous["mode"])
+    shorter_period = (
+        immutability_is_enabled(current)
+        and immutability_is_enabled(previous)
+        and current["retention_days"] < previous["retention_days"]
+    )
+    if weaker_mode or shorter_period:
+        limitations.append(
+            "Object Lock retention that is already written can never be shortened or removed, so relaxing immutability "
+            "only affects backups created from now on."
+        )
+
+    return {
+        "previous": previous,
+        "current": current,
+        "changed": previous != current,
+        "existing_restore_points": existing_points,
+        "existing_data_protected": False,
+        "effect": effect,
+        "limitations": limitations,
+        "warnings": _immutability_job_retention_warnings(repository_id, current),
+    }
+
+
+def _assert_repository_supports_immutability(repository: dict[str, Any]) -> None:
+    _ensure(
+        str(repository.get("type") or "").strip().lower() == "s3",
+        422,
+        "invalid_repository",
+        "Immutability is only available for s3 repositories",
+        repository_id=repository.get("id"),
+        repository_type=repository.get("type"),
+    )
+
+
+def _assert_immutability_is_usable(config: dict[str, Any]) -> None:
+    result = validate_s3_immutability_config(config)
+    if result.get("status") == "success":
+        return
+    raise api_error(
+        422,
+        "repository_immutability_unsupported",
+        str(result.get("message") or "S3 repository cannot be configured for immutable backups"),
+        checks=result.get("checks") or [],
+    )
+
+
+def _restore_point_abr_targets(point: dict[str, Any]) -> list[tuple[str, str]]:
+    artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+    targets: list[tuple[str, str]] = []
+    manifest_paths: set[str] = set()
+    for disk in artifact.get("disks", []):
+        if not isinstance(disk, dict):
+            continue
+        abr_path = str(disk.get("abr_path") or "").strip()
+        backup_name = str(disk.get("abr_backup_name") or "").strip()
+        if not abr_path or not backup_name:
+            continue
+        targets.append((abr_path, backup_name))
+        manifest_paths.add(abr_path)
+    targets.extend((abr_path, "manifest") for abr_path in sorted(manifest_paths))
+    return targets
+
+
+def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:
+    configured = int(config.get("retention_days") or 0)
+    if not applied_days:
+        return f"for {configured} day(s)"
+    low, high = min(applied_days), max(applied_days)
+    span = f"{low} day(s)" if low == high else f"{low}-{high} day(s)"
+    return f"for {span} ({configured} configured plus the job's full-backup cycle)"
+
+
+def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
+    repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    _assert_repository_supports_immutability(repository)
+    config = normalize_immutability_config(extract_s3_config(repository).get("immutability"))
+    _ensure(
+        immutability_is_enabled(config),
+        422,
+        "invalid_repository",
+        "Repository immutability is disabled; enable it before applying it to stored backups",
+        repository_id=record_id,
+    )
+
+    points = [point for point in normalized_backup_points() if str(point.get("repository_id") or "") == record_id]
+    updated: list[str] = []
+    failures: list[dict[str, Any]] = []
+    applied_days: set[int] = set()
+    attempted_days: set[int] = set()
+    for point in points:
+        point_failed = False
+        job = JOBS.get(str(point.get("job_id") or ""))
+        actual_days = repository_actual_retention_days(job if isinstance(job, dict) else None, config)
+        attempted_days.add(actual_days)
+        for abr_path, backup_name in _restore_point_abr_targets(point):
+            try:
+                apply_repository_immutability(
+                    repository,
+                    abr_path,
+                    backup_name,
+                    retention_days=actual_days,
+                    timeout=_s3_immutability_probe_timeout(),
+                )
+            except StorageToolError as exc:
+                point_failed = True
+                failures.append(
+                    {
+                        "restore_point_id": str(point.get("id") or ""),
+                        "backup_name": backup_name,
+                        "message": condense_disk_tool_message(exc),
+                    }
+                )
+        if not point_failed:
+            updated.append(str(point.get("id") or ""))
+            applied_days.add(actual_days)
+
+    result = {
+        "id": record_id,
+        "name": repository.get("name"),
+        "immutability": config,
+        "actual_retention_days": sorted(applied_days),
+        "restore_point_count": len(points),
+        "updated_restore_points": len(updated),
+        "failed_restore_points": len(points) - len(updated),
+        "failures": failures,
+    }
+    if not points:
+        result["status"] = "success"
+        result["message"] = "Repository holds no restore points; nothing to place under Object Lock"
+        return result
+    period = _applied_period_text(applied_days or attempted_days, config)
+    if failures:
+        result["status"] = "error"
+        result["message"] = (
+            f"{len(updated)} of {len(points)} restore point(s) were placed under {config['mode']} Object Lock "
+            f"{period}; the storage refused the rest"
+        )
+        return result
+    result["status"] = "success"
+    result["message"] = (
+        f"{len(updated)} restore point(s) are now held in {config['mode']} mode {period}, counted from now"
+    )
+    return result
+
+
+def test_s3_immutability(payload: dict[str, Any]) -> dict[str, Any]:
+    config = _normalize_s3_configuration(payload)
+    _validate_s3_configuration(config)
+    return validate_s3_immutability_config(config)
+
+
+def verify_repository_immutability(record_id: str) -> dict[str, Any]:
+    repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    _assert_repository_supports_immutability(repository)
+    config = extract_s3_config(repository)
+    result = validate_s3_immutability_config(config)
+    payload = normalize_repository_record(repository)
+    payload.update(result)
+    immutability = normalize_immutability_config(config.get("immutability"))
+    payload["immutability_effect"] = _immutability_effect_report(
+        record_id, previous=immutability, current=immutability
+    )
+    return payload
 
 
 def test_s3_connection(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3504,6 +4111,8 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     }
     if str(task.get("task_type") or "") == "verify":
         dto["verify"] = result.get("verify")
+    if str(task.get("task_type") or "") == "delete":
+        dto["delete"] = result.get("delete")
     # A session's log is the bulk of its DTO (task_pool appends a line per
     # progress update), so list callers that only need the row can drop it and
     # read GET /sessions/{id}/log on demand instead.
@@ -4253,7 +4862,7 @@ def _create_verify_session(backup_id: str, points: list[dict[str, Any]]) -> dict
     return task
 
 
-def _update_verify_session(task_id: str, update: dict[str, Any], *, status: str | None = None) -> None:
+def _update_session_result(task_id: str, update: dict[str, Any], *, status: str | None = None) -> None:
     with TASK_LOCK:
         task = TASKS.get(task_id)
         if not task:
@@ -4284,14 +4893,14 @@ def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
     try:
         report = verify_backup_chain(
             backup_id,
-            progress_callback=lambda update: _update_verify_session(
+            progress_callback=lambda update: _update_session_result(
                 task_id,
                 {**update, "log_entry": False},
             ),
             should_cancel=lambda: _verify_session_cancel_requested(task_id),
         )
     except ApiError as exc:
-        _update_verify_session(
+        _update_session_result(
             task_id,
             {"progress": 100, "message": str(exc.message), "finished_at": utc_now()},
             status="failed",
@@ -4299,7 +4908,7 @@ def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
         raise
     except Exception as exc:
         LOGGER.exception("Verification of backup '%s' failed", backup_id)
-        _update_verify_session(
+        _update_session_result(
             task_id,
             {"progress": 100, "message": str(exc), "finished_at": utc_now()},
             status="failed",
@@ -4312,7 +4921,7 @@ def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
         status = "failed"
     else:
         status = "completed"
-    _update_verify_session(
+    _update_session_result(
         task_id,
         {
             "progress": 100,
@@ -4356,7 +4965,122 @@ def verify_backup_chain_request(backup_id: str, *, wait: bool = True) -> dict[st
     }
 
 
-def delete_backup_chain(backup_id: str, *, segment_id: str | None = None, force: bool = False) -> dict[str, Any]:
+def _create_delete_session(backup_id: str, points: list[dict[str, Any]]) -> dict[str, Any]:
+    latest = points[-1] if points else {}
+    task = {
+        "id": str(uuid4()),
+        "job_id": None,
+        "task_type": "delete",
+        "hypervisor_id": None,
+        "resource_type": "virtual_machine",
+        "resource_external_id": latest.get("vm_id"),
+        "status": "running",
+        "parameters": {
+            "backup_id": backup_id,
+            "vm_name": str(latest.get("vm_name") or "").strip() or None,
+            "repository_id": latest.get("repository_id"),
+            "repository_name": latest.get("repository_name"),
+        },
+        "result": {"progress": 0},
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "logs": [],
+    }
+    _append_task_log(task, level="info", message=f"Started deletion of backup {backup_id}", component="session")
+    persist_task(task)
+    return task
+
+
+def _run_delete_session(
+    backup_id: str, task_id: str, *, segment_id: str | None, force: bool
+) -> dict[str, Any]:
+    try:
+        report = delete_backup_chain(
+            backup_id,
+            segment_id=segment_id,
+            force=force,
+            progress_callback=lambda update: _update_session_result(task_id, {**update, "log_entry": False}),
+        )
+    except ApiError as exc:
+        _update_session_result(
+            task_id,
+            {"progress": 100, "message": str(exc.message), "finished_at": utc_now()},
+            status="failed",
+        )
+        raise
+    except Exception as exc:
+        LOGGER.exception("Deletion of backup '%s' failed", backup_id)
+        _update_session_result(
+            task_id, {"progress": 100, "message": str(exc), "finished_at": utc_now()}, status="failed"
+        )
+        raise
+
+    _update_session_result(
+        task_id,
+        {
+            "progress": 100,
+            "message": report.get("message") or "Backup chain deleted",
+            "finished_at": utc_now(),
+            "delete": report,
+        },
+        status="completed" if report.get("deleted") else "failed",
+    )
+    return report
+
+
+def delete_backup_chain_request(
+    backup_id: str, *, segment_id: str | None = None, force: bool = False, wait: bool = True
+) -> dict[str, Any]:
+    chains = grouped_backup_points()
+    points = chains.get(backup_id)
+    if not points:
+        raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
+
+    task = _create_delete_session(backup_id, points)
+    task_id = str(task["id"])
+
+    if wait:
+        report = _run_delete_session(backup_id, task_id, segment_id=segment_id, force=force)
+        return {**report, "session_id": task_id}
+
+    thread = threading.Thread(
+        target=_run_delete_session,
+        args=(backup_id, task_id),
+        kwargs={"segment_id": segment_id, "force": force},
+        name=f"delete-{task_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "id": backup_id,
+        "session_id": task_id,
+        "state": _session_state(task),
+        "deleted": False,
+        "restore_point_count": len(points),
+        "artifacts_removed": False,
+    }
+
+
+def _point_repository_holds_immutable_backups(point: dict[str, Any]) -> bool:
+    repository_id = str(point.get("repository_id") or "")
+    if not repository_id:
+        return False
+    try:
+        repository = _find_by_id(catalog_records(REPOSITORIES), repository_id, label="Repository")
+    except ApiError:
+        return False
+    if not is_s3_repository(repository):
+        return False
+    return immutability_is_enabled(extract_s3_config(repository).get("immutability"))
+
+
+def delete_backup_chain(
+    backup_id: str,
+    *,
+    segment_id: str | None = None,
+    force: bool = False,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     chains = grouped_backup_points()
     points = chains.get(backup_id)
     if not points:
@@ -4391,21 +5115,62 @@ def delete_backup_chain(backup_id: str, *, segment_id: str | None = None, force:
         raise api_error(409, "inconsistent_backup_chain", "Repository/catalog state is inconsistent", restore_point_ids=inconsistent)
 
     artifacts_removed = True
-    for point in points:
-        if not _delete_backup_artifacts_from_point(point):
-            artifacts_removed = False
+    retained_points: list[str] = []
+
+    def _emit(progress: int, message: str) -> None:
+        if progress_callback is not None:
+            progress_callback({"progress": progress, "message": message})
+
+    total_points = len(points)
+    _emit(0, f"Deleting {total_points} restore point(s)")
+    for position, point in enumerate(points, start=1):
+        _emit(
+            int((position - 1) * 100 / total_points) if total_points else 100,
+            f"Deleting restore point {position}/{total_points}",
+        )
+        if _delete_backup_artifacts_from_point(point):
+            delete_backup(point["id"])
+            continue
+        artifacts_removed = False
+        if _point_repository_holds_immutable_backups(point):
+            LOGGER.error(
+                "Object Lock refused the deletion of backup artifacts; keeping catalog entry for retry: "
+                "point=%s repository=%s",
+                point.get("id"),
+                point.get("repository_id"),
+            )
+            retained_points.append(str(point.get("id") or ""))
+            continue
         delete_backup(point["id"])
 
-    result = {"id": backup_id, "deleted": True, "restore_point_count": len(points), "artifacts_removed": artifacts_removed}
+    _emit(100, f"Deleted {total_points - len(retained_points)} of {total_points} restore point(s)")
+    immutable_points = len(retained_points)
+    result = {
+        "id": backup_id,
+        "deleted": not retained_points,
+        "restore_point_count": len(points),
+        "artifacts_removed": artifacts_removed,
+    }
     if segment_id is not None:
         result["segment_id"] = segment_id
     if gfs_protected_point_ids:
         result["gfs_protection_overridden"] = True
     if not artifacts_removed:
+        if immutable_points:
+            result["immutable_restore_points"] = immutable_points
+            result["retained_restore_point_ids"] = retained_points
         result["message"] = (
-            "Catalog entry removed. Some backup files were outside this repository's storage root "
-            "(e.g. an imported/reference chain) and were left untouched to avoid deleting another "
-            "repository's data."
+            (
+                f"{immutable_points} restore point(s) are still held under S3 Object Lock and the storage refused "
+                "to delete their data. They are kept in the catalog and retried once the lock expires, so nothing "
+                "is left untracked in the bucket."
+            )
+            if immutable_points
+            else (
+                "Catalog entry removed. Some backup files were outside this repository's storage root "
+                "(e.g. an imported/reference chain) and were left untouched to avoid deleting another "
+                "repository's data."
+            )
         )
     return result
 

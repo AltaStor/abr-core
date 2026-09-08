@@ -13,6 +13,9 @@ from ..parsing.common_arguments import add_name_or_id_selector
 from ..progress_watch import run_with_elapsed_indicator
 from .base import CommandDependencies
 
+IMMUTABILITY_MODES = ("none", "governance", "compliance")
+IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS = 21600
+
 
 def _parse_remote_address(repo_type: str, address: str | None) -> dict[str, str]:
     if not address:
@@ -26,6 +29,21 @@ def _parse_remote_address(repo_type: str, address: str | None) -> dict[str, str]
         if len(parts) == 2:
             return {"server": parts[0], "share": parts[1]}
     return {"path": address}
+
+
+def _configures_immutability(args: argparse.Namespace) -> bool:
+    return getattr(args, "immutable", None) is not None or getattr(args, "immutability_days", None) is not None
+
+
+def _build_immutability_payload(args: argparse.Namespace) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    mode = getattr(args, "immutable", None)
+    days = getattr(args, "immutability_days", None)
+    if mode is not None:
+        payload["mode"] = str(mode).strip().lower()
+    if days is not None:
+        payload["retention_days"] = int(days)
+    return payload
 
 
 def _build_s3_payload(args: argparse.Namespace) -> dict[str, object]:
@@ -47,11 +65,54 @@ def _build_s3_payload(args: argparse.Namespace) -> dict[str, object]:
         payload["path_style"] = bool(args.path_style)
     if getattr(args, "verify_tls", None) is not None:
         payload["verify_tls"] = bool(args.verify_tls)
+    immutability = _build_immutability_payload(args)
+    if immutability:
+        payload["immutability"] = immutability
     return payload
+
+
+def _current_immutability(current: dict[str, object] | None) -> tuple[str, int]:
+    stored = (current or {}).get("immutability")
+    stored = stored if isinstance(stored, dict) else {}
+    try:
+        days = int(stored.get("retention_days") or 0)
+    except (TypeError, ValueError):
+        days = 0
+    return str(stored.get("mode") or "none").strip().lower(), days
+
+
+def _validate_immutability_args(
+    args: argparse.Namespace,
+    *,
+    repo_type: str,
+    current: dict[str, object] | None = None,
+) -> None:
+    mode = getattr(args, "immutable", None)
+    days = getattr(args, "immutability_days", None)
+    if mode is None and days is None:
+        return
+    if repo_type != "s3":
+        raise ValueError("--immutable and --immutability-days are only available for s3 repositories")
+    if days is not None and int(days) < 1:
+        raise ValueError("--immutability-days must be at least 1")
+
+    current_mode, current_days = _current_immutability(current)
+    effective_mode = str(mode).strip().lower() if mode is not None else current_mode
+    effective_days = int(days) if days is not None else current_days
+
+    if effective_mode == "none":
+        if mode is not None and days is not None:
+            raise ValueError("--immutable none cannot be combined with --immutability-days")
+        if days is not None:
+            raise ValueError("--immutability-days requires --immutable governance or --immutable compliance")
+        return
+    if effective_days < 1:
+        raise ValueError(f"--immutable {effective_mode} requires --immutability-days")
 
 
 def _validate_create_args(args: argparse.Namespace) -> None:
     repo_type = str(args.type or "").lower()
+    _validate_immutability_args(args, repo_type=repo_type)
     if repo_type == "local":
         if not getattr(args, "path", None):
             raise ValueError("local repositories require --path")
@@ -83,7 +144,9 @@ def _validate_create_args(args: argparse.Namespace) -> None:
 
 
 def _validate_edit_args(current: dict[str, object], args: argparse.Namespace) -> None:
-    if str(current.get("type") or "").lower() != "s3":
+    repo_type = str(current.get("type") or "").lower()
+    _validate_immutability_args(args, repo_type=repo_type, current=current)
+    if repo_type != "s3":
         return
     s3_payload = _build_s3_payload(args)
     if not s3_payload:
@@ -102,6 +165,36 @@ def _print_repository_warnings(result: object) -> None:
         print(f"Warning: {warning}", file=sys.stderr)
 
 
+def _print_immutability_effect(result: object) -> None:
+    if not isinstance(result, dict):
+        return
+    effect = result.get("immutability_effect")
+    if not isinstance(effect, dict):
+        return
+    current = effect.get("current") if isinstance(effect.get("current"), dict) else {}
+    mode = str(current.get("mode") or "none")
+    days = int(current.get("retention_days") or 0)
+    headline = "disabled" if mode == "none" or days < 1 else f"{mode}, {days} day(s)"
+    print(f"Immutability: {headline}", file=sys.stderr)
+    for line in effect.get("effect") or []:
+        print(f"  {line}", file=sys.stderr)
+    for line in effect.get("limitations") or []:
+        print(f"  Limitation: {line}", file=sys.stderr)
+    for line in effect.get("warnings") or []:
+        print(f"  Warning: {line}", file=sys.stderr)
+
+
+def _print_immutability_checks(result: object) -> None:
+    if not isinstance(result, dict):
+        return
+    for check in result.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        message = str(check.get("message") or "").strip()
+        suffix = f": {message}" if message else ""
+        print(f"  [{check.get('status')}] {check.get('name')}{suffix}", file=sys.stderr)
+
+
 class RepositoryCommands:
     def register(self, registry) -> None:
         repo = registry.add_parser("repo", help="Repository management", description="Repository commands", formatter_class=CompactHelpFormatter)
@@ -117,7 +210,9 @@ class RepositoryCommands:
                 '  abr repo add --name "SMB-Repo" --type smb --address //fileserver/backups '
                 '--username backupsvc --password "********"\n'
                 '  abr repo add --name "S3-Repo" --type s3 --bucket altastor-backups --region us-east-1 '
-                "--access-key AKIA... --secret-key ..."
+                "--access-key AKIA... --secret-key ...\n"
+                '  abr repo add --name "S3-WORM" --type s3 --bucket altastor-objectlock --region us-east-1 '
+                "--access-key AKIA... --secret-key ... --immutable governance --immutability-days 30"
             ),
             formatter_class=CompactHelpFormatter,
         )
@@ -143,6 +238,17 @@ class RepositoryCommands:
         add_tls = add.add_mutually_exclusive_group()
         add_tls.add_argument("--verify-tls", dest="verify_tls", action="store_true", default=None, help="Verify TLS certificates for S3 endpoints")
         add_tls.add_argument("--no-verify-tls", dest="verify_tls", action="store_false", help="Disable TLS verification for S3 endpoints")
+        add.add_argument(
+            "--immutable",
+            choices=IMMUTABILITY_MODES,
+            help="S3 Object Lock mode applied to new backups (s3 repositories only)",
+        )
+        add.add_argument(
+            "--immutability-days",
+            dest="immutability_days",
+            type=int,
+            help="Days S3 Object Lock holds each new backup; required with --immutable governance/compliance",
+        )
         add.set_defaults(handler=self.create)
 
         list_parser = commands.add_parser(
@@ -176,7 +282,9 @@ class RepositoryCommands:
                 "Edit repository settings.\n\n"
                 "Examples:\n"
                 '  abr repo edit --name "Local-Repo-1" --description "Primary on-prem repository"\n'
-                '  abr repo edit --id <repo-id> --new-name "Local-Repo-1-Renamed"'
+                '  abr repo edit --id <repo-id> --new-name "Local-Repo-1-Renamed"\n'
+                '  abr repo edit --name "S3-WORM" --immutable governance --immutability-days 30\n'
+                '  abr repo edit --name "S3-WORM" --immutable none'
             ),
             formatter_class=CompactHelpFormatter,
         )
@@ -202,7 +310,50 @@ class RepositoryCommands:
         edit_tls = edit.add_mutually_exclusive_group()
         edit_tls.add_argument("--verify-tls", dest="verify_tls", action="store_true", default=None, help="Verify TLS certificates for S3 endpoints")
         edit_tls.add_argument("--no-verify-tls", dest="verify_tls", action="store_false", help="Disable TLS verification for S3 endpoints")
+        edit.add_argument(
+            "--immutable",
+            choices=IMMUTABILITY_MODES,
+            help="Updated S3 Object Lock mode applied to new backups (s3 repositories only)",
+        )
+        edit.add_argument(
+            "--immutability-days",
+            dest="immutability_days",
+            type=int,
+            help="Updated number of days S3 Object Lock holds each new backup",
+        )
         edit.set_defaults(handler=self.edit)
+
+        verify_immutability = commands.add_parser(
+            "verify-immutability",
+            help="Validate that an S3 repository can hold immutable backups.",
+            description=(
+                "Validate that an S3 repository can hold immutable backups.\n\n"
+                "Checks Object Lock, versioning and permissions, then proves them by writing a small locked test\n"
+                "backup and confirming the storage refuses to delete it. The probe stays until its lock expires.\n\n"
+                "Examples:\n"
+                '  abr repo verify-immutability --name "S3-WORM"\n'
+                "  abr repo verify-immutability --id <repo-id>"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        add_name_or_id_selector(verify_immutability, name_help="Repository name", id_help="Repository ID")
+        verify_immutability.set_defaults(handler=self.verify_immutability)
+
+        apply_immutability = commands.add_parser(
+            "apply-immutability",
+            help="Put stored backups under the repository's current immutability setting.",
+            description=(
+                "Put stored backups under the repository's current immutability setting.\n\n"
+                "Applies it to every restore point already stored, counting the period from now. Object Lock\n"
+                "cannot be lifted, so this cannot be undone; refusals are reported per restore point.\n\n"
+                "Examples:\n"
+                '  abr repo apply-immutability --name "S3-WORM"\n'
+                "  abr repo apply-immutability --id <repo-id>"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        add_name_or_id_selector(apply_immutability, name_help="Repository name", id_help="Repository ID")
+        apply_immutability.set_defaults(handler=self.apply_immutability)
 
     @staticmethod
     def _resolve(deps: CommandDependencies, args: argparse.Namespace) -> dict[str, object]:
@@ -243,9 +394,18 @@ class RepositoryCommands:
         payload.update({k: v for k, v in _parse_remote_address(args.type, args.address).items() if payload.get(k) in {None, ""}})
         if args.type == "s3":
             payload["s3"] = _build_s3_payload(args)
-        result = deps.context.api_client.post("api/v1/repositories", json=payload)
+        if _configures_immutability(args):
+            result = run_with_elapsed_indicator(
+                lambda: deps.context.api_client.post(
+                    "api/v1/repositories", json=payload, timeout=IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS
+                ),
+                label="Validating repository immutability",
+            )
+        else:
+            result = deps.context.api_client.post("api/v1/repositories", json=payload)
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("path", "PATH"), ("status", "STATUS")])
         _print_repository_warnings(result)
+        _print_immutability_effect(result)
         return 0
 
     def list(self, args: argparse.Namespace) -> int:
@@ -279,9 +439,18 @@ class RepositoryCommands:
             s3_payload = _build_s3_payload(args)
             if s3_payload:
                 payload["s3"] = s3_payload
-        result = deps.context.api_client.patch(f"api/v1/repositories/{repo_id}", json=payload)
+        if _configures_immutability(args):
+            result = run_with_elapsed_indicator(
+                lambda: deps.context.api_client.patch(
+                    f"api/v1/repositories/{repo_id}", json=payload, timeout=IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS
+                ),
+                label="Validating repository immutability",
+            )
+        else:
+            result = deps.context.api_client.patch(f"api/v1/repositories/{repo_id}", json=payload)
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("path", "PATH"), ("status", "STATUS")])
         _print_repository_warnings(result)
+        _print_immutability_effect(result)
         return 0
 
     def remove(self, args: argparse.Namespace) -> int:
@@ -302,6 +471,53 @@ class RepositoryCommands:
             label="Verifying repository",
         )
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("status", "STATUS"), ("message", "MESSAGE")])
+        if isinstance(result, dict) and result.get("status") == "error":
+            return INVALID_STATE
+        return 0
+
+    def apply_immutability(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        repository_id = self._resolve_id(deps, args)
+        result = run_with_elapsed_indicator(
+            lambda: deps.context.api_client.post(
+                f"api/v1/repositories/{repository_id}/apply-immutability",
+                timeout=IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS,
+            ),
+            label="Applying immutability to stored backups",
+        )
+        deps.context.print_output(
+            result,
+            [
+                ("id", "ID"),
+                ("name", "NAME"),
+                ("status", "STATUS"),
+                ("updated_restore_points", "UPDATED"),
+                ("failed_restore_points", "FAILED"),
+                ("message", "MESSAGE"),
+            ],
+        )
+        if isinstance(result, dict):
+            for failure in result.get("failures") or []:
+                print(
+                    f"  {failure.get('restore_point_id')} / {failure.get('backup_name')}: {failure.get('message')}",
+                    file=sys.stderr,
+                )
+            if result.get("status") == "error":
+                return INVALID_STATE
+        return 0
+
+    def verify_immutability(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        repository_id = self._resolve_id(deps, args)
+        result = run_with_elapsed_indicator(
+            lambda: deps.context.api_client.post(
+                f"api/v1/repositories/{repository_id}/verify-immutability", timeout=21600
+            ),
+            label="Validating repository immutability",
+        )
+        deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("status", "STATUS"), ("message", "MESSAGE")])
+        _print_immutability_checks(result)
+        _print_immutability_effect(result)
         if isinstance(result, dict) and result.get("status") == "error":
             return INVALID_STATE
         return 0

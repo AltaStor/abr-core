@@ -15,7 +15,7 @@ import unittest
 import uuid
 from unittest.mock import patch
 
-os.environ.setdefault("ABR_ENABLE_MOCK_INVENTORY", "1")
+os.environ["ABR_ENABLE_MOCK_INVENTORY"] = "1"
 
 try:
     from fastapi.testclient import TestClient

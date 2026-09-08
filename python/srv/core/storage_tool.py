@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import socket
@@ -12,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from .server_defaults import env_int
 from .subprocess_util import CompletedProcess, run_capped
@@ -23,6 +25,11 @@ CREDENTIAL_FIELD_NAMES = frozenset({"password", "token", "encryption_key"})
 SECRET_MASK = "********"
 _SAFE_PATH_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 VERIFY_PROGRESS_POLL_SECONDS = 0.25
+IMMUTABILITY_MODES = ("none", "governance", "compliance")
+_IMMUTABILITY_RANKS = {"none": 0, "governance": 1, "compliance": 2}
+IMMUTABILITY_PROBE_FOLDER = ".abr-immutability-probe"
+IMMUTABILITY_PROBE_NAME_PREFIX = "immutability-probe-"
+IMMUTABILITY_PROBE_RETENTION_DAYS = 1
 
 
 class StorageToolError(RuntimeError):
@@ -55,6 +62,31 @@ def join_s3_prefix(*parts: Any) -> str:
 def build_s3_location(bucket: str, prefix: Any = None) -> str:
     normalized_prefix = normalize_s3_prefix(prefix)
     return f"s3://{bucket}/{normalized_prefix}" if normalized_prefix else f"s3://{bucket}"
+
+
+def normalize_immutability_mode(value: Any) -> str:
+    return str(value or "none").strip().lower() or "none"
+
+
+def immutability_rank(mode: Any) -> int:
+    return _IMMUTABILITY_RANKS.get(normalize_immutability_mode(mode), 0)
+
+
+def normalize_immutability_config(raw: Any) -> dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    try:
+        retention_days = int(source.get("retention_days") or 0)
+    except (TypeError, ValueError):
+        retention_days = 0
+    return {
+        "mode": normalize_immutability_mode(source.get("mode")),
+        "retention_days": max(retention_days, 0),
+    }
+
+
+def immutability_is_enabled(config: Any) -> bool:
+    normalized = normalize_immutability_config(config)
+    return normalized["mode"] != "none" and normalized["retention_days"] > 0
 
 
 def mask_access_key(value: Any) -> str | None:
@@ -100,6 +132,9 @@ def extract_s3_config(record: dict[str, Any]) -> dict[str, Any]:
         default=True,
     )
     description = str(raw.get("description") or metadata.get("description") or record.get("description") or "").strip() or None
+    immutability = normalize_immutability_config(
+        raw.get("immutability") if isinstance(raw.get("immutability"), dict) else record.get("immutability")
+    )
 
     return {
         "bucket": bucket,
@@ -112,6 +147,7 @@ def extract_s3_config(record: dict[str, Any]) -> dict[str, Any]:
         "path_style": path_style,
         "verify_tls": verify_tls,
         "description": description,
+        "immutability": immutability,
         "location": build_s3_location(bucket, prefix) if bucket else None,
     }
 
@@ -128,6 +164,7 @@ def sanitize_s3_config(config: dict[str, Any]) -> dict[str, Any]:
         "description": config.get("description"),
         "access_key_masked": mask_access_key(config.get("access_key")),
         "has_secret_key": bool(str(config.get("secret_key") or "").strip()),
+        "immutability": normalize_immutability_config(config.get("immutability")),
     }
     sanitized["location"] = build_s3_location(
         str(sanitized.get("bucket") or ""),
@@ -258,6 +295,15 @@ def disk_tool_storage_args(
     if not bool(config.get("verify_tls", True)):
         args.append("--no-verify-tls")
     return args
+
+
+def disk_tool_immutability_args(repository: dict[str, Any]) -> list[str]:
+    if not is_s3_repository(repository):
+        return []
+    config = normalize_immutability_config(extract_s3_config(repository).get("immutability"))
+    if not immutability_is_enabled(config):
+        return []
+    return ["--immutable", config["mode"], "--retention", str(config["retention_days"])]
 
 
 def redact_disk_tool_command(command: list[str]) -> list[str]:
@@ -407,6 +453,217 @@ def probe_repository_access(
         raise
 
     remove_disk_tool_backup(repository, abr_path, backup_name, timeout=timeout)
+
+
+def condense_disk_tool_message(text: Any) -> str:
+    lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if line.lower().startswith("error:"):
+            line = line[len("error:"):].strip()
+        if line and line not in lines:
+            lines.append(line)
+    return "; ".join(lines)
+
+
+def parse_disk_tool_json(stdout: str) -> dict[str, Any]:
+    start = stdout.find("{")
+    if start < 0:
+        raise StorageToolError("backup tool returned no JSON result document")
+    try:
+        document = json.loads(stdout[start:])
+    except ValueError as exc:
+        raise StorageToolError(f"backup tool returned a malformed JSON result document: {exc}") from exc
+    if not isinstance(document, dict):
+        raise StorageToolError("backup tool returned an unexpected JSON result document")
+    return document
+
+
+def run_disk_tool_json(args: list[str], *, timeout: int | None = None) -> dict[str, Any]:
+    command = [args[0], "--json", *args[1:]] if args else ["--json"]
+    return parse_disk_tool_json(run_disk_tool(command, timeout=timeout).stdout)
+
+
+def read_storage_folder_info(
+    repository: dict[str, Any],
+    abr_path: str | None = None,
+    *,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    return run_disk_tool_json(
+        ["info", *disk_tool_storage_args(repository, abr_path=abr_path)],
+        timeout=timeout,
+    )
+
+
+def read_storage_backup_info(
+    repository: dict[str, Any],
+    abr_path: str | None,
+    backup_name: str,
+    *,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    return run_disk_tool_json(
+        ["info", "--name", backup_name, *disk_tool_storage_args(repository, abr_path=abr_path)],
+        timeout=timeout,
+    )
+
+
+def set_disk_tool_backup_retention(
+    repository: dict[str, Any],
+    abr_path: str | None,
+    backup_name: str,
+    *,
+    mode: str,
+    retention_days: int,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    normalized_mode = normalize_immutability_mode(mode)
+    if normalized_mode == "none":
+        raise StorageToolError("Object Lock cannot release a backup that is already held")
+    if int(retention_days) < 1:
+        raise StorageToolError("Object Lock retention must be at least 1 day")
+    return run_disk_tool_json(
+        [
+            "retention",
+            "--name",
+            backup_name,
+            *disk_tool_storage_args(repository, abr_path=abr_path),
+            "--immutable",
+            normalized_mode,
+            "--retention",
+            str(int(retention_days)),
+        ],
+        timeout=timeout,
+    )
+
+
+def _is_absent_data_object_error(message: str, backup_name: str) -> bool:
+    lowered = message.lower()
+    return "nosuchkey" in lowered and f"{backup_name}.abrd" in lowered
+
+
+def with_immutability_retention_days(repository: dict[str, Any], retention_days: int) -> dict[str, Any]:
+    if not is_s3_repository(repository):
+        return repository
+    config = extract_s3_config(repository)
+    if not immutability_is_enabled(config.get("immutability")):
+        return repository
+    effective = dict(repository)
+    config["immutability"] = dict(config["immutability"], retention_days=max(int(retention_days), 1))
+    effective["s3"] = config
+    return effective
+
+
+def apply_repository_immutability(
+    repository: dict[str, Any],
+    abr_path: str | None,
+    backup_name: str,
+    *,
+    retention_days: int | None = None,
+    timeout: int = 120,
+) -> dict[str, Any] | None:
+    config = normalize_immutability_config(extract_s3_config(repository).get("immutability"))
+    if not immutability_is_enabled(config):
+        return None
+    try:
+        return set_disk_tool_backup_retention(
+            repository,
+            abr_path,
+            backup_name,
+            mode=config["mode"],
+            retention_days=config["retention_days"] if retention_days is None else retention_days,
+            timeout=timeout,
+        )
+    except StorageToolError as exc:
+        if not _is_absent_data_object_error(str(exc), backup_name):
+            raise
+        return {
+            "command": "retention",
+            "status": "ok",
+            "name": backup_name,
+            "immutability": config["mode"],
+            "retention_days": config["retention_days"] if retention_days is None else retention_days,
+            "metadata_only": True,
+        }
+
+
+def immutability_probe_path(prefix: Any) -> str:
+    return join_s3_prefix(prefix, IMMUTABILITY_PROBE_FOLDER)
+
+
+def sweep_immutability_probes(
+    repository: dict[str, Any],
+    probe_path: str,
+    *,
+    timeout: int = 60,
+) -> int:
+    try:
+        leftovers = list_disk_tool_backups(repository, probe_path, timeout=timeout)
+    except StorageToolError:
+        return 0
+    swept = 0
+    for name in sorted(leftovers):
+        if not name.startswith(IMMUTABILITY_PROBE_NAME_PREFIX):
+            continue
+        try:
+            remove_disk_tool_backup(repository, probe_path, name, timeout=timeout)
+        except StorageToolError:
+            continue
+        swept += 1
+    return swept
+
+
+def probe_repository_immutability(
+    repository: dict[str, Any],
+    *,
+    prefix: Any,
+    mode: str,
+    retention_days: int,
+    timeout: int = 180,
+) -> dict[str, Any]:
+    probe_path = immutability_probe_path(prefix)
+    sweep_immutability_probes(repository, probe_path, timeout=timeout)
+    backup_name = f"{IMMUTABILITY_PROBE_NAME_PREFIX}{uuid4().hex[:12]}"
+
+    with tempfile.NamedTemporaryFile(prefix="abr-immutability-probe-", suffix=".bin") as probe:
+        probe.write(b"\xa5" * 512)
+        probe.flush()
+        run_disk_tool(
+            [
+                "backup",
+                "--name",
+                backup_name,
+                *disk_tool_storage_args(repository, abr_path=probe_path),
+                "--source",
+                probe.name,
+                "--immutable",
+                mode,
+                "--retention",
+                str(max(int(retention_days), 1)),
+            ],
+            timeout=timeout,
+        )
+
+    stored = read_storage_backup_info(repository, probe_path, backup_name, timeout=timeout)
+
+    delete_rejected = True
+    delete_error: str | None = None
+    try:
+        remove_disk_tool_backup(repository, probe_path, backup_name, timeout=timeout)
+        delete_rejected = False
+    except StorageToolError as exc:
+        delete_error = str(exc)
+
+    return {
+        "backup_name": backup_name,
+        "path": probe_path,
+        "mode": normalize_immutability_mode(stored.get("immutability")),
+        "retention_days": int(stored.get("retention_days") or 0),
+        "supported_mode": normalize_immutability_mode(stored.get("immutability_supported")),
+        "delete_rejected": delete_rejected,
+        "delete_error": condense_disk_tool_message(delete_error) if delete_error else None,
+    }
 
 
 def run_disk_tool(
