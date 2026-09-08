@@ -2968,10 +2968,12 @@ def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
     updated: list[str] = []
     failures: list[dict[str, Any]] = []
     applied_days: set[int] = set()
+    attempted_days: set[int] = set()
     for point in points:
         point_failed = False
         job = JOBS.get(str(point.get("job_id") or ""))
         actual_days = repository_actual_retention_days(job if isinstance(job, dict) else None, config)
+        attempted_days.add(actual_days)
         for abr_path, backup_name in _restore_point_abr_targets(point):
             try:
                 apply_repository_immutability(
@@ -3008,7 +3010,7 @@ def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
         result["status"] = "success"
         result["message"] = "Repository holds no restore points; nothing to place under Object Lock"
         return result
-    period = _applied_period_text(applied_days, config)
+    period = _applied_period_text(applied_days or attempted_days, config)
     if failures:
         result["status"] = "error"
         result["message"] = (

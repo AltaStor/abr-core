@@ -799,6 +799,7 @@ class S3RetroactiveImmutabilityTests(unittest.TestCase):
         self.assertEqual(result["updated_restore_points"], 0)
         self.assertEqual(result["failed_restore_points"], 2)
         self.assertTrue(all("already held" in f["message"] for f in result["failures"]))
+        self.assertIn("for 40 day(s)", result["message"])
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")
