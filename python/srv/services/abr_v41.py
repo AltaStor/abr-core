@@ -2826,16 +2826,24 @@ def validate_s3_immutability_config(config: dict[str, Any], *, write_probe: bool
 def _immutability_job_retention_warnings(repository_id: str, immutability: dict[str, Any]) -> list[str]:
     if not immutability_is_enabled(immutability):
         return []
-    lock_days = immutability["retention_days"]
     warnings: list[str] = []
     for job in normalized_job_records():
         if str(job.get("repo_id") or "") != repository_id:
             continue
         job_days = int(job.get("retention_days") or 0)
-        if 0 < job_days < lock_days:
+        if job_days <= 0:
+            continue
+        lock_days = repository_actual_retention_days(job, immutability)
+        if job_days < lock_days:
             warnings.append(
                 f"Job '{job.get('name')}' keeps restore points for {job_days} day(s), but backups written to this "
                 f"repository stay locked for {lock_days} day(s); retention cannot delete them until the lock expires."
+            )
+        elif lock_days < job_days:
+            warnings.append(
+                f"Job '{job.get('name')}' keeps restore points for {job_days} day(s), but they are locked for only "
+                f"{lock_days} day(s); from day {lock_days} to day {job_days} its backups are still needed but can be "
+                "deleted. Raise the immutability period to cover the whole retention."
             )
     return warnings
 

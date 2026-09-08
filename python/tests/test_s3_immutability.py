@@ -616,10 +616,11 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
         warnings = result["immutability_effect"]["warnings"]
         self.assertTrue(any("Nightly" in warning for warning in warnings), warnings)
         self.assertTrue(any("cannot delete them until the lock expires" in warning for warning in warnings))
+        self.assertTrue(any("stay locked for 40 day(s)" in warning for warning in warnings), warnings)
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")
-    def test_job_retention_longer_than_the_lock_is_not_warned_about(self, run_mock, _connect) -> None:
+    def test_job_retention_longer_than_the_lock_warns_about_the_unprotected_window(self, run_mock, _connect) -> None:
         run_mock.side_effect = _disk_tool_stub()
         repository = abr_v41.create_repository_record({"name": "ObjectRepo", "type": "s3", "s3": dict(S3_SETTINGS)})
         JOBS["job-1"] = {
@@ -634,7 +635,9 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
             repository["id"], {"s3": {"immutability": {"mode": "governance", "retention_days": 30}}}
         )
 
-        self.assertEqual(result["immutability_effect"]["warnings"], [])
+        warnings = result["immutability_effect"]["warnings"]
+        self.assertTrue(any("locked for only 40 day(s)" in warning for warning in warnings), warnings)
+        self.assertTrue(any("from day 40 to day 90" in warning for warning in warnings), warnings)
 
 
 class S3ImmutabilityDeletionReportingTests(unittest.TestCase):
@@ -962,6 +965,45 @@ class BackupDeleteSessionTests(unittest.TestCase):
 
         self.assertEqual(seen[0], 0)
         self.assertEqual(seen[-1], 100)
+
+
+class S3ImmutabilityWarningBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for store in (BACKUPS, JOBS, REPOSITORIES, TASKS):
+            store.clear()
+
+    def tearDown(self) -> None:
+        for store in (BACKUPS, JOBS, REPOSITORIES, TASKS):
+            store.clear()
+
+    def _warnings(self, job_retention_days: int, immutability_days: int) -> list[str]:
+        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "R", "type": "s3", "metadata": {"s3": dict(S3_SETTINGS)}}
+        JOBS["job-1"] = {
+            "id": "job-1",
+            "name": "Nightly",
+            "job_type": "backup",
+            "repo_id": "repo-1",
+            "retention_days": job_retention_days,
+            "active_full_days": ["Sun"],
+        }
+        return abr_v41._immutability_job_retention_warnings(
+            "repo-1", {"mode": "governance", "retention_days": immutability_days}
+        )
+
+    def test_equal_periods_produce_no_warning(self) -> None:
+        self.assertEqual(self._warnings(37, 30), [])
+
+    def test_lock_longer_than_retention_warns_about_blocked_cleanup(self) -> None:
+        warnings = self._warnings(10, 30)
+        self.assertTrue(any("cannot delete them until the lock expires" in w for w in warnings), warnings)
+
+    def test_lock_shorter_than_retention_warns_about_the_gap(self) -> None:
+        warnings = self._warnings(90, 7)
+        self.assertTrue(any("from day 14 to day 90" in w for w in warnings), warnings)
+
+    def test_warning_counts_the_full_cycle_not_the_configured_period(self) -> None:
+        warnings = self._warnings(35, 30)
+        self.assertTrue(any("stay locked for 37 day(s)" in w for w in warnings), warnings)
 
 
 class S3ImmutabilityBackupCommandTests(unittest.TestCase):
