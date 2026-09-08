@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
 import sys
@@ -672,10 +673,13 @@ class S3ImmutabilityDeletionReportingTests(unittest.TestCase):
         result = abr_v41.delete_backup_chain(chain_id)
 
         self.assertFalse(result["artifacts_removed"])
+        self.assertFalse(result["deleted"])
         self.assertEqual(result["immutable_restore_points"], 1)
+        self.assertEqual(result["retained_restore_point_ids"], ["point-1"])
         self.assertIn("Object Lock", result["message"])
-        self.assertIn("until its retention expires", result["message"])
+        self.assertIn("kept in the catalog", result["message"])
         self.assertNotIn("storage root", result["message"])
+        self.assertIn("point-1", BACKUPS)
 
     @patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=False)
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
@@ -687,8 +691,10 @@ class S3ImmutabilityDeletionReportingTests(unittest.TestCase):
         result = abr_v41.delete_backup_chain(chain_id)
 
         self.assertFalse(result["artifacts_removed"])
+        self.assertTrue(result["deleted"])
         self.assertNotIn("immutable_restore_points", result)
         self.assertIn("storage root", result["message"])
+        self.assertNotIn("point-1", BACKUPS)
 
 
 class S3RetroactiveImmutabilityTests(unittest.TestCase):
@@ -884,6 +890,77 @@ class S3ActualRetentionTests(unittest.TestCase):
         repository = vcenter_backup._resolve_repository({"job_id": "job-1"})
 
         self.assertEqual(disk_tool_immutability_args(repository), [])
+
+
+class BackupDeleteCliTests(unittest.TestCase):
+    def test_incomplete_delete_exits_non_zero(self) -> None:
+        from python.cli.commands.backup_commands import BackupCommands
+        from python.cli.exit_codes import INVALID_STATE
+
+        payloads = {"deleted": False, "artifacts_removed": False, "immutable_restore_points": 1}
+        with patch("python.cli.commands.backup_commands.CommandDependencies") as deps_mock:
+            context = deps_mock.return_value.context
+            context.api_client.delete.return_value = payloads
+            code = BackupCommands().delete(
+                argparse.Namespace(id="chain-1", force=False, base_url="http://x", output="table", log_level="info")
+            )
+        self.assertEqual(code, INVALID_STATE)
+
+    def test_complete_delete_exits_zero(self) -> None:
+        from python.cli.commands.backup_commands import BackupCommands
+
+        with patch("python.cli.commands.backup_commands.CommandDependencies") as deps_mock:
+            context = deps_mock.return_value.context
+            context.api_client.delete.return_value = {"deleted": True, "artifacts_removed": True}
+            code = BackupCommands().delete(
+                argparse.Namespace(id="chain-1", force=False, base_url="http://x", output="table", log_level="info")
+            )
+        self.assertEqual(code, 0)
+
+
+class BackupDeleteSessionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for store in (BACKUPS, JOBS, REPOSITORIES, TASKS):
+            store.clear()
+
+    def tearDown(self) -> None:
+        for store in (BACKUPS, JOBS, REPOSITORIES, TASKS):
+            store.clear()
+
+    def _chain(self) -> str:
+        BACKUPS["point-1"] = {
+            "id": "point-1",
+            "job_id": "job-1",
+            "vm_id": "vm-1",
+            "repository_id": "repo-1",
+            "status": "success",
+            "backup_type": "full",
+            "execution_type": "Full",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        return str(abr_v41.normalize_backup_point(BACKUPS["point-1"])["chain_id"])
+
+    @patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True)
+    def test_session_carries_the_delete_report_to_the_client(self, _delete) -> None:
+        chain_id = self._chain()
+
+        started = abr_v41.delete_backup_chain_request(chain_id, wait=True)
+        session = abr_v41.session_to_dto(TASKS[started["session_id"]])
+
+        self.assertEqual(session["type"], "delete")
+        self.assertEqual(session["progress"], 100)
+        self.assertTrue(session["delete"]["deleted"])
+        self.assertEqual(session["delete"]["restore_point_count"], 1)
+
+    @patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True)
+    def test_progress_is_reported_for_every_restore_point(self, _delete) -> None:
+        chain_id = self._chain()
+        seen: list[int] = []
+
+        abr_v41.delete_backup_chain(chain_id, progress_callback=lambda update: seen.append(update["progress"]))
+
+        self.assertEqual(seen[0], 0)
+        self.assertEqual(seen[-1], 100)
 
 
 class S3ImmutabilityBackupCommandTests(unittest.TestCase):

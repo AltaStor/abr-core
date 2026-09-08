@@ -214,7 +214,7 @@ class BackupCommandTests(unittest.TestCase):
         self.assertNotIn("SIZE", stream.getvalue())
 
     @patch("python.cli.api.client.requests.request")
-    def test_delete_removes_backup_by_id(self, request_mock: object) -> None:
+    def test_delete_removes_backup_by_id_and_keeps_the_extended_timeout(self, request_mock: object) -> None:
         request_mock.return_value = _FakeResponse(
             {"id": "backup-1", "deleted": True, "restore_point_count": 1, "artifacts_removed": 3}
         )
@@ -230,8 +230,8 @@ class BackupCommandTests(unittest.TestCase):
             "DELETE",
             "http://example.test/api/v1/backups/backup-1",
             json=None,
-            params=None,
-            timeout=30,
+            params={"wait": "false"},
+            timeout=21600,
             headers={"X-Client-Type": "cli", "X-ABR-API-Version": "1.0"},
             verify=False,
         )

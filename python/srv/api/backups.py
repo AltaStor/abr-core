@@ -31,8 +31,9 @@ def delete_backup(
     backup_id: str,
     segment: str | None = Query(default=None),
     force: bool = Query(default=False),
+    wait: bool = Query(default=True),
 ) -> dict[str, Any]:
-    return abr_v41.delete_backup_chain(backup_id, segment_id=segment, force=force)
+    return abr_v41.delete_backup_chain_request(backup_id, segment_id=segment, force=force, wait=wait)
 
 
 def verify_backup(backup_id: str, wait: bool = Query(default=True)) -> dict[str, Any]:

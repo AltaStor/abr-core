@@ -2510,7 +2510,7 @@ def _s3_connectivity_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]
             {"type": "s3", "s3": config},
             abr_path=prefix,
             backup_name=f"repo-probe-{uuid4().hex[:12]}",
-            timeout=120,
+            timeout=_s3_probe_timeout(),
         )
     except StorageToolError as exc:
         checks.append({"name": "connectivity", "status": "failed", "message": str(exc)})
@@ -2565,6 +2565,10 @@ def _verify_s3_repository(repository: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _s3_probe_timeout() -> int:
+    return env_int("ALTASTOR_S3_PROBE_TIMEOUT_SECONDS")
+
+
 def _s3_immutability_info_timeout() -> int:
     return env_int("ALTASTOR_S3_IMMUTABILITY_INFO_TIMEOUT_SECONDS")
 
@@ -2584,9 +2588,9 @@ def repository_actual_retention_days(job: dict[str, Any] | None, immutability: d
 
 
 OBJECT_LOCK_UNAVAILABLE_HINT = (
-    "S3 Object Lock can only be turned on when a bucket is created, never afterwards. "
-    "Create a new bucket with Object Lock enabled and point the repository at it, and make sure the "
-    "credentials are allowed to read the bucket's Object Lock configuration."
+    "Either this storage does not implement Object Lock at all, or the bucket was created without it - "
+    "Object Lock can only be turned on when a bucket is created, never afterwards - or the credentials "
+    "are not allowed to read the bucket's Object Lock configuration."
 )
 
 
@@ -4097,6 +4101,8 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     }
     if str(task.get("task_type") or "") == "verify":
         dto["verify"] = result.get("verify")
+    if str(task.get("task_type") or "") == "delete":
+        dto["delete"] = result.get("delete")
     # A session's log is the bulk of its DTO (task_pool appends a line per
     # progress update), so list callers that only need the row can drop it and
     # read GET /sessions/{id}/log on demand instead.
@@ -4846,7 +4852,7 @@ def _create_verify_session(backup_id: str, points: list[dict[str, Any]]) -> dict
     return task
 
 
-def _update_verify_session(task_id: str, update: dict[str, Any], *, status: str | None = None) -> None:
+def _update_session_result(task_id: str, update: dict[str, Any], *, status: str | None = None) -> None:
     with TASK_LOCK:
         task = TASKS.get(task_id)
         if not task:
@@ -4877,14 +4883,14 @@ def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
     try:
         report = verify_backup_chain(
             backup_id,
-            progress_callback=lambda update: _update_verify_session(
+            progress_callback=lambda update: _update_session_result(
                 task_id,
                 {**update, "log_entry": False},
             ),
             should_cancel=lambda: _verify_session_cancel_requested(task_id),
         )
     except ApiError as exc:
-        _update_verify_session(
+        _update_session_result(
             task_id,
             {"progress": 100, "message": str(exc.message), "finished_at": utc_now()},
             status="failed",
@@ -4892,7 +4898,7 @@ def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
         raise
     except Exception as exc:
         LOGGER.exception("Verification of backup '%s' failed", backup_id)
-        _update_verify_session(
+        _update_session_result(
             task_id,
             {"progress": 100, "message": str(exc), "finished_at": utc_now()},
             status="failed",
@@ -4905,7 +4911,7 @@ def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
         status = "failed"
     else:
         status = "completed"
-    _update_verify_session(
+    _update_session_result(
         task_id,
         {
             "progress": 100,
@@ -4949,6 +4955,102 @@ def verify_backup_chain_request(backup_id: str, *, wait: bool = True) -> dict[st
     }
 
 
+def _create_delete_session(backup_id: str, points: list[dict[str, Any]]) -> dict[str, Any]:
+    latest = points[-1] if points else {}
+    task = {
+        "id": str(uuid4()),
+        "job_id": None,
+        "task_type": "delete",
+        "hypervisor_id": None,
+        "resource_type": "virtual_machine",
+        "resource_external_id": latest.get("vm_id"),
+        "status": "running",
+        "parameters": {
+            "backup_id": backup_id,
+            "vm_name": str(latest.get("vm_name") or "").strip() or None,
+            "repository_id": latest.get("repository_id"),
+            "repository_name": latest.get("repository_name"),
+        },
+        "result": {"progress": 0},
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+        "logs": [],
+    }
+    _append_task_log(task, level="info", message=f"Started deletion of backup {backup_id}", component="session")
+    persist_task(task)
+    return task
+
+
+def _run_delete_session(
+    backup_id: str, task_id: str, *, segment_id: str | None, force: bool
+) -> dict[str, Any]:
+    try:
+        report = delete_backup_chain(
+            backup_id,
+            segment_id=segment_id,
+            force=force,
+            progress_callback=lambda update: _update_session_result(task_id, {**update, "log_entry": False}),
+        )
+    except ApiError as exc:
+        _update_session_result(
+            task_id,
+            {"progress": 100, "message": str(exc.message), "finished_at": utc_now()},
+            status="failed",
+        )
+        raise
+    except Exception as exc:
+        LOGGER.exception("Deletion of backup '%s' failed", backup_id)
+        _update_session_result(
+            task_id, {"progress": 100, "message": str(exc), "finished_at": utc_now()}, status="failed"
+        )
+        raise
+
+    _update_session_result(
+        task_id,
+        {
+            "progress": 100,
+            "message": report.get("message") or "Backup chain deleted",
+            "finished_at": utc_now(),
+            "delete": report,
+        },
+        status="completed" if report.get("deleted") else "failed",
+    )
+    return report
+
+
+def delete_backup_chain_request(
+    backup_id: str, *, segment_id: str | None = None, force: bool = False, wait: bool = True
+) -> dict[str, Any]:
+    chains = grouped_backup_points()
+    points = chains.get(backup_id)
+    if not points:
+        raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
+
+    task = _create_delete_session(backup_id, points)
+    task_id = str(task["id"])
+
+    if wait:
+        report = _run_delete_session(backup_id, task_id, segment_id=segment_id, force=force)
+        return {**report, "session_id": task_id}
+
+    thread = threading.Thread(
+        target=_run_delete_session,
+        args=(backup_id, task_id),
+        kwargs={"segment_id": segment_id, "force": force},
+        name=f"delete-{task_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "id": backup_id,
+        "session_id": task_id,
+        "state": _session_state(task),
+        "deleted": False,
+        "restore_point_count": len(points),
+        "artifacts_removed": False,
+    }
+
+
 def _point_repository_holds_immutable_backups(point: dict[str, Any]) -> bool:
     repository_id = str(point.get("repository_id") or "")
     if not repository_id:
@@ -4962,7 +5064,13 @@ def _point_repository_holds_immutable_backups(point: dict[str, Any]) -> bool:
     return immutability_is_enabled(extract_s3_config(repository).get("immutability"))
 
 
-def delete_backup_chain(backup_id: str, *, segment_id: str | None = None, force: bool = False) -> dict[str, Any]:
+def delete_backup_chain(
+    backup_id: str,
+    *,
+    segment_id: str | None = None,
+    force: bool = False,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     chains = grouped_backup_points()
     points = chains.get(backup_id)
     if not points:
@@ -4997,15 +5105,42 @@ def delete_backup_chain(backup_id: str, *, segment_id: str | None = None, force:
         raise api_error(409, "inconsistent_backup_chain", "Repository/catalog state is inconsistent", restore_point_ids=inconsistent)
 
     artifacts_removed = True
-    immutable_points = 0
-    for point in points:
-        if not _delete_backup_artifacts_from_point(point):
-            artifacts_removed = False
-            if _point_repository_holds_immutable_backups(point):
-                immutable_points += 1
+    retained_points: list[str] = []
+
+    def _emit(progress: int, message: str) -> None:
+        if progress_callback is not None:
+            progress_callback({"progress": progress, "message": message})
+
+    total_points = len(points)
+    _emit(0, f"Deleting {total_points} restore point(s)")
+    for position, point in enumerate(points, start=1):
+        _emit(
+            int((position - 1) * 100 / total_points) if total_points else 100,
+            f"Deleting restore point {position}/{total_points}",
+        )
+        if _delete_backup_artifacts_from_point(point):
+            delete_backup(point["id"])
+            continue
+        artifacts_removed = False
+        if _point_repository_holds_immutable_backups(point):
+            LOGGER.error(
+                "Object Lock refused the deletion of backup artifacts; keeping catalog entry for retry: "
+                "point=%s repository=%s",
+                point.get("id"),
+                point.get("repository_id"),
+            )
+            retained_points.append(str(point.get("id") or ""))
+            continue
         delete_backup(point["id"])
 
-    result = {"id": backup_id, "deleted": True, "restore_point_count": len(points), "artifacts_removed": artifacts_removed}
+    _emit(100, f"Deleted {total_points - len(retained_points)} of {total_points} restore point(s)")
+    immutable_points = len(retained_points)
+    result = {
+        "id": backup_id,
+        "deleted": not retained_points,
+        "restore_point_count": len(points),
+        "artifacts_removed": artifacts_removed,
+    }
     if segment_id is not None:
         result["segment_id"] = segment_id
     if gfs_protected_point_ids:
@@ -5013,11 +5148,12 @@ def delete_backup_chain(backup_id: str, *, segment_id: str | None = None, force:
     if not artifacts_removed:
         if immutable_points:
             result["immutable_restore_points"] = immutable_points
+            result["retained_restore_point_ids"] = retained_points
         result["message"] = (
             (
-                f"Catalog entry removed, but the backup data of {immutable_points} restore point(s) is held under "
-                "S3 Object Lock and the storage refused to delete it. That data stays in the bucket until its "
-                "retention expires, and AltaStor no longer tracks it."
+                f"{immutable_points} restore point(s) are still held under S3 Object Lock and the storage refused "
+                "to delete their data. They are kept in the catalog and retried once the lock expires, so nothing "
+                "is left untracked in the bucket."
             )
             if immutable_points
             else (
