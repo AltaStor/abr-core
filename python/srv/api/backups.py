@@ -3,14 +3,20 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import Body, Query
 
 from python.srv.services import abr_v41
 
 from ._routing import build_router, register
-from .schemas import BackupChainDTO, BackupList, ImportBackupRequest, unset_excluded
+from .schemas import (
+    BackupChainDTO,
+    BackupDeleteResult,
+    BackupList,
+    BackupVerifyResult,
+    ImportBackupRequest,
+    TreeResponse,
+    unset_excluded,
+)
 
 router = build_router("/backups", tag="backups")
 
@@ -19,7 +25,7 @@ def list_backups(repo: str | None = Query(default=None)) -> BackupList:
     return {"items": abr_v41.list_backup_chains(repo_name=repo)}
 
 
-def list_backup_tree() -> dict[str, Any]:
+def list_backup_tree() -> TreeResponse:
     return {"nodes": abr_v41.list_backup_tree()}
 
 
@@ -32,11 +38,11 @@ def delete_backup(
     segment: str | None = Query(default=None),
     force: bool = Query(default=False),
     wait: bool = Query(default=True),
-) -> dict[str, Any]:
+) -> BackupDeleteResult:
     return abr_v41.delete_backup_chain_request(backup_id, segment_id=segment, force=force, wait=wait)
 
 
-def verify_backup(backup_id: str, wait: bool = Query(default=True)) -> dict[str, Any]:
+def verify_backup(backup_id: str, wait: bool = Query(default=True)) -> BackupVerifyResult:
     return abr_v41.verify_backup_chain_request(backup_id, wait=wait)
 
 

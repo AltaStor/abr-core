@@ -3,26 +3,36 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import Body, Query
 
 from python.srv.services import abr_v41, support_bundle_service, system_log_service
 
-from ._routing import body_dict, build_router, register
+from ._routing import build_router, register
+from .schemas import (
+    CatalogRestoreRequest,
+    CatalogRestoreResult,
+    CatalogSnapshotRequest,
+    CatalogSnapshotResult,
+    SupportBundleResult,
+    SystemHealthDTO,
+    SystemInfoDTO,
+    SystemLogsDTO,
+    SystemVersionDTO,
+    unset_excluded,
+)
 
 router = build_router("/system", tag="system")
 
 
-def system_version() -> dict[str, Any]:
+def system_version() -> SystemVersionDTO:
     return abr_v41.system_version()
 
 
-def system_info() -> dict[str, Any]:
+def system_info() -> SystemInfoDTO:
     return abr_v41.system_info()
 
 
-def system_health() -> dict[str, Any]:
+def system_health() -> SystemHealthDTO:
     """Report per-component health.
 
     Always answers 200, including while a dependency is down: `status` is "ok"
@@ -37,7 +47,7 @@ def system_health() -> dict[str, Any]:
 def system_logs(
     limit: int | None = Query(default=None, ge=1, le=system_log_service.MAX_LIMIT),
     level: str | None = Query(default=None, pattern="^(debug|info|warn|error)$"),
-) -> dict[str, Any]:
+) -> SystemLogsDTO:
     """Newest-first tail of the appliance's own server log.
 
     This is the server's log (`server.log`), not a session's: a session's lines
@@ -49,15 +59,19 @@ def system_logs(
     return system_log_service.read_system_log(limit=limit, level=level)
 
 
-def export_catalog_snapshot(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
-    return abr_v41.export_catalog_snapshot(body_dict(payload))
+def export_catalog_snapshot(
+    payload: CatalogSnapshotRequest = Body(default_factory=CatalogSnapshotRequest),
+) -> CatalogSnapshotResult:
+    return abr_v41.export_catalog_snapshot(unset_excluded(payload))
 
 
-def import_catalog_snapshot(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
-    return abr_v41.import_catalog_snapshot(body_dict(payload))
+def import_catalog_snapshot(
+    payload: CatalogRestoreRequest = Body(default_factory=CatalogRestoreRequest),
+) -> CatalogRestoreResult:
+    return abr_v41.import_catalog_snapshot(unset_excluded(payload))
 
 
-def get_support_bundle() -> dict[str, Any]:
+def get_support_bundle() -> SupportBundleResult:
     return support_bundle_service.generate_support_bundle()
 
 

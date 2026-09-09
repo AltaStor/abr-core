@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import Body
 
 from python.srv.services import abr_v41
@@ -12,8 +10,13 @@ from python.srv.services import abr_v41
 from ._routing import build_router, register
 from .schemas import (
     CreateRepositoryRequest,
+    RemovedResult,
     RepositoryDTO,
+    RepositoryImmutabilityApplyResult,
     RepositoryList,
+    RepositoryScanResult,
+    RepositoryVerifyResult,
+    S3TestResult,
     UpdateRepositoryRequest,
     unset_excluded,
 )
@@ -29,13 +32,13 @@ def create_repository(
 
 def test_s3_connection(
     payload: CreateRepositoryRequest = Body(default_factory=CreateRepositoryRequest),
-) -> dict[str, Any]:
+) -> S3TestResult:
     return abr_v41.test_s3_connection(unset_excluded(payload))
 
 
 def test_s3_immutability(
     payload: CreateRepositoryRequest = Body(default_factory=CreateRepositoryRequest),
-) -> dict[str, Any]:
+) -> S3TestResult:
     return abr_v41.test_s3_immutability(unset_excluded(payload))
 
 
@@ -53,23 +56,23 @@ def patch_repository(
     return abr_v41.edit_repository_record(repository_id, unset_excluded(payload))
 
 
-def delete_repository(repository_id: str) -> dict[str, Any]:
+def delete_repository(repository_id: str) -> RemovedResult:
     return abr_v41.remove_repository_record(repository_id)
 
 
-def rescan_repository(repository_id: str) -> dict[str, Any]:
+def rescan_repository(repository_id: str) -> RepositoryScanResult:
     return abr_v41.rescan_repository(repository_id)
 
 
-def verify_repository(repository_id: str) -> dict[str, Any]:
+def verify_repository(repository_id: str) -> RepositoryVerifyResult:
     return abr_v41.verify_repository(repository_id)
 
 
-def verify_repository_immutability(repository_id: str) -> dict[str, Any]:
+def verify_repository_immutability(repository_id: str) -> RepositoryVerifyResult:
     return abr_v41.verify_repository_immutability(repository_id)
 
 
-def apply_repository_immutability(repository_id: str) -> dict[str, Any]:
+def apply_repository_immutability(repository_id: str) -> RepositoryImmutabilityApplyResult:
     return abr_v41.apply_immutability_to_existing_backups(repository_id)
 
 
