@@ -22,9 +22,6 @@ from ..errors import CliStructuredError
 from ..exit_codes import GENERAL_ERROR
 from .server_defaults_template import render_recovered_server_defaults
 
-_LOCAL_LOG_TAIL_BYTES = 2 * 1024 * 1024
-
-
 def _default_support_bundle_filename() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"support-bundle-{timestamp}.zip"
@@ -67,20 +64,12 @@ def _find_local_cli_logs() -> list[Path]:
         return []
 
 
-def _read_tail(path: Path, limit: int) -> bytes:
-    with path.open("rb") as handle:
-        handle.seek(0, os.SEEK_END)
-        size = handle.tell()
-        handle.seek(max(0, size - limit))
-        return handle.read()
-
-
 def _add_local_cli_logs(entries: dict[str, bytes], manifest: dict, log_files: list[Path]) -> bool:
     changed = False
 
     for log_file in log_files:
         try:
-            content = _redact_log_bytes(_read_tail(log_file, _LOCAL_LOG_TAIL_BYTES))
+            content = _redact_log_bytes(log_file.read_bytes())
         except OSError:
             continue
 

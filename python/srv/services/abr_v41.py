@@ -169,7 +169,7 @@ def schedule_inventory_discovery(inventory_id: str, *, force: bool = False) -> t
     return thread
 
 PRODUCT_NAME = "AltaStor Backup & Replication"
-PRODUCT_VERSION = "4.1.0"
+PRODUCT_VERSION = "1.0"
 
 REPO_TYPES = ("local", "nfs", "smb", "s3")
 

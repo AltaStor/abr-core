@@ -573,8 +573,8 @@ Example:
 abr system get-support-bundle --file /tmp/support-bundle.zip
 
 Bundle contents:
-logs: logs/server/server.log, logs/cli/cli.log, logs/mongodb/mongod.log (if available)
-config: server.conf
+logs: logs/server/server.log, logs/cli/cli.log, logs/mongodb/mongod.log
+config: server.conf, mongod.conf
 dumps: logs/server/server.log.fault (if server crashed)
 catalog (from DB, as JSON): sessions.json (200 most recent), jobs.json, repositories.json, inventories.json, restore-points.json, health.json
 system-info.json (OS/host/CPU/RAM/disk)
