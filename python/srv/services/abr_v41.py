@@ -441,6 +441,14 @@ def _ensure(condition: bool, status_code: int, code: str, message: str, **detail
 
 def _ensure_ascii_name(value: str, *, field: str, code: str) -> None:
     _ensure(
+        value == value.strip(),
+        400,
+        code,
+        f"{field} must not start or end with whitespace",
+        field=field,
+        value=value,
+    )
+    _ensure(
         len(value) <= MAX_NAME_LENGTH,
         400,
         code,
@@ -1396,7 +1404,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             "invalid_inventory",
             f"Unsupported inventory type: {inventory_type}. Supported types: {', '.join(creatable_inventory_types())}",
         )
-    name = str(payload.get("name") or "").strip()
+    name = str(payload.get("name") or "")
     address = str(payload.get("address") or "").strip()
     port = int(payload.get("port") or 0) if payload.get("port") is not None else None
     username = str(payload.get("username") or "").strip()
@@ -1404,7 +1412,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
     token = str(payload.get("token") or "").strip()
     insecure = bool(payload.get("insecure", False))
     description = str(payload.get("description") or "")
-    _ensure(bool(name), 422, "invalid_inventory", "Inventory name is required")
+    _ensure(bool(name.strip()), 422, "invalid_inventory", "Inventory name is required")
     _ensure_ascii_name(name, field="Inventory name", code="invalid_inventory")
     _validate_text_fields(payload, INVENTORY_TEXT_FIELDS, code="invalid_inventory")
     _ensure(bool(address), 422, "invalid_inventory", "Inventory address is required")
@@ -1503,8 +1511,8 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
         normalized["updated_at"] = utc_now()
     if updates:
         if "name" in updates:
-            new_name = str(updates["name"] or "").strip()
-            _ensure(bool(new_name), 422, "invalid_inventory", "Inventory name must not be empty")
+            new_name = str(updates["name"] or "")
+            _ensure(bool(new_name.strip()), 422, "invalid_inventory", "Inventory name must not be empty")
             _ensure_ascii_name(new_name, field="Inventory name", code="invalid_inventory")
         normalized = apply_inventory_updates(normalized, updates)
     _ensure(any(key in payload for key in ("name", "address", "port", "username", "password", "description", "token", "insecure")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
@@ -2084,7 +2092,7 @@ def resolve_repository(name: str | None = None, record_id: str | None = None) ->
 
 
 def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
-    name = str(payload.get("name") or "").strip()
+    name = str(payload.get("name") or "")
     repo_type = str(payload.get("type") or "").strip().lower()
     path = str(payload.get("path") or "").strip() or None
     address = str(payload.get("address") or "").strip() or None
@@ -2093,7 +2101,7 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
     username = str(payload.get("username") or "").strip() or None
     password = str(payload.get("password") or "") or None
     description = str(payload.get("description") or "").strip() or None
-    _ensure(bool(name), 422, "invalid_repository", "Repository name is required")
+    _ensure(bool(name.strip()), 422, "invalid_repository", "Repository name is required")
     _ensure_ascii_name(name, field="Repository name", code="invalid_repository")
     _validate_text_fields(payload, REPOSITORY_TEXT_FIELDS, code="invalid_repository")
     _ensure(repo_type in REPO_TYPES, 422, "invalid_repository", "Repository type must be one of: local, nfs, smb, s3", repo_type=repo_type)
@@ -2217,8 +2225,8 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
     next_immutability: dict[str, Any] | None = None
     next_s3_config: dict[str, Any] | None = None
     if "name" in payload and payload["name"] is not None:
-        new_name = str(payload["name"]).strip()
-        _ensure(bool(new_name), 422, "invalid_repository", "Repository name must not be empty")
+        new_name = str(payload["name"])
+        _ensure(bool(new_name.strip()), 422, "invalid_repository", "Repository name must not be empty")
         _ensure_ascii_name(new_name, field="Repository name", code="invalid_repository")
         for existing_id, existing in catalog_entries(REPOSITORIES):
             if existing_id == record_id:
@@ -3400,7 +3408,7 @@ def list_jobs() -> list[dict[str, Any]]:
 
 
 def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
-    name = str(payload.get("name") or "").strip()
+    name = str(payload.get("name") or "")
     vm_tokens = payload.get("vms")
     repo_name = payload.get("repo")
     repo_id = payload.get("repo_id")
@@ -3421,7 +3429,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         task_parameters = {}
     _ensure(isinstance(task_parameters, dict), 422, "invalid_job", "task_parameters must be an object")
     task_parameters = _validate_task_parameters(task_parameters)
-    _ensure(bool(name), 422, "invalid_job", "Job name is required")
+    _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
     _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
     _ensure(retention_days > 0, 422, "invalid_job", "retention-days must be greater than 0")
@@ -3477,7 +3485,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
-    name = str(payload.get("name") or "").strip()
+    name = str(payload.get("name") or "")
     source_job = resolve_job(
         name=payload.get("source") or payload.get("source_job"),
         record_id=payload.get("source_id") or payload.get("source_job_id"),
@@ -3495,7 +3503,7 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
         raw_retention_days = source_job.get("retention_days")
     retention_days = int(raw_retention_days) if raw_retention_days is not None else 14
     description = str(payload.get("description") or source_job.get("description") or "").strip()
-    _ensure(bool(name), 422, "invalid_job", "Job name is required")
+    _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
     _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
     _ensure(retention_days > 0, 422, "invalid_job", "retention-days must be greater than 0")
@@ -3545,8 +3553,8 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     updated = _json_clone(current)
     changed = False
     if payload.get("name"):
-        new_name = str(payload["name"]).strip()
-        _ensure(bool(new_name), 422, "invalid_job", "Job name must not be empty")
+        new_name = str(payload["name"])
+        _ensure(bool(new_name.strip()), 422, "invalid_job", "Job name must not be empty")
         _ensure_ascii_name(new_name, field="Job name", code="invalid_job")
         for existing_id, existing in catalog_entries(JOBS):
             if existing_id == job_id:

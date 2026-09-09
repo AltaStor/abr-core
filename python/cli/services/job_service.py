@@ -36,10 +36,10 @@ class JobService:
 
     @staticmethod
     def _normalize_name(value: Any, *, label: str) -> str:
-        normalized = str(value or "").strip()
-        if not normalized:
+        name = str(value or "")
+        if not name.strip():
             raise ValueError(f"{label} must not be empty")
-        return normalized
+        return name
 
     @staticmethod
     def _raw_vm_tokens(args: Any) -> list[str]:
