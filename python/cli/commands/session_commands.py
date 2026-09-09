@@ -108,6 +108,8 @@ class SessionCommands:
         return 0
 
     def stop(self, args: argparse.Namespace) -> int:
+        if not str(args.id or "").strip():
+            raise ValueError("Session selection requires a non-empty --id")
         deps = CommandDependencies(args)
         deps.context.print_output(deps.context.api_client.post(f"api/v1/sessions/{args.id}/stop", json={"force": args.force}), [("id", "SESSION ID"), ("state", "STATE"), ("message", "MESSAGE")])
         return 0
