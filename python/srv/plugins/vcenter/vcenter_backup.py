@@ -22,6 +22,7 @@ from ...core.storage_tool import (
     default_disk_tool_path,
     disk_tool_immutability_args,
     disk_tool_storage_args,
+    ensure_private_directory,
     extract_s3_config,
     is_s3_repository,
     join_s3_prefix,
@@ -1009,7 +1010,7 @@ def run_vcenter_backup(
         parameters=parameters,
         repository=repository,
     )
-    task_root.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(task_root)
     # Every repository now uses the .abr format. When no repository record is
     # configured, treat it as a local-file repo rooted at the task directory so
     # the abr command builders have a concrete context to work with.

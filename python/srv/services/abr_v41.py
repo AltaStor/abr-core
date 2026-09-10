@@ -70,6 +70,7 @@ from python.srv.core.storage_tool import (
     hydrate_manifest_via_disk_tool,
     immutability_is_enabled,
     immutability_rank,
+    is_abr_repository,
     is_s3_repository,
     list_disk_tool_backups,
     mask_credential_fields,
@@ -179,6 +180,7 @@ EXECUTION_TYPES = ("Incremental", "ActiveFull", "SyntheticFull")
 EXECUTION_REASONS = (
     "FirstRun",
     "ForceFull",
+    "ForceSynthetic",
     "ActiveFullWindow",
     "SyntheticFullWindow",
     "ActiveOverridesSynthetic",
@@ -965,7 +967,7 @@ def repository_supports_synthetic(repository: dict[str, Any]) -> bool:
     metadata = repository.get("metadata") if isinstance(repository.get("metadata"), dict) else {}
     if isinstance(metadata.get("supports_synthetic_full"), bool):
         return bool(metadata["supports_synthetic_full"])
-    return str(repository.get("type") or "") in {"local", "nfs"}
+    return is_abr_repository(repository)
 
 
 def repository_catalog_summary(repository_id: str) -> dict[str, int]:
@@ -3740,10 +3742,21 @@ def resolve_job_execution(
     *,
     vm_id: str,
     force_full: bool,
+    force_synthetic: bool = False,
     now: datetime | None = None,
 ) -> tuple[str, str]:
     current = now or _now_utc()
     repository = resolve_repository(record_id=str(job.get("repo_id") or "")) if job.get("repo_id") else {}
+    if force_synthetic:
+        _ensure(
+            repository_supports_synthetic(repository),
+            422,
+            "invalid_job",
+            f"Repository '{repository.get('name') or job.get('repo_name')}' cannot merge a backup chain, "
+            "so a synthetic full cannot be run against it",
+            repository_id=job.get("repo_id"),
+        )
+        return "SyntheticFull", "ForceSynthetic"
     if force_full:
         return "ActiveFull", "ForceFull"
     previous = _latest_successful_point(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
@@ -4117,6 +4130,8 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
         "errors": error or ([] if not result.get("message") or _session_state(task) == "completed" else [{"message": result.get("message")}]),
         "warnings": task.get("warnings") if isinstance(task.get("warnings"), list) else [],
     }
+    if result.get("failure_kind"):
+        dto["failure_kind"] = result.get("failure_kind")
     if str(task.get("task_type") or "") == "verify":
         dto["verify"] = result.get("verify")
     if str(task.get("task_type") or "") == "delete":
@@ -6467,13 +6482,22 @@ def _create_completed_copy_session(job: dict[str, Any]) -> dict[str, Any]:
     return session_to_dto(session)
 
 
-def _create_backup_session(job: dict[str, Any], *, vm_id: str, vm_name: str, execution_type: str, execution_reason: str) -> dict[str, Any]:
+def _create_backup_session(
+    job: dict[str, Any],
+    *,
+    vm_id: str,
+    vm_name: str,
+    execution_type: str,
+    execution_reason: str,
+    target_repository: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     task_parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else {}
     parameters = dict(task_parameters)
     parameters.update(
         {
-            "repository_id": job.get("repo_id"),
-            "repository_name": job.get("repo_name"),
+            "repository_id": (target_repository or {}).get("id") or job.get("repo_id"),
+            "repository_name": (target_repository or {}).get("name") or job.get("repo_name"),
+            "source_repository_id": job.get("repo_id") if target_repository else None,
             "vm_name": vm_name,
             "resolved_backup_type": execution_type,
             "resolved_backup_reason": execution_reason,
@@ -6507,14 +6531,44 @@ def _create_backup_session(job: dict[str, Any], *, vm_id: str, vm_name: str, exe
     return session_to_dto(task)
 
 
-def start_job_record(job_id: str, *, force_full: bool = False) -> dict[str, Any]:
+def start_job_record(
+    job_id: str,
+    *,
+    force_full: bool = False,
+    force_synthetic: bool = False,
+    target_repository_id: str | None = None,
+) -> dict[str, Any]:
     job = resolve_job(record_id=job_id)
+    _ensure(
+        not (force_full and force_synthetic),
+        422,
+        "invalid_job",
+        "A run is either an active full or a synthetic full, not both",
+    )
+    target_repository = None
+    if target_repository_id:
+        _ensure(
+            force_synthetic,
+            422,
+            "invalid_job",
+            "A target repository is only used by a synthetic full",
+        )
+        target_repository = _find_by_id(catalog_records(REPOSITORIES), target_repository_id, label="Repository")
+        _ensure(
+            repository_supports_synthetic(normalize_repository_record(target_repository)),
+            422,
+            "invalid_job",
+            f"Repository '{target_repository.get('name')}' cannot hold a merged backup",
+            repository_id=target_repository_id,
+        )
     sessions = []
     if job["job_type"] == "backup-copy":
         sessions.append(_create_completed_copy_session(job))
     else:
         for vm_id, vm_name in zip(job.get("vm_ids") or [], job.get("vm_names") or []):
-            execution_type, execution_reason = resolve_job_execution(job, vm_id=vm_id, force_full=force_full)
+            execution_type, execution_reason = resolve_job_execution(
+                job, vm_id=vm_id, force_full=force_full, force_synthetic=force_synthetic
+            )
             sessions.append(
                 _create_backup_session(
                     job,
@@ -6522,6 +6576,7 @@ def start_job_record(job_id: str, *, force_full: bool = False) -> dict[str, Any]
                     vm_name=vm_name,
                     execution_type=execution_type,
                     execution_reason=execution_reason,
+                    target_repository=target_repository,
                 )
             )
     schedule = job.get("schedule")

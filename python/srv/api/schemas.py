@@ -402,6 +402,8 @@ class UpdateJobRequest(_LenientModel):
 
 class StartJobRequest(_LenientModel):
     force_full: LaxBool | None = None
+    force_synthetic: LaxBool | None = None
+    target_repository_id: LaxStr | None = None
 
 
 class StopSessionRequest(_LenientModel):

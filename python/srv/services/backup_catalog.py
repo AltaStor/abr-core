@@ -270,6 +270,7 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
             segment_id = str(prior_points[-1].get("segment_id") or prior_points[-1].get("id") or "")
     if full_backup:
         segment_id = None
+        parent_point_id = None
 
     record = {
         "id": str(uuid4()),

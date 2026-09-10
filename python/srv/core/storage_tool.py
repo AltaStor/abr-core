@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from .server_defaults import env_int
-from .subprocess_util import CompletedProcess, run_capped
+from .subprocess_util import CompletedProcess, ProcessCancelled, run_capped
 
 APP_ROOT = Path("/opt/altastor-backup")
 DISK_TOOL_LAUNCHER = "abr-vmdk-tool.sh"
@@ -226,6 +226,22 @@ def safe_path_component(value: Any, *, fallback: str = "item") -> str:
     return cleaned or fallback
 
 
+def ensure_private_directory(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(exist_ok=True)
+        try:
+            os.chmod(directory, 0o750)
+        except OSError:
+            pass
+
+
 def repository_cache_root(base_root: Path, repository: dict[str, Any]) -> Path:
     repo_id = safe_path_component(repository.get("id"), fallback="unknown-repository")
     return base_root / ".catalog" / "repositories" / repo_id
@@ -306,12 +322,94 @@ def disk_tool_immutability_args(repository: dict[str, Any]) -> list[str]:
     return ["--immutable", config["mode"], "--retention", str(config["retention_days"])]
 
 
+_SOURCE_STORAGE_FLAGS = {
+    "--mode": "--source-mode",
+    "--folder": "--source-folder",
+    "--path": "--source-path",
+    "--region": "--source-region",
+    "--endpoint": "--source-endpoint",
+    "--access-key": "--source-access-key",
+    "--secret-key": "--source-secret-key",
+    "--aws-profile": "--source-aws-profile",
+    "--path-style": "--source-path-style",
+    "--no-verify-tls": "--source-no-verify-tls",
+}
+_VALUELESS_STORAGE_FLAGS = frozenset({"--path-style", "--no-verify-tls", "--create-folder"})
+
+
+def disk_tool_source_storage_args(repository: dict[str, Any], *, abr_path: str | None = None) -> list[str]:
+    args = disk_tool_storage_args(repository, abr_path=abr_path)
+    renamed: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        mapped = _SOURCE_STORAGE_FLAGS.get(token, token)
+        renamed.append(mapped)
+        if token in _VALUELESS_STORAGE_FLAGS:
+            index += 1
+            continue
+        renamed.append(args[index + 1])
+        index += 2
+    if "--source-path" not in renamed:
+        renamed.extend(["--source-path", ""])
+    return renamed
+
+
+def copy_disk_tool_chain(
+    *,
+    source_repository: dict[str, Any],
+    source_abr_path: str | None,
+    source_names: list[str],
+    destination_repository: dict[str, Any],
+    destination_abr_path: str | None,
+    backup_name: str,
+    compression_level: int | None = None,
+    encryption_key: str = "",
+    source_encryption_key: str = "",
+    retention_days: int | None = None,
+    timeout: int | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    if not source_names:
+        raise StorageToolError("a synthetic full needs at least one source backup")
+    command = [
+        "copy",
+        "--json",
+        "--name",
+        backup_name,
+        *disk_tool_storage_args(destination_repository, abr_path=destination_abr_path, create_folder=True),
+        *disk_tool_source_storage_args(source_repository, abr_path=source_abr_path),
+        "--source-names",
+        ",".join(source_names),
+    ]
+    if compression_level is not None:
+        command.extend(["--compression", str(compression_level)])
+    if encryption_key:
+        command.extend(["--key", encryption_key])
+    if source_encryption_key:
+        command.extend(["--source-key", source_encryption_key])
+    immutability = disk_tool_immutability_args(destination_repository)
+    if immutability and retention_days is not None:
+        immutability = [immutability[0], immutability[1], "--retention", str(int(retention_days))]
+    command.extend(immutability)
+
+    completed = run_disk_tool(
+        command,
+        timeout=timeout,
+        on_progress=on_progress,
+        progress_poll_seconds=VERIFY_PROGRESS_POLL_SECONDS if on_progress else None,
+        should_cancel=should_cancel,
+    )
+    return parse_disk_tool_json(completed.stdout)
+
+
 def redact_disk_tool_command(command: list[str]) -> list[str]:
     redacted = list(command)
     for index, value in enumerate(redacted[:-1]):
-        if value in {"--password", "--secret-key", "--key", "-k"}:
+        if value in {"--password", "--secret-key", "--key", "-k", "--source-secret-key", "--source-key"}:
             redacted[index + 1] = SECRET_MASK
-        if value == "--access-key":
+        if value in {"--access-key", "--source-access-key"}:
             redacted[index + 1] = mask_access_key(redacted[index + 1]) or SECRET_MASK
     return redacted
 
@@ -673,6 +771,7 @@ def run_disk_tool(
     timeout: int | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     progress_poll_seconds: float | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> CompletedProcess:
     """Run abr-vmdk-tool; args start with the subcommand, e.g. ["list", ...]."""
     resolved_tool_path = (tool_path or default_disk_tool_path()).expanduser()
@@ -685,6 +784,8 @@ def run_disk_tool(
             progress_options["on_progress"] = on_progress
             if progress_poll_seconds is not None:
                 progress_options["progress_poll_seconds"] = progress_poll_seconds
+        if should_cancel is not None:
+            progress_options["should_cancel"] = should_cancel
         completed = run_capped(
             [str(resolved_tool_path), *args],
             check=False,
