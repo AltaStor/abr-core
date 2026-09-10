@@ -480,7 +480,7 @@ def _discard_task_backups(
     abr_path: str | None,
     backup_names: list[str],
     task_root: Path,
-) -> None:
+) -> list[str]:
     stranded: list[str] = []
     if isinstance(repository, dict):
         for backup_name in dict.fromkeys(name for name in backup_names if name):
@@ -498,6 +498,17 @@ def _discard_task_backups(
             abr_path or task_root,
             ", ".join(stranded),
         )
+    return stranded
+
+
+def _stop_message(stranded: list[str], abr_path: str | None, task_root: Path) -> str:
+    if not stranded:
+        return "Session stop requested"
+    return (
+        f"Session stop requested. Object Lock kept {len(stranded)} unreferenced backup(s) in "
+        f"{abr_path or task_root}: {', '.join(stranded)}. They belong to no restore point and "
+        "can only be removed once their retention expires."
+    )
 
 
 def _resolve_backup_storage_layout(
@@ -1143,6 +1154,7 @@ def run_vcenter_backup(
     vm_config_change_reason = ""
     task_id = str(task.get("id") or "")
     written_backup_names: list[str] = []
+    stop_requested_after_completion = False
 
     try:
         # The data mover carries the disk over its own VDDK connection, so this
@@ -2479,15 +2491,23 @@ def run_vcenter_backup(
             except StorageToolError:
                 logger.debug("Ignoring manifest metadata mirror failure for %s", manifest_path, exc_info=True)
 
-            _emit_progress(
-                progress_callback,
-                "finalize",
-                92,
-                f"Removing snapshot {snapshot_name}",
-                worker_mode="vcenter-abr-vmdk-tool",
-                processed_bytes=total_read_bytes,
-                transferred_bytes=total_transferred_bytes,
-            )
+            try:
+                _emit_progress(
+                    progress_callback,
+                    "finalize",
+                    92,
+                    f"Removing snapshot {snapshot_name}",
+                    worker_mode="vcenter-abr-vmdk-tool",
+                    processed_bytes=total_read_bytes,
+                    transferred_bytes=total_transferred_bytes,
+                )
+            except TaskStopRequested:
+                stop_requested_after_completion = True
+                logger.info(
+                    "Stop requested for backup task %s after its data was already complete; "
+                    "keeping the backup instead of discarding it.",
+                    task.get("id"),
+                )
             node.remove_snapshot(vm_name, snapshot_name)
             logger.info(
                 "Backup snapshot %s removed for VM %s",
@@ -2495,6 +2515,14 @@ def run_vcenter_backup(
                 vm_name,
             )
             snapshot_name = None
+
+        if not stop_requested_after_completion and cancel_requested(task_id):
+            stop_requested_after_completion = True
+            logger.info(
+                "Stop requested for backup task %s after its data was already complete; "
+                "keeping the backup instead of discarding it.",
+                task.get("id"),
+            )
 
         total_duration = time.time() - start_time
         logger.info(
@@ -2523,6 +2551,7 @@ def run_vcenter_backup(
             "vm_config_change_reason": vm_config_change_reason,
             "cbt_enabled": cbt_enabled,
             "snapshot_removed": True,
+            "stop_requested_after_completion": stop_requested_after_completion,
             "backup_root": str(task_root),
             "manifest_path": str(manifest_path),
             "repository_id": str(repository.get("id") or "") if isinstance(repository, dict) else "",
@@ -2547,14 +2576,20 @@ def run_vcenter_backup(
         logger.info(
             "Backup task %s stopped; discarding the backup data it had written.", task.get("id")
         )
-        _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root)
-        raise TaskStopRequested("Session stop requested") from exc
+        stranded = _discard_task_backups(
+            repository, repository_abr_path, written_backup_names, task_root
+        )
+        raise TaskStopRequested(
+            _stop_message(stranded, repository_abr_path, task_root)
+        ) from exc
     except TaskStopRequested:
         logger.info(
             "Backup task %s stopped; discarding the backup data it had written.", task.get("id")
         )
-        _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root)
-        raise
+        stranded = _discard_task_backups(
+            repository, repository_abr_path, written_backup_names, task_root
+        )
+        raise TaskStopRequested(_stop_message(stranded, repository_abr_path, task_root)) from None
     except Exception as exc:
         logger.exception("Task %s failed critically during vCenter interaction: %s", task.get("id"), exc)
         _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root)
