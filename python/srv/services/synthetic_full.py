@@ -12,6 +12,7 @@ from typing import Any, Callable
 from python.srv.core.mongo_db_wrapper import REPOSITORIES, TASK_LOCK, TASKS
 from python.srv.core.storage_tool import (
     StorageToolError,
+    remove_disk_tool_backup,
     apply_repository_immutability,
     copy_disk_tool_chain,
     disk_tool_storage_args,
@@ -160,6 +161,33 @@ def build_disk_merges(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merges
 
 
+def _discard_partial_merge(
+    repository: dict[str, Any],
+    destination_path: str | None,
+    written: list[str],
+    task_root: Path,
+) -> None:
+    stranded: list[str] = []
+    for backup_name in written:
+        try:
+            remove_disk_tool_backup(repository, destination_path, backup_name, timeout=120)
+        except StorageToolError:
+            stranded.append(backup_name)
+    if stranded:
+        logger.error(
+            "Synthetic full left %d merged disk(s) behind at %s: %s. Object Lock keeps them until their "
+            "retention expires; remove them once it does.",
+            len(stranded),
+            destination_path or task_root,
+            ", ".join(stranded),
+        )
+    try:
+        if task_root.exists() and not any(task_root.iterdir()):
+            task_root.rmdir()
+    except OSError:
+        pass
+
+
 def _source_manifest(point: dict[str, Any]) -> dict[str, Any]:
     from python.srv.services.backup_catalog import _load_backup_manifest_payload
 
@@ -265,6 +293,7 @@ def run_synthetic_full(
 
     total = len(merges)
     disk_outputs: list[dict[str, Any]] = []
+    written_names: list[str] = []
     logical_total = 0
     stored_total = 0
 
@@ -303,9 +332,13 @@ def run_synthetic_full(
         except ProcessCancelled as exc:
             from python.srv.core.task_executor import TaskStopRequested
 
+            _discard_partial_merge(repository, destination_path, written_names, task_root)
             raise TaskStopRequested("Synthetic full cancelled; the merged backup was discarded") from exc
         except StorageToolError as exc:
+            _discard_partial_merge(repository, destination_path, written_names, task_root)
             raise SyntheticFullError(f"Merging disk {position + 1}/{total} failed: {exc}") from exc
+
+        written_names.append(backup_name)
 
         logical = int(result.get("raw_data_size") or 0)
         stored = int(result.get("stored_data_size") or 0)
@@ -338,6 +371,7 @@ def run_synthetic_full(
         stored_total = _dir_size_bytes(task_root)
     manifest_payload = _source_manifest(points[-1])
     if not manifest_payload:
+        _discard_partial_merge(repository, destination_path, written_names, task_root)
         raise SyntheticFullError(
             f"The manifest of restore point {points[-1].get('id')} could not be read, so the merged backup "
             "would not be restorable"

@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from python.srv.core.mongo_db_wrapper import BACKUPS, JOBS, REPOSITORIES, TASKS
+from python.srv.core.storage_tool import StorageToolError
 from python.srv.core.subprocess_util import ProcessCancelled
 from python.srv.core.task_executor import TaskStopRequested
 from python.srv.services import synthetic_full
@@ -313,6 +314,54 @@ class SyntheticFullRunTests(unittest.TestCase):
         result = synthetic_full.run_synthetic_full(self._task())
 
         self.assertEqual(result["merged_restore_point_ids"], ["p2", "p3"])
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_failure_part_way_through_discards_the_disks_already_merged(self, copy_mock, remove_mock) -> None:
+        for point_id in ("p1", "p2", "p3"):
+            BACKUPS[point_id]["artifact"]["disks"] = [_disk("task-x", "01-disk.vmdk"), _disk("task-x", "02-disk.vmdk")]
+        copy_mock.side_effect = [
+            {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3},
+            StorageToolError("disk full"),
+        ]
+
+        with self.assertRaises(SyntheticFullError):
+            synthetic_full.run_synthetic_full(self._task())
+
+        removed = [call.args[2] for call in remove_mock.call_args_list]
+        self.assertEqual(removed, ["01-disk.vmdk"])
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_an_object_lock_that_blocks_cleanup_is_reported(self, copy_mock, remove_mock) -> None:
+        for point_id in ("p1", "p2", "p3"):
+            BACKUPS[point_id]["artifact"]["disks"] = [_disk("task-x", "01-disk.vmdk"), _disk("task-x", "02-disk.vmdk")]
+        copy_mock.side_effect = [
+            {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3},
+            StorageToolError("disk full"),
+        ]
+        remove_mock.side_effect = StorageToolError("WORM protected")
+
+        with self.assertLogs("python.srv.services.synthetic_full", level="ERROR") as logs:
+            with self.assertRaises(SyntheticFullError):
+                synthetic_full.run_synthetic_full(self._task())
+
+        self.assertTrue(any("left 1 merged disk(s) behind" in line for line in logs.output))
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_cancellation_discards_what_was_already_merged(self, copy_mock, remove_mock) -> None:
+        for point_id in ("p1", "p2", "p3"):
+            BACKUPS[point_id]["artifact"]["disks"] = [_disk("task-x", "01-disk.vmdk"), _disk("task-x", "02-disk.vmdk")]
+        copy_mock.side_effect = [
+            {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3},
+            ProcessCancelled("cancellation requested"),
+        ]
+
+        with self.assertRaises(TaskStopRequested):
+            synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual([call.args[2] for call in remove_mock.call_args_list], ["01-disk.vmdk"])
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_cancellation_is_surfaced_as_a_stop_request(self, copy_mock) -> None:
