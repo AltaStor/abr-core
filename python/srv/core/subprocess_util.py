@@ -164,10 +164,27 @@ def _wait_with_progress(
                         try:
                             on_progress(percent, block_index)
                         except Exception:
+                            if should_cancel is not None and should_cancel():
+                                raise ProcessCancelled("cancellation requested") from None
                             logger.warning("on_progress callback raised; ignoring.", exc_info=True)
         if finished:
             return
         if should_cancel is not None and should_cancel():
+            raise ProcessCancelled("cancellation requested")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        time.sleep(poll_seconds)
+
+
+def _wait_for_cancel(
+    proc: subprocess.Popen,
+    poll_seconds: float,
+    timeout: float | None,
+    should_cancel: Callable[[], bool],
+) -> None:
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    while proc.poll() is None:
+        if should_cancel():
             raise ProcessCancelled("cancellation requested")
         if deadline is not None and time.monotonic() >= deadline:
             raise subprocess.TimeoutExpired(proc.args, timeout)
@@ -224,6 +241,8 @@ def run_capped(
                 _wait_with_progress(
                     proc, out_f, on_progress, progress_poll_seconds, timeout, should_cancel
                 )
+            elif should_cancel is not None:
+                _wait_for_cancel(proc, progress_poll_seconds, timeout, should_cancel)
             else:
                 proc.wait(timeout=timeout)
         except ProcessCancelled:

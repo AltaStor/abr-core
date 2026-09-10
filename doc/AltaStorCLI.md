@@ -422,7 +422,7 @@ abr session log --id <id>
 
 abr session stop 
 
-Description: Stop a running session. 
+Description: Stop a running session. A stopped backup discards the data it had written; a stopped restore removes the VM or disk it had created. 
 
 abr session stop --id <id> [--force] 
 

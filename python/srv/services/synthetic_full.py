@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from python.srv.core.mongo_db_wrapper import REPOSITORIES, TASK_LOCK, TASKS
+from python.srv.core.mongo_db_wrapper import REPOSITORIES
 from python.srv.core.storage_tool import (
     StorageToolError,
     remove_disk_tool_backup,
@@ -225,12 +225,6 @@ def _write_synthetic_manifest(
     return manifest_path
 
 
-def _cancel_requested(task_id: str) -> bool:
-    with TASK_LOCK:
-        task = TASKS.get(task_id)
-        return bool(task and task.get("cancel_requested"))
-
-
 def run_synthetic_full(
     task: dict[str, Any],
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -244,6 +238,7 @@ def run_synthetic_full(
     )
     from python.srv.services.abr_v41 import repository_actual_retention_days
     from python.srv.core.mongo_db_wrapper import JOBS
+    from python.srv.core.task_executor import cancel_requested
     from python.srv.core.storage_tool import extract_s3_config, is_s3_repository
 
     start_time = time.time()
@@ -327,7 +322,7 @@ def run_synthetic_full(
                 retention_days=retention_days,
                 timeout=timeout_seconds,
                 on_progress=_on_progress,
-                should_cancel=lambda: _cancel_requested(task_id),
+                should_cancel=lambda: cancel_requested(task_id),
             )
         except ProcessCancelled as exc:
             from python.srv.core.task_executor import TaskStopRequested

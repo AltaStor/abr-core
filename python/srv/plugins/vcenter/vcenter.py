@@ -1342,6 +1342,46 @@ class VCenterNode(Hypervisor):
             "disk_type": spec.diskType,
         }
 
+    def detach_disk(self, vm_name: str, datastore_path: str) -> bool:
+        vm = self._get_vm(vm_name)
+        if not vm:
+            return False
+        for device in vm.config.hardware.device:
+            if not isinstance(device, vim.vm.device.VirtualDisk):
+                continue
+            backing = getattr(device, "backing", None)
+            if str(getattr(backing, "fileName", "") or "") != datastore_path:
+                continue
+            device_spec = vim.vm.device.VirtualDeviceSpec()
+            device_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.remove
+            device_spec.device = device
+            task = vm.ReconfigVM_Task(spec=vim.vm.ConfigSpec(deviceChange=[device_spec]))
+            self._wait_for_task(task)
+            logger.info("Detached disk '%s' from VM '%s'.", datastore_path, vm_name)
+            return True
+        return False
+
+    def delete_managed_disk(self, disk_path: str) -> None:
+        if self.si is None:
+            raise ValueError("Not connected")
+
+        datastore_name, _, _ = _parse_datastore_path_for_api(disk_path)
+        datacenter = None
+        if self.get_service_type() == "VirtualCenter":
+            datastore = self._get_datastore(datastore_name)
+            if datastore is None:
+                raise ValueError(
+                    f"Datastore '{datastore_name}' not found on {self.host} while deleting managed disk"
+                )
+            datacenter = self._get_datacenter(datastore)
+
+        task = self.si.RetrieveContent().virtualDiskManager.DeleteVirtualDisk_Task(
+            name=disk_path,
+            datacenter=datacenter,
+        )
+        self._wait_for_task(task)
+        logger.info("Deleted managed disk '%s'.", disk_path)
+
     def _vm_matches_orphan_cleanup_fallback(self, vm: Any, error: Exception) -> bool:
         connection_state = str(
             getattr(getattr(vm, "runtime", None), "connectionState", "") or ""

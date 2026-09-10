@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import subprocess
+import time
 import unittest
 from unittest.mock import patch
 
 from python.srv.core import subprocess_util
-from python.srv.core.subprocess_util import run_capped
+from python.srv.core.subprocess_util import ProcessCancelled, run_capped
 
 
 class RunCappedRegressionTests(unittest.TestCase):
@@ -34,6 +35,67 @@ class RunCappedRegressionTests(unittest.TestCase):
         )
         self.assertLessEqual(len(result.stdout.encode("utf-8")), 200)  # tail + truncation notice
         self.assertIn("truncated", result.stdout)
+
+
+class RunCappedCancellationTests(unittest.TestCase):
+    def test_a_cancelled_run_stops_the_child_while_it_reports_progress(self) -> None:
+        script = (
+            "import time\n"
+            "for pct in range(0, 101, 10):\n"
+            "    print(f'{pct}% (1)')\n"
+            "    time.sleep(0.3)\n"
+        )
+        started = time.monotonic()
+        with self.assertRaises(ProcessCancelled):
+            run_capped(
+                ["python3", "-u", "-c", script],
+                timeout=30,
+                on_progress=lambda pct, idx: None,
+                progress_poll_seconds=0.05,
+                should_cancel=lambda: True,
+            )
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_cancelled_run_stops_the_child_with_no_progress_reporter(self) -> None:
+        started = time.monotonic()
+        with self.assertRaises(ProcessCancelled):
+            run_capped(
+                ["python3", "-c", "import time; time.sleep(30)"],
+                timeout=30,
+                progress_poll_seconds=0.05,
+                should_cancel=lambda: True,
+            )
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_progress_callback_that_raises_on_a_stop_cancels_the_run(self) -> None:
+        script = (
+            "import time\n"
+            "for pct in range(0, 101, 10):\n"
+            "    print(f'{pct}% (1)')\n"
+            "    time.sleep(0.3)\n"
+        )
+
+        def raise_on_progress(percent: int, block_index: int) -> None:
+            raise RuntimeError("Session stop requested")
+
+        with self.assertRaises(ProcessCancelled):
+            run_capped(
+                ["python3", "-u", "-c", script],
+                timeout=30,
+                on_progress=raise_on_progress,
+                progress_poll_seconds=0.05,
+                should_cancel=lambda: True,
+            )
+
+    def test_a_run_nobody_cancelled_finishes_normally(self) -> None:
+        result = run_capped(
+            ["echo", "hello"],
+            timeout=10,
+            progress_poll_seconds=0.05,
+            should_cancel=lambda: False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "hello")
 
 
 class RunCappedProgressTests(unittest.TestCase):

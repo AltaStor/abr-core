@@ -63,7 +63,8 @@ class SessionCommands:
             "stop",
             help="Stop a session.",
             description=(
-                "Stop a running or queued session.\n\n"
+                "Stop a running or queued session. A stopped backup discards the data it "
+                "had written; a stopped restore removes the VM or disk it had created.\n\n"
                 "Examples:\n"
                 "  abr session stop --id <session-id>\n"
                 "  abr session stop --id <session-id> --force"

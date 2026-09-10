@@ -16,6 +16,7 @@ from unittest.mock import patch
 try:
     from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, RESOURCES_BY_HV, TASKS
     from python.srv.core.storage_tool import StorageToolError
+    from python.srv.core.subprocess_util import ProcessCancelled
     from python.srv.core.task_executor import TaskStopRequested, run_task
     from python.srv.plugins.vcenter.vcenter_disk_types import VddkDiskType
     from python.srv.plugins.vcenter.vcenter_backup import (
@@ -31,6 +32,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(site_packages))
     from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, RESOURCES_BY_HV, TASKS
     from python.srv.core.storage_tool import StorageToolError
+    from python.srv.core.subprocess_util import ProcessCancelled
     from python.srv.core.task_executor import TaskStopRequested, run_task
     from python.srv.plugins.vcenter.vcenter_disk_types import VddkDiskType
     from python.srv.plugins.vcenter.vcenter_backup import (
@@ -6163,6 +6165,244 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["result"]["error_type"], "VCenterBackupError")
         self.assertIn("Discovered resource not found", result["result"]["message"])
+
+
+    def _register_vcenter_stand(self) -> None:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {"num_cpu": 2, "memory_mb": 4096},
+            }
+        }
+
+    @staticmethod
+    def _write_abr_artifacts(command: list[str]) -> None:
+        artifact = abr_artifact_path(command)
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        (artifact.parent / f"{artifact.name}.abrd").write_bytes(b"x" * 4096)
+        (artifact.parent / f"{artifact.name}.abri").write_bytes(b"i" * 128)
+
+    @staticmethod
+    def _files_under(root: "pathlib.Path") -> list[str]:
+        return sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file())
+
+    def _run_stopped_backup(self, fake_run, progress_callback=None) -> tuple[dict, str]:
+        self._register_vcenter_stand()
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "task-vcenter-stop",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "destination_dir": temp_dir,
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}), patch(
+                "python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run
+            ), patch(
+                "python.srv.plugins.vcenter.vcenter_backup.remove_disk_tool_backup"
+            ) as remove_mock, patch(
+                "python.srv.plugins.vcenter.vcenter_backup.read_storage_backup_info",
+                side_effect=StorageToolError("backup not found"),
+            ):
+                result = run_task(task, progress_callback=progress_callback)
+            leftovers = self._files_under(pathlib.Path(temp_dir))
+
+        self.removed_backup_names = [call.args[2] for call in remove_mock.call_args_list]
+        return result, leftovers
+
+    def test_a_backup_stopped_while_a_disk_is_copying_leaves_no_data_behind(self) -> None:
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            self._write_abr_artifacts(command)
+            raise ProcessCancelled("cancellation requested")
+
+        result, leftovers = self._run_stopped_backup(fake_run)
+
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(leftovers, [])
+        self.assertIn("01-demo-vm.vmdk", self.removed_backup_names)
+
+    def test_a_backup_stopped_after_a_disk_finished_leaves_no_data_behind(self) -> None:
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            self._write_abr_artifacts(command)
+            return FakeCompletedProcess(returncode=0, stdout="ok")
+
+        def stop_once_the_disk_is_stored(update: dict) -> None:
+            if str(update.get("message") or "").startswith("Stored disk"):
+                raise TaskStopRequested("Session stop requested")
+
+        result, leftovers = self._run_stopped_backup(fake_run, stop_once_the_disk_is_stored)
+
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(leftovers, [])
+        self.assertIn("01-demo-vm.vmdk", self.removed_backup_names)
+
+    def test_a_backup_that_fails_after_a_disk_finished_leaves_no_data_behind(self) -> None:
+        calls: list[int] = []
+
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            calls.append(1)
+            self._write_abr_artifacts(command)
+            return FakeCompletedProcess(returncode=7, stderr="disk copy failed")
+
+        result, leftovers = self._run_stopped_backup(fake_run)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(leftovers, [])
+
+    def test_a_single_disk_restore_stopped_mid_disk_settles_stopped(self) -> None:
+        self._register_vcenter_stand()
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = pathlib.Path(temp_dir) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "vm_name": "demo-vm",
+                        "vm_config": {
+                            "guest_id": "ubuntu64Guest",
+                            "firmware": "efi",
+                            "num_cpu": 2,
+                            "memory_mb": 4096,
+                        },
+                        "disks": [
+                            {
+                                "index": 1,
+                                "disk_label": "Hard disk 1",
+                                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                                "destination_path": "",
+                                "abr_path": str(pathlib.Path(temp_dir)),
+                                "abr_backup_name": "01-demo-vm.vmdk",
+                                "storage_mode": "local",
+                                "store_mode": "full",
+                                "source_disk_type_code": 5,
+                                "source_disk_type_name": "vmfs_flat",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._register_backup_point("point-vm-1", manifest_path)
+
+            task = {
+                "id": "task-vcenter-restore-stop",
+                "status": "queued",
+                "task_type": "restore",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "manifest_path": str(manifest_path),
+                    "point_id": "point-vm-1",
+                    "target_vm_name": "demo-vm-restored",
+                    "target_host_name": "esx-dst.local",
+                    "target_datastore_name": "datastore2",
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                raise ProcessCancelled("cancellation requested")
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch(
+                    "python.srv.plugins.vcenter.vcenter_restore.run_capped", side_effect=fake_run
+                ):
+                    result = run_task(task)
+
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["result"]["message"], "Session stop requested")
+        self.assertEqual(len(FakeVCenterNode.created_vms), 1)
+        self.assertEqual(
+            FakeVCenterNode.destroyed_vms, [FakeVCenterNode.created_vms[0]["vm_name"]]
+        )
+
+    def test_a_restore_asks_the_data_mover_to_stop_when_the_session_is_cancelled(self) -> None:
+        self._register_vcenter_stand()
+        TASKS["task-vcenter-restore-cancel"] = {
+            "id": "task-vcenter-restore-cancel",
+            "cancel_requested": True,
+        }
+        self.addCleanup(TASKS.clear)
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        observed: list[bool] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = pathlib.Path(temp_dir) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "vm_name": "demo-vm",
+                        "vm_config": {"guest_id": "ubuntu64Guest", "firmware": "efi"},
+                        "disks": [
+                            {
+                                "index": 1,
+                                "disk_label": "Hard disk 1",
+                                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                                "destination_path": "",
+                                "abr_path": str(pathlib.Path(temp_dir)),
+                                "abr_backup_name": "01-demo-vm.vmdk",
+                                "storage_mode": "local",
+                                "store_mode": "full",
+                                "source_disk_type_code": 5,
+                                "source_disk_type_name": "vmfs_flat",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._register_backup_point("point-vm-cancel", manifest_path)
+
+            task = {
+                "id": "task-vcenter-restore-cancel",
+                "status": "queued",
+                "task_type": "restore",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "manifest_path": str(manifest_path),
+                    "point_id": "point-vm-cancel",
+                    "target_vm_name": "demo-vm-restored",
+                    "target_host_name": "esx-dst.local",
+                    "target_datastore_name": "datastore2",
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                should_cancel = kwargs.get("should_cancel")
+                observed.append(should_cancel is not None and should_cancel())
+                return FakeCompletedProcess(returncode=0, stdout="ok")
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch(
+                    "python.srv.plugins.vcenter.vcenter_restore.run_capped", side_effect=fake_run
+                ):
+                    run_task(task)
+
+        self.assertEqual(observed, [True])
 
 
 class TaskPoolProgressReportingTests(unittest.TestCase):

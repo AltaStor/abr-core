@@ -7,7 +7,7 @@ import logging
 import traceback
 from typing import Any, Callable
 
-from ..core.mongo_db_wrapper import HYPERVISORS
+from ..core.mongo_db_wrapper import HYPERVISORS, TASK_LOCK, TASKS
 from ..plugins import build_hypervisor_plugin
 from .utils import utc_now
 
@@ -20,6 +20,12 @@ class TaskExecutionError(RuntimeError):
 
 class TaskStopRequested(RuntimeError):
     pass
+
+
+def cancel_requested(task_id: str) -> bool:
+    with TASK_LOCK:
+        task = TASKS.get(task_id)
+        return bool(task and task.get("cancel_requested"))
 
 
 def _task_resolved_execution_field(task: dict[str, Any], field_name: str) -> Any:

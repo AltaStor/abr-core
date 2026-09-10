@@ -7,15 +7,16 @@ import os
 import re
 import json
 import logging
+import shutil
 import time
 import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
-from ...core.subprocess_util import run_capped
+from ...core.subprocess_util import ProcessCancelled, run_capped
 from ...core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV
 from ...core.server_defaults import env_int
-from ...core.task_executor import TaskStopRequested
+from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...core.storage_tool import (
     StorageToolError,
     apply_repository_immutability,
@@ -26,7 +27,9 @@ from ...core.storage_tool import (
     extract_s3_config,
     is_s3_repository,
     join_s3_prefix,
+    read_storage_backup_info,
     redact_disk_tool_command,
+    remove_disk_tool_backup,
     repository_cache_root,
     run_disk_tool,
     with_immutability_retention_days,
@@ -458,6 +461,43 @@ _TRANSIENT_DISK_ACCESS_RETRY_DELAY_SECONDS = 4.0
 def _is_transient_disk_access_error(output: str) -> bool:
     lowered = output.lower()
     return "access rights" in lowered or "file_access_error" in lowered
+
+
+def _backup_still_stored(
+    repository: dict[str, Any],
+    abr_path: str | None,
+    backup_name: str,
+) -> bool:
+    try:
+        read_storage_backup_info(repository, abr_path, backup_name, timeout=60)
+    except StorageToolError:
+        return False
+    return True
+
+
+def _discard_task_backups(
+    repository: dict[str, Any] | None,
+    abr_path: str | None,
+    backup_names: list[str],
+    task_root: Path,
+) -> None:
+    stranded: list[str] = []
+    if isinstance(repository, dict):
+        for backup_name in dict.fromkeys(name for name in backup_names if name):
+            try:
+                remove_disk_tool_backup(repository, abr_path, backup_name, timeout=120)
+            except StorageToolError:
+                if _backup_still_stored(repository, abr_path, backup_name):
+                    stranded.append(backup_name)
+    shutil.rmtree(task_root, ignore_errors=True)
+    if stranded:
+        logger.error(
+            "Backup left %d disk image(s) behind in %s: %s. Object Lock keeps them until their "
+            "retention expires; remove them once it does.",
+            len(stranded),
+            abr_path or task_root,
+            ", ".join(stranded),
+        )
 
 
 def _resolve_backup_storage_layout(
@@ -1101,6 +1141,8 @@ def run_vcenter_backup(
     incremental_metadata_fallback_used = False
     vm_config_changed_full_required = False
     vm_config_change_reason = ""
+    task_id = str(task.get("id") or "")
+    written_backup_names: list[str] = []
 
     try:
         # The data mover carries the disk over its own VDDK connection, so this
@@ -1554,6 +1596,7 @@ def run_vcenter_backup(
                     final_destination_path = _build_disk_destination(task_root, vm_name, disk_resource, index)
                     final_destination_path.parent.mkdir(parents=True, exist_ok=True)
                     disk_backup_name = final_destination_path.name
+                    written_backup_names.append(disk_backup_name)
                     progress = min(25 + int((index - 1) * 60 / max(len(disks), 1)), 85)
                     progress_span = max(1, min(25 + int(index * 60 / max(len(disks), 1)), 85) - progress)
                     _emit_progress(
@@ -1668,6 +1711,7 @@ def run_vcenter_backup(
                                 check=False,
                                 capture_output=True,
                                 text=True,
+                                should_cancel=lambda: cancel_requested(task_id),
                                 timeout=full_disk_timeout_seconds,
                                 on_progress=_disk_tool_progress_reporter(
                                     progress_callback,
@@ -1737,6 +1781,7 @@ def run_vcenter_backup(
                                 check=False,
                                 capture_output=True,
                                 text=True,
+                                should_cancel=lambda: cancel_requested(task_id),
                                 timeout=disk_timeout_seconds,
                                 on_progress=_disk_tool_progress_reporter(
                                     progress_callback,
@@ -1839,6 +1884,7 @@ def run_vcenter_backup(
                                         check=False,
                                         capture_output=True,
                                         text=True,
+                                        should_cancel=lambda: cancel_requested(task_id),
                                         timeout=full_disk_timeout_seconds,
                                         on_progress=_disk_tool_progress_reporter(
                                             progress_callback,
@@ -1979,6 +2025,7 @@ def run_vcenter_backup(
                     final_destination_path = _build_disk_destination(task_root, vm_name, disk_resource, index)
                     final_destination_path.parent.mkdir(parents=True, exist_ok=True)
                     disk_backup_name = final_destination_path.name
+                    written_backup_names.append(disk_backup_name)
                     logger.info(
                         "Backing up disk %d/%d from %s as .abr backup %s",
                         index,
@@ -2062,6 +2109,7 @@ def run_vcenter_backup(
                             check=False,
                             capture_output=True,
                             text=True,
+                            should_cancel=lambda: cancel_requested(task_id),
                             timeout=disk_timeout_seconds,
                             on_progress=_disk_tool_progress_reporter(
                                 progress_callback,
@@ -2126,6 +2174,7 @@ def run_vcenter_backup(
                             check=False,
                             capture_output=True,
                             text=True,
+                            should_cancel=lambda: cancel_requested(task_id),
                             timeout=disk_timeout_seconds,
                             on_progress=_disk_tool_progress_reporter(
                                 progress_callback,
@@ -2215,6 +2264,7 @@ def run_vcenter_backup(
                                 check=False,
                                 capture_output=True,
                                 text=True,
+                                should_cancel=lambda: cancel_requested(task_id),
                                 timeout=disk_timeout_seconds,
                                 on_progress=_disk_tool_progress_reporter(
                                     progress_callback,
@@ -2424,6 +2474,7 @@ def run_vcenter_backup(
                     tool_path=tool_path,
                     timeout=60,
                 )
+                written_backup_names.append("manifest")
                 apply_repository_immutability(repository, repository_abr_path, "manifest", timeout=120)
             except StorageToolError:
                 logger.debug("Ignoring manifest metadata mirror failure for %s", manifest_path, exc_info=True)
@@ -2492,8 +2543,21 @@ def run_vcenter_backup(
             "compression_ratio": backup_compression_ratio,
             "finished_at": utc_now(),
         }
+    except ProcessCancelled as exc:
+        logger.info(
+            "Backup task %s stopped; discarding the backup data it had written.", task.get("id")
+        )
+        _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root)
+        raise TaskStopRequested("Session stop requested") from exc
+    except TaskStopRequested:
+        logger.info(
+            "Backup task %s stopped; discarding the backup data it had written.", task.get("id")
+        )
+        _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root)
+        raise
     except Exception as exc:
         logger.exception("Task %s failed critically during vCenter interaction: %s", task.get("id"), exc)
+        _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root)
         raise
     finally:
         if snapshot_name:

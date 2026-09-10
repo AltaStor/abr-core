@@ -10,8 +10,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from ...core.subprocess_util import run_capped
+from ...core.subprocess_util import ProcessCancelled, run_capped
 from ...core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES, catalog_records
+from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...core.storage_tool import (
     build_s3_location,
     disk_tool_storage_args,
@@ -402,6 +403,13 @@ def _build_abr_restore_command(
     return command
 
 
+def _run_restore_layer(command: list[str], **kwargs: Any):
+    try:
+        return run_capped(command, **kwargs)
+    except ProcessCancelled as exc:
+        raise TaskStopRequested("Session stop requested") from exc
+
+
 def _redact_restore_command(command: list[str]) -> list[str]:
     return redact_disk_tool_command(command)
 
@@ -492,6 +500,7 @@ def run_vcenter_restore(
     if not isinstance(parameters, dict):
         parameters = {}
     encryption_key = str(parameters.get("encryption_key") or "").strip()
+    task_id = str(task.get("id") or "")
     selected_point_id = str(parameters.get("point_id") or "").strip()
     selected_point = _backup_point_by_id(selected_point_id) if selected_point_id else None
     repository = _resolve_task_repository(task)
@@ -835,11 +844,12 @@ def run_vcenter_restore(
                                 len(abr_layers),
                                 _redact_restore_command(command),
                             )
-                            completed = run_capped(
+                            completed = _run_restore_layer(
                                 command,
                                 check=False,
                                 capture_output=True,
                                 text=True,
+                                should_cancel=lambda: cancel_requested(task_id),
                                 on_progress=_disk_tool_progress_reporter(
                                     progress_callback,
                                     base_progress=layer_base,
@@ -936,7 +946,7 @@ def run_vcenter_restore(
                         target_vm_name,
                         vm_moref=str(created_vm.get("vm_moref") or ""),
                     )
-            except Exception:
+            except Exception as exc:
                 if is_in_place and original_destroyed:
                     # Every disk was confirmed written and the original was
                     # already retired — only the rename (or the power-on
@@ -960,7 +970,8 @@ def run_vcenter_restore(
                     )
                     raise
                 logger.warning(
-                    "Restore failed for VM shell %s; destroying created VM and cleaning up.",
+                    "Restore %s for VM shell %s; destroying created VM and cleaning up.",
+                    "stopped" if isinstance(exc, TaskStopRequested) else "failed",
                     create_vm_name,
                 )
                 try:
@@ -1107,140 +1118,156 @@ def run_vcenter_restore(
             disk_type_code=resolved_disk_type_code,
         )
 
-        attachment: dict[str, Any] | None = None
-        # The VM spec stays set even for a detached restore: abr-vmdk-tool
-        # needs --vm to open a VMDK through a host.
-        restore_vm_spec = _format_vm_spec(vm_moref, service_type)
-        if attach_to_vm:
-            attachment = node.attach_existing_disk(
-                vm_name,
-                restored_datastore_path,
-                disk_uuid=(manifest_disk_entry or {}).get("uuid"),
-            )
-
-        # Best-effort byte counters (see the full-VM restore path above for the
-        # same approach): READ is the .abr layer files' actual repository size
-        # (or the capacity estimate for S3 / a direct backup_path clone), SENT
-        # is the full decompressed size written to the datastore.
-        sent_bytes = int(capacity_gb * 1024**3)
-        if abr_layers:
-            if repository_type != "s3":
-                read_bytes = sum(
-                    _abr_backup_files_size_bytes(str(layer["abr_path"]), str(layer["abr_backup_name"]))
-                    for layer in abr_layers
+        try:
+            attachment: dict[str, Any] | None = None
+            # The VM spec stays set even for a detached restore: abr-vmdk-tool
+            # needs --vm to open a VMDK through a host.
+            restore_vm_spec = _format_vm_spec(vm_moref, service_type)
+            if attach_to_vm:
+                attachment = node.attach_existing_disk(
+                    vm_name,
+                    restored_datastore_path,
+                    disk_uuid=(manifest_disk_entry or {}).get("uuid"),
                 )
+
+            # Best-effort byte counters (see the full-VM restore path above for the
+            # same approach): READ is the .abr layer files' actual repository size
+            # (or the capacity estimate for S3 / a direct backup_path clone), SENT
+            # is the full decompressed size written to the datastore.
+            sent_bytes = int(capacity_gb * 1024**3)
+            if abr_layers:
+                if repository_type != "s3":
+                    read_bytes = sum(
+                        _abr_backup_files_size_bytes(str(layer["abr_path"]), str(layer["abr_backup_name"]))
+                        for layer in abr_layers
+                    )
+                else:
+                    read_bytes = sent_bytes
+            elif backup_path is not None:  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+                try:
+                    read_bytes = backup_path.stat().st_size  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+                except OSError:
+                    read_bytes = sent_bytes
             else:
                 read_bytes = sent_bytes
-        elif backup_path is not None:  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
-            try:
-                read_bytes = backup_path.stat().st_size  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
-            except OSError:
-                read_bytes = sent_bytes
-        else:
-            read_bytes = sent_bytes
 
-        _emit_progress(
-            progress_callback,
-            "transfer",
-            30,
-            f"Restoring backup VMDK to {restored_datastore_path}",
-            worker_mode="vcenter-abr-vmdk-tool",
-            current_disk=restored_datastore_path,
-            # Nothing has moved yet -- the per-layer reporter below interpolates
-            # up to read_bytes/sent_bytes as the transfer runs. Reporting the
-            # finished figures here left the console with no delta to derive a
-            # rate from, so a disk restore showed no throughput.
-            processed_bytes=0,
-            transferred_bytes=0,
-        )
-
-        if abr_layers:
-            # Same fix as the full-VM restore path above: a multi-layer .abr
-            # chain runs as several sequential subprocesses, each reporting
-            # its own independent 0-100% — give each layer its own slice of
-            # the [30, 80) band instead of remapping every layer onto the
-            # whole band, which snaps the bar back to 30% each time a layer
-            # finishes and the next one starts.
-            layer_count = len(abr_layers)
-            for layer_index, layer in enumerate(abr_layers, start=1):
-                layer_base = 30 + int((layer_index - 1) * 50 / layer_count)
-                layer_span = max(1, 30 + int(layer_index * 50 / layer_count) - layer_base)
-                # Byte budget split across layers the same way the progress band
-                # is, so counters and bar advance together.
-                layer_read_base = int((layer_index - 1) * read_bytes / layer_count)
-                layer_read_bytes = int(layer_index * read_bytes / layer_count) - layer_read_base
-                layer_sent_base = int((layer_index - 1) * sent_bytes / layer_count)
-                layer_sent_bytes = int(layer_index * sent_bytes / layer_count) - layer_sent_base
-                command = _build_abr_restore_command(
-                    tool_path=tool_path,
-                    repository=repository,
-                    abr_path=str(layer["abr_path"]),
-                    backup_name=str(layer["abr_backup_name"]),
-                    remote_datastore_path=restored_datastore_path,
-                    host=host,
-                    port=port,
-                    username=username,
-                    password=password,
-                    thumbprint=thumbprint,
-                    vm_moref=restore_vm_spec,
-                    transport_mode=transport_mode if is_virtual_center else None,
-                    encryption_key=encryption_key,
-                    force=str(layer.get("store_mode") or "").strip().lower() != "full",
-                )
-                logger.info(
-                    ".abr disk restore command preview for task %s layer %d/%d: %s",
-                    task.get("id"),
-                    layer_index,
-                    len(abr_layers),
-                    _redact_restore_command(command),
-                )
-                completed = run_capped(
-                    command,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    on_progress=_disk_tool_progress_reporter(
-                        progress_callback,
-                        base_progress=layer_base,
-                        progress_span=layer_span,
-                        message_prefix=f"Restoring backup VMDK to {restored_datastore_path}",
-                        base_read_bytes=layer_read_base,
-                        disk_total_bytes=layer_read_bytes,
-                        base_sent_bytes=layer_sent_base,
-                        disk_sent_bytes=layer_sent_bytes,
-                    ),
-                )
-                if completed.returncode != 0:
-                    stderr = (completed.stderr or completed.stdout or "").strip()
-                    logger.error(
-                        ".abr disk restore command failed for %s layer %s: %s",
-                        restored_datastore_path,
-                        layer.get("source"),
-                        stderr or f"exit code {completed.returncode}",
-                    )
-                    raise VCenterBackupError(
-                        f".abr disk restore failed to {restored_datastore_path} from {layer.get('source')}: "
-                        f"{stderr or f'exit code {completed.returncode}'}"
-                    )
-        else:
-            raise VCenterBackupError(
-                f"No .abr restore layers resolved for {restored_datastore_path}"
-            )
-        disk_duration = time.time() - disk_start_time
-        logger.info("Disk cloning to %s completed in %.2f seconds.", restored_datastore_path, disk_duration)
-
-        if attach_to_vm:
-            logger.info("Attached restored disk %s to VM %s before clone", restored_datastore_path, vm_name)
             _emit_progress(
                 progress_callback,
-                "attach",
-                80,
-                f"Attached restored disk to {vm_name}",
+                "transfer",
+                30,
+                f"Restoring backup VMDK to {restored_datastore_path}",
                 worker_mode="vcenter-abr-vmdk-tool",
                 current_disk=restored_datastore_path,
-                processed_bytes=read_bytes,
-                transferred_bytes=sent_bytes,
+                # Nothing has moved yet -- the per-layer reporter below interpolates
+                # up to read_bytes/sent_bytes as the transfer runs. Reporting the
+                # finished figures here left the console with no delta to derive a
+                # rate from, so a disk restore showed no throughput.
+                processed_bytes=0,
+                transferred_bytes=0,
             )
+
+            if abr_layers:
+                # Same fix as the full-VM restore path above: a multi-layer .abr
+                # chain runs as several sequential subprocesses, each reporting
+                # its own independent 0-100% — give each layer its own slice of
+                # the [30, 80) band instead of remapping every layer onto the
+                # whole band, which snaps the bar back to 30% each time a layer
+                # finishes and the next one starts.
+                layer_count = len(abr_layers)
+                for layer_index, layer in enumerate(abr_layers, start=1):
+                    layer_base = 30 + int((layer_index - 1) * 50 / layer_count)
+                    layer_span = max(1, 30 + int(layer_index * 50 / layer_count) - layer_base)
+                    # Byte budget split across layers the same way the progress band
+                    # is, so counters and bar advance together.
+                    layer_read_base = int((layer_index - 1) * read_bytes / layer_count)
+                    layer_read_bytes = int(layer_index * read_bytes / layer_count) - layer_read_base
+                    layer_sent_base = int((layer_index - 1) * sent_bytes / layer_count)
+                    layer_sent_bytes = int(layer_index * sent_bytes / layer_count) - layer_sent_base
+                    command = _build_abr_restore_command(
+                        tool_path=tool_path,
+                        repository=repository,
+                        abr_path=str(layer["abr_path"]),
+                        backup_name=str(layer["abr_backup_name"]),
+                        remote_datastore_path=restored_datastore_path,
+                        host=host,
+                        port=port,
+                        username=username,
+                        password=password,
+                        thumbprint=thumbprint,
+                        vm_moref=restore_vm_spec,
+                        transport_mode=transport_mode if is_virtual_center else None,
+                        encryption_key=encryption_key,
+                        force=str(layer.get("store_mode") or "").strip().lower() != "full",
+                    )
+                    logger.info(
+                        ".abr disk restore command preview for task %s layer %d/%d: %s",
+                        task.get("id"),
+                        layer_index,
+                        len(abr_layers),
+                        _redact_restore_command(command),
+                    )
+                    completed = _run_restore_layer(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        should_cancel=lambda: cancel_requested(task_id),
+                        on_progress=_disk_tool_progress_reporter(
+                            progress_callback,
+                            base_progress=layer_base,
+                            progress_span=layer_span,
+                            message_prefix=f"Restoring backup VMDK to {restored_datastore_path}",
+                            base_read_bytes=layer_read_base,
+                            disk_total_bytes=layer_read_bytes,
+                            base_sent_bytes=layer_sent_base,
+                            disk_sent_bytes=layer_sent_bytes,
+                        ),
+                    )
+                    if completed.returncode != 0:
+                        stderr = (completed.stderr or completed.stdout or "").strip()
+                        logger.error(
+                            ".abr disk restore command failed for %s layer %s: %s",
+                            restored_datastore_path,
+                            layer.get("source"),
+                            stderr or f"exit code {completed.returncode}",
+                        )
+                        raise VCenterBackupError(
+                            f".abr disk restore failed to {restored_datastore_path} from {layer.get('source')}: "
+                            f"{stderr or f'exit code {completed.returncode}'}"
+                        )
+            else:
+                raise VCenterBackupError(
+                    f"No .abr restore layers resolved for {restored_datastore_path}"
+                )
+            disk_duration = time.time() - disk_start_time
+            logger.info("Disk cloning to %s completed in %.2f seconds.", restored_datastore_path, disk_duration)
+
+            if attach_to_vm:
+                logger.info("Attached restored disk %s to VM %s before clone", restored_datastore_path, vm_name)
+                _emit_progress(
+                    progress_callback,
+                    "attach",
+                    80,
+                    f"Attached restored disk to {vm_name}",
+                    worker_mode="vcenter-abr-vmdk-tool",
+                    current_disk=restored_datastore_path,
+                    processed_bytes=read_bytes,
+                    transferred_bytes=sent_bytes,
+                )
+        except Exception:
+            logger.warning(
+                "Disk restore to %s did not finish; detaching and deleting the disk it created.",
+                restored_datastore_path,
+            )
+            try:
+                node.detach_disk(vm_name, restored_datastore_path)
+                node.delete_managed_disk(restored_datastore_path)
+            except Exception:
+                logger.exception(
+                    "Failed to remove the restored disk %s during cleanup.",
+                    restored_datastore_path,
+                )
+            raise
 
         total_duration = time.time() - start_time
         logger.info(
