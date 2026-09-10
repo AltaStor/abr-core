@@ -490,6 +490,30 @@ class SystemCatalogSnapshotApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["error"]["code"], "invalid_argument")
 
+    def test_export_with_a_short_password_is_rejected(self) -> None:
+        for password in ("a", "1234", "passwor", "7chars!"):
+            with self.subTest(password=password):
+                response = self._export(password=password)
+
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(response.json()["error"]["code"], "invalid_argument")
+                self.assertIn("at least 8 characters", response.json()["error"]["message"])
+
+    def test_export_with_a_password_of_the_minimum_length_is_accepted(self) -> None:
+        response = self._export(password="8chars!!")
+
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_import_still_opens_an_archive_written_with_a_short_password(self) -> None:
+        from python.srv.core.secure_archive import encrypt_payload
+
+        _body, payload = self._decrypted_export()
+        archive = encrypt_payload(payload, "a")
+
+        response = self._restore(base64.b64encode(archive).decode("ascii"), password="a")
+
+        self.assertEqual(response.status_code, 200, response.text)
+
     def test_import_without_password_or_archive_is_rejected(self) -> None:
         response = self.client.post("/api/v1/system/catalog-restore", json={})
 

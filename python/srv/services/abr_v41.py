@@ -103,6 +103,7 @@ from python.srv.services.backup_mode import object_lock_actual_retention_days
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL
 
 from .api_errors import ApiError, api_error
+from .auth_service import MIN_PASSWORD_LENGTH
 
 LOGGER = logging.getLogger(__name__)
 
@@ -7076,6 +7077,13 @@ def export_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     password = payload.get("password") if isinstance(payload, dict) else None
     if not isinstance(password, str) or not password:
         raise api_error(422, "invalid_argument", "password is required")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise api_error(
+            422,
+            "invalid_argument",
+            f"Export password must be at least {MIN_PASSWORD_LENGTH} characters. "
+            "It is the only thing protecting the credentials and server configuration in the archive.",
+        )
 
     catalog = snapshot_catalog()
     configuration = snapshot_configuration()

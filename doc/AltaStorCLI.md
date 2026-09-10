@@ -557,6 +557,8 @@ abr system export --file <path>
 Example: 
 abr system export --file /tmp/test.adrx
 
+The passphrase comes from ABR_EXPORT_PASSWORD, or is asked for interactively, and must be at least 8 characters - the same minimum the product enforces for user passwords. It is the only thing protecting the credentials and server settings inside the archive, and it cannot be recovered. A shorter one is refused before anything is written. 
+
 abr system import 
 
 Description: Restore DB catalog + configuration from a previously exported system archive.
