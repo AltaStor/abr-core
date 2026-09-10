@@ -3,14 +3,19 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import Body, Query
 
 from python.srv.services import abr_v41
 
 from ._routing import build_router, register
-from .schemas import SessionDTO, SessionList, StopSessionRequest, unset_excluded
+from .schemas import (
+    SessionDTO,
+    SessionList,
+    SessionLogDTO,
+    StopSessionRequest,
+    StopSessionResult,
+    unset_excluded,
+)
 
 router = build_router("/sessions", tag="sessions")
 
@@ -46,13 +51,13 @@ def get_session(session_id: str) -> SessionDTO:
     return abr_v41.get_session(session_id)
 
 
-def get_session_log(session_id: str) -> dict[str, Any]:
+def get_session_log(session_id: str) -> SessionLogDTO:
     return abr_v41.get_session_log(session_id)
 
 
 def stop_session(
     session_id: str, payload: StopSessionRequest = Body(default_factory=StopSessionRequest)
-) -> dict[str, Any]:
+) -> StopSessionResult:
     return abr_v41.stop_session(session_id, force=bool(unset_excluded(payload).get("force", False)))
 
 

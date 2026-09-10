@@ -49,10 +49,10 @@ def normalise_host(raw: str | bytes) -> str | None:
         if remainder and not (remainder.startswith(":") and _is_port(remainder[1:])):
             return None
         try:
-            ipaddress.IPv6Address(literal)
+            parsed = ipaddress.IPv6Address(literal)
         except ValueError:
             return None
-        return f"[{literal}]"
+        return f"[{parsed.compressed}]"
 
     host, separator, port = value.partition(":")
     if separator and not _is_port(port):
@@ -63,9 +63,75 @@ def normalise_host(raw: str | bytes) -> str | None:
         return str(ipaddress.IPv4Address(host))
     except ValueError:
         pass
-    if _HOSTNAME_RE.match(host):
+    if _HOSTNAME_RE.fullmatch(host):
         return host
     return None
+
+
+def host_key(host: str) -> str:
+    return host.lower().rstrip(".")
+
+
+def _host_for_header(raw: str) -> str | None:
+    try:
+        parsed = ipaddress.ip_address(raw)
+    except ValueError:
+        return normalise_host(raw)
+    return f"[{parsed.compressed}]" if parsed.version == 6 else parsed.compressed
+
+
+def _detected_local_ips() -> list[str]:
+    try:
+        from python.srv.core.tls_bootstrap import _detect_local_ips
+
+        return _detect_local_ips()
+    except Exception as exc:
+        logger.warning(
+            "Could not detect this host's own addresses (%s); the redirect "
+            "listener falls back to loopback and the system host name.", exc,
+        )
+        return []
+
+
+def _preferred_address(ips: list[str]) -> str | None:
+    parsed: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for ip in ips:
+        try:
+            parsed.append(ipaddress.ip_address(ip))
+        except ValueError:
+            continue
+    routable = [ip for ip in parsed if not ip.is_loopback and not ip.is_link_local]
+    if not routable:
+        return None
+    best = sorted(routable, key=lambda ip: (ip.version, ip.compressed))[0]
+    return f"[{best.compressed}]" if best.version == 6 else best.compressed
+
+
+@dataclass(frozen=True)
+class HostPolicy:
+    allowed: frozenset[str]
+    canonical: str
+
+
+def server_host_policy() -> HostPolicy:
+    local_ips = _detected_local_ips()
+    candidates: list[str] = ["localhost", "127.0.0.1", "::1"]
+    try:
+        candidates.extend((socket.gethostname(), socket.getfqdn()))
+    except OSError:
+        pass
+    candidates.extend(local_ips)
+
+    allowed: set[str] = set()
+    for candidate in candidates:
+        normalised = _host_for_header(str(candidate or "").strip())
+        if normalised is not None:
+            allowed.add(host_key(normalised))
+
+    return HostPolicy(
+        allowed=frozenset(allowed),
+        canonical=_preferred_address(local_ips) or "127.0.0.1",
+    )
 
 
 def _host_from_scope(scope: dict[str, Any]) -> str | None:
@@ -94,10 +160,18 @@ def _path_and_query(scope: dict[str, Any]) -> str:
     return f"{path}?{query}" if query else path
 
 
-def redirect_target(scope: dict[str, Any], https_port: int) -> str | None:
+def redirect_target(
+    scope: dict[str, Any], https_port: int, policy: HostPolicy
+) -> str | None:
     host = _host_from_scope(scope)
     if host is None:
         return None
+    if host_key(host) not in policy.allowed:
+        logger.debug(
+            "Request named host %r, which this server does not answer to; "
+            "redirecting to %s instead.", host, policy.canonical,
+        )
+        host = policy.canonical
     netloc = host if https_port == 443 else f"{host}:{https_port}"
     return f"https://{netloc}{_path_and_query(scope)}"
 
@@ -105,6 +179,7 @@ def redirect_target(scope: dict[str, Any], https_port: int) -> str | None:
 def build_redirect_app(
     *,
     https_port: int,
+    policy: HostPolicy,
     security_headers: SecurityHeaderProvider | None = None,
 ):
     async def _respond(
@@ -124,7 +199,7 @@ def build_redirect_app(
         if scope["type"] != "http":
             return
 
-        target = redirect_target(scope, https_port)
+        target = redirect_target(scope, https_port, policy)
         if target is None:
             await _respond(
                 send,
@@ -199,7 +274,12 @@ def start_redirect_listener(
 
     import uvicorn
 
-    app = build_redirect_app(https_port=https_port, security_headers=security_headers)
+    policy = server_host_policy()
+    app = build_redirect_app(
+        https_port=https_port,
+        policy=policy,
+        security_headers=security_headers,
+    )
     config = uvicorn.Config(
         app,
         host=host,
@@ -213,6 +293,8 @@ def start_redirect_listener(
     )
     thread.start()
     logger.info(
-        "Plain-HTTP redirect listener on %s:%s -> https://<host>:%s", host, port, https_port
+        "Plain-HTTP redirect listener on %s:%s -> https://<host>:%s. It keeps the "
+        "requested host when it is one of %s, and sends anything else to %s.",
+        host, port, https_port, ", ".join(sorted(policy.allowed)), policy.canonical,
     )
     return RedirectListener(host=host, port=port, server=server, thread=thread)

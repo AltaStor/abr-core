@@ -3,14 +3,12 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import Body
 
 from python.srv.services import auth_service
 
 from ._routing import build_router, register
-from .schemas import CreateUserRequest, PublicUserDTO, UserList, unset_excluded
+from .schemas import CreateUserRequest, DeletedResult, PublicUserDTO, UserList, unset_excluded
 
 router = build_router("/users", tag="users")
 
@@ -23,7 +21,7 @@ def create_user(payload: CreateUserRequest = Body(default_factory=CreateUserRequ
     return auth_service.create_user(unset_excluded(payload))
 
 
-def delete_user(user_id: str) -> dict[str, Any]:
+def delete_user(user_id: str) -> DeletedResult:
     return auth_service.remove_user(user_id)
 
 

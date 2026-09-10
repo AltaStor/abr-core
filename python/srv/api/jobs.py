@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import Body
 
 from python.srv.services import abr_v41
@@ -13,8 +11,10 @@ from ._routing import build_router, register
 from .schemas import (
     CreateCopyJobRequest,
     CreateJobRequest,
+    DeletedResult,
     JobDTO,
     JobList,
+    JobStartResult,
     StartJobRequest,
     UpdateJobRequest,
     unset_excluded,
@@ -43,12 +43,18 @@ def patch_job(job_id: str, payload: UpdateJobRequest = Body(default_factory=Upda
     return abr_v41.edit_job_record(job_id, unset_excluded(payload))
 
 
-def delete_job(job_id: str) -> dict[str, Any]:
+def delete_job(job_id: str) -> DeletedResult:
     return abr_v41.delete_job_record(job_id)
 
 
-def start_job(job_id: str, payload: StartJobRequest = Body(default_factory=StartJobRequest)) -> dict[str, Any]:
-    return abr_v41.start_job_record(job_id, force_full=bool(unset_excluded(payload).get("force_full", False)))
+def start_job(job_id: str, payload: StartJobRequest = Body(default_factory=StartJobRequest)) -> JobStartResult:
+    body = unset_excluded(payload)
+    return abr_v41.start_job_record(
+        job_id,
+        force_full=bool(body.get("force_full", False)),
+        force_synthetic=bool(body.get("force_synthetic", False)),
+        target_repository_id=str(body.get("target_repository_id") or "") or None,
+    )
 
 
 register(router, [

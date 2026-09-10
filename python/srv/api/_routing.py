@@ -4,16 +4,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any
 
 from fastapi import APIRouter, Depends
 
 from .auth_guard import require_session
-
-
-def body_dict(value: dict[str, Any] | None) -> dict[str, Any]:
-    return dict(value or {})
-
 
 RouteSpec = tuple[str, Callable, list[str]]
 

@@ -383,13 +383,16 @@ abr job start
 
 Description: Start a job immediately. The engine resolves execution type (Incremental, Synthetic Full, Active Full) automatically based on today's day-of-week match against the parameters configured inside the job. 
 
-abr job start --name <name> [--id <id>] [--full] [--wait] 
+abr job start --name <name> [--id <id>] [--full | --synthetic] [--target-repo <name>] [--wait] 
 
 Notes: 
 • First-run rule: The very first execution of a job always produces a Full backup, regardless of scheduled execution windows. 
 • --full forces an immediate Active Full execution regardless of previous restore points or scheduling rules. `--force-full` is accepted as a backward-compatible alias. 
+• --synthetic forces a Synthetic Full: the full backup is built by merging the chain already in the repository, so the VM is never read and no snapshot is taken. It needs a full backup followed by at least one incremental, and a repository that stores the .abr format (local or s3). AltaStor takes the chain order from its own catalog, so the ordering hazard the storage tool warns about does not apply here. The chain is only read - the restore points it merged are left in place for retention to age out. --full and --synthetic are mutually exclusive. 
+• --target-repo writes the merged full into another repository instead of the job's own, so a chain in one repository can be collapsed into a standalone full in another (local and s3 in any combination). The chain itself is only read, and the copy lands as the first restore point of its own chain there - the job keeps writing to its own repository. Only valid with --synthetic. 
+• A run refused because the chain cannot be merged (no incrementals, a full in the middle, disks that do not match) exits 6, separately from 4 used when a run fails while it is already under way. 
 • Priority notice: If the current day matches both synthetic and active targets in the job parameters, Active Full always takes priority. 
-• Repository capability notice: If today is a job-designated Synthetic Full day, but the target repository does not natively support synthesis, the engine transparently escalates the run execution to an Active Full. 
+• Repository capability notice: If today is a job-designated Synthetic Full day, but the target repository does not natively support synthesis, the engine transparently escalates the run execution to an Active Full. nfs and smb repositories are in that group; local and s3 both merge natively. 
 • --wait follows the started session's real progress (abr-vmdk-tool's own percent per disk) on stderr as a live bar until it finishes, then prints the final session state; stdout stays clean for scripting either way. If the job starts more than one session at once, --wait refuses to guess which one to follow and instead prints all of their session IDs so you can watch each with `abr session info --id <id> --watch`. Without --wait, the command returns immediately with the queued session(s), same as before this flag existed. If the followed session does not end completed (failed/stopped/canceled), the command exits with the same non-zero code used elsewhere for an unhealthy state, so `abr job start --wait || alert ...` reacts to the run's real outcome instead of always seeing exit 0. 
 
 SESSION COMMANDS 
@@ -419,7 +422,7 @@ abr session log --id <id>
 
 abr session stop 
 
-Description: Stop a running session. 
+Description: Stop a running session. A stopped backup discards the data it had written; a stopped restore removes the VM or disk it had created. 
 
 abr session stop --id <id> [--force] 
 
@@ -554,6 +557,8 @@ abr system export --file <path>
 Example: 
 abr system export --file /tmp/test.adrx
 
+The passphrase comes from ABR_EXPORT_PASSWORD, or is asked for interactively, and must be at least 8 characters - the same minimum the product enforces for user passwords. It is the only thing protecting the credentials and server settings inside the archive, and it cannot be recovered. A shorter one is refused before anything is written. 
+
 abr system import 
 
 Description: Restore DB catalog + configuration from a previously exported system archive.
@@ -573,8 +578,8 @@ Example:
 abr system get-support-bundle --file /tmp/support-bundle.zip
 
 Bundle contents:
-logs: logs/server/server.log, logs/cli/cli.log, logs/mongodb/mongod.log (if available)
-config: server.conf
+logs: logs/server/server.log, logs/cli/cli.log, logs/mongodb/mongod.log
+config: server.conf, mongod.conf
 dumps: logs/server/server.log.fault (if server crashed)
 catalog (from DB, as JSON): sessions.json (200 most recent), jobs.json, repositories.json, inventories.json, restore-points.json, health.json
 system-info.json (OS/host/CPU/RAM/disk)

@@ -63,7 +63,8 @@ class SessionCommands:
             "stop",
             help="Stop a session.",
             description=(
-                "Stop a running or queued session.\n\n"
+                "Stop a running or queued session. A stopped backup discards the data it "
+                "had written; a stopped restore removes the VM or disk it had created.\n\n"
                 "Examples:\n"
                 "  abr session stop --id <session-id>\n"
                 "  abr session stop --id <session-id> --force"
@@ -108,6 +109,8 @@ class SessionCommands:
         return 0
 
     def stop(self, args: argparse.Namespace) -> int:
+        if not str(args.id or "").strip():
+            raise ValueError("Session selection requires a non-empty --id")
         deps = CommandDependencies(args)
         deps.context.print_output(deps.context.api_client.post(f"api/v1/sessions/{args.id}/stop", json={"force": args.force}), [("id", "SESSION ID"), ("state", "STATE"), ("message", "MESSAGE")])
         return 0

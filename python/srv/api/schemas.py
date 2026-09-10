@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, SkipValidation
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, SkipValidation
 
 
 class _LenientModel(BaseModel):
@@ -15,6 +15,16 @@ class _LenientModel(BaseModel):
 class _Ref(_LenientModel):
     id: str | None = None
     name: str | None = None
+
+
+DocStr = Annotated[Any, Field(json_schema_extra={"type": "string"})]
+DocInt = Annotated[Any, Field(json_schema_extra={"type": "integer"})]
+DocNum = Annotated[Any, Field(json_schema_extra={"type": "number"})]
+DocBool = Annotated[Any, Field(json_schema_extra={"type": "boolean"})]
+DocObject = Annotated[Any, Field(json_schema_extra={"type": "object"})]
+DocArray = Annotated[Any, Field(json_schema_extra={"type": "array"})]
+DocStrArray = Annotated[Any, Field(json_schema_extra={"type": "array", "items": {"type": "string"}})]
+DocObjectArray = Annotated[Any, Field(json_schema_extra={"type": "array", "items": {"type": "object"}})]
 
 
 class JobDTO(_LenientModel):
@@ -392,6 +402,8 @@ class UpdateJobRequest(_LenientModel):
 
 class StartJobRequest(_LenientModel):
     force_full: LaxBool | None = None
+    force_synthetic: LaxBool | None = None
+    target_repository_id: LaxStr | None = None
 
 
 class StopSessionRequest(_LenientModel):
@@ -408,3 +420,308 @@ class CreateUserRequest(_LenientModel):
     name: LaxStr | None = None
     password: LaxStr | None = None
     fullName: LaxStr | None = None
+
+
+
+
+class UserResult(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+    fullName: DocStr = None
+    created_at: DocStr = None
+    passwordPolicyExempt: DocBool = None
+
+
+
+
+
+class StartRestoreTarget(_LenientModel):
+    inventory_id: LaxStr | None = None
+    inventory: LaxStr | None = None
+    host_id: LaxStr | None = None
+    datastore_id: LaxStr | None = None
+    vm_name: LaxStr | None = None
+    folder_id: LaxStr | None = None
+    resource_pool_id: LaxStr | None = None
+
+
+class StartRestoreOptions(_LenientModel):
+    power_on_after_restore: LaxBool | None = None
+    preserve_mac_addresses: LaxBool | None = None
+    preserve_firmware: LaxBool | None = None
+    connect_nics: LaxBool | None = None
+    disk_provisioning: LaxStr | None = None
+
+
+class StartRestoreNetworkMapping(_LenientModel):
+    source_nic_id: LaxStr | None = None
+    target_network_id: LaxStr | None = None
+
+
+class StartRestoreRequest(_LenientModel):
+    restore_point_id: LaxStr | None = None
+    point_id: LaxStr | None = None
+    backup_id: LaxStr | None = None
+    backup: LaxStr | None = None
+    inventory_id: LaxStr | None = None
+    repository_id: LaxStr | None = None
+    repository: LaxStr | None = None
+    repo_id: LaxStr | None = None
+    repo: LaxStr | None = None
+    restore_mode: LaxStr | None = None
+    target: SkipValidation[StartRestoreTarget] | None = None
+    options: SkipValidation[StartRestoreOptions] | None = None
+    network_mappings: SkipValidation[list[StartRestoreNetworkMapping]] | None = None
+    network_map: DocStrArray = None
+    target_inventory: LaxStr | None = None
+    target_inventory_id: LaxStr | None = None
+    target_host: LaxStr | None = None
+    target_host_id: LaxStr | None = None
+    target_datastore: LaxStr | None = None
+    target_datastore_id: LaxStr | None = None
+    target_vm_name: LaxStr | None = None
+    name: LaxStr | None = None
+    power_on: LaxBool | None = None
+    power_on_after_restore: LaxBool | None = None
+    preserve_mac_addresses: LaxBool | None = None
+    preserve_firmware: LaxBool | None = None
+    connect_nics: LaxBool | None = None
+    disk_provisioning: LaxStr | None = None
+    disk_type: LaxStr | None = None
+    force: LaxBool | None = None
+
+
+class RestoreStartResult(_LenientModel):
+    id: DocStr = None
+    restore_session_id: DocStr = None
+    session_state: DocStr = None
+    state: DocStr = None
+    status: DocStr = None
+    restore_mode: DocStr = None
+    restore_point_id: DocStr = None
+    backup_id: DocStr = None
+    source_inventory_id: DocStr = None
+    source_inventory_name: DocStr = None
+    source_vm_id: DocStr = None
+    source_vm_name: DocStr = None
+    target_inventory_id: DocStr = None
+    target_inventory_name: DocStr = None
+    target_host_id: DocStr = None
+    target_host_name: DocStr = None
+    target_datastore_id: DocStr = None
+    datastore_name: DocStr = None
+    new_name: DocStr = None
+
+
+
+
+class RestoreVmList(_LenientModel):
+    items: DocObjectArray = None
+
+
+class RestorePointList(_LenientModel):
+    items: DocObjectArray = None
+
+
+
+
+
+
+class RestoreContextDTO(_LenientModel):
+    restore_point: DocObject = None
+    source_vm: DocObject = None
+    targets: DocObject = None
+    defaults: DocObject = None
+    capabilities: DocObject = None
+
+
+class SystemVersionDTO(_LenientModel):
+    product: DocStr = None
+    version: DocStr = None
+    cli_binary: DocStr = None
+
+
+class SystemInfoDTO(_LenientModel):
+    product: DocStr = None
+    version: DocStr = None
+    hostname: DocStr = None
+    os: DocStr = None
+    kernel: DocStr = None
+    uptime_sec: DocNum = None
+    cpu_cores: DocInt = None
+    memory_gb: DocNum = None
+
+
+
+
+class SystemHealthDTO(_LenientModel):
+    status: DocStr = None
+    components: DocObject = None
+    counts: DocObject = None
+
+
+class DeletedResult(_LenientModel):
+    id: DocStr = None
+    deleted: DocBool = None
+
+
+class RemovedResult(_LenientModel):
+    id: DocStr = None
+    removed: DocBool = None
+
+
+
+class JobStartResult(_LenientModel):
+    job: DocObject = None
+    items: DocObjectArray = None
+
+
+
+class SessionLogDTO(_LenientModel):
+    id: DocStr = None
+    logs: DocObjectArray = None
+
+
+class StopSessionResult(_LenientModel):
+    id: DocStr = None
+    state: DocStr = None
+    message: DocStr = None
+
+
+
+class TreeResponse(_LenientModel):
+    nodes: DocObjectArray = None
+
+
+class RepositoryScanResult(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+    status: DocStr = None
+    last_scan_at: DocStr = None
+    catalog: DocObject = None
+
+
+class S3TestResult(_LenientModel):
+    status: DocStr = None
+    message: DocStr = None
+    checks: DocObjectArray = None
+
+
+class RepositoryVerifyResult(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+    type: DocStr = None
+    status: DocStr = None
+    message: DocStr = None
+    checks: DocObjectArray = None
+    immutability: DocObject = None
+    immutability_effect: DocObject = None
+
+
+class RepositoryImmutabilityApplyResult(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+    status: DocStr = None
+    message: DocStr = None
+    immutability: DocObject = None
+    actual_retention_days: DocArray = None
+    restore_point_count: DocInt = None
+    updated_restore_points: DocInt = None
+    failed_restore_points: DocInt = None
+    failures: DocObjectArray = None
+
+
+class InventoryScanResult(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+    status: DocStr = None
+    last_scan_at: DocStr = None
+    discovery: DocObject = None
+
+
+class InventoryTestResult(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+    type: DocStr = None
+    status: DocStr = None
+    code: DocStr = None
+    message: DocStr = None
+    cluster: DocStr = None
+    error: DocStr = None
+
+
+class BackupDeleteResult(_LenientModel):
+    id: DocStr = None
+    session_id: DocStr = None
+    state: DocStr = None
+    deleted: DocBool = None
+    restore_point_count: DocInt = None
+    artifacts_removed: DocBool = None
+
+
+class BackupVerifyResult(_LenientModel):
+    id: DocStr = None
+    session_id: DocStr = None
+    state: DocStr = None
+    result: DocStr = None
+    checked_restore_points: DocInt = None
+    checked_artifacts: DocInt = None
+    warnings: DocArray = None
+    errors: DocArray = None
+
+
+
+class SystemLogsDTO(_LenientModel):
+    entries: DocObjectArray = None
+    total: DocInt = None
+    limit: DocInt = None
+    level: DocStr = None
+    has_more: DocBool = None
+    files: DocStrArray = None
+    searched: DocStrArray = None
+    warnings: DocStrArray = None
+
+
+class CatalogSnapshotRequest(_LenientModel):
+    password: LaxStr | None = None
+
+
+class CatalogRestoreRequest(_LenientModel):
+    password: LaxStr | None = None
+    archive_base64: LaxStr | None = None
+
+
+
+class CatalogSnapshotResult(_LenientModel):
+    manifest: DocObject = None
+    archive_base64: DocStr = None
+
+
+class CatalogRestoreResult(_LenientModel):
+    manifest: DocObject = None
+    restored: DocObject = None
+    configuration: DocObject = None
+
+
+
+class SupportBundleResult(_LenientModel):
+    manifest: DocObject = None
+    archive_base64: DocStr = None
+
+
+class HealthDTO(_LenientModel):
+    status: DocStr = None
+
+
+class LoginResult(_LenientModel):
+    token: DocStr = None
+    expires_at: DocStr = None
+    user: DocObject = None
+
+
+class LogoutResult(_LenientModel):
+    status: DocStr = None
+
+
+class ExtendSessionResult(_LenientModel):
+    expires_at: DocStr = None

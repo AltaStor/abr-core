@@ -48,6 +48,7 @@ from .api import sessions as sessions_api
 from .api import system as system_api
 from .api import users as users_api
 from .api.dashboard import router as dashboard_router
+from .api.schemas import HealthDTO
 from .core import tls_renewal
 from .core.job_scheduler import JobScheduler
 from .core.mongo_db_wrapper import (
@@ -451,7 +452,7 @@ for domain in (
 app.include_router(dashboard_router)
 
 
-@app.get("/health")
+@app.get("/health", response_model=HealthDTO)
 def health() -> dict[str, str]:
     return {"status": "ok"}
 

@@ -56,6 +56,9 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
                     "python.srv.services.support_bundle_service._resolve_log_dir",
                     return_value=str(tmp_path / "empty-logs"),
                 ),
+                patch(
+                    "python.srv.services.support_bundle_service._run_tool", return_value=None
+                ),
             ]
 
             if mongodb_defaults_text is not None:
@@ -270,11 +273,113 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
         text = dict(files)["config/defaults.env"].decode("utf-8")
         self.assertIn("BACKUP_WORKER_COUNT=", text)
 
-    def test_the_mongodb_config_read_is_the_one_the_package_ships(self) -> None:
-        self.assertEqual(
-            str(support_bundle_service._mongodb_configuration_file()),
-            "/etc/altastor-backup/mongod.conf",
+    def test_the_mongodb_config_path_comes_from_the_unit_mongod_actually_runs(self) -> None:
+        with patch(
+            "python.srv.services.support_bundle_service._unit_property",
+            return_value="{ path=/usr/bin/mongod ; argv[]=/usr/bin/mongod "
+            "--config /etc/altastor-backup/mongod.conf ; ignore_errors=no }",
+        ):
+            self.assertEqual(
+                str(support_bundle_service._mongodb_configuration_file()),
+                "/etc/altastor-backup/mongod.conf",
+            )
+
+    def test_the_mongodb_config_falls_back_to_the_packaged_path_without_systemd(self) -> None:
+        with patch(
+            "python.srv.services.support_bundle_service._unit_property", return_value=""
+        ), patch.object(support_bundle_service.Path, "is_file", return_value=False):
+            self.assertEqual(
+                str(support_bundle_service._mongodb_configuration_file()),
+                "/etc/altastor-backup/mongod.conf",
+            )
+
+    def test_package_versions_are_listed_in_the_manifest(self) -> None:
+        dpkg_output = (
+            "altastor-backup-mongodb-config 8.0.26+4\n"
+            "altastor-backup-server 1.0+37.g39d04b7cae77\n"
+            "altastor-backup-webui 1.0+24.g691e43457344\n"
         )
+
+        with patch(
+            "python.srv.services.support_bundle_service._run_tool", return_value=dpkg_output
+        ):
+            self.assertEqual(
+                support_bundle_service._package_versions(),
+                {
+                    "altastor-backup-mongodb-config": "8.0.26+4",
+                    "altastor-backup-server": "1.0+37.g39d04b7cae77",
+                    "altastor-backup-webui": "1.0+24.g691e43457344",
+                },
+            )
+
+    def test_the_manifest_omits_package_versions_when_dpkg_is_unavailable(self) -> None:
+        with patch(
+            "python.srv.services.support_bundle_service._package_versions", return_value={}
+        ):
+            result = self._generate()
+
+        self.assertNotIn("package_versions", result["manifest"])
+        self.assertFalse([w for w in result["manifest"]["warnings"] if "package" in w.lower()])
+
+    def test_the_manifest_carries_package_versions_when_dpkg_answers(self) -> None:
+        with patch(
+            "python.srv.services.support_bundle_service._package_versions",
+            return_value={"altastor-backup-server": "1.0+37.g39d04b7cae77"},
+        ):
+            result = self._generate()
+
+        self.assertEqual(
+            result["manifest"]["package_versions"],
+            {"altastor-backup-server": "1.0+37.g39d04b7cae77"},
+        )
+
+    def test_systemd_units_and_drop_ins_are_collected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            unit = tmp_path / "altastor-backup-server.service"
+            unit.write_text("[Service]\nUser=altastor-backup\n", encoding="utf-8")
+            drop_in_dir = tmp_path / "mongod.service.d"
+            drop_in_dir.mkdir()
+            drop_in = drop_in_dir / "altastor-backup.conf"
+            drop_in.write_text("[Service]\nExecStart=/usr/bin/mongod\n", encoding="utf-8")
+
+            def unit_files(name: str):
+                return [unit] if name.startswith("altastor") else [drop_in]
+
+            with patch(
+                "python.srv.services.support_bundle_service._systemd_unit_files",
+                side_effect=unit_files,
+            ):
+                files = dict(support_bundle_service._collect_systemd_units())
+
+        self.assertIn("config/systemd/altastor-backup-server.service", files)
+        self.assertIn("config/systemd/mongod.service.d/altastor-backup.conf", files)
+        self.assertIn(b"User=altastor-backup", files["config/systemd/altastor-backup-server.service"])
+
+    def test_a_secret_in_a_unit_file_is_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            unit = pathlib.Path(tmp) / "altastor-backup-server.service"
+            unit.write_text(
+                "[Service]\n"
+                "Environment=ABR_BOOTSTRAP_ADMIN_PASSWORD=TotallySecretPW123\n"
+                "Environment=ABR_TLS_KEY_FILE=/etc/altastor-backup/tls/server.key\n",
+                encoding="utf-8",
+            )
+
+            with patch(
+                "python.srv.services.support_bundle_service._systemd_unit_files",
+                side_effect=lambda name: [unit] if name.startswith("altastor") else [],
+            ):
+                files = dict(support_bundle_service._collect_systemd_units())
+
+        text = files["config/systemd/altastor-backup-server.service"].decode("utf-8")
+        self.assertNotIn("TotallySecretPW123", text)
+        self.assertIn("Environment=ABR_BOOTSTRAP_ADMIN_PASSWORD=********", text)
+        self.assertIn("ABR_TLS_KEY_FILE=/etc/altastor-backup/tls/server.key", text)
+
+    def test_no_systemd_means_no_files_and_no_warnings(self) -> None:
+        with patch("python.srv.services.support_bundle_service._run_tool", return_value=None):
+            self.assertEqual(support_bundle_service._collect_systemd_units(), [])
 
     def test_mongodb_log_path_is_read_from_the_yaml_mongod_conf(self) -> None:
         text = (
@@ -408,7 +513,7 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
         self.assertIn("mode 0640", warnings[0])
         self.assertIn("the support bundle runs as", warnings[0])
 
-    def test_a_missing_mongod_conf_is_warned_not_fatal(self) -> None:
+    def test_a_missing_mongod_conf_is_skipped_without_a_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with patch(
                 "python.srv.services.support_bundle_service._mongodb_configuration_file",
@@ -418,7 +523,7 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
                 files = support_bundle_service._collect_mongodb_configuration(warnings)
 
         self.assertEqual(files, [])
-        self.assertTrue(any("MongoDB configuration file not found" in w for w in warnings))
+        self.assertEqual(warnings, [])
 
     def test_the_log_is_still_collected_when_mongod_conf_cannot_be_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -554,7 +659,7 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
         self.assertNotIn(b"AKIAEXAMPLE", collected)
         self.assertIn(b"********", collected)
 
-    def test_a_log_larger_than_the_cap_is_tailed_and_the_bundle_says_so(self) -> None:
+    def test_a_large_log_is_collected_whole(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = pathlib.Path(tmp)
             mongo_dir = tmp_path / "mongodb"
@@ -562,9 +667,10 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
             huge = mongo_dir / "mongod.log"
             filler = b"x" * 1024 + b"\n"
             with huge.open("wb") as handle:
-                while handle.tell() < support_bundle_service._LOG_TAIL_BYTES + 4096:
+                while handle.tell() < 3 * 1024 * 1024:
                     handle.write(filler)
                 handle.write(b"the newest line\n")
+            size = huge.stat().st_size
 
             config = tmp_path / "mongod.conf"
             config.write_text(f"systemLog:\n  path: {huge}\n", encoding="utf-8")
@@ -580,10 +686,9 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
                 files = dict(support_bundle_service._collect_logs(warnings))
 
         collected = files["logs/mongodb/mongod.log"]
-        self.assertLessEqual(len(collected), support_bundle_service._LOG_TAIL_BYTES)
+        self.assertEqual(len(collected), size)
         self.assertTrue(collected.endswith(b"the newest line\n"))
-        self.assertTrue(collected.startswith(b"x"))
-        self.assertTrue(any("Collected only the last" in w for w in warnings))
+        self.assertFalse([w for w in warnings if "Collected only" in w])
 
     def test_rotated_server_logs_are_collected_too(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -694,6 +799,8 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
         ), patch(
             "python.srv.services.support_bundle_service._mongodb_configuration_file",
             return_value=pathlib.Path(log_dir) / "does-not-exist-mongodb.default",
+        ), patch(
+            "python.srv.services.support_bundle_service._run_tool", return_value=None
         ):
             return support_bundle_service.generate_support_bundle()
 

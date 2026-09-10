@@ -70,6 +70,7 @@ from python.srv.core.storage_tool import (
     hydrate_manifest_via_disk_tool,
     immutability_is_enabled,
     immutability_rank,
+    is_abr_repository,
     is_s3_repository,
     list_disk_tool_backups,
     mask_credential_fields,
@@ -102,6 +103,7 @@ from python.srv.services.backup_mode import object_lock_actual_retention_days
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL
 
 from .api_errors import ApiError, api_error
+from .auth_service import MIN_PASSWORD_LENGTH
 
 LOGGER = logging.getLogger(__name__)
 
@@ -169,7 +171,7 @@ def schedule_inventory_discovery(inventory_id: str, *, force: bool = False) -> t
     return thread
 
 PRODUCT_NAME = "AltaStor Backup & Replication"
-PRODUCT_VERSION = "4.1.0"
+PRODUCT_VERSION = "26.09.1"
 
 REPO_TYPES = ("local", "nfs", "smb", "s3")
 
@@ -179,6 +181,7 @@ EXECUTION_TYPES = ("Incremental", "ActiveFull", "SyntheticFull")
 EXECUTION_REASONS = (
     "FirstRun",
     "ForceFull",
+    "ForceSynthetic",
     "ActiveFullWindow",
     "SyntheticFullWindow",
     "ActiveOverridesSynthetic",
@@ -440,6 +443,14 @@ def _ensure(condition: bool, status_code: int, code: str, message: str, **detail
 
 
 def _ensure_ascii_name(value: str, *, field: str, code: str) -> None:
+    _ensure(
+        value == value.strip(),
+        400,
+        code,
+        f"{field} must not start or end with whitespace",
+        field=field,
+        value=value,
+    )
     _ensure(
         len(value) <= MAX_NAME_LENGTH,
         400,
@@ -957,7 +968,7 @@ def repository_supports_synthetic(repository: dict[str, Any]) -> bool:
     metadata = repository.get("metadata") if isinstance(repository.get("metadata"), dict) else {}
     if isinstance(metadata.get("supports_synthetic_full"), bool):
         return bool(metadata["supports_synthetic_full"])
-    return str(repository.get("type") or "") in {"local", "nfs"}
+    return is_abr_repository(repository)
 
 
 def repository_catalog_summary(repository_id: str) -> dict[str, int]:
@@ -1396,7 +1407,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             "invalid_inventory",
             f"Unsupported inventory type: {inventory_type}. Supported types: {', '.join(creatable_inventory_types())}",
         )
-    name = str(payload.get("name") or "").strip()
+    name = str(payload.get("name") or "")
     address = str(payload.get("address") or "").strip()
     port = int(payload.get("port") or 0) if payload.get("port") is not None else None
     username = str(payload.get("username") or "").strip()
@@ -1404,7 +1415,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
     token = str(payload.get("token") or "").strip()
     insecure = bool(payload.get("insecure", False))
     description = str(payload.get("description") or "")
-    _ensure(bool(name), 422, "invalid_inventory", "Inventory name is required")
+    _ensure(bool(name.strip()), 422, "invalid_inventory", "Inventory name is required")
     _ensure_ascii_name(name, field="Inventory name", code="invalid_inventory")
     _validate_text_fields(payload, INVENTORY_TEXT_FIELDS, code="invalid_inventory")
     _ensure(bool(address), 422, "invalid_inventory", "Inventory address is required")
@@ -1503,8 +1514,8 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
         normalized["updated_at"] = utc_now()
     if updates:
         if "name" in updates:
-            new_name = str(updates["name"] or "").strip()
-            _ensure(bool(new_name), 422, "invalid_inventory", "Inventory name must not be empty")
+            new_name = str(updates["name"] or "")
+            _ensure(bool(new_name.strip()), 422, "invalid_inventory", "Inventory name must not be empty")
             _ensure_ascii_name(new_name, field="Inventory name", code="invalid_inventory")
         normalized = apply_inventory_updates(normalized, updates)
     _ensure(any(key in payload for key in ("name", "address", "port", "username", "password", "description", "token", "insecure")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
@@ -2084,7 +2095,7 @@ def resolve_repository(name: str | None = None, record_id: str | None = None) ->
 
 
 def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
-    name = str(payload.get("name") or "").strip()
+    name = str(payload.get("name") or "")
     repo_type = str(payload.get("type") or "").strip().lower()
     path = str(payload.get("path") or "").strip() or None
     address = str(payload.get("address") or "").strip() or None
@@ -2093,7 +2104,7 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
     username = str(payload.get("username") or "").strip() or None
     password = str(payload.get("password") or "") or None
     description = str(payload.get("description") or "").strip() or None
-    _ensure(bool(name), 422, "invalid_repository", "Repository name is required")
+    _ensure(bool(name.strip()), 422, "invalid_repository", "Repository name is required")
     _ensure_ascii_name(name, field="Repository name", code="invalid_repository")
     _validate_text_fields(payload, REPOSITORY_TEXT_FIELDS, code="invalid_repository")
     _ensure(repo_type in REPO_TYPES, 422, "invalid_repository", "Repository type must be one of: local, nfs, smb, s3", repo_type=repo_type)
@@ -2217,8 +2228,8 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
     next_immutability: dict[str, Any] | None = None
     next_s3_config: dict[str, Any] | None = None
     if "name" in payload and payload["name"] is not None:
-        new_name = str(payload["name"]).strip()
-        _ensure(bool(new_name), 422, "invalid_repository", "Repository name must not be empty")
+        new_name = str(payload["name"])
+        _ensure(bool(new_name.strip()), 422, "invalid_repository", "Repository name must not be empty")
         _ensure_ascii_name(new_name, field="Repository name", code="invalid_repository")
         for existing_id, existing in catalog_entries(REPOSITORIES):
             if existing_id == record_id:
@@ -3400,7 +3411,7 @@ def list_jobs() -> list[dict[str, Any]]:
 
 
 def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
-    name = str(payload.get("name") or "").strip()
+    name = str(payload.get("name") or "")
     vm_tokens = payload.get("vms")
     repo_name = payload.get("repo")
     repo_id = payload.get("repo_id")
@@ -3421,7 +3432,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         task_parameters = {}
     _ensure(isinstance(task_parameters, dict), 422, "invalid_job", "task_parameters must be an object")
     task_parameters = _validate_task_parameters(task_parameters)
-    _ensure(bool(name), 422, "invalid_job", "Job name is required")
+    _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
     _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
     _ensure(retention_days > 0, 422, "invalid_job", "retention-days must be greater than 0")
@@ -3477,7 +3488,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
-    name = str(payload.get("name") or "").strip()
+    name = str(payload.get("name") or "")
     source_job = resolve_job(
         name=payload.get("source") or payload.get("source_job"),
         record_id=payload.get("source_id") or payload.get("source_job_id"),
@@ -3495,7 +3506,7 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
         raw_retention_days = source_job.get("retention_days")
     retention_days = int(raw_retention_days) if raw_retention_days is not None else 14
     description = str(payload.get("description") or source_job.get("description") or "").strip()
-    _ensure(bool(name), 422, "invalid_job", "Job name is required")
+    _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
     _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
     _ensure(retention_days > 0, 422, "invalid_job", "retention-days must be greater than 0")
@@ -3545,8 +3556,8 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     updated = _json_clone(current)
     changed = False
     if payload.get("name"):
-        new_name = str(payload["name"]).strip()
-        _ensure(bool(new_name), 422, "invalid_job", "Job name must not be empty")
+        new_name = str(payload["name"])
+        _ensure(bool(new_name.strip()), 422, "invalid_job", "Job name must not be empty")
         _ensure_ascii_name(new_name, field="Job name", code="invalid_job")
         for existing_id, existing in catalog_entries(JOBS):
             if existing_id == job_id:
@@ -3732,10 +3743,21 @@ def resolve_job_execution(
     *,
     vm_id: str,
     force_full: bool,
+    force_synthetic: bool = False,
     now: datetime | None = None,
 ) -> tuple[str, str]:
     current = now or _now_utc()
     repository = resolve_repository(record_id=str(job.get("repo_id") or "")) if job.get("repo_id") else {}
+    if force_synthetic:
+        _ensure(
+            repository_supports_synthetic(repository),
+            422,
+            "invalid_job",
+            f"Repository '{repository.get('name') or job.get('repo_name')}' cannot merge a backup chain, "
+            "so a synthetic full cannot be run against it",
+            repository_id=job.get("repo_id"),
+        )
+        return "SyntheticFull", "ForceSynthetic"
     if force_full:
         return "ActiveFull", "ForceFull"
     previous = _latest_successful_point(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
@@ -4109,6 +4131,8 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
         "errors": error or ([] if not result.get("message") or _session_state(task) == "completed" else [{"message": result.get("message")}]),
         "warnings": task.get("warnings") if isinstance(task.get("warnings"), list) else [],
     }
+    if result.get("failure_kind"):
+        dto["failure_kind"] = result.get("failure_kind")
     if str(task.get("task_type") or "") == "verify":
         dto["verify"] = result.get("verify")
     if str(task.get("task_type") or "") == "delete":
@@ -6459,13 +6483,22 @@ def _create_completed_copy_session(job: dict[str, Any]) -> dict[str, Any]:
     return session_to_dto(session)
 
 
-def _create_backup_session(job: dict[str, Any], *, vm_id: str, vm_name: str, execution_type: str, execution_reason: str) -> dict[str, Any]:
+def _create_backup_session(
+    job: dict[str, Any],
+    *,
+    vm_id: str,
+    vm_name: str,
+    execution_type: str,
+    execution_reason: str,
+    target_repository: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     task_parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else {}
     parameters = dict(task_parameters)
     parameters.update(
         {
-            "repository_id": job.get("repo_id"),
-            "repository_name": job.get("repo_name"),
+            "repository_id": (target_repository or {}).get("id") or job.get("repo_id"),
+            "repository_name": (target_repository or {}).get("name") or job.get("repo_name"),
+            "source_repository_id": job.get("repo_id") if target_repository else None,
             "vm_name": vm_name,
             "resolved_backup_type": execution_type,
             "resolved_backup_reason": execution_reason,
@@ -6499,14 +6532,44 @@ def _create_backup_session(job: dict[str, Any], *, vm_id: str, vm_name: str, exe
     return session_to_dto(task)
 
 
-def start_job_record(job_id: str, *, force_full: bool = False) -> dict[str, Any]:
+def start_job_record(
+    job_id: str,
+    *,
+    force_full: bool = False,
+    force_synthetic: bool = False,
+    target_repository_id: str | None = None,
+) -> dict[str, Any]:
     job = resolve_job(record_id=job_id)
+    _ensure(
+        not (force_full and force_synthetic),
+        422,
+        "invalid_job",
+        "A run is either an active full or a synthetic full, not both",
+    )
+    target_repository = None
+    if target_repository_id:
+        _ensure(
+            force_synthetic,
+            422,
+            "invalid_job",
+            "A target repository is only used by a synthetic full",
+        )
+        target_repository = _find_by_id(catalog_records(REPOSITORIES), target_repository_id, label="Repository")
+        _ensure(
+            repository_supports_synthetic(normalize_repository_record(target_repository)),
+            422,
+            "invalid_job",
+            f"Repository '{target_repository.get('name')}' cannot hold a merged backup",
+            repository_id=target_repository_id,
+        )
     sessions = []
     if job["job_type"] == "backup-copy":
         sessions.append(_create_completed_copy_session(job))
     else:
         for vm_id, vm_name in zip(job.get("vm_ids") or [], job.get("vm_names") or []):
-            execution_type, execution_reason = resolve_job_execution(job, vm_id=vm_id, force_full=force_full)
+            execution_type, execution_reason = resolve_job_execution(
+                job, vm_id=vm_id, force_full=force_full, force_synthetic=force_synthetic
+            )
             sessions.append(
                 _create_backup_session(
                     job,
@@ -6514,6 +6577,7 @@ def start_job_record(job_id: str, *, force_full: bool = False) -> dict[str, Any]
                     vm_name=vm_name,
                     execution_type=execution_type,
                     execution_reason=execution_reason,
+                    target_repository=target_repository,
                 )
             )
     schedule = job.get("schedule")
@@ -7013,6 +7077,13 @@ def export_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     password = payload.get("password") if isinstance(payload, dict) else None
     if not isinstance(password, str) or not password:
         raise api_error(422, "invalid_argument", "password is required")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise api_error(
+            422,
+            "invalid_argument",
+            f"Export password must be at least {MIN_PASSWORD_LENGTH} characters. "
+            "It is the only thing protecting the credentials and server configuration in the archive.",
+        )
 
     catalog = snapshot_catalog()
     configuration = snapshot_configuration()

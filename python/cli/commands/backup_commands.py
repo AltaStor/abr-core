@@ -111,6 +111,8 @@ class BackupCommands:
         return 0
 
     def delete(self, args: argparse.Namespace) -> int:
+        if not str(args.id or "").strip():
+            raise ValueError("Backup selection requires a non-empty --id")
         deps = CommandDependencies(args)
         params: dict[str, Any] = {"wait": "false"}
         if getattr(args, "force", False):
@@ -144,6 +146,8 @@ class BackupCommands:
         return 0
 
     def verify(self, args: argparse.Namespace) -> int:
+        if not str(args.id or "").strip():
+            raise ValueError("Backup selection requires a non-empty --id")
         deps = CommandDependencies(args)
         started = deps.context.api_client.post(
             f"api/v1/backups/{args.id}/verify", params={"wait": "false"}, timeout=21600

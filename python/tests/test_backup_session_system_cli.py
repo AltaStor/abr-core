@@ -17,7 +17,7 @@ from unittest.mock import patch
 from python.cli.commands.backup_commands import BackupCommands
 from python.cli.commands.session_commands import SessionCommands
 from python.cli.commands.system_commands import PASSWORD_ENV_VAR, SystemCommands
-from python.cli.errors import CliStructuredError
+from python.cli.errors import CliStructuredError, cli_error_from_exception
 from python.cli.exit_codes import INVALID_STATE, INVALID_USAGE
 from python.cli.parsing.parser_builder import AltaStorParserBuilder
 from python.srv.core.secure_archive import encrypt_payload
@@ -559,6 +559,69 @@ class SessionCommandTests(unittest.TestCase):
             headers={"X-Client-Type": "cli", "X-ABR-API-Version": "1.0"},
             verify=False,
         )
+
+
+class EmptyIdSelectorTests(unittest.TestCase):
+    BASE = {"base_url": "http://example.test", "output": "table", "log_level": "info"}
+
+    def _cases(self):
+        return [
+            ("backup delete", "Backup", lambda value: BackupCommands().delete(
+                SimpleNamespace(**self.BASE, id=value, force=False)
+            )),
+            ("backup verify", "Backup", lambda value: BackupCommands().verify(
+                SimpleNamespace(**self.BASE, id=value)
+            )),
+            ("session stop", "Session", lambda value: SessionCommands().stop(
+                SimpleNamespace(**self.BASE, id=value, force=False)
+            )),
+        ]
+
+    @patch("python.cli.api.client.requests.request")
+    def test_an_empty_id_is_refused_before_any_request(self, request_mock) -> None:
+        for label, noun, run in self._cases():
+            for value in ("", "   ", "\t"):
+                with self.subTest(command=label, value=value):
+                    with self.assertRaises(ValueError) as ctx:
+                        run(value)
+                    self.assertEqual(
+                        str(ctx.exception), f"{noun} selection requires a non-empty --id"
+                    )
+                    request_mock.assert_not_called()
+
+    def test_the_refusal_maps_to_an_invalid_usage_exit_code(self) -> None:
+        for label, _noun, run in self._cases():
+            with self.subTest(command=label):
+                with self.assertRaises(ValueError) as ctx:
+                    run("")
+                cli_error = cli_error_from_exception(ctx.exception)
+                self.assertEqual(cli_error.exit_code, INVALID_USAGE)
+                self.assertEqual(cli_error.code, "invalid_argument")
+
+    def test_the_message_names_the_argument_and_hides_the_endpoint(self) -> None:
+        for label, _noun, run in self._cases():
+            with self.subTest(command=label):
+                with self.assertRaises(ValueError) as ctx:
+                    run("")
+                message = str(ctx.exception)
+                self.assertIn("--id", message)
+                self.assertNotIn("api/v1", message)
+                self.assertNotIn("http", message)
+
+    @patch("python.cli.api.client.requests.request")
+    def test_a_non_empty_id_still_reaches_the_endpoint(self, request_mock) -> None:
+        request_mock.return_value = _FakeResponse({})
+        expected = {
+            "backup delete": "http://example.test/api/v1/backups/backup::abc",
+            "backup verify": "http://example.test/api/v1/backups/backup::abc/verify",
+            "session stop": "http://example.test/api/v1/sessions/backup::abc/stop",
+        }
+        for label, _noun, run in self._cases():
+            with self.subTest(command=label):
+                request_mock.reset_mock()
+                with redirect_stdout(io.StringIO()):
+                    run("backup::abc")
+                self.assertEqual(request_mock.call_args[0][1], expected[label])
 
 
 class SystemCommandTests(unittest.TestCase):

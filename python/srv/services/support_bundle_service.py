@@ -8,6 +8,7 @@ import gzip
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import zipfile
@@ -22,14 +23,19 @@ from python.srv.core.logger_conf import (
 )
 from python.srv.core.logger_conf import is_worth_collecting as _is_worth_collecting
 from python.srv.core.logger_conf import redact_log_bytes as _redact_log_bytes
+from python.srv.core.logger_conf import REDACTED_VALUE
 from python.srv.core.logger_conf import redact_text as _redact_config_text
 from python.srv.core.server_defaults import DEFAULTS_ENV_PATH
+from python.srv.core.subprocess_util import run_capped
 from python.srv.core.utils import utc_now
 
 from . import abr_v41
 
 _DEFAULT_MONGODB_LOG_PATH = "/var/log/mongodb/mongod.log"
-_LOG_TAIL_BYTES = 2 * 1024 * 1024
+_SYSTEMCTL_TIMEOUT_SECONDS = 10
+_UNIT_SECRET_ENVIRONMENT = re.compile(
+    r'(?im)^(\s*Environment="?[A-Za-z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|APIKEY)[A-Za-z0-9_]*\s*=\s*)([^"\s]+)'
+)
 
 
 def _server_configuration_file_candidates() -> list[Path]:
@@ -43,8 +49,68 @@ def _server_configuration_file_candidates() -> list[Path]:
     ]
 
 
+def _run_tool(command: list[str]) -> str | None:
+    try:
+        result = run_capped(command, timeout=_SYSTEMCTL_TIMEOUT_SECONDS, nice=False)
+    except Exception:
+        return None
+    output = result.stdout
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    return output or None
+
+
+def _package_versions() -> dict[str, str]:
+    output = _run_tool(["dpkg-query", "-W", "-f=${Package} ${Version}\\n", "altastor-*"])
+    if not output:
+        return {}
+
+    versions: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].startswith("altastor"):
+            versions[parts[0]] = parts[1]
+    return versions
+
+
+def _unit_property(unit: str, name: str) -> str:
+    output = _run_tool(["systemctl", "show", unit, "-p", name, "--value"])
+    return (output or "").strip()
+
+
+def _systemd_unit_files(unit: str) -> list[Path]:
+    paths: list[Path] = []
+    fragment = _unit_property(unit, "FragmentPath")
+    if fragment:
+        paths.append(Path(fragment))
+    paths.extend(Path(entry) for entry in _unit_property(unit, "DropInPaths").split())
+    return paths
+
+
+def _mongodb_configuration_from_systemd() -> Path | None:
+    exec_start = _unit_property("mongod.service", "ExecStart")
+    if not exec_start:
+        return None
+
+    tokens = exec_start.replace(";", " ").split()
+    for index, token in enumerate(tokens):
+        if token.startswith("--config="):
+            return Path(token[len("--config="):])
+        if token in ("--config", "-f") and index + 1 < len(tokens):
+            return Path(tokens[index + 1])
+    return None
+
+
 def _mongodb_configuration_file() -> Path:
-    return Path("/etc/altastor-backup/mongod.conf")
+    from_systemd = _mongodb_configuration_from_systemd()
+    if from_systemd is not None:
+        return from_systemd
+
+    fallbacks = (Path("/etc/altastor-backup/mongod.conf"), Path("/etc/mongod.conf"))
+    for candidate in fallbacks:
+        if candidate.is_file():
+            return candidate
+    return fallbacks[0]
 
 
 def _scalar(value: str) -> str:
@@ -146,33 +212,11 @@ def _ownership_hint(path: Path) -> str:
     )
 
 
-def _read_log_tail(path: Path) -> tuple[bytes, bool]:
+def _read_log_bytes(path: Path) -> bytes:
     if path.name.endswith(".gz"):
-        tail = b""
-        truncated = False
         with gzip.open(path, "rb") as handle:
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                tail += chunk
-                if len(tail) > _LOG_TAIL_BYTES:
-                    tail = tail[-_LOG_TAIL_BYTES:]
-                    truncated = True
-    else:
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            truncated = size > _LOG_TAIL_BYTES
-            handle.seek(size - _LOG_TAIL_BYTES if truncated else 0)
-            tail = handle.read()
-
-    if truncated:
-        newline = tail.find(b"\n")
-        if newline != -1:
-            tail = tail[newline + 1:]
-
-    return tail, truncated
+            return handle.read()
+    return path.read_bytes()
 
 
 def _collected_log_name(path: Path) -> str:
@@ -183,7 +227,7 @@ def _collect_log_file(
     path: Path, arc_dir: str, files: list[tuple[str, bytes]], warnings: list[str]
 ) -> None:
     try:
-        content, truncated = _read_log_tail(path)
+        content = _read_log_bytes(path)
     except PermissionError as exc:
         warnings.append(f"Failed to read {path}: {exc}{_ownership_hint(path)}")
         return
@@ -192,10 +236,6 @@ def _collect_log_file(
         return
 
     files.append((f"{arc_dir}/{_collected_log_name(path)}", _redact_log_bytes(content)))
-    if truncated:
-        warnings.append(
-            f"Collected only the last {_LOG_TAIL_BYTES // (1024 * 1024)} MB of {path}"
-        )
 
 
 def _rotated_siblings(path: Path) -> list[Path]:
@@ -287,11 +327,36 @@ def _collect_configuration(warnings: list[str]) -> list[tuple[str, bytes]]:
     return files
 
 
+def _collect_systemd_units() -> list[tuple[str, bytes]]:
+    files: list[tuple[str, bytes]] = []
+    seen: set[str] = set()
+
+    for unit in ("altastor-backup-server.service", "mongod.service"):
+        for path in _systemd_unit_files(unit):
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            parent = path.parent.name
+            arcname = (
+                f"config/systemd/{parent}/{path.name}"
+                if parent.endswith(".d")
+                else f"config/systemd/{path.name}"
+            )
+            masked = _UNIT_SECRET_ENVIRONMENT.sub(rf"\1{REDACTED_VALUE}", text)
+            files.append((arcname, _redact_config_text(masked).encode("utf-8")))
+
+    return files
+
+
 def _collect_mongodb_configuration(warnings: list[str]) -> list[tuple[str, bytes]]:
     candidate = _mongodb_configuration_file()
     try:
         if not candidate.is_file():
-            warnings.append(f"MongoDB configuration file not found at {candidate}")
             return []
         text = candidate.read_text(encoding="utf-8")
     except PermissionError as exc:
@@ -365,6 +430,7 @@ def generate_support_bundle() -> dict[str, Any]:
         *_collect_logs(warnings),
         *_collect_configuration(warnings),
         *_collect_mongodb_configuration(warnings),
+        *_collect_systemd_units(),
         *_collect_catalog(warnings),
     ]
     system_info = _collect_system_info()
@@ -381,6 +447,9 @@ def generate_support_bundle() -> dict[str, Any]:
         "files": included_files,
         "warnings": warnings,
     }
+    package_versions = _package_versions()
+    if package_versions:
+        manifest["package_versions"] = package_versions
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:

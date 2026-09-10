@@ -198,11 +198,13 @@ def _resolve_compression_level(result: dict[str, Any]) -> int | None:
         return None
 
 
-def _record_session_warning(task: dict[str, Any], message: str, **details: Any) -> None:
+def _record_session_warning(
+    task: dict[str, Any], message: str, *, component: str = "retention", **details: Any
+) -> None:
     warnings = task.get("warnings") if isinstance(task.get("warnings"), list) else []
     warnings.append({"message": message, **{k: v for k, v in details.items() if v}})
     task["warnings"] = warnings
-    _append_task_log(task, level="warn", message=message, component="retention")
+    _append_task_log(task, level="warn", message=message, component=component)
 
 
 def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] | None:
@@ -212,6 +214,14 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
     result = task.get("result")
     if not isinstance(result, dict):
         return None
+
+    if result.get("stop_requested_after_completion"):
+        _record_session_warning(
+            task,
+            "Stop requested after the backup data was already complete; the backup was kept "
+            "rather than discarded.",
+            component="engine",
+        )
 
     existing = next(
         (
@@ -270,6 +280,7 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
             segment_id = str(prior_points[-1].get("segment_id") or prior_points[-1].get("id") or "")
     if full_backup:
         segment_id = None
+        parent_point_id = None
 
     record = {
         "id": str(uuid4()),

@@ -198,8 +198,9 @@ class CliRedesignTests(unittest.TestCase):
 
         help_output = self._parse_help(parser, ["job", "start", "--help"])
 
-        self.assertIn("[--full]", help_output)
+        self.assertIn("[--full | --synthetic]", help_output)
         self.assertIn("Force a full backup", help_output)
+        self.assertIn("merging the stored chain", help_output)
         self.assertIn('abr job start --name "Job-SQL-Server" --full', help_output)
         self.assertIn("abr job start --id", help_output)
         self.assertIn("<job-id> --full", help_output)

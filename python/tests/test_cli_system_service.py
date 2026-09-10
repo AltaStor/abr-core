@@ -104,19 +104,34 @@ class MergeLocalDiagnosticsIntoBundleTests(unittest.TestCase):
         self.assertNotIn("hunter2", content)
         self.assertIn("********", content)
 
-    def test_local_cli_log_is_tailed_not_shipped_whole(self) -> None:
+    def test_local_cli_log_is_shipped_whole(self) -> None:
         manifest = {"files": ["manifest.json"], "warnings": []}
         archive_bytes = _build_zip(manifest)
+        content = b"OLD" * 100 + b"NEWEST"
 
         with tempfile.TemporaryDirectory() as log_dir:
             log_file = Path(log_dir) / "cli.log"
-            log_file.write_bytes(b"OLD" * 100 + b"NEWEST")
+            log_file.write_bytes(content)
 
-            with patch("python.cli.services.system_service._LOCAL_LOG_TAIL_BYTES", 6):
-                result_bytes, _ = self._merge(archive_bytes, manifest, logs=[log_file])
+            result_bytes, _ = self._merge(archive_bytes, manifest, logs=[log_file])
 
         with zipfile.ZipFile(io.BytesIO(result_bytes)) as archive:
-            self.assertEqual(archive.read("logs/cli-local/cli.log"), b"NEWEST")
+            self.assertEqual(archive.read("logs/cli-local/cli.log"), content)
+
+    def test_a_large_local_log_matching_the_servers_copy_is_not_duplicated(self) -> None:
+        content = (b"x" * 1024 + b"\n") * 3000
+        manifest = {"files": ["manifest.json", "logs/cli/cli.log"], "warnings": []}
+        archive_bytes = _build_zip(manifest, {"logs/cli/cli.log": content})
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            log_file = Path(log_dir) / "cli.log"
+            log_file.write_bytes(content)
+
+            result_bytes, result_manifest = self._merge(archive_bytes, manifest, logs=[log_file])
+
+        self.assertNotIn("logs/cli-local/cli.log", result_manifest["files"])
+        with zipfile.ZipFile(io.BytesIO(result_bytes)) as archive:
+            self.assertNotIn("logs/cli-local/cli.log", archive.namelist())
 
 class FindLocalCliLogsTests(unittest.TestCase):
     def test_returns_cli_logs_including_rotations_and_a_non_empty_fault_file(self) -> None:

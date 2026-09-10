@@ -8,11 +8,19 @@ import sys
 from typing import Any
 
 from ..compact_help_formatter import CompactHelpFormatter
-from ..exit_codes import INVALID_STATE
+from ..exit_codes import INVALID_STATE, VALIDATION_FAILED
 from ..parsing.common_arguments import add_name_or_id_selector
 from ..parsing.validators import parse_compression_level, parse_day_of_month, parse_duration, parse_strict_hhmm, parse_weekday_csv
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
+
+
+def _session_failure_exit_code(session: Any) -> int:
+    if not isinstance(session, dict):
+        return INVALID_STATE
+    if str(session.get("failure_kind") or "") == "validation":
+        return VALIDATION_FAILED
+    return INVALID_STATE
 
 
 class JobCommands:
@@ -106,23 +114,42 @@ class JobCommands:
 
         start = commands.add_parser(
             "start",
-            help="Start job now. --full forces a full backup.",
+            help="Start job now. --full forces a full backup, --synthetic merges the stored chain.",
             description=(
                 "Start a job manually.\n\n"
+                "--full reads the whole VM again. --synthetic builds the same full backup by merging\n"
+                "the chain already in the repository, so the VM is never touched.\n\n"
                 "Examples:\n"
                 '  abr job start --name "Job-SQL-Server"\n'
                 '  abr job start --name "Job-SQL-Server" --full\n'
+                '  abr job start --name "Job-SQL-Server" --synthetic --wait\n'
+                '  abr job start --name "Job-SQL-Server" --synthetic --target-repo "Archive-S3"\n'
                 "  abr job start --id <job-id> --full"
             ),
             formatter_class=CompactHelpFormatter,
         )
         add_name_or_id_selector(start, name_help="Job name", id_help="Job ID")
-        start.add_argument(
+        start_kind = start.add_mutually_exclusive_group()
+        start_kind.add_argument(
             "--full",
             "--force-full",
             dest="full",
             action="store_true",
             help="Force a full backup instead of an incremental backup",
+        )
+        start_kind.add_argument(
+            "--synthetic",
+            dest="synthetic",
+            action="store_true",
+            help=(
+                "Build a full backup by merging the stored chain in the repository instead of reading "
+                "the VM again. Needs a full backup followed by at least one incremental"
+            ),
+        )
+        start.add_argument(
+            "--target-repo",
+            dest="target_repo",
+            help="Write the synthetic full into this repository instead of the job's own (--synthetic only)",
         )
         start.add_argument(
             "--wait",
@@ -327,9 +354,28 @@ class JobCommands:
         deps.context.print_output(payload, self._delete_columns())
         return 0
 
+    @staticmethod
+    def _resolve_repository_id(deps: CommandDependencies, name: str) -> str:
+        items = deps.context.api_client.get("api/v1/repositories").get("items", [])
+        matches = [item for item in items if str(item.get("name") or "").lower() == name.lower()]
+        if not matches:
+            raise ValueError(f"Repository not found: {name}")
+        if len(matches) > 1:
+            raise ValueError(f"Multiple repositories matched name: {name}")
+        return str(matches[0]["id"])
+
     def start(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
-        result = deps.context.api_client.post(f"api/v1/jobs/{self._resolve_id(deps, args)}/start", json={"force_full": args.full})
+        synthetic = getattr(args, "synthetic", False)
+        target_repo = getattr(args, "target_repo", None)
+        if target_repo and not synthetic:
+            raise ValueError("--target-repo is only used with --synthetic")
+        payload: dict[str, Any] = {"force_full": args.full, "force_synthetic": synthetic}
+        if target_repo:
+            payload["target_repository_id"] = self._resolve_repository_id(deps, str(target_repo))
+        result = deps.context.api_client.post(
+            f"api/v1/jobs/{self._resolve_id(deps, args)}/start", json=payload
+        )
         sessions = result.get("items") if isinstance(result, dict) else None
         if getattr(args, "wait", False) and isinstance(sessions, list) and sessions:
             if len(sessions) > 1:
@@ -345,7 +391,7 @@ class JobCommands:
                 watched = watch_session(deps.context.api_client, str(sessions[0]["id"]))
                 deps.context.print_output(watched)
                 if not session_watch_succeeded(watched):
-                    return INVALID_STATE
+                    return _session_failure_exit_code(watched)
         else:
             deps.context.print_output(result, self._start_columns())
         return 0

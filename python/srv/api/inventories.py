@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import Body
 
 from python.srv.services import abr_v41
@@ -14,6 +12,10 @@ from .schemas import (
     CreateInventoryRequest,
     InventoryDTO,
     InventoryList,
+    InventoryScanResult,
+    InventoryTestResult,
+    RemovedResult,
+    TreeResponse,
     UpdateInventoryRequest,
     unset_excluded,
 )
@@ -29,7 +31,7 @@ def list_inventories() -> InventoryList:
     return {"items": abr_v41.list_inventory_records()}
 
 
-def list_inventory_vm_tree() -> dict[str, Any]:
+def list_inventory_vm_tree() -> TreeResponse:
     return {"nodes": abr_v41.list_inventory_vm_tree()}
 
 
@@ -43,15 +45,15 @@ def patch_inventory(
     return abr_v41.edit_inventory_record(inventory_id, unset_excluded(payload))
 
 
-def delete_inventory(inventory_id: str) -> dict[str, Any]:
+def delete_inventory(inventory_id: str) -> RemovedResult:
     return abr_v41.remove_inventory_record(inventory_id)
 
 
-def rescan_inventory(inventory_id: str) -> dict[str, Any]:
+def rescan_inventory(inventory_id: str) -> InventoryScanResult:
     return abr_v41.rescan_inventory(inventory_id)
 
 
-def test_inventory(inventory_id: str) -> dict[str, Any]:
+def test_inventory(inventory_id: str) -> InventoryTestResult:
     return abr_v41.test_inventory(inventory_id)
 
 

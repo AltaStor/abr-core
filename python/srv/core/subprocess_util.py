@@ -52,6 +52,11 @@ _TRUNCATION_NOTICE = "...[output truncated: showing last {kept} of {total} bytes
 # the real tool's output never matched, on_progress never fired, and the console
 # progress bar sat at each stage's base value until the stage ended.
 _PROGRESS_LINE_PATTERN = re.compile(rb"(\d{1,3})%(?:\s*\((\d+)\))?")
+
+
+class ProcessCancelled(RuntimeError):
+    pass
+
 _DEFAULT_PROGRESS_POLL_SECONDS = 1.0
 
 
@@ -126,6 +131,7 @@ def _wait_with_progress(
     on_progress: Callable[[int, int], None],
     poll_seconds: float,
     timeout: float | None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> None:
     deadline = time.monotonic() + timeout if timeout is not None else None
     pos = 0
@@ -158,9 +164,28 @@ def _wait_with_progress(
                         try:
                             on_progress(percent, block_index)
                         except Exception:
+                            if should_cancel is not None and should_cancel():
+                                raise ProcessCancelled("cancellation requested") from None
                             logger.warning("on_progress callback raised; ignoring.", exc_info=True)
         if finished:
             return
+        if should_cancel is not None and should_cancel():
+            raise ProcessCancelled("cancellation requested")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        time.sleep(poll_seconds)
+
+
+def _wait_for_cancel(
+    proc: subprocess.Popen,
+    poll_seconds: float,
+    timeout: float | None,
+    should_cancel: Callable[[], bool],
+) -> None:
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    while proc.poll() is None:
+        if should_cancel():
+            raise ProcessCancelled("cancellation requested")
         if deadline is not None and time.monotonic() >= deadline:
             raise subprocess.TimeoutExpired(proc.args, timeout)
         time.sleep(poll_seconds)
@@ -188,6 +213,7 @@ def run_capped(
     capture_output: bool = True,
     on_progress: Callable[[int, int], None] | None = None,
     progress_poll_seconds: float = _DEFAULT_PROGRESS_POLL_SECONDS,
+    should_cancel: Callable[[], bool] | None = None,
     **_ignored,
 ) -> CompletedProcess:
     """Run ``command`` capturing only a bounded tail of stdout/stderr.
@@ -212,9 +238,21 @@ def run_capped(
         proc = subprocess.Popen(full_cmd, stdout=out_f, stderr=err_f)
         try:
             if on_progress is not None:
-                _wait_with_progress(proc, out_f, on_progress, progress_poll_seconds, timeout)
+                _wait_with_progress(
+                    proc, out_f, on_progress, progress_poll_seconds, timeout, should_cancel
+                )
+            elif should_cancel is not None:
+                _wait_for_cancel(proc, progress_poll_seconds, timeout, should_cancel)
             else:
                 proc.wait(timeout=timeout)
+        except ProcessCancelled:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            raise
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
