@@ -5725,6 +5725,7 @@ def _build_restore_source_vm(point: dict[str, Any], manifest: dict[str, Any]) ->
                 "id": _source_disk_id(vm_id, index, disk_entry, discovered),
                 "label": str(disk_entry.get("disk_label") or (discovered or {}).get("name") or f"Hard disk {index}"),
                 "capacity_bytes": _capacity_bytes_from_disk_entry(disk_entry) or _capacity_bytes_from_disk_entry(discovered_payload),
+                "used_bytes": _restore_disk_used_bytes(manifest, disk_entry),
                 "provisioning": str(disk_entry.get("source_disk_type_name") or discovered_payload.get("source_disk_type_name") or "").strip() or None,
                 "controller_type": str(disk_entry.get("controller_type") or discovered_payload.get("bus") or "scsi").strip() or None,
                 "datastore_path": effective_path,
@@ -6110,21 +6111,63 @@ def _resolve_restore_target_datastore(inventory_id: str, datastore_identifier: s
     )
 
 
-def _ensure_restore_target_capacity(source_vm: dict[str, Any], datastore: dict[str, Any], restore_mode: str) -> None:
+_THIN_PROVISIONING_REQUESTS = {"thin", "thin-provisioned", "thin_provisioned", "vmfs_thin"}
+
+_THIN_SOURCE_DISK_TYPES = {"vmfs_thin", "vmfs_sparse", "monolithic_sparse", "split_sparse"}
+
+_WHOLE_DISK_BACKUP_MODES = {"full", "incremental-full-fallback"}
+
+
+def _restore_disk_used_bytes(manifest: dict[str, Any], disk_entry: dict[str, Any]) -> int | None:
+    store_mode = str(disk_entry.get("store_mode") or "").strip().lower()
+    backup_mode = str(manifest.get("backup_mode") or "").strip().lower()
+    holds_whole_disk = store_mode == "full" or (
+        not store_mode and backup_mode in _WHOLE_DISK_BACKUP_MODES
+    )
+    if not holds_whole_disk:
+        return None
+    used = _safe_int(disk_entry.get("logical_bytes"))
+    return used if used is not None and used >= 0 else None
+
+
+def _restore_disk_target_is_thin(disk: dict[str, Any], disk_provisioning: str | None) -> bool:
+    requested = str(disk_provisioning or "").strip().lower()
+    if requested and requested != "original":
+        return requested in _THIN_PROVISIONING_REQUESTS
+    return str(disk.get("provisioning") or "").strip().lower() in _THIN_SOURCE_DISK_TYPES
+
+
+def _ensure_restore_target_capacity(
+    source_vm: dict[str, Any],
+    datastore: dict[str, Any],
+    restore_mode: str,
+    disk_provisioning: str | None = None,
+) -> None:
     """Hard-reject only when we KNOW the datastore can't fit the restore —
     unknown capacity (a datastore whose free_bytes hasn't been reported, or a
     source disk whose capacity wasn't recorded) is never enough evidence to
     block, since thin-provisioned disks routinely use far less than their
     declared capacity. In-place restore needs a full second copy of the VM's
     disks to coexist with the still-live original until the swap completes,
-    so it's checked against 2x the provisioned size rather than 1x — free_bytes
+    so it's checked against 2x the required size rather than 1x — free_bytes
     already excludes the original's own footprint, so this is a deliberate
     safety margin (thin-disk growth during write, buffer before the original
     is destroyed), not a strict minimum.
     """
     disks = source_vm.get("disks") if isinstance(source_vm.get("disks"), list) else []
-    capacities = [_safe_int(disk.get("capacity_bytes")) for disk in disks if isinstance(disk, dict)]
-    required = sum(capacities) if capacities and all(c is not None for c in capacities) else None
+    requirements: list[int | None] = []
+    thin_target = False
+    for disk in disks:
+        if not isinstance(disk, dict):
+            continue
+        if _restore_disk_target_is_thin(disk, disk_provisioning):
+            thin_target = True
+            requirements.append(_safe_int(disk.get("used_bytes")))
+        else:
+            requirements.append(_safe_int(disk.get("capacity_bytes")))
+    required = (
+        sum(requirements) if requirements and all(value is not None for value in requirements) else None
+    )
     required_total = None if required is None else required * (2 if restore_mode == "in_place" else 1)
     free_bytes = _safe_int(datastore.get("free_bytes"))
     _ensure(
@@ -6132,6 +6175,12 @@ def _ensure_restore_target_capacity(source_vm: dict[str, Any], datastore: dict[s
         409,
         "insufficient_datastore_space",
         "Target datastore does not have enough free space for this restore"
+        + (
+            " — thin-provisioned disks are measured by the data the backup holds, "
+            "not by their provisioned size"
+            if thin_target
+            else ""
+        )
         + (
             " — an in-place restore needs room for a full second copy of the VM's disks "
             "while the original stays live during the swap"
@@ -6776,7 +6825,12 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     datastore = _resolve_restore_target_datastore(str(target_inventory["id"]), target_datastore_identifier, host=host)
     resolved_target_datastore_id = str(datastore.get("id") or "").strip() or None
     target_datastore_name = str(datastore.get("name") or "").strip()
-    _ensure_restore_target_capacity(source_vm, datastore, restore_mode)
+    _ensure_restore_target_capacity(
+        source_vm,
+        datastore,
+        restore_mode,
+        str(request.get("disk_provisioning") or "").strip() or None,
+    )
 
     if restore_mode == "in_place":
         target_vm_name = str(source_vm.get("name") or point.get("vm_name") or "").strip()

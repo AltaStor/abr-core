@@ -852,7 +852,15 @@ class AbrV41EngineTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, "target_vm_exists")
 
-    def _register_in_place_fixture(self, *, register_source_vm: bool = True, free_bytes: int | None = None) -> tuple[dict, str]:
+    def _register_in_place_fixture(
+        self,
+        *,
+        register_source_vm: bool = True,
+        free_bytes: int | None = None,
+        disk_type_name: str | None = None,
+        logical_bytes: int | None = None,
+        backup_mode: str = "full",
+    ) -> tuple[dict, str]:
         """A vCenter inventory with a host/datastore matching a backup's
         manifest (source_host=esx-01.local, disk on [tstds]) — the shared
         fixture shape in-place restore tests need so the source VM's
@@ -896,7 +904,16 @@ class AbrV41EngineTests(unittest.TestCase):
                     "vm_name": "tstvm",
                     "vm_external_id": "vm-1",
                     "vm_config": {"name": "tstvm", "source_host": "esx-01.local"},
-                    "disks": [{"disk_label": "Hard disk 1", "capacity_gb": 40, "datastore_path": "[tstds] tstvm/tstvm.vmdk"}],
+                    "backup_mode": backup_mode,
+                    "disks": [
+                        {
+                            "disk_label": "Hard disk 1",
+                            "capacity_gb": 40,
+                            "datastore_path": "[tstds] tstvm/tstvm.vmdk",
+                            **({"source_disk_type_name": disk_type_name} if disk_type_name else {}),
+                            **({"logical_bytes": logical_bytes} if logical_bytes is not None else {}),
+                        }
+                    ],
                 },
                 handle,
             )
@@ -999,6 +1016,117 @@ class AbrV41EngineTests(unittest.TestCase):
             abr_v41.restore_start({"restore_point_id": point_id, "restore_mode": "in_place", "force": True})
 
         self.assertEqual(ctx.exception.code, "insufficient_datastore_space")
+
+    def test_a_thin_restore_is_measured_by_the_data_the_backup_holds(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=10_000_000_000,
+            disk_type_name="vmfs_thin",
+            logical_bytes=2_000_000_000,
+        )
+
+        session = abr_v41.restore_start(
+            {
+                "restore_point_id": point_id,
+                "restore_mode": "new_vm",
+                "target_vm_name": "restoredtstvm",
+            }
+        )
+
+        self.assertEqual(session["restore_mode"], "new_vm")
+
+    def test_a_thin_restore_bigger_than_the_datastore_is_still_refused(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=10_000_000_000,
+            disk_type_name="vmfs_thin",
+            logical_bytes=20_000_000_000,
+        )
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.restore_start(
+                {
+                    "restore_point_id": point_id,
+                    "restore_mode": "new_vm",
+                    "target_vm_name": "restoredtstvm",
+                }
+            )
+
+        self.assertEqual(ctx.exception.code, "insufficient_datastore_space")
+        self.assertEqual(ctx.exception.details["required_bytes"], 20_000_000_000)
+        self.assertIn("thin-provisioned", ctx.exception.message)
+
+    def test_a_thick_restore_is_still_measured_by_provisioned_size(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=10_000_000_000,
+            disk_type_name="vmfs_flat",
+            logical_bytes=2_000_000_000,
+        )
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.restore_start(
+                {
+                    "restore_point_id": point_id,
+                    "restore_mode": "new_vm",
+                    "target_vm_name": "restoredtstvm",
+                }
+            )
+
+        self.assertEqual(ctx.exception.code, "insufficient_datastore_space")
+        self.assertEqual(ctx.exception.details["required_bytes"], 40 * 1024**3)
+
+    def test_asking_for_thick_overrides_a_thin_source_disk(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=10_000_000_000,
+            disk_type_name="vmfs_thin",
+            logical_bytes=2_000_000_000,
+        )
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.restore_start(
+                {
+                    "restore_point_id": point_id,
+                    "restore_mode": "new_vm",
+                    "target_vm_name": "restoredtstvm",
+                    "disk_provisioning": "thick-provisioned",
+                }
+            )
+
+        self.assertEqual(ctx.exception.details["required_bytes"], 40 * 1024**3)
+
+    def test_asking_for_thin_overrides_a_thick_source_disk(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=10_000_000_000,
+            disk_type_name="vmfs_flat",
+            logical_bytes=2_000_000_000,
+        )
+
+        session = abr_v41.restore_start(
+            {
+                "restore_point_id": point_id,
+                "restore_mode": "new_vm",
+                "target_vm_name": "restoredtstvm",
+                "disk_provisioning": "thin-provisioned",
+            }
+        )
+
+        self.assertEqual(session["restore_mode"], "new_vm")
+
+    def test_a_thin_restore_from_an_incremental_point_is_not_blocked(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=10_000_000_000,
+            disk_type_name="vmfs_thin",
+            logical_bytes=40_000,
+            backup_mode="incremental",
+        )
+
+        session = abr_v41.restore_start(
+            {
+                "restore_point_id": point_id,
+                "restore_mode": "new_vm",
+                "target_vm_name": "restoredtstvm",
+            }
+        )
+
+        self.assertEqual(session["restore_mode"], "new_vm")
 
     def test_inventory_test_success_persists_available_status(self) -> None:
         inventory = abr_v41.create_inventory_record(
