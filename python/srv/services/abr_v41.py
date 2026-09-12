@@ -171,7 +171,7 @@ def schedule_inventory_discovery(inventory_id: str, *, force: bool = False) -> t
     return thread
 
 PRODUCT_NAME = "AltaStor Backup & Replication"
-PRODUCT_VERSION = "26.09.1"
+PRODUCT_VERSION = "26.09"
 
 REPO_TYPES = ("local", "nfs", "smb", "s3")
 
@@ -3786,6 +3786,9 @@ def _point_period_key(point: dict[str, Any], *, kind: str) -> str:
     return f"{created.year:04d}"
 
 
+_GFS_INELIGIBLE_REASONS = {"ForceFull", "ForceSynthetic"}
+
+
 def _apply_gfs_marks(points: list[dict[str, Any]], gfs: dict[str, Any]) -> None:
     enabled = _coerce_gfs_enabled(gfs.get("enabled"))
     for point in points:
@@ -3798,7 +3801,8 @@ def _apply_gfs_marks(points: list[dict[str, Any]], gfs: dict[str, Any]) -> None:
     full_points = [
         point
         for point in points
-        if bool(point.get("full_backup")) and str(point.get("execution_reason") or "") != "ForceFull"
+        if bool(point.get("full_backup"))
+        and str(point.get("execution_reason") or "") not in _GFS_INELIGIBLE_REASONS
     ]
     for key in ("weekly", "monthly", "yearly"):
         # A disabled policy suspends protection (counts stay configured for a later re-enable).

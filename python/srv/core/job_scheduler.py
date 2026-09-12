@@ -374,7 +374,15 @@ class JobScheduler:
 
         return targets
 
-    def _build_task_parameters(self, job: dict[str, Any]) -> dict[str, Any]:
+    def _build_task_parameters(
+        self,
+        job: dict[str, Any],
+        *,
+        vm_name: str = "",
+        execution_type: str = "",
+        execution_reason: str = "",
+        requires_task_id: str | None = None,
+    ) -> dict[str, Any]:
         # task_parameters lives at the top level of the job record (see
         # create_backup_job/normalize_job_record in abr_v41.py) -- metadata is
         # only a fallback for legacy records that predate that field moving
@@ -383,45 +391,87 @@ class JobScheduler:
         # dropping compression/encryption settings for auto-run backups.
         parameters = job.get("task_parameters")
         if isinstance(parameters, dict):
-            return dict(parameters)
+            parameters = dict(parameters)
+        else:
+            metadata = job.get("metadata")
+            parameters = (
+                dict(metadata["task_parameters"])
+                if isinstance(metadata, dict) and isinstance(metadata.get("task_parameters"), dict)
+                else {}
+            )
 
-        metadata = job.get("metadata")
-        if isinstance(metadata, dict) and isinstance(metadata.get("task_parameters"), dict):
-            return dict(metadata["task_parameters"])
+        if not execution_type:
+            return parameters
 
-        return {}
+        parameters.update(
+            {
+                "repository_id": job.get("repo_id"),
+                "repository_name": job.get("repo_name"),
+                "vm_name": vm_name,
+                "resolved_backup_type": execution_type,
+                "resolved_backup_reason": execution_reason,
+                "backup_mode_request": (
+                    "full" if execution_type in {"ActiveFull", "SyntheticFull"} else "auto"
+                ),
+                "incremental": execution_type == "Incremental",
+                "synthetic_full": execution_type == "SyntheticFull",
+                "active_full": execution_type == "ActiveFull",
+            }
+        )
+        if requires_task_id:
+            parameters["requires_task_id"] = requires_task_id
+        return parameters
 
     def _create_scheduled_tasks(self, job: dict[str, Any]) -> list[dict[str, Any]]:
         resolved_targets = self._resolve_task_targets(job)
         if not resolved_targets:
             return []
 
-        now = utc_now()
         tasks: list[dict[str, Any]] = []
         for resource_type, resource_external_id, resource in resolved_targets:
             execution_type, execution_reason = resolve_job_execution(job, vm_id=resource_external_id, force_full=False)
-            task = {
-                "id": str(uuid4()),
-                "job_id": str(job["id"]),
-                "task_type": "backup",
-                "hypervisor_id": str(job.get("inventory_id") or job.get("hypervisor_id")),
-                "resource_type": resource_type,
-                "resource_external_id": resource_external_id,
-                "status": "queued",
-                "trigger": "schedule",
-                "parameters": self._build_task_parameters(job),
-                "result": {
-                    "progress": 0,
-                    "resolved_backup_type": execution_type,
-                    "resolved_backup_reason": execution_reason,
-                },
-                "created_at": now,
-                "updated_at": now,
-                "note": (
-                    "Task was enqueued automatically from the job schedule template for "
-                    f"{resource.get('name', resource_external_id)}."
-                ),
-            }
-            persist_task(task)
-            tasks.append(task)
+            vm_name = str(resource.get("name") or resource_external_id)
+            requires_task_id: str | None = None
+            for phase_type, phase_reason in self._execution_phases(execution_type, execution_reason):
+                now = utc_now()
+                task = {
+                    "id": str(uuid4()),
+                    "job_id": str(job["id"]),
+                    "task_type": "backup",
+                    "hypervisor_id": str(job.get("inventory_id") or job.get("hypervisor_id")),
+                    "resource_type": resource_type,
+                    "resource_external_id": resource_external_id,
+                    "status": "queued",
+                    "trigger": "schedule",
+                    "parameters": self._build_task_parameters(
+                        job,
+                        vm_name=vm_name,
+                        execution_type=phase_type,
+                        execution_reason=phase_reason,
+                        requires_task_id=requires_task_id,
+                    ),
+                    "result": {
+                        "progress": 0,
+                        "resolved_backup_type": phase_type,
+                        "resolved_backup_reason": phase_reason,
+                    },
+                    "created_at": now,
+                    "updated_at": now,
+                    "note": (
+                        "Task was enqueued automatically from the job schedule template for "
+                        f"{vm_name}."
+                    ),
+                }
+                persist_task(task)
+                tasks.append(task)
+                requires_task_id = task["id"]
         return tasks
+
+    @staticmethod
+    def _execution_phases(execution_type: str, execution_reason: str) -> list[tuple[str, str]]:
+        if execution_type != "SyntheticFull":
+            return [(execution_type, execution_reason)]
+        return [
+            ("Incremental", "SyntheticFullSourceIncrement"),
+            (execution_type, execution_reason),
+        ]

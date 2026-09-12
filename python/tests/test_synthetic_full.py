@@ -230,6 +230,43 @@ class SyntheticFullRunTests(unittest.TestCase):
                            "resolved_backup_type": "SyntheticFull"},
         }
 
+    def test_a_merge_waiting_on_an_increment_refuses_when_it_did_not_complete(self) -> None:
+        from python.srv.core.mongo_db_wrapper import TASKS
+
+        task = self._task()
+        task["parameters"]["requires_task_id"] = "task-increment"
+        self.addCleanup(TASKS.pop, "task-increment", None)
+
+        for status in ("failed", "stopped", "running"):
+            TASKS["task-increment"] = {"id": "task-increment", "status": status}
+            with self.assertRaises(synthetic_full.SyntheticFullValidationError) as ctx:
+                synthetic_full.run_synthetic_full(task)
+            self.assertIn(status, str(ctx.exception))
+
+    def test_a_merge_waiting_on_a_vanished_increment_refuses(self) -> None:
+        from python.srv.core.mongo_db_wrapper import TASKS
+
+        TASKS.pop("task-increment", None)
+        task = self._task()
+        task["parameters"]["requires_task_id"] = "task-increment"
+
+        with self.assertRaises(synthetic_full.SyntheticFullValidationError):
+            synthetic_full.run_synthetic_full(task)
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_merge_runs_once_its_increment_has_completed(self, copy_mock) -> None:
+        from python.srv.core.mongo_db_wrapper import TASKS
+
+        copy_mock.return_value = {"raw_data_size": 1024, "stored_data_size": 512, "merged_from": 3}
+        TASKS["task-increment"] = {"id": "task-increment", "status": "completed"}
+        self.addCleanup(TASKS.pop, "task-increment", None)
+        task = self._task()
+        task["parameters"]["requires_task_id"] = "task-increment"
+
+        result = synthetic_full.run_synthetic_full(task)
+
+        self.assertTrue(result["synthetic_full"])
+
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_merge_produces_a_synthetic_full_result(self, copy_mock) -> None:
         copy_mock.return_value = {"raw_data_size": 1024, "stored_data_size": 512, "merged_from": 3}

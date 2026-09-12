@@ -492,13 +492,13 @@ abr restore start
 
 Description: Start a full VM restore workflow from a selected restore point or backup chain. 
 
-abr restore start --restore-point <id> --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src:dst>] [--power-on] [--wait] 
+abr restore start --restore-point <id> --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--power-on] [--wait] 
 
 Alternate source resolution:
-abr restore start --backup <backup-id> [--vm <name-or-id>] --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src:dst>] [--power-on] [--wait] 
+abr restore start --backup <backup-id> [--vm <name-or-id>] --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--power-on] [--wait] 
 
 Legacy compatibility:
-abr restore start --point-id <id> [--name <new-name>] [--target-inventory <name>] [--target-host <host>] [--target-datastore <name>] [--network-map <src:dst>] [--repo <name>] [--power-on] [--in-place] [--force] [--wait] 
+abr restore start --point-id <id> [--name <new-name>] [--target-inventory <name>] [--target-host <host>] [--target-datastore <name>] [--network-map <src=dst>] [--repo <name>] [--power-on] [--in-place] [--force] [--wait] 
 
 Targeted Restore Scenarios: 
  
@@ -515,8 +515,8 @@ Requires that the backup captured the VM's original host and datastore -- if the
  
 2. Out-of-Place / Advanced DR (Restore as a new VM on another host) 
 Description: A duplicate VM is deployed on a secondary host or recovery site for testing or disaster recovery. 
-Syntax: abr restore start --restore-point <id> --new-name <new-name> --target-inventory <name> --target-host <host> --datastore <name> [--network-map <src:dst>] [--power-on] 
-Example: abr restore start --restore-point rp-2026-05-16-0200-f1 --new-name VM-SQL-01-DR --target-inventory DR-Inventory --target-host esxi-dr-01.company.local --datastore DR-SSD --network-map Production:DR-Network --power-on 
+Syntax: abr restore start --restore-point <id> --new-name <new-name> --target-inventory <name> --target-host <host> --datastore <name> [--network-map <src=dst>] [--power-on] 
+Example: abr restore start --restore-point rp-2026-05-16-0200-f1 --new-name VM-SQL-01-DR --target-inventory DR-Inventory --target-host esxi-dr-01.company.local --datastore DR-SSD --network-map Production=DR-Network --power-on 
 
 JSON output:
 - `abr --output json restore list` returns `{ "items": [...] }`

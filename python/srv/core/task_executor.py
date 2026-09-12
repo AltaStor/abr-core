@@ -28,6 +28,12 @@ def cancel_requested(task_id: str) -> bool:
         return bool(task and task.get("cancel_requested"))
 
 
+def task_status(task_id: str) -> str | None:
+    with TASK_LOCK:
+        task = TASKS.get(task_id)
+        return str(task.get("status") or "") if task else None
+
+
 def _task_resolved_execution_field(task: dict[str, Any], field_name: str) -> Any:
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     if field_name in parameters:

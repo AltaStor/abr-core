@@ -238,7 +238,7 @@ def run_synthetic_full(
     )
     from python.srv.services.abr_v41 import repository_actual_retention_days
     from python.srv.core.mongo_db_wrapper import JOBS
-    from python.srv.core.task_executor import cancel_requested
+    from python.srv.core.task_executor import cancel_requested, task_status
     from python.srv.core.storage_tool import extract_s3_config, is_s3_repository
 
     start_time = time.time()
@@ -246,6 +246,16 @@ def run_synthetic_full(
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     job_id = str(task.get("job_id") or "")
     vm_id = str(task.get("resource_external_id") or "")
+    required_task_id = str(parameters.get("requires_task_id") or "")
+    if required_task_id:
+        prerequisite = task_status(required_task_id)
+        if prerequisite != "completed":
+            raise SyntheticFullValidationError(
+                "The backup that was to supply this run's newest changes finished as "
+                f"'{prerequisite or 'unknown'}', so merging now would publish a restore point "
+                "that is missing them"
+            )
+
     repository_id = str(parameters.get("repository_id") or "")
     source_repository_id = str(parameters.get("source_repository_id") or "") or repository_id
     repository = REPOSITORIES.get(repository_id)

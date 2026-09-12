@@ -10,7 +10,14 @@ from typing import Any
 from ..compact_help_formatter import CompactHelpFormatter
 from ..exit_codes import INVALID_STATE, VALIDATION_FAILED
 from ..parsing.common_arguments import add_name_or_id_selector
-from ..parsing.validators import parse_compression_level, parse_day_of_month, parse_duration, parse_strict_hhmm, parse_weekday_csv
+from ..parsing.validators import (
+    parse_compression_level,
+    parse_day_of_month,
+    parse_duration,
+    parse_optional_weekday_csv,
+    parse_strict_hhmm,
+    parse_weekday_csv,
+)
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
 
@@ -252,8 +259,16 @@ class JobCommands:
                 action="store_true",
                 help="Suspend the GFS long-term retention policy, keeping its configured counts for a later --gfs-enable",
             )
-            parser.add_argument("--synthetic-full-days", type=parse_weekday_csv, help="Synthetic full weekdays, comma-separated Mon-Sun")
-            parser.add_argument("--active-full-days", type=parse_weekday_csv, help="Active full weekdays, comma-separated Mon-Sun")
+            parser.add_argument(
+                "--synthetic-full-days",
+                type=parse_optional_weekday_csv,
+                help="Synthetic full weekdays, comma-separated Mon-Sun; pass none to turn it off",
+            )
+            parser.add_argument(
+                "--active-full-days",
+                type=parse_optional_weekday_csv,
+                help="Active full weekdays, comma-separated Mon-Sun; pass none to turn it off",
+            )
 
     @staticmethod
     def _resolve_id(deps: CommandDependencies, args: argparse.Namespace) -> str:

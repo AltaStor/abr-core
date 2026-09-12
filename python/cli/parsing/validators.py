@@ -54,6 +54,12 @@ def parse_strict_hhmm(value: str) -> str:
     return value
 
 
+def parse_optional_weekday_csv(raw: str) -> list[str]:
+    if str(raw).strip().lower() in {"", "none", "off"}:
+        return []
+    return parse_weekday_csv(raw)
+
+
 def parse_weekday_csv(raw: str) -> list[str]:
     values = parse_csv_values(raw)
     if not values:

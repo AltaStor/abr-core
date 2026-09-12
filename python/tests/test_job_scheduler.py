@@ -10,14 +10,16 @@ import unittest
 
 try:
     from python.srv.core.job_scheduler import JobScheduler
-    from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS
+    from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS
+    from python.srv.services.synthetic_full import is_synthetic_full_task
 except ModuleNotFoundError:
     repo_root = pathlib.Path(__file__).resolve().parents[2]
     venv_lib = repo_root / ".venv" / "lib"
     for site_packages in sorted(venv_lib.glob("python*/site-packages")):
         sys.path.insert(0, str(site_packages))
     from python.srv.core.job_scheduler import JobScheduler
-    from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS
+    from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS
+    from python.srv.services.synthetic_full import is_synthetic_full_task
 
 
 class JobSchedulerTests(unittest.TestCase):
@@ -89,7 +91,8 @@ class JobSchedulerTests(unittest.TestCase):
         self.assertEqual(task["task_type"], "backup")
         self.assertEqual(task["resource_type"], "virtual_machine")
         self.assertEqual(task["resource_external_id"], "vm-1")
-        self.assertEqual(task["parameters"], {"duration_seconds": 5})
+        self.assertEqual(task["parameters"]["duration_seconds"], 5)
+        self.assertEqual(task["parameters"]["resolved_backup_type"], "ActiveFull")
 
         job = JOBS["job-1"]
         self.assertEqual(job["last_task_id"], task["id"])
@@ -99,7 +102,7 @@ class JobSchedulerTests(unittest.TestCase):
         self.assertIsInstance(job["next_run_at"], str)
         self.assertIsInstance(job["last_scheduled_at"], str)
 
-    def test_due_interval_backup_job_preserves_incremental_task_parameter(self) -> None:
+    def test_due_interval_backup_job_reads_task_parameters_from_metadata(self) -> None:
         created_at = (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat()
         HYPERVISORS["hv-1"] = {"id": "hv-1", "kind": "vcenter"}
         RESOURCES_BY_HV["hv-1"] = {
@@ -118,7 +121,7 @@ class JobSchedulerTests(unittest.TestCase):
             "status": "active",
             "metadata": {
                 "vm_external_id": "vm-1",
-                "task_parameters": {"incremental": True},
+                "task_parameters": {"incremental": True, "compression_level": 6},
             },
             "schedule": {
                 "schedule_type": "interval",
@@ -136,7 +139,9 @@ class JobSchedulerTests(unittest.TestCase):
 
         self.assertEqual(len(TASKS), 1)
         task = next(iter(TASKS.values()))
-        self.assertEqual(task["parameters"], {"incremental": True})
+        self.assertEqual(task["parameters"]["compression_level"], 6)
+        self.assertEqual(task["parameters"]["resolved_backup_type"], "ActiveFull")
+        self.assertFalse(task["parameters"]["incremental"])
 
     def test_due_interval_backup_job_preserves_top_level_task_parameters(self) -> None:
         created_at = (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat()
@@ -177,10 +182,12 @@ class JobSchedulerTests(unittest.TestCase):
 
         self.assertEqual(len(TASKS), 1)
         task = next(iter(TASKS.values()))
-        self.assertEqual(
-            task["parameters"],
-            {"compression_level": 6, "encryption_enabled": True, "encryption_key": "demo-passphrase-1"},
-        )
+        for key, value in {
+            "compression_level": 6,
+            "encryption_enabled": True,
+            "encryption_key": "demo-passphrase-1",
+        }.items():
+            self.assertEqual(task["parameters"][key], value)
 
     def test_due_daily_backup_job_enqueues_vm_task(self) -> None:
         created_at = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
@@ -441,3 +448,194 @@ class JobSchedulerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SyntheticFullSchedulingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        HYPERVISORS.clear()
+        JOBS.clear()
+        RESOURCES_BY_HV.clear()
+        TASKS.clear()
+        BACKUPS.clear()
+        REPOSITORIES.clear()
+        self.scheduler = JobScheduler(poll_interval_seconds=0.1)
+        self.addCleanup(HYPERVISORS.clear)
+        self.addCleanup(JOBS.clear)
+        self.addCleanup(RESOURCES_BY_HV.clear)
+        self.addCleanup(TASKS.clear)
+        self.addCleanup(BACKUPS.clear)
+        self.addCleanup(REPOSITORIES.clear)
+
+        HYPERVISORS["hv-1"] = {"id": "hv-1", "kind": "mock"}
+        RESOURCES_BY_HV["hv-1"] = {
+            ("virtual_machine", "vm-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-1",
+                "name": "demo-vm",
+                "payload": {},
+                "discovered_at": datetime.now(timezone.utc).isoformat(),
+            }
+        }
+        REPOSITORIES["repo-1"] = {
+            "id": "repo-1",
+            "name": "Repo",
+            "type": "local",
+            "path": "/tmp/repo-1",
+        }
+        BACKUPS["point-1"] = {
+            "id": "point-1",
+            "chain_id": "backup::job-1::vm-1::repo-1",
+            "job_id": "job-1",
+            "vm_id": "vm-1",
+            "repository_id": "repo-1",
+            "status": "available",
+            "execution_type": "ActiveFull",
+            "created_at": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+        }
+
+    @staticmethod
+    def _weekday(offset: int = 0) -> str:
+        names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+        return names[(datetime.now(timezone.utc).weekday() + offset) % 7]
+
+    def _register_job(self, **days: list[str]) -> None:
+        JOBS["job-1"] = {
+            "id": "job-1",
+            "name": "nightly",
+            "job_type": "backup",
+            "inventory_id": "hv-1",
+            "hypervisor_id": "hv-1",
+            "status": "active",
+            "repo_id": "repo-1",
+            "repo_name": "Repo",
+            "vm_ids": ["vm-1"],
+            "vm_names": ["demo-vm"],
+            "metadata": {"vm_external_id": "vm-1"},
+            "task_parameters": {"compression_level": 3},
+            "active_full_days": [],
+            "synthetic_full_days": [],
+            "schedule": {
+                "schedule_type": "interval",
+                "enabled": True,
+                "timezone": "UTC",
+                "interval_minutes": 10,
+                "start_time": None,
+                "weekdays": [],
+                "day_of_month": None,
+            },
+            "created_at": (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(),
+            **days,
+        }
+
+    def _dispatch(self) -> list[dict]:
+        self.scheduler._dispatch_due_jobs()
+        return sorted(TASKS.values(), key=lambda task: str(task.get("created_at")))
+
+    def test_a_synthetic_full_day_takes_todays_increment_before_merging(self) -> None:
+        self._register_job(synthetic_full_days=[self._weekday()])
+
+        tasks = self._dispatch()
+
+        self.assertEqual(
+            [task["parameters"]["resolved_backup_type"] for task in tasks],
+            ["Incremental", "SyntheticFull"],
+        )
+        self.assertEqual(tasks[1]["parameters"]["requires_task_id"], tasks[0]["id"])
+        self.assertLess(tasks[0]["created_at"], tasks[1]["created_at"])
+
+    def test_a_scheduled_synthetic_full_reaches_the_synthetic_engine(self) -> None:
+        self._register_job(synthetic_full_days=[self._weekday()])
+
+        synthetic = self._dispatch()[1]
+
+        self.assertTrue(is_synthetic_full_task(synthetic))
+        self.assertEqual(synthetic["parameters"]["repository_id"], "repo-1")
+        self.assertEqual(synthetic["result"]["resolved_backup_type"], "SyntheticFull")
+
+    def test_synthetic_full_scheduling_turned_off_never_triggers_it(self) -> None:
+        self._register_job(synthetic_full_days=[])
+
+        tasks = self._dispatch()
+
+        self.assertEqual([task["parameters"]["resolved_backup_type"] for task in tasks], ["Incremental"])
+
+    def test_a_day_outside_the_synthetic_window_runs_an_ordinary_increment(self) -> None:
+        self._register_job(synthetic_full_days=[self._weekday(3)])
+
+        tasks = self._dispatch()
+
+        self.assertEqual([task["parameters"]["resolved_backup_type"] for task in tasks], ["Incremental"])
+
+    def test_an_active_full_day_wins_over_a_synthetic_full_day(self) -> None:
+        self._register_job(
+            synthetic_full_days=[self._weekday()], active_full_days=[self._weekday()]
+        )
+
+        tasks = self._dispatch()
+
+        self.assertEqual([task["parameters"]["resolved_backup_type"] for task in tasks], ["ActiveFull"])
+
+    def test_each_vm_in_a_job_gets_its_own_pair_of_phases(self) -> None:
+        RESOURCES_BY_HV["hv-1"][("virtual_machine", "vm-2")] = {
+            "resource_type": "virtual_machine",
+            "external_id": "vm-2",
+            "name": "demo-vm-2",
+            "payload": {},
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        BACKUPS["point-2"] = {
+            **BACKUPS["point-1"],
+            "id": "point-2",
+            "chain_id": "backup::job-1::vm-2::repo-1",
+            "vm_id": "vm-2",
+        }
+        self._register_job(synthetic_full_days=[self._weekday()])
+        JOBS["job-1"]["vm_ids"] = ["vm-1", "vm-2"]
+        JOBS["job-1"]["vm_names"] = ["demo-vm", "demo-vm-2"]
+
+        tasks = self._dispatch()
+
+        self.assertEqual(len(tasks), 4)
+        for vm_id in ("vm-1", "vm-2"):
+            own = [task for task in tasks if task["resource_external_id"] == vm_id]
+            self.assertEqual(
+                [task["parameters"]["resolved_backup_type"] for task in own],
+                ["Incremental", "SyntheticFull"],
+            )
+            self.assertEqual(own[1]["parameters"]["requires_task_id"], own[0]["id"])
+
+    def test_a_repository_that_cannot_merge_falls_back_to_a_single_active_full(self) -> None:
+        REPOSITORIES["repo-nfs"] = {
+            "id": "repo-nfs",
+            "name": "NFS Repo",
+            "type": "nfs",
+            "path": "",
+        }
+        self._register_job(synthetic_full_days=[self._weekday()])
+        JOBS["job-1"]["repo_id"] = "repo-nfs"
+        JOBS["job-1"]["repo_name"] = "NFS Repo"
+        BACKUPS["point-1"]["chain_id"] = "backup::job-1::vm-1::repo-nfs"
+        BACKUPS["point-1"]["repository_id"] = "repo-nfs"
+
+        tasks = self._dispatch()
+
+        self.assertEqual(
+            [task["parameters"]["resolved_backup_type"] for task in tasks], ["ActiveFull"]
+        )
+        self.assertEqual(
+            tasks[0]["parameters"]["resolved_backup_reason"],
+            "RepositorySyntheticUnsupportedEscalatedToActive",
+        )
+        self.assertNotIn("requires_task_id", tasks[0]["parameters"])
+
+    def test_one_scheduled_execution_enqueues_the_synthetic_full_once(self) -> None:
+        self._register_job(synthetic_full_days=[self._weekday()])
+
+        self.scheduler._dispatch_due_jobs()
+        self.scheduler._dispatch_due_jobs()
+        self.scheduler._dispatch_due_jobs()
+
+        synthetic = [
+            task for task in TASKS.values()
+            if task["parameters"]["resolved_backup_type"] == "SyntheticFull"
+        ]
+        self.assertEqual(len(synthetic), 1)
