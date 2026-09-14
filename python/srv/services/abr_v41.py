@@ -4263,6 +4263,30 @@ def _session_vm_names(task: dict[str, Any]) -> tuple[str | None, str | None]:
     return str(parameters.get("vm_name") or "").strip() or None, None
 
 
+def _repository_name_for(repository_id: str) -> str | None:
+    record = REPOSITORIES.get(repository_id) if repository_id else None
+    return str(record.get("name") or "") or None if isinstance(record, dict) else None
+
+
+def _synthetic_full_report(result: dict[str, Any]) -> dict[str, Any] | None:
+    if not bool(result.get("synthetic_full")):
+        return None
+    merged_ids = result.get("merged_restore_point_ids")
+    target_id = str(result.get("repository_id") or "")
+    source_id = str(result.get("source_repository_id") or "") or target_id
+    return {
+        "merged_from": _safe_int(result.get("merged_from")),
+        "merged_restore_point_ids": list(merged_ids) if isinstance(merged_ids, list) else [],
+        "source_repository_id": source_id or None,
+        "source_repository_name": _repository_name_for(source_id),
+        "target_repository_id": target_id or None,
+        "target_repository_name": _repository_name_for(target_id),
+        "disk_count": _safe_int(result.get("disk_count")),
+        "logical_bytes": _safe_int(result.get("logical_bytes")),
+        "stored_bytes": _safe_int(result.get("transferred_bytes")),
+    }
+
+
 def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[str, Any]:
     result = task.get("result") if isinstance(task.get("result"), dict) else {}
     error = task.get("error") if isinstance(task.get("error"), dict) else {}
@@ -4298,6 +4322,9 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     }
     if result.get("failure_kind"):
         dto["failure_kind"] = result.get("failure_kind")
+    synthetic = _synthetic_full_report(result)
+    if synthetic is not None:
+        dto["synthetic_full"] = synthetic
     if str(task.get("task_type") or "") == "verify":
         dto["verify"] = result.get("verify")
     if str(task.get("task_type") or "") == "delete":

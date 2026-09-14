@@ -14,7 +14,7 @@ from python.srv.core.mongo_db_wrapper import BACKUPS, JOBS, REPOSITORIES, TASKS
 from python.srv.core.storage_tool import StorageToolError
 from python.srv.core.subprocess_util import ProcessCancelled
 from python.srv.core.task_executor import TaskStopRequested
-from python.srv.services import synthetic_full
+from python.srv.services import abr_v41, synthetic_full
 from python.srv.services.synthetic_full import (
     SyntheticFullError,
     SyntheticFullValidationError,
@@ -569,6 +569,68 @@ class FullBackupParentTests(unittest.TestCase):
 
         self.assertIsNone(synthetic.get("parent_point_id"))
         self.assertIsNone(second_full.get("parent_point_id"))
+
+    def test_a_synthetic_full_session_reports_what_it_merged(self) -> None:
+        REPOSITORIES["repo-src"] = {"id": "repo-src", "name": "Nightly", "type": "local"}
+        REPOSITORIES["repo-dst"] = {"id": "repo-dst", "name": "Archive", "type": "s3"}
+        self.addCleanup(REPOSITORIES.pop, "repo-src", None)
+        self.addCleanup(REPOSITORIES.pop, "repo-dst", None)
+        task = {
+            "id": "task-1",
+            "task_type": "backup",
+            "status": "completed",
+            "result": {
+                "synthetic_full": True,
+                "resolved_backup_type": "SyntheticFull",
+                "merged_from": 3,
+                "merged_restore_point_ids": ["p1", "p2", "p3"],
+                "source_repository_id": "repo-src",
+                "repository_id": "repo-dst",
+                "disk_count": 2,
+                "logical_bytes": 2048,
+                "transferred_bytes": 512,
+            },
+        }
+
+        report = abr_v41.session_to_dto(task)["synthetic_full"]
+
+        self.assertEqual(report["merged_from"], 3)
+        self.assertEqual(report["merged_restore_point_ids"], ["p1", "p2", "p3"])
+        self.assertEqual(report["source_repository_name"], "Nightly")
+        self.assertEqual(report["target_repository_name"], "Archive")
+        self.assertEqual(report["disk_count"], 2)
+        self.assertEqual(report["stored_bytes"], 512)
+
+    def test_a_merge_inside_one_repository_reports_it_as_both_source_and_target(self) -> None:
+        previous = REPOSITORIES.get("repo-1")
+        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Nightly", "type": "local"}
+        self.addCleanup(lambda: REPOSITORIES.__setitem__("repo-1", previous) if previous else REPOSITORIES.pop("repo-1", None))
+        task = {
+            "id": "task-1",
+            "task_type": "backup",
+            "status": "completed",
+            "result": {
+                "synthetic_full": True,
+                "merged_from": 2,
+                "repository_id": "repo-1",
+                "source_repository_id": "",
+            },
+        }
+
+        report = abr_v41.session_to_dto(task)["synthetic_full"]
+
+        self.assertEqual(report["source_repository_id"], "repo-1")
+        self.assertEqual(report["target_repository_id"], "repo-1")
+
+    def test_an_ordinary_backup_session_carries_no_synthetic_report(self) -> None:
+        task = {
+            "id": "task-1",
+            "task_type": "backup",
+            "status": "completed",
+            "result": {"resolved_backup_type": "ActiveFull"},
+        }
+
+        self.assertNotIn("synthetic_full", abr_v41.session_to_dto(task))
 
     def test_a_synthetic_full_registers_as_a_full_and_opens_its_own_segment(self) -> None:
         first = self._register("ActiveFull", "task-1")
