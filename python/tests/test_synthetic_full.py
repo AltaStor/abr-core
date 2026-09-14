@@ -570,6 +570,15 @@ class FullBackupParentTests(unittest.TestCase):
         self.assertIsNone(synthetic.get("parent_point_id"))
         self.assertIsNone(second_full.get("parent_point_id"))
 
+    def test_a_synthetic_full_registers_as_a_full_and_opens_its_own_segment(self) -> None:
+        first = self._register("ActiveFull", "task-1")
+        self._register("Incremental", "task-2")
+        synthetic = self._register("SyntheticFull", "task-3")
+
+        self.assertTrue(synthetic.get("full_backup"))
+        self.assertEqual(synthetic.get("segment_id"), synthetic.get("id"))
+        self.assertNotEqual(synthetic.get("segment_id"), first.get("segment_id"))
+
     def test_an_incremental_still_records_its_parent(self) -> None:
         first = self._register("ActiveFull", "task-1")
         incremental = self._register("Incremental", "task-2")
