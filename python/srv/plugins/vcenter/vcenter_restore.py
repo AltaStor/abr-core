@@ -353,7 +353,7 @@ def _resolve_abr_restore_layers(
                 "manifest_path": _manifest_path_for_point(point),
                 "abr_path": abr_path,
                 "abr_backup_name": abr_backup_name,
-                "store_mode": store_mode or "full",
+                "store_mode": "incremental" if store_mode == "incremental" else "full",
                 "source": source,
             }
         )

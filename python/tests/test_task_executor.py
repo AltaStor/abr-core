@@ -6178,6 +6178,134 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertIn("Discovered resource not found", result["result"]["message"])
 
 
+    def _write_chain_manifest(
+        self, root: "pathlib.Path", backup_name: str, store_mode: str
+    ) -> "pathlib.Path":
+        root.mkdir(parents=True, exist_ok=True)
+        manifest_path = root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "backup_mode": "full" if store_mode == "full" else "incremental",
+                    "vm_name": "demo-vm",
+                    "vm_config": {"guest_id": "ubuntu64Guest", "firmware": "efi"},
+                    "disks": [
+                        {
+                            "index": 1,
+                            "disk_label": "Hard disk 1",
+                            "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                            "destination_path": "",
+                            "abr_path": str(root),
+                            "abr_backup_name": backup_name,
+                            "storage_mode": "local",
+                            "store_mode": store_mode,
+                            "source_disk_type_code": int(VddkDiskType.VMFS_THIN),
+                            "source_disk_type_name": "vmfs_thin",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return manifest_path
+
+    def _register_synthetic_chain(self, temp_dir: str) -> dict[str, "pathlib.Path"]:
+        base = pathlib.Path(temp_dir)
+        manifests = {
+            "full": self._write_chain_manifest(base / "task-full", "01-full.vmdk", "full"),
+            "inc": self._write_chain_manifest(base / "task-inc", "01-inc.vmdk", "incremental"),
+            "synthetic": self._write_chain_manifest(
+                base / "task-synthetic", "01-synthetic.vmdk", "full"
+            ),
+            "inc2": self._write_chain_manifest(base / "task-inc2", "01-inc2.vmdk", "incremental"),
+        }
+        self._register_backup_point("point-full", manifests["full"])
+        self._register_backup_point("point-inc", manifests["inc"], parent_point_id="point-full")
+        # A synthetic full opens a new chain, so it records no parent — the same
+        # shape register_backup_from_completed_task produces for any full.
+        self._register_backup_point("point-synthetic", manifests["synthetic"])
+        self._register_backup_point(
+            "point-inc2", manifests["inc2"], parent_point_id="point-synthetic"
+        )
+        return manifests
+
+    def _run_chain_restore(self, point_id: str, manifest_path: "pathlib.Path") -> list[list[str]]:
+        self._register_vcenter_stand()
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        recorded: list[list[str]] = []
+
+        task = {
+            "id": f"task-restore-{point_id}",
+            "status": "queued",
+            "task_type": "restore",
+            "hypervisor_id": "hv-vc",
+            "resource_type": "virtual_machine",
+            "resource_external_id": "vm-uuid-1",
+            "parameters": {
+                "manifest_path": str(manifest_path),
+                "point_id": point_id,
+                "target_vm_name": "demo-vm-restored",
+                "target_host_name": "esx-dst.local",
+                "target_datastore_name": "datastore2",
+                "tool_path": EXISTING_TOOL_PATH,
+            },
+        }
+
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            recorded.append(command)
+            return FakeCompletedProcess(returncode=0, stdout="ok")
+
+        with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+            with patch("python.srv.plugins.vcenter.vcenter_restore.run_capped", side_effect=fake_run):
+                result = run_task(task)
+
+        self.assertEqual(result["status"], "completed")
+        return recorded
+
+    def test_a_restore_from_a_synthetic_full_replays_only_that_one_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifests = self._register_synthetic_chain(temp_dir)
+            recorded = self._run_chain_restore("point-synthetic", manifests["synthetic"])
+
+        names = [command[command.index("--name") + 1] for command in recorded]
+        self.assertEqual(names, ["01-synthetic.vmdk"])
+
+    def test_a_restore_from_an_increment_over_a_synthetic_stops_at_the_synthetic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifests = self._register_synthetic_chain(temp_dir)
+            recorded = self._run_chain_restore("point-inc2", manifests["inc2"])
+
+        names = [command[command.index("--name") + 1] for command in recorded]
+        self.assertEqual(names, ["01-synthetic.vmdk", "01-inc2.vmdk"])
+        self.assertNotIn("01-full.vmdk", names, "the pre-synthetic chain must not be replayed")
+        self.assertNotIn("01-inc.vmdk", names)
+
+    def test_every_layer_of_a_synthetic_chain_restores_onto_the_same_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifests = self._register_synthetic_chain(temp_dir)
+            recorded = self._run_chain_restore("point-inc2", manifests["inc2"])
+
+        targets = {command[command.index("--vmdk") + 1] for command in recorded}
+        self.assertEqual(len(targets), 1)
+
+    def test_a_synthetic_base_layer_is_restored_like_any_other_full(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifests = self._register_synthetic_chain(temp_dir)
+            synthetic = self._run_chain_restore("point-synthetic", manifests["synthetic"])
+            FakeVCenterNode.created_vms.clear()
+            plain_full = self._run_chain_restore("point-full", manifests["full"])
+
+        self.assertNotIn("--force", synthetic[0])
+        self.assertEqual("--force" in synthetic[0], "--force" in plain_full[0])
+
+    def test_increments_over_a_synthetic_are_still_applied_with_force(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifests = self._register_synthetic_chain(temp_dir)
+            recorded = self._run_chain_restore("point-inc2", manifests["inc2"])
+
+        self.assertNotIn("--force", recorded[0])
+        self.assertIn("--force", recorded[1])
+
     def _register_vcenter_stand(self) -> None:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",
