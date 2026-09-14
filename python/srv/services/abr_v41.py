@@ -4322,6 +4322,9 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     }
     if result.get("failure_kind"):
         dto["failure_kind"] = result.get("failure_kind")
+    if result.get("restore_point_id"):
+        dto["restore_point_id"] = result.get("restore_point_id")
+        dto["backup_id"] = result.get("backup_id")
     synthetic = _synthetic_full_report(result)
     if synthetic is not None:
         dto["synthetic_full"] = synthetic

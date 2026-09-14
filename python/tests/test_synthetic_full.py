@@ -570,6 +570,48 @@ class FullBackupParentTests(unittest.TestCase):
         self.assertIsNone(synthetic.get("parent_point_id"))
         self.assertIsNone(second_full.get("parent_point_id"))
 
+    def test_a_completed_backup_session_names_the_restore_point_it_created(self) -> None:
+        from concurrent.futures import Future
+
+        from python.srv.core.task_pool import TaskProcessPool
+
+        task = {"id": "task-1", "task_type": "backup", "status": "queued", "result": {}, "logs": []}
+        TASKS["task-1"] = task
+        self.addCleanup(TASKS.pop, "task-1", None)
+        outcome = {
+            "task_id": "task-1",
+            "status": "completed",
+            "result": {"operation": "backup"},
+            "updated_at": "2026-09-14T00:00:00+00:00",
+        }
+        pool = TaskProcessPool(worker_count=1)
+
+        future: Future = Future()
+        future.set_result(outcome)
+        pool._futures[future] = ("task-1", "backup", None)
+
+        with patch(
+            "python.srv.core.task_pool.register_backup_from_completed_task",
+            return_value={"id": "point-9", "chain_id": "chain-9"},
+        ):
+            pool._complete_task(future)
+
+        self.assertEqual(TASKS["task-1"]["result"]["restore_point_id"], "point-9")
+        self.assertEqual(TASKS["task-1"]["result"]["backup_id"], "chain-9")
+
+    def test_the_session_passes_the_created_restore_point_through(self) -> None:
+        task = {
+            "id": "task-1",
+            "task_type": "backup",
+            "status": "completed",
+            "result": {"restore_point_id": "point-9", "backup_id": "chain-9"},
+        }
+
+        dto = abr_v41.session_to_dto(task)
+
+        self.assertEqual(dto["restore_point_id"], "point-9")
+        self.assertEqual(dto["backup_id"], "chain-9")
+
     def test_a_synthetic_full_session_reports_what_it_merged(self) -> None:
         REPOSITORIES["repo-src"] = {"id": "repo-src", "name": "Nightly", "type": "local"}
         REPOSITORIES["repo-dst"] = {"id": "repo-dst", "name": "Archive", "type": "s3"}

@@ -306,7 +306,19 @@ def run_synthetic_full(
         if progress_callback is not None:
             progress_callback({"progress": max(0, min(100, progress)), "message": message})
 
-    _emit(0, f"Merging {len(points)} restore point(s) into a synthetic full")
+    target_name = str(repository.get("name") or repository_id)
+    source_name = str(source_repository.get("name") or source_repository_id)
+    where = (
+        f"in '{target_name}'"
+        if source_name == target_name
+        else f"from '{source_name}' into '{target_name}'"
+    )
+    source_clause = "" if source_name == target_name else f" from '{source_name}'"
+    _emit(
+        0,
+        f"Merging {len(points)} restore point(s){source_clause} "
+        f"into a synthetic full in '{target_name}'",
+    )
 
     for position, merge in enumerate(merges):
         template = merge["template"]
@@ -410,12 +422,20 @@ def run_synthetic_full(
     manifest_path = _write_synthetic_manifest(
         repository, task_root, destination_path, manifest_payload, retention_days=retention_days
     )
-    _emit(100, f"Synthetic full written from {len(points)} restore point(s)")
+    _emit(
+        100,
+        f"Synthetic full written to '{target_name}' from {len(points)} restore point(s): "
+        f"{logical_total} logical / {stored_total} stored byte(s)",
+    )
     logger.info(
-        "Synthetic full for task %s merged %d restore point(s) across %d disk(s) in %.2f seconds",
+        "Synthetic full for task %s merged %d restore point(s) %s across %d disk(s), "
+        "%d logical / %d stored byte(s), in %.2f seconds",
         task_id,
         len(points),
+        where,
         total,
+        logical_total,
+        stored_total,
         time.time() - start_time,
     )
     return {

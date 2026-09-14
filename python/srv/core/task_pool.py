@@ -283,8 +283,11 @@ class TaskProcessPool:
             task["logs"] = logs
             try:
                 persist_task(dict(task))
-                register_backup_from_completed_task(task)
-                if task.get("warnings"):
+                created_point = register_backup_from_completed_task(task)
+                if isinstance(created_point, dict) and isinstance(task.get("result"), dict):
+                    task["result"]["restore_point_id"] = created_point.get("id")
+                    task["result"]["backup_id"] = created_point.get("chain_id")
+                if created_point or task.get("warnings"):
                     persist_task(dict(task))
             except Exception as exc:
                 logger.error("Failed to persist final outcome for task '%s': %s", task_id, exc)
