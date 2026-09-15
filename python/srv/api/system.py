@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
-from fastapi import Body, Query
+from fastapi import Body, Query, Request
 
-from python.srv.services import abr_v41, support_bundle_service, system_log_service
+from python.srv.services import (
+    abr_v41,
+    support_bundle_service,
+    system_log_service,
+    tls_certificate_service,
+)
 
 from ._routing import build_router, register
 from .schemas import (
@@ -18,6 +23,8 @@ from .schemas import (
     SystemInfoDTO,
     SystemLogsDTO,
     SystemVersionDTO,
+    TlsCertificateDTO,
+    TlsCertificateInstallRequest,
     unset_excluded,
 )
 
@@ -75,6 +82,52 @@ def get_support_bundle() -> SupportBundleResult:
     return support_bundle_service.generate_support_bundle()
 
 
+def get_tls_certificate() -> TlsCertificateDTO:
+    """The certificate the console and API are served over HTTPS with.
+
+    `source` is "generated" for the appliance's own self-signed certificate
+    (renewed automatically) or "administrator" for one installed with PUT or
+    placed over the certificate files by hand (never renewed or replaced by the
+    appliance). `warnings` lists what a browser would object to, such as an
+    approaching expiry or none of the appliance's names being in the certificate.
+    """
+    return tls_certificate_service.get_certificate()
+
+
+def install_tls_certificate(
+    request: Request,
+    payload: TlsCertificateInstallRequest = Body(default_factory=TlsCertificateInstallRequest),
+) -> TlsCertificateDTO:
+    """Replace the HTTPS certificate and private key.
+
+    Everything is validated before anything on disk changes: the PEM parses, the
+    key belongs to the certificate, the certificate is currently valid and
+    issued for TLS servers, and any intermediates are in order. The new pair is
+    loaded into the running server, so new connections get it without a
+    restart (`reloaded`). The passphrase of an encrypted key is used once to
+    read it and is not stored.
+    """
+    body = unset_excluded(payload)
+    return tls_certificate_service.install_certificate(
+        body.get("certificate"),
+        body.get("private_key"),
+        body.get("passphrase"),
+        installed_by=getattr(request.state, "user_name", None),
+    )
+
+
+def revert_tls_certificate(request: Request) -> TlsCertificateDTO:
+    """Remove the administrator's certificate and go back to a self-signed one.
+
+    A new key and self-signed certificate are generated and loaded into the
+    running server. Answers with the current certificate unchanged when it is
+    already the appliance's own.
+    """
+    return tls_certificate_service.revert_to_generated_certificate(
+        requested_by=getattr(request.state, "user_name", None),
+    )
+
+
 register(router, [
     ("/version", system_version, ["GET"]),
     ("/info", system_info, ["GET"]),
@@ -83,4 +136,7 @@ register(router, [
     ("/catalog-snapshot", export_catalog_snapshot, ["POST"]),
     ("/catalog-restore", import_catalog_snapshot, ["POST"]),
     ("/support-bundle", get_support_bundle, ["POST"]),
+    ("/tls-certificate", get_tls_certificate, ["GET"]),
+    ("/tls-certificate", install_tls_certificate, ["PUT"]),
+    ("/tls-certificate", revert_tls_certificate, ["DELETE"]),
 ])

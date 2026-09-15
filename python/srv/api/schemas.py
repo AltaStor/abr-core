@@ -554,6 +554,44 @@ class SystemInfoDTO(_LenientModel):
 
 
 
+class TlsCertificateInstallRequest(_LenientModel):
+    certificate: LaxStr | None = Field(
+        default=None,
+        description="PEM certificate: the server certificate first, then any intermediates in order.",
+    )
+    private_key: LaxStr | None = Field(
+        default=None, description="PEM private key (RSA 2048+ or EC P-256/P-384/P-521)."
+    )
+    passphrase: LaxStr | None = Field(
+        default=None, description="Passphrase of an encrypted private key; not stored."
+    )
+
+
+class TlsCertificateDTO(_LenientModel):
+    source: DocStr = None
+    auto_renew: DocBool = None
+    subject: DocStr = None
+    common_name: DocStr = None
+    issuer: DocStr = None
+    issuer_common_name: DocStr = None
+    self_signed: DocBool = None
+    dns_names: DocStrArray = None
+    ip_addresses: DocStrArray = None
+    serial_number: DocStr = None
+    fingerprint_sha256: DocStr = None
+    key_type: DocStr = None
+    not_before: DocStr = None
+    not_after: DocStr = None
+    days_remaining: DocInt = None
+    expired: DocBool = None
+    chain_length: DocInt = None
+    installed_at: DocStr = None
+    installed_by: DocStr = None
+    live_reload: DocBool = None
+    reloaded: DocBool = None
+    warnings: DocObjectArray = None
+
+
 class SystemHealthDTO(_LenientModel):
     status: DocStr = None
     components: DocObject = None

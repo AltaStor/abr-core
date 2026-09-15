@@ -9,7 +9,7 @@ import ssl
 from pathlib import Path
 
 from .server_defaults import env_int
-from .tls_bootstrap import ensure_self_signed_cert
+from .tls_bootstrap import TLS_FILES_LOCK, ensure_self_signed_cert
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,33 @@ def renewal_check_interval_seconds() -> int:
     return env_int("ABR_TLS_RENEWAL_CHECK_INTERVAL_SECONDS")
 
 
+def load_into_live_context(ssl_context: ssl.SSLContext, cert_path: Path, key_path: Path) -> None:
+    # load_cert_chain() on a context already serving a certificate only replaces
+    # the one of the same key type: load an EC certificate into an RSA context
+    # and it holds both, and clients that prefer RSA keep getting the old one
+    # (and the other way round). So the pair is loaded into a context of its own
+    # and every handshake is moved onto it from the ClientHello callback, which
+    # OpenSSL calls with or without SNI. Protocol, cipher and session settings
+    # stay those of the live context. Loading the pair into the live context as
+    # well only keeps what it holds current; the callback decides what is served.
+    serving = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    serving.load_cert_chain(str(cert_path), str(key_path))
+    ssl_context.load_cert_chain(str(cert_path), str(key_path))
+
+    def use_current_certificate(ssl_object, _server_name, _context) -> None:
+        ssl_object.context = serving
+
+    ssl_context.sni_callback = use_current_certificate
+
+
 def check_and_renew(
+    cert_path: Path, key_path: Path, ssl_context: ssl.SSLContext | None
+) -> bool:
+    with TLS_FILES_LOCK:
+        return _check_and_renew_locked(cert_path, key_path, ssl_context)
+
+
+def _check_and_renew_locked(
     cert_path: Path, key_path: Path, ssl_context: ssl.SSLContext | None
 ) -> bool:
     logger.info("Checking TLS certificate %s for renewal.", cert_path)
@@ -46,7 +72,7 @@ def check_and_renew(
         return True
 
     try:
-        ssl_context.load_cert_chain(str(cert_path), str(key_path))
+        load_into_live_context(ssl_context, cert_path, key_path)
     except Exception:
         logger.exception(
             "Renewed TLS certificate %s on disk but failed to load it into the "

@@ -70,7 +70,7 @@ from .core.mongo_db_wrapper import (
     load_tasks,
     load_users,
 )
-from .services import auth_service, backup_catalog
+from .services import auth_service, backup_catalog, tls_certificate_service
 from .core.server_defaults import env_int
 from .core.task_pool import TaskProcessPool
 from .services.api_errors import (
@@ -273,6 +273,9 @@ async def lifespan(_: FastAPI):
         logger.info("Background job scheduler started.")
 
         if TLS_RUNTIME is not None:
+            tls_certificate_service.register_live_tls(
+                TLS_RUNTIME.cert_path, TLS_RUNTIME.key_path, TLS_RUNTIME.ssl_context
+            )
             CERT_RENEWAL_TASK = asyncio.create_task(
                 tls_renewal.periodic_renewal_loop(
                     TLS_RUNTIME.cert_path, TLS_RUNTIME.key_path, TLS_RUNTIME.ssl_context
@@ -307,6 +310,7 @@ async def lifespan(_: FastAPI):
             with suppress(asyncio.CancelledError):
                 await CERT_RENEWAL_TASK
             CERT_RENEWAL_TASK = None
+        tls_certificate_service.clear_live_tls()
         if JOB_SCHEDULER:
             logger.debug("Stopping job scheduler...")
             JOB_SCHEDULER.stop()

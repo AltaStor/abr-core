@@ -32,6 +32,7 @@ class CheckAndRenewTests(unittest.TestCase):
     def test_reloads_live_ssl_context_when_renewed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cert_path, key_path = Path(tmp) / "server.crt", Path(tmp) / "server.key"
+            ensure_self_signed_cert(cert_path, key_path)
             with patch(
                 "python.srv.core.tls_renewal.ensure_self_signed_cert", return_value=True
             ):

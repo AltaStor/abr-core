@@ -215,6 +215,18 @@ instead it pins the certificate it sees on first connection and refuses to
 proceed if a later connection to the same host:port presents a different one
 (see `python/cli/tls_trust.py`) -- no extra flags needed for normal use.
 
+To serve a certificate of your own -- CA-issued or self-signed -- install it
+from the web console (Settings > Security > HTTPS certificate) or with
+`PUT /api/v1/system/tls-certificate` (`certificate`: PEM, server certificate
+first then intermediates; `private_key`: PEM; optional `passphrase` for an
+encrypted key). The pair is validated before anything is replaced and loaded
+into the running server without a restart. It is never renewed or regenerated
+by the appliance -- that only happens to the self-signed certificate it created
+itself -- so replace it before it expires; `DELETE` on the same path goes back
+to a freshly generated self-signed one. Because the key changes, a CLI that
+pinned the previous certificate refuses to connect until its entry is removed
+from `~/.altastor-backup/trusted_certs.json`.
+
 Log in. Every `/api/v1` call needs a session, so this comes before anything
 else. The shipped `admin`/`admin` is a bootstrap credential -- change it with
 `abr auth change-password` once the environment is up:

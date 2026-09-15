@@ -6,6 +6,7 @@ from __future__ import annotations
 import array
 import fcntl
 import ipaddress
+import json
 import logging
 import os
 import socket
@@ -13,6 +14,7 @@ import ssl
 import struct
 import sys
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 TLS_CIPHERS_ENV_VAR = "ABR_TLS_CIPHERS"
+
+# Held around every rewrite of the certificate/key pair on disk and the reload
+# into the live TLS context that follows it, so the periodic renewal check and
+# an administrator installing their own certificate cannot interleave.
+TLS_FILES_LOCK = threading.RLock()
+
+_GENERATED_SUBJECT = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
 
 
 def _cipher_string_error(value: str | None) -> str | None:
@@ -98,6 +107,63 @@ def default_cert_paths() -> tuple[Path, Path]:
         dev_dir,
     )
     return dev_dir / "server.crt", dev_dir / "server.key"
+
+
+def administrator_marker_path(cert_path: Path) -> Path:
+    return cert_path.with_name(cert_path.name + ".administrator.json")
+
+
+def read_administrator_marker(cert_path: Path) -> dict | None:
+    try:
+        payload = json.loads(administrator_marker_path(cert_path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        # Present but unreadable still means somebody put their own certificate
+        # here on purpose; that intent is what matters, not the metadata.
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def write_administrator_marker(cert_path: Path, metadata: dict) -> None:
+    marker = administrator_marker_path(cert_path)
+    marker.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    marker.chmod(0o644)
+
+
+def is_appliance_generated(cert: x509.Certificate) -> bool:
+    return cert.subject == _GENERATED_SUBJECT and cert.issuer == _GENERATED_SUBJECT
+
+
+def _is_managed_by_appliance(cert_path: Path, cert: x509.Certificate) -> bool:
+    # Only a certificate this module minted is ours to renew. Anything else --
+    # installed through the API (marker present) or dropped in over the files
+    # by hand -- names hosts and a chain the appliance cannot reproduce, and
+    # regenerating it would silently put the self-signed one back.
+    return read_administrator_marker(cert_path) is None and is_appliance_generated(cert)
+
+
+def _warn_if_administrator_cert_expiring(cert_path: Path, cert: x509.Certificate) -> None:
+    threshold_days = env_int("ABR_TLS_RENEWAL_THRESHOLD_DAYS")
+    remaining = cert.not_valid_after_utc - datetime.now(timezone.utc)
+    if remaining > timedelta(days=threshold_days):
+        return
+    if remaining <= timedelta(0):
+        logger.error(
+            "The administrator-provided TLS certificate %s expired on %s. It is not "
+            "renewed automatically; install a new one from Settings > Security or "
+            "revert to the appliance's self-signed certificate.",
+            cert_path,
+            cert.not_valid_after_utc.isoformat(),
+        )
+        return
+    logger.warning(
+        "The administrator-provided TLS certificate %s expires on %s (%d days left). "
+        "It is not renewed automatically; install a replacement before then.",
+        cert_path,
+        cert.not_valid_after_utc.isoformat(),
+        remaining.days,
+    )
 
 
 def _detect_ips_via_hostname_and_probe() -> set[str]:
@@ -260,9 +326,13 @@ def ensure_self_signed_cert(cert_path: Path, key_path: Path) -> bool:
         stale_san = False
         try:
             existing_cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
-            stale_san = _existing_san_ips(existing_cert) != desired_ips
         except (OSError, ValueError):
-            pass
+            existing_cert = None
+        if existing_cert is not None:
+            if not _is_managed_by_appliance(cert_path, existing_cert):
+                _warn_if_administrator_cert_expiring(cert_path, existing_cert)
+                return False
+            stale_san = _existing_san_ips(existing_cert) != desired_ips
 
         if not _needs_renewal(cert_path) and not stale_san:
             return False
@@ -281,9 +351,13 @@ def ensure_self_signed_cert(cert_path: Path, key_path: Path) -> bool:
         cert_path.unlink()
 
     cert_path.parent.mkdir(parents=True, exist_ok=True)
+    # Whatever stood here before is gone or unreadable, so a marker left behind
+    # would claim the certificate about to be generated as an administrator's
+    # and exempt it from renewal for good.
+    administrator_marker_path(cert_path).unlink(missing_ok=True)
 
     private_key = _load_or_generate_key(key_path)
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    subject = issuer = _GENERATED_SUBJECT
     now = datetime.now(timezone.utc)
     validity_days = env_int("ABR_TLS_CERT_VALIDITY_DAYS")
 
