@@ -2759,12 +2759,20 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertFalse(any("03-demo-vm" in name for name in restored_file_names))
         self.assertEqual(FakeVCenterNode.destroyed_vms, ["demo-vm"])
 
-    def _in_place_restore_task(self, temp_dir: "pathlib.Path", *, point_id: str, task_id: str, power_on: bool = False) -> dict[str, object]:
+    def _in_place_restore_task(
+        self,
+        temp_dir: "pathlib.Path",
+        *,
+        point_id: str,
+        task_id: str,
+        power_on: bool = False,
+        vm_name: str = "demo-vm",
+    ) -> dict[str, object]:
         manifest_path = pathlib.Path(temp_dir) / "manifest.json"
         manifest_path.write_text(
             json.dumps(
                 {
-                    "vm_name": "demo-vm",
+                    "vm_name": vm_name,
                     "vm_config": {
                         "guest_id": "ubuntu64Guest",
                         "guest_os": "Ubuntu Linux (64-bit)",
@@ -2806,13 +2814,128 @@ class TaskExecutorTests(unittest.TestCase):
                 # abr_v41.restore_start forces this server-side; here it's
                 # set directly since the test drives run_task without going
                 # through restore_start.
-                "target_vm_name": "demo-vm",
+                "target_vm_name": vm_name,
                 "target_host_name": "esx-dst.local",
                 "target_datastore_name": "datastore2",
                 "power_on": power_on,
                 "tool_path": EXISTING_TOOL_PATH,
             },
         }
+
+    def test_a_restored_disk_keeps_its_plain_name_when_there_is_room(self) -> None:
+        from python.srv.plugins.vcenter import vcenter_restore
+
+        self.assertEqual(vcenter_restore._build_disk_file_name(2, "demo-vm.vmdk"), "02-demo-vm.vmdk")
+
+    def test_repeated_restores_cannot_grow_a_disk_name_past_the_limit(self) -> None:
+        from python.srv.plugins.vcenter import vcenter_restore
+
+        name = "demo-vm.vmdk"
+        for _ in range(200):
+            name = vcenter_restore._build_disk_file_name(1, name)
+
+        self.assertLessEqual(len(name), vcenter_restore.RESTORED_DISK_FILE_NAME_LIMIT)
+        self.assertTrue(name.startswith("01-"))
+        self.assertTrue(name.endswith(".vmdk"))
+
+    def test_a_restored_disk_still_leaves_room_for_a_snapshot_of_its_own(self) -> None:
+        from python.srv.plugins.vcenter import vcenter_restore
+
+        name = "d" * 104 + ".vmdk"
+        for _ in range(10):
+            name = vcenter_restore._build_disk_file_name(1, name)
+            delta = f"{name[:-5]}-000001-sesparse.vmdk"
+            self.assertLessEqual(
+                len(delta),
+                vcenter_restore.VSPHERE_DISK_FILE_NAME_LIMIT,
+                "a restored disk that cannot be snapshotted can never be backed up again",
+            )
+
+    def test_disks_of_one_vm_stay_distinct_even_when_their_names_are_trimmed(self) -> None:
+        from python.srv.plugins.vcenter import vcenter_restore
+
+        source = f"{'q' * 400}.vmdk"
+        names = {vcenter_restore._build_disk_file_name(index, source) for index in (1, 2, 3)}
+
+        self.assertEqual(len(names), 3)
+        for name in names:
+            self.assertLessEqual(len(name), vcenter_restore.RESTORED_DISK_FILE_NAME_LIMIT)
+
+    def test_a_staging_name_never_exceeds_what_vsphere_accepts(self) -> None:
+        from python.srv.plugins.vcenter import vcenter_restore
+
+        for length in (8, 60, 61, 62, 80, 125):
+            staging = vcenter_restore._build_staging_vm_name("x" * length, "abcdef1234")
+            self.assertLessEqual(len(staging), vcenter_restore.VSPHERE_VM_NAME_LIMIT, length)
+            self.assertTrue(staging.endswith("-restoring-abcdef12"), length)
+
+    def test_a_short_name_keeps_its_whole_staging_name(self) -> None:
+        from python.srv.plugins.vcenter import vcenter_restore
+
+        self.assertEqual(
+            vcenter_restore._build_staging_vm_name("demo-vm", "abcdef1234"),
+            "demo-vm-restoring-abcdef12",
+        )
+
+    def test_a_restored_disk_file_name_stays_within_the_datastore_limit(self) -> None:
+        from python.srv.plugins.vcenter import vcenter_restore
+
+        path = vcenter_restore._build_restore_target_path(
+            f"[datastore1] vm/{'y' * 300}.vmdk", "abcdef1234"
+        )
+        file_name = path.rsplit("/", 1)[-1]
+
+        self.assertLessEqual(len(file_name), vcenter_restore.RESTORED_DISK_FILE_NAME_LIMIT)
+        self.assertTrue(file_name.endswith("-restored-abcdef12.vmdk"))
+
+    def test_an_in_place_restore_works_for_a_name_that_leaves_no_room_for_the_suffix(self) -> None:
+        from python.srv.plugins.vcenter import vcenter_restore
+
+        long_name = "prod-eu-west-db-cluster-01-node-03-" + "x" * 27
+        self.assertEqual(len(long_name), 62)
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": long_name,
+                "payload": {},
+            }
+        }
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = self._in_place_restore_task(
+                temp_dir,
+                point_id="point-ip-long",
+                task_id="task-in-place-long-name",
+                vm_name=long_name,
+            )
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                return FakeCompletedProcess(returncode=0, stdout="ok")
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch("python.srv.plugins.vcenter.vcenter_restore.run_capped", side_effect=fake_run):
+                    result = run_task(task)
+
+        self.assertEqual(result["status"], "completed")
+        staging_name = FakeVCenterNode.created_vms[0]["vm_name"]
+        self.assertLessEqual(len(staging_name), vcenter_restore.VSPHERE_VM_NAME_LIMIT)
+        self.assertNotEqual(staging_name, long_name)
+        self.assertEqual(
+            FakeVCenterNode.renamed_vms,
+            [{"from": staging_name, "to": long_name, "vm_moref": "vm-restore-001"}],
+        )
 
     def test_vcenter_vm_restore_in_place_creates_staging_vm_then_swaps(self) -> None:
         HYPERVISORS["hv-vc"] = {

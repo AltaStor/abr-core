@@ -70,10 +70,41 @@ def _parse_datastore_path(datastore_path: str) -> tuple[str, str, str]:
     return datastore_name, folder, filename
 
 
+VSPHERE_VM_NAME_LIMIT = 80
+
+VSPHERE_DISK_FILE_NAME_LIMIT = 122
+
+SNAPSHOT_DELTA_NAME_EXTRA = 16
+
+RESTORED_DISK_FILE_NAME_LIMIT = VSPHERE_DISK_FILE_NAME_LIMIT - SNAPSHOT_DELTA_NAME_EXTRA
+
+
+def _name_with_suffix(base: str, suffix: str, limit: int) -> str:
+    room = max(limit - len(suffix), 0)
+    return f"{base[:room]}{suffix}"
+
+
+def _build_disk_file_name(index: int, source_name: str) -> str:
+    source = Path(source_name)
+    extension = source.suffix or ".vmdk"
+    return _name_with_suffix(f"{index:02d}-{source.stem}", extension, RESTORED_DISK_FILE_NAME_LIMIT)
+
+
+def _build_staging_vm_name(target_vm_name: str, task_id: str) -> str:
+    return _name_with_suffix(
+        target_vm_name, f"-restoring-{task_id[:8]}", VSPHERE_VM_NAME_LIMIT
+    )
+
+
 def _build_restore_target_path(original_datastore_path: str, task_id: str) -> str:
     datastore_name, folder, filename = _parse_datastore_path(original_datastore_path)
     source_path = Path(filename)
-    restored_name = f"{source_path.stem}-restored-{task_id[:8]}{source_path.suffix or '.vmdk'}"
+    extension = source_path.suffix or ".vmdk"
+    restored_name = _name_with_suffix(
+        source_path.stem,
+        f"-restored-{task_id[:8]}{extension}",
+        RESTORED_DISK_FILE_NAME_LIMIT,
+    )
     relative = f"{folder}/{restored_name}" if folder else restored_name
     return f"[{datastore_name}] {relative}"
 
@@ -103,7 +134,7 @@ def _build_disk_layout(disk_entries: list[dict[str, Any]]) -> list[dict[str, Any
             {
                 "label": str(disk.get("disk_label") or f"Hard disk {index}"),
                 "capacity_gb": max(capacity_gb, 1.0),
-                "file_name": f"{index:02d}-{source_name}",
+                "file_name": _build_disk_file_name(index, source_name),
                 "disk_uuid": disk.get("uuid"),
             }
         )
@@ -629,7 +660,11 @@ def run_vcenter_restore(
         # datastore folder, never touching the still-live original until the
         # swap below. For every other restore mode create_vm_name is simply
         # target_vm_name — zero behavior change.
-        create_vm_name = f"{target_vm_name}-restoring-{str(task.get('id') or '')[:8]}" if is_in_place else target_vm_name
+        create_vm_name = (
+            _build_staging_vm_name(target_vm_name, str(task.get("id") or ""))
+            if is_in_place
+            else target_vm_name
+        )
 
         _emit_progress(
             progress_callback,
