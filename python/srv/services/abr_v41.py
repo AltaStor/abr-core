@@ -3191,6 +3191,41 @@ def _resolve_vm_selection(
     return vm_ids, vm_names
 
 
+def _schedule_from_legacy_days(
+    days: list[str], base_schedule: Any, created_at: Any
+) -> dict[str, Any] | None:
+    if not days:
+        return None
+    base = base_schedule if isinstance(base_schedule, dict) else {}
+    time_value = str(base.get("time") or "")
+    if not time_value:
+        time_value = _time_of_day_in_schedule_timezone(created_at, base)
+    return normalize_schedule_payload(
+        {
+            "type": "weekly",
+            "days": list(days),
+            "time": time_value,
+            "timezone": base.get("timezone"),
+            "enabled": True,
+        }
+    )
+
+
+def _time_of_day_in_schedule_timezone(created_at: Any, schedule: dict[str, Any]) -> str:
+    moment = _parse_dt(created_at) if created_at else None
+    if moment is None:
+        return "00:00"
+    return _localize(moment, schedule).strftime("%H:%M")
+
+
+def _normalize_execution_schedule(
+    raw: Any, legacy_days: list[str], base_schedule: Any, created_at: Any
+) -> dict[str, Any] | None:
+    if raw in (None, ""):
+        return _schedule_from_legacy_days(legacy_days, base_schedule, created_at)
+    return normalize_schedule_payload(raw)
+
+
 def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
     item = _json_clone(record)
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
@@ -3242,6 +3277,18 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
     }
     item["active_full_days"] = _normalize_day_list(item.get("active_full_days") or metadata.get("active_full_days") or ())
     item["synthetic_full_days"] = _normalize_day_list(item.get("synthetic_full_days") or metadata.get("synthetic_full_days") or ())
+    item["active_full_schedule"] = _normalize_execution_schedule(
+        item.get("active_full_schedule") or metadata.get("active_full_schedule"),
+        item["active_full_days"],
+        item["schedule"],
+        item.get("created_at"),
+    )
+    item["synthetic_full_schedule"] = _normalize_execution_schedule(
+        item.get("synthetic_full_schedule") or metadata.get("synthetic_full_schedule"),
+        item["synthetic_full_days"],
+        item["schedule"],
+        item.get("created_at"),
+    )
     item["description"] = str(item.get("description") or metadata.get("description") or "")
     task_parameters = item.get("task_parameters")
     if not isinstance(task_parameters, dict):
@@ -3340,6 +3387,8 @@ def job_effective_policy(job: dict[str, Any]) -> dict[str, Any]:
         "manual_force_full": {"type": "ActiveFull", "reason": "ForceFull"},
         "active_full_days": list(job.get("active_full_days") or []),
         "synthetic_full_days": list(job.get("synthetic_full_days") or []),
+        "active_full_schedule": _schedule_dto(job.get("active_full_schedule")),
+        "synthetic_full_schedule": _schedule_dto(job.get("synthetic_full_schedule")),
         "active_overrides_synthetic": True,
         "synthetic_requires_repository_support": True,
         "default": {"type": "Incremental", "reason": "StandardIncremental"},
@@ -3388,6 +3437,10 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "gfs": normalized.get("gfs"),
         "active_full_days": normalized.get("active_full_days"),
         "synthetic_full_days": normalized.get("synthetic_full_days"),
+        "active_full_schedule": _schedule_dto(normalized.get("active_full_schedule")),
+        "synthetic_full_schedule": _schedule_dto(normalized.get("synthetic_full_schedule")),
+        "active_full_next_run_at": normalized.get("active_full_next_run_at"),
+        "synthetic_full_next_run_at": normalized.get("synthetic_full_next_run_at"),
         "compression_level": compression_level,
         "encryption": {"enabled": encryption_enabled, "key_set": has_encryption_key},
         "task_parameters": task_parameters_view,
@@ -3410,6 +3463,38 @@ def list_jobs() -> list[dict[str, Any]]:
     return [job_to_dto(job) for job in normalized_job_records()]
 
 
+EXECUTION_SCHEDULE_FIELDS = (
+    ("active_full_schedule", "active_full_days", "active_full_next_run_at"),
+    ("synthetic_full_schedule", "synthetic_full_days", "synthetic_full_next_run_at"),
+)
+
+
+def _execution_schedule_next_run(schedule: dict[str, Any] | None) -> str | None:
+    if not isinstance(schedule, dict) or not bool(schedule.get("enabled", True)):
+        return None
+    return schedule_next_run(schedule, after=_now_utc()).isoformat()
+
+
+def _has_full_backup_schedule(schedule: Any, legacy_days: Any) -> bool:
+    if isinstance(schedule, dict):
+        return bool(schedule.get("enabled", True))
+    return bool(legacy_days)
+
+
+def _ensure_full_backup_schedule(job: dict[str, Any]) -> None:
+    enabled = any(
+        _has_full_backup_schedule(job.get(schedule_key), job.get(days_key))
+        for schedule_key, days_key, _next_run_key in EXECUTION_SCHEDULE_FIELDS
+    )
+    _ensure(
+        enabled,
+        422,
+        "invalid_job",
+        "A backup job requires at least one full backup schedule so that retention can free the chain: "
+        "set an active full or a synthetic full schedule",
+    )
+
+
 def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or "")
     vm_tokens = payload.get("vms")
@@ -3426,6 +3511,12 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     gfs["enabled"] = _coerce_gfs_enabled(raw_gfs.get("enabled") if isinstance(raw_gfs, dict) else None)
     active_full_days = _normalize_day_list(payload.get("active_full_days") or _split_csv(payload.get("active_full_days_csv")))
     synthetic_full_days = _normalize_day_list(payload.get("synthetic_full_days") or _split_csv(payload.get("synthetic_full_days_csv")))
+    active_full_schedule = normalize_schedule_payload(payload.get("active_full_schedule"))
+    synthetic_full_schedule = normalize_schedule_payload(payload.get("synthetic_full_schedule"))
+    if "active_full_schedule" in payload and active_full_schedule is None:
+        active_full_days = []
+    if "synthetic_full_schedule" in payload and synthetic_full_schedule is None:
+        synthetic_full_days = []
     description = str(payload.get("description") or "").strip()
     task_parameters = payload.get("task_parameters") if isinstance(payload.get("task_parameters"), dict) else payload.get("backup_options")
     if task_parameters is None:
@@ -3436,6 +3527,14 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
     _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
     _ensure(retention_days > 0, 422, "invalid_job", "retention-days must be greater than 0")
+    _ensure_full_backup_schedule(
+        {
+            "active_full_schedule": active_full_schedule,
+            "active_full_days": active_full_days,
+            "synthetic_full_schedule": synthetic_full_schedule,
+            "synthetic_full_days": synthetic_full_days,
+        }
+    )
     _ensure(bool(vm_tokens), 422, "invalid_job", "Backup jobs require at least one VM")
     _ensure(not any(str(existing.get("name") or "").lower() == name.lower() for existing in catalog_records(JOBS)), 409, "job_name_exists", "Job name already exists", name=name)
     repository = resolve_repository(name=repo_name, record_id=repo_id)
@@ -3475,6 +3574,10 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "gfs": gfs,
         "active_full_days": active_full_days,
         "synthetic_full_days": synthetic_full_days,
+        "active_full_schedule": active_full_schedule,
+        "synthetic_full_schedule": synthetic_full_schedule,
+        "active_full_next_run_at": _execution_schedule_next_run(active_full_schedule),
+        "synthetic_full_next_run_at": _execution_schedule_next_run(synthetic_full_schedule),
         "description": description,
         "task_parameters": dict(task_parameters),
         "status": "active" if schedule and bool(schedule.get("enabled", True)) else "disabled" if schedule else "planned",
@@ -3536,6 +3639,8 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "active_full_days": list(source_job.get("active_full_days") or []),
         "synthetic_full_days": list(source_job.get("synthetic_full_days") or []),
+        "active_full_schedule": _json_clone(source_job.get("active_full_schedule")),
+        "synthetic_full_schedule": _json_clone(source_job.get("synthetic_full_schedule")),
         "description": description,
         "task_parameters": dict(source_task_parameters),
         "status": "active" if schedule and bool(schedule.get("enabled", True)) else "disabled" if schedule else "planned",
@@ -3551,9 +3656,34 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     return job_to_dto(_persist_canonical_job(job))
 
 
+def _retune_weekly_schedule(schedule: Any, days: list[str]) -> dict[str, Any] | None:
+    if not isinstance(schedule, dict) or str(schedule.get("kind") or "") != "weekly":
+        return schedule
+    if not days:
+        return None
+    return dict(schedule, weekdays=list(days))
+
+
+def _touches_full_backup_policy(payload: dict[str, Any]) -> bool:
+    if payload.get("retention_days") is not None:
+        return True
+    for schedule_key, days_key, _next_run_key in EXECUTION_SCHEDULE_FIELDS:
+        if schedule_key in payload:
+            return True
+        if payload.get(days_key) is not None:
+            return True
+    return False
+
+
+def _base_schedule_is_enabled(job: dict[str, Any]) -> bool:
+    schedule = job.get("schedule")
+    return isinstance(schedule, dict) and bool(schedule.get("enabled", True))
+
+
 def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     current = resolve_job(record_id=job_id)
     updated = _json_clone(current)
+    was_enabled = _base_schedule_is_enabled(updated)
     changed = False
     if payload.get("name"):
         new_name = str(payload["name"])
@@ -3590,11 +3720,24 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         new_gfs["enabled"] = bool(payload["gfs_enabled"]) if gfs_enabled_given else _coerce_gfs_enabled(current_gfs.get("enabled"))
         updated["gfs"] = new_gfs
         changed = True
-    if "active_full_days" in payload and payload["active_full_days"] is not None:
-        updated["active_full_days"] = _normalize_day_list(payload["active_full_days"])
+    for schedule_key, days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
+        if schedule_key not in payload:
+            continue
+        schedule_value = normalize_schedule_payload(payload[schedule_key])
+        updated[schedule_key] = schedule_value
+        updated[next_run_key] = _execution_schedule_next_run(schedule_value)
+        if schedule_value is None:
+            updated[days_key] = []
         changed = True
-    if "synthetic_full_days" in payload and payload["synthetic_full_days"] is not None:
-        updated["synthetic_full_days"] = _normalize_day_list(payload["synthetic_full_days"])
+    for schedule_key, days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
+        if days_key not in payload or payload[days_key] is None:
+            continue
+        days = _normalize_day_list(payload[days_key])
+        updated[days_key] = days
+        retuned = _retune_weekly_schedule(updated.get(schedule_key), days)
+        if retuned != updated.get(schedule_key):
+            updated[schedule_key] = retuned
+            updated[next_run_key] = _execution_schedule_next_run(retuned)
         changed = True
     if "description" in payload:
         description = str(payload.get("description") or "").strip()
@@ -3636,6 +3779,8 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             updated["inventory_id"] = source["inventory_id"]
             updated["inventory_name"] = source["inventory_name"]
             changed = True
+    if updated["job_type"] == "backup" and _touches_full_backup_policy(payload):
+        _ensure_full_backup_schedule(updated)
     _ensure(changed, 422, "invalid_job", "job edit requires at least one editable option")
     updated["updated_at"] = utc_now()
     if updated.get("schedule"):
@@ -3646,6 +3791,13 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     else:
         updated["status"] = "planned"
         updated["next_run_at"] = None
+    is_enabled = _base_schedule_is_enabled(updated)
+    if was_enabled and not is_enabled:
+        for _schedule_key, _days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
+            updated[next_run_key] = None
+    elif is_enabled and not was_enabled:
+        for schedule_key, _days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
+            updated[next_run_key] = _execution_schedule_next_run(updated.get(schedule_key))
     return job_to_dto(_persist_canonical_job(updated))
 
 
@@ -3745,6 +3897,7 @@ def resolve_job_execution(
     force_full: bool,
     force_synthetic: bool = False,
     now: datetime | None = None,
+    scheduled_type: str | None = None,
 ) -> tuple[str, str]:
     current = now or _now_utc()
     repository = resolve_repository(record_id=str(job.get("repo_id") or "")) if job.get("repo_id") else {}
@@ -3763,6 +3916,14 @@ def resolve_job_execution(
     previous = _latest_successful_point(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
     if previous is None:
         return "ActiveFull", "FirstRun"
+    if scheduled_type == "ActiveFull":
+        return "ActiveFull", "ActiveFullSchedule"
+    if scheduled_type == "SyntheticFull":
+        if repository and not repository_supports_synthetic(repository):
+            return "ActiveFull", "RepositorySyntheticUnsupportedEscalatedToActive"
+        return "SyntheticFull", "SyntheticFullSchedule"
+    if scheduled_type == "Incremental":
+        return "Incremental", "StandardIncremental"
     active_match = schedule_today_matches_days(job, list(job.get("active_full_days") or []), now=current)
     synthetic_match = schedule_today_matches_days(job, list(job.get("synthetic_full_days") or []), now=current)
     if active_match and synthetic_match:

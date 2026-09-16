@@ -142,6 +142,7 @@ class BackupServerApiFlowTests(unittest.TestCase):
                 "vms": ["vm-1"],
                 "inventory_id": inventory["id"],
                 "repo_id": repository["id"],
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {
                     "schedule_type": "weekly",
                     "start_time": "22:30",
@@ -174,6 +175,7 @@ class BackupServerApiFlowTests(unittest.TestCase):
                 "vms": ["vm-1"],
                 "inventory_id": inventory["id"],
                 "repo_id": repository["id"],
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {
                     "schedule_type": "interval",
                     "interval_minutes": 30,
@@ -674,6 +676,49 @@ class BackupServerApiFlowTests(unittest.TestCase):
         self.assertEqual(second_session["resolved_backup_type"], "ActiveFull")
         self.assertEqual(second_session["resolved_backup_reason"], "ForceFull")
 
+    def test_job_create_rejects_retention_days_without_a_full_schedule(self) -> None:
+        inventory = self._create_mock_inventory("test-retention-nofull-hv")
+        repository = self._create_repository("retention-nofull-repo", "local", path="/backup/retention-nofull")
+
+        response = self.client.post(
+            "/api/v1/jobs",
+            json={
+                "name": "retention-nofull-job",
+                "vms": ["vm-1"],
+                "inventory_id": inventory["id"],
+                "repo_id": repository["id"],
+                "retention_days": 30,
+            },
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("full backup schedule", response.json()["error"]["message"])
+        listed = self.client.get("/api/v1/jobs")
+        self.assertFalse(any(item["name"] == "retention-nofull-job" for item in listed.json()["items"]))
+
+    def test_job_create_accepts_retention_days_with_a_synthetic_full_schedule(self) -> None:
+        inventory = self._create_mock_inventory("test-retention-synthetic-hv")
+        repository = self._create_repository("retention-synthetic-repo", "local", path="/backup/retention-synthetic")
+
+        response = self.client.post(
+            "/api/v1/jobs",
+            json={
+                "name": "retention-synthetic-job",
+                "vms": ["vm-1"],
+                "inventory_id": inventory["id"],
+                "repo_id": repository["id"],
+                "retention_days": 30,
+                "schedule": {"type": "daily", "time": "22:00"},
+                "synthetic_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        item = response.json()
+        self.assertEqual(item["synthetic_full_schedule"]["type"], "weekly")
+        self.assertIsNotNone(item["synthetic_full_next_run_at"])
+        self.assertIsNone(item["active_full_schedule"])
+
     def test_job_create_rejects_retention_days_zero_like_job_edit_does(self) -> None:
         inventory = self._create_mock_inventory("test-retention-zero-create-hv")
         repository = self._create_repository("retention-zero-repo", "local", path="/backup/retention-zero")
@@ -685,6 +730,7 @@ class BackupServerApiFlowTests(unittest.TestCase):
                 "vms": ["vm-1"],
                 "inventory_id": inventory["id"],
                 "repo_id": repository["id"],
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "retention_days": 0,
             },
         )
@@ -811,6 +857,7 @@ class BackupServerApiFlowTests(unittest.TestCase):
             "vms": vm_names,
             "inventory_id": inventory_id,
             "repo_id": repo_id,
+            "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
         }
         if task_parameters is not None:
             payload["task_parameters"] = task_parameters

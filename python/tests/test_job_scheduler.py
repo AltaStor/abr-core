@@ -11,6 +11,7 @@ import unittest
 try:
     from python.srv.core.job_scheduler import JobScheduler
     from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS
+    from python.srv.services.abr_v41 import normalize_job_record
     from python.srv.services.synthetic_full import is_synthetic_full_task
 except ModuleNotFoundError:
     repo_root = pathlib.Path(__file__).resolve().parents[2]
@@ -19,6 +20,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(site_packages))
     from python.srv.core.job_scheduler import JobScheduler
     from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS
+    from python.srv.services.abr_v41 import normalize_job_record
     from python.srv.services.synthetic_full import is_synthetic_full_task
 
 
@@ -446,24 +448,12 @@ class JobSchedulerTests(unittest.TestCase):
         self.assertEqual(TASKS["task-stale"]["status"], "failed")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class SyntheticFullSchedulingTests(unittest.TestCase):
     def setUp(self) -> None:
-        HYPERVISORS.clear()
-        JOBS.clear()
-        RESOURCES_BY_HV.clear()
-        TASKS.clear()
-        BACKUPS.clear()
-        REPOSITORIES.clear()
+        for store in (HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, BACKUPS, REPOSITORIES):
+            store.clear()
+            self.addCleanup(store.clear)
         self.scheduler = JobScheduler(poll_interval_seconds=0.1)
-        self.addCleanup(HYPERVISORS.clear)
-        self.addCleanup(JOBS.clear)
-        self.addCleanup(RESOURCES_BY_HV.clear)
-        self.addCleanup(TASKS.clear)
-        self.addCleanup(BACKUPS.clear)
-        self.addCleanup(REPOSITORIES.clear)
 
         HYPERVISORS["hv-1"] = {"id": "hv-1", "kind": "mock"}
         RESOURCES_BY_HV["hv-1"] = {
@@ -493,11 +483,16 @@ class SyntheticFullSchedulingTests(unittest.TestCase):
         }
 
     @staticmethod
+    def _due_daily() -> dict:
+        moment = datetime.now(timezone.utc) - timedelta(minutes=1)
+        return {"type": "daily", "time": moment.strftime("%H:%M"), "timezone": "UTC"}
+
+    @staticmethod
     def _weekday(offset: int = 0) -> str:
         names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
         return names[(datetime.now(timezone.utc).weekday() + offset) % 7]
 
-    def _register_job(self, **days: list[str]) -> None:
+    def _register_job(self, **overrides) -> None:
         JOBS["job-1"] = {
             "id": "job-1",
             "name": "nightly",
@@ -511,8 +506,6 @@ class SyntheticFullSchedulingTests(unittest.TestCase):
             "vm_names": ["demo-vm"],
             "metadata": {"vm_external_id": "vm-1"},
             "task_parameters": {"compression_level": 3},
-            "active_full_days": [],
-            "synthetic_full_days": [],
             "schedule": {
                 "schedule_type": "interval",
                 "enabled": True,
@@ -523,56 +516,130 @@ class SyntheticFullSchedulingTests(unittest.TestCase):
                 "day_of_month": None,
             },
             "created_at": (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(),
-            **days,
+            **overrides,
         }
 
     def _dispatch(self) -> list[dict]:
         self.scheduler._dispatch_due_jobs()
         return sorted(TASKS.values(), key=lambda task: str(task.get("created_at")))
 
-    def test_a_synthetic_full_day_takes_todays_increment_before_merging(self) -> None:
-        self._register_job(synthetic_full_days=[self._weekday()])
+    @staticmethod
+    def _types(tasks: list[dict]) -> list[str]:
+        return [task["parameters"]["resolved_backup_type"] for task in tasks]
+
+    def test_a_due_synthetic_schedule_takes_todays_increment_before_merging(self) -> None:
+        self._register_job(synthetic_full_schedule=self._due_daily())
 
         tasks = self._dispatch()
 
-        self.assertEqual(
-            [task["parameters"]["resolved_backup_type"] for task in tasks],
-            ["Incremental", "SyntheticFull"],
-        )
+        self.assertEqual(self._types(tasks), ["Incremental", "SyntheticFull"])
         self.assertEqual(tasks[1]["parameters"]["requires_task_id"], tasks[0]["id"])
         self.assertLess(tasks[0]["created_at"], tasks[1]["created_at"])
 
     def test_a_scheduled_synthetic_full_reaches_the_synthetic_engine(self) -> None:
-        self._register_job(synthetic_full_days=[self._weekday()])
+        self._register_job(synthetic_full_schedule=self._due_daily())
 
         synthetic = self._dispatch()[1]
 
         self.assertTrue(is_synthetic_full_task(synthetic))
         self.assertEqual(synthetic["parameters"]["repository_id"], "repo-1")
-        self.assertEqual(synthetic["result"]["resolved_backup_type"], "SyntheticFull")
+        self.assertEqual(synthetic["parameters"]["resolved_backup_reason"], "SyntheticFullSchedule")
 
-    def test_synthetic_full_scheduling_turned_off_never_triggers_it(self) -> None:
-        self._register_job(synthetic_full_days=[])
+    def test_a_job_without_a_synthetic_schedule_only_takes_increments(self) -> None:
+        self._register_job()
 
-        tasks = self._dispatch()
+        self.assertEqual(self._types(self._dispatch()), ["Incremental"])
 
-        self.assertEqual([task["parameters"]["resolved_backup_type"] for task in tasks], ["Incremental"])
-
-    def test_a_day_outside_the_synthetic_window_runs_an_ordinary_increment(self) -> None:
-        self._register_job(synthetic_full_days=[self._weekday(3)])
-
-        tasks = self._dispatch()
-
-        self.assertEqual([task["parameters"]["resolved_backup_type"] for task in tasks], ["Incremental"])
-
-    def test_an_active_full_day_wins_over_a_synthetic_full_day(self) -> None:
+    def test_a_synthetic_schedule_that_is_not_due_leaves_the_base_schedule_alone(self) -> None:
         self._register_job(
-            synthetic_full_days=[self._weekday()], active_full_days=[self._weekday()]
+            synthetic_full_schedule={
+                "type": "weekly",
+                "days": [self._weekday(3)],
+                "time": "03:00",
+                "timezone": "UTC",
+            }
         )
 
+        self.assertEqual(self._types(self._dispatch()), ["Incremental"])
+
+    def test_a_disabled_synthetic_schedule_keeps_its_settings_but_never_fires(self) -> None:
+        schedule = dict(self._due_daily(), enabled=False)
+        self._register_job(synthetic_full_schedule=schedule)
+
+        self.assertEqual(self._types(self._dispatch()), ["Incremental"])
+
+    def test_a_job_without_a_base_schedule_never_runs_its_full_schedules(self) -> None:
+        self._register_job(active_full_schedule=self._due_daily())
+        JOBS["job-1"]["schedule"] = None
+
+        self.assertEqual(self._types(self._dispatch()), [])
+
+    def test_a_disabled_base_schedule_stops_the_full_schedules_too(self) -> None:
+        self._register_job(active_full_schedule=self._due_daily(), synthetic_full_schedule=self._due_daily())
+        JOBS["job-1"]["schedule"]["enabled"] = False
+
+        self.assertEqual(self._types(self._dispatch()), [])
+
+    def test_a_base_schedule_that_is_not_due_still_lets_the_active_full_fire(self) -> None:
+        self._register_job(
+            schedule={
+                "schedule_type": "daily",
+                "enabled": True,
+                "timezone": "UTC",
+                "start_time": "05:00",
+                "weekdays": [],
+                "day_of_month": None,
+            },
+            active_full_schedule=self._due_daily(),
+        )
+        JOBS["job-1"]["next_run_at"] = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat()
+
+        self.assertEqual(self._types(self._dispatch()), ["ActiveFull"])
+
+    def test_an_active_full_schedule_wins_when_both_are_due(self) -> None:
+        self._register_job(
+            active_full_schedule=self._due_daily(), synthetic_full_schedule=self._due_daily()
+        )
+
+        self.assertEqual(self._types(self._dispatch()), ["ActiveFull"])
+
+    def test_a_schedule_that_lost_the_tie_does_not_fire_straight_after(self) -> None:
+        self._register_job(active_full_schedule=self._due_daily())
+
+        first = self._types(self._dispatch())
+        TASKS.clear()
+        second = self._types(self._dispatch())
+
+        self.assertEqual(first, ["ActiveFull"])
+        self.assertEqual(second, [], "the base schedule was due too and must have been advanced")
+
+    def test_one_dispatch_enqueues_the_synthetic_full_once(self) -> None:
+        self._register_job(synthetic_full_schedule=self._due_daily())
+
+        for _ in range(3):
+            self.scheduler._dispatch_due_jobs()
+
+        synthetic = [
+            task for task in TASKS.values()
+            if task["parameters"]["resolved_backup_type"] == "SyntheticFull"
+        ]
+        self.assertEqual(len(synthetic), 1)
+
+    def test_a_repository_that_cannot_merge_falls_back_to_a_single_active_full(self) -> None:
+        REPOSITORIES["repo-nfs"] = {"id": "repo-nfs", "name": "NFS Repo", "type": "nfs", "path": ""}
+        self._register_job(synthetic_full_schedule=self._due_daily())
+        JOBS["job-1"]["repo_id"] = "repo-nfs"
+        JOBS["job-1"]["repo_name"] = "NFS Repo"
+        BACKUPS["point-1"]["chain_id"] = "backup::job-1::vm-1::repo-nfs"
+        BACKUPS["point-1"]["repository_id"] = "repo-nfs"
+
         tasks = self._dispatch()
 
-        self.assertEqual([task["parameters"]["resolved_backup_type"] for task in tasks], ["ActiveFull"])
+        self.assertEqual(self._types(tasks), ["ActiveFull"])
+        self.assertEqual(
+            tasks[0]["parameters"]["resolved_backup_reason"],
+            "RepositorySyntheticUnsupportedEscalatedToActive",
+        )
 
     def test_each_vm_in_a_job_gets_its_own_pair_of_phases(self) -> None:
         RESOURCES_BY_HV["hv-1"][("virtual_machine", "vm-2")] = {
@@ -588,7 +655,7 @@ class SyntheticFullSchedulingTests(unittest.TestCase):
             "chain_id": "backup::job-1::vm-2::repo-1",
             "vm_id": "vm-2",
         }
-        self._register_job(synthetic_full_days=[self._weekday()])
+        self._register_job(synthetic_full_schedule=self._due_daily())
         JOBS["job-1"]["vm_ids"] = ["vm-1", "vm-2"]
         JOBS["job-1"]["vm_names"] = ["demo-vm", "demo-vm-2"]
 
@@ -597,45 +664,68 @@ class SyntheticFullSchedulingTests(unittest.TestCase):
         self.assertEqual(len(tasks), 4)
         for vm_id in ("vm-1", "vm-2"):
             own = [task for task in tasks if task["resource_external_id"] == vm_id]
-            self.assertEqual(
-                [task["parameters"]["resolved_backup_type"] for task in own],
-                ["Incremental", "SyntheticFull"],
-            )
+            self.assertEqual(self._types(own), ["Incremental", "SyntheticFull"])
             self.assertEqual(own[1]["parameters"]["requires_task_id"], own[0]["id"])
 
-    def test_a_repository_that_cannot_merge_falls_back_to_a_single_active_full(self) -> None:
-        REPOSITORIES["repo-nfs"] = {
-            "id": "repo-nfs",
-            "name": "NFS Repo",
-            "type": "nfs",
-            "path": "",
-        }
-        self._register_job(synthetic_full_days=[self._weekday()])
-        JOBS["job-1"]["repo_id"] = "repo-nfs"
-        JOBS["job-1"]["repo_name"] = "NFS Repo"
-        BACKUPS["point-1"]["chain_id"] = "backup::job-1::vm-1::repo-nfs"
-        BACKUPS["point-1"]["repository_id"] = "repo-nfs"
 
-        tasks = self._dispatch()
-
-        self.assertEqual(
-            [task["parameters"]["resolved_backup_type"] for task in tasks], ["ActiveFull"]
+class LegacyFullDayMigrationTests(unittest.TestCase):
+    @staticmethod
+    def _job(schedule: dict, **overrides) -> dict:
+        return normalize_job_record(
+            {
+                "id": "job-1",
+                "name": "nightly",
+                "job_type": "backup",
+                "created_at": "2026-09-15T14:37:00+00:00",
+                "schedule": schedule,
+                **overrides,
+            }
         )
-        self.assertEqual(
-            tasks[0]["parameters"]["resolved_backup_reason"],
-            "RepositorySyntheticUnsupportedEscalatedToActive",
+
+    def test_day_lists_become_weekly_schedules_at_the_base_time(self) -> None:
+        job = self._job(
+            {"type": "daily", "time": "02:00", "timezone": "UTC"},
+            active_full_days=["sunday"],
+            synthetic_full_days=["wednesday"],
         )
-        self.assertNotIn("requires_task_id", tasks[0]["parameters"])
 
-    def test_one_scheduled_execution_enqueues_the_synthetic_full_once(self) -> None:
-        self._register_job(synthetic_full_days=[self._weekday()])
+        self.assertEqual(job["active_full_schedule"]["weekdays"], ["Sun"])
+        self.assertEqual(job["active_full_schedule"]["time"], "02:00")
+        self.assertEqual(job["synthetic_full_schedule"]["weekdays"], ["Wed"])
+        self.assertEqual(job["synthetic_full_schedule"]["time"], "02:00")
 
-        self.scheduler._dispatch_due_jobs()
-        self.scheduler._dispatch_due_jobs()
-        self.scheduler._dispatch_due_jobs()
+    def test_a_periodic_base_falls_back_to_the_time_the_job_was_created(self) -> None:
+        job = self._job(
+            {"type": "periodic", "every": "10m", "timezone": "UTC"},
+            synthetic_full_days=["sunday"],
+        )
 
-        synthetic = [
-            task for task in TASKS.values()
-            if task["parameters"]["resolved_backup_type"] == "SyntheticFull"
-        ]
-        self.assertEqual(len(synthetic), 1)
+        self.assertEqual(job["synthetic_full_schedule"]["time"], "14:37")
+
+    def test_the_migrated_time_follows_the_schedule_timezone(self) -> None:
+        job = self._job(
+            {"type": "periodic", "every": "10m", "timezone": "Europe/Kyiv"},
+            synthetic_full_days=["sunday"],
+        )
+
+        self.assertEqual(job["synthetic_full_schedule"]["time"], "17:37")
+
+    def test_an_explicit_schedule_is_never_overwritten_by_the_old_day_list(self) -> None:
+        job = self._job(
+            {"type": "daily", "time": "02:00", "timezone": "UTC"},
+            synthetic_full_days=["sunday"],
+            synthetic_full_schedule={"type": "weekly", "days": ["friday"], "time": "23:00", "timezone": "UTC"},
+        )
+
+        self.assertEqual(job["synthetic_full_schedule"]["weekdays"], ["Fri"])
+        self.assertEqual(job["synthetic_full_schedule"]["time"], "23:00")
+
+    def test_a_job_with_no_day_lists_has_no_extra_schedules(self) -> None:
+        job = self._job({"type": "daily", "time": "02:00", "timezone": "UTC"})
+
+        self.assertIsNone(job["active_full_schedule"])
+        self.assertIsNone(job["synthetic_full_schedule"])
+
+
+if __name__ == "__main__":
+    unittest.main()

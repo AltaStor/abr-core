@@ -95,26 +95,20 @@ class JobScheduler:
                 continue
 
             normalized_job = normalize_job_record(job)
-            next_run_at = self._get_next_run_at(normalized_job)
-            if next_run_at is None:
-                logger.warning("Skipping scheduled job '%s': unable to determine next run time.", job.get("id"))
-                continue
-            if now < next_run_at:
+            due_slots = self._due_slots(normalized_job, job, now)
+            if not due_slots:
                 continue
 
-            tasks = self._create_scheduled_tasks(normalized_job)
+            tasks = self._create_scheduled_tasks(normalized_job, scheduled_type=due_slots[0][1])
             if not tasks:
                 continue
+            self._advance_due_slots(job, due_slots)
 
             job["status"] = "active"
             job["last_task_id"] = tasks[-1]["id"]
             job["last_session_id"] = tasks[-1]["id"]
             job["last_scheduled_at"] = tasks[-1]["created_at"]
             job["last_run_at"] = tasks[-1]["created_at"]
-            job["next_run_at"] = self._compute_next_run_after(
-                normalized_job.get("schedule", {}),
-                datetime.fromisoformat(tasks[-1]["created_at"]),
-            ).isoformat()
             job["updated_at"] = tasks[-1]["created_at"]
             job["last_scheduler_error"] = None
             persist_job(dict(job))
@@ -124,6 +118,57 @@ class JobScheduler:
                 len(tasks),
                 tasks[-1]["id"],
             )
+
+    EXECUTION_SLOTS = (
+        ("active_full_schedule", "ActiveFull", "active_full_next_run_at"),
+        ("synthetic_full_schedule", "SyntheticFull", "synthetic_full_next_run_at"),
+        ("schedule", "Incremental", "next_run_at"),
+    )
+
+    def _due_slots(
+        self, normalized_job: dict[str, Any], job: dict[str, Any], now: datetime
+    ) -> list[tuple[str, str, str, dict[str, Any]]]:
+        due: list[tuple[str, str, str, dict[str, Any]]] = []
+        for schedule_key, execution_type, next_run_key in self.EXECUTION_SLOTS:
+            schedule = normalized_job.get(schedule_key)
+            if not isinstance(schedule, dict) or not bool(schedule.get("enabled", True)):
+                continue
+            next_run_at = self._slot_next_run_at(job, schedule, next_run_key)
+            if next_run_at is None or now < next_run_at:
+                continue
+            due.append((schedule_key, execution_type, next_run_key, schedule))
+        return due
+
+    def _slot_next_run_at(
+        self, job: dict[str, Any], schedule: dict[str, Any], next_run_key: str
+    ) -> datetime | None:
+        stored = _parse_timestamp(job.get(next_run_key))
+        if stored is not None:
+            return stored
+        base = _parse_timestamp(job.get("last_scheduled_at")) or _parse_timestamp(job.get("created_at"))
+        if base is None:
+            return None
+        if job.get("status") != "active":
+            job["status"] = "active"
+        try:
+            computed = self._compute_next_run_after(schedule, base)
+        except ValueError as exc:
+            logger.warning("Skipping schedule of job '%s': %s", job.get("id"), exc)
+            return None
+        job[next_run_key] = computed.isoformat()
+        job["updated_at"] = utc_now()
+        persist_job(dict(job))
+        return computed
+
+    def _advance_due_slots(
+        self, job: dict[str, Any], due_slots: list[tuple[str, str, str, dict[str, Any]]]
+    ) -> None:
+        fired_at = datetime.fromisoformat(utc_now())
+        for _schedule_key, _execution_type, next_run_key, schedule in due_slots:
+            try:
+                job[next_run_key] = self._compute_next_run_after(schedule, fired_at).isoformat()
+            except ValueError:
+                job[next_run_key] = None
 
     def _is_supported_backup_job(self, job: dict[str, Any]) -> bool:
         normalized_job = normalize_job_record(job)
@@ -220,29 +265,6 @@ class JobScheduler:
         else:
             base = base.astimezone(timezone.utc)
         return schedule_next_run(schedule, after=base)
-
-    def _get_next_run_at(self, job: dict[str, Any]) -> datetime | None:
-        next_run_at = _parse_timestamp(job.get("next_run_at"))
-        if next_run_at is not None:
-            return next_run_at
-
-        base = _parse_timestamp(job.get("last_scheduled_at")) or _parse_timestamp(job.get("created_at"))
-        if base is None:
-            return None
-
-        if job.get("status") != "active":
-            job["status"] = "active"
-        try:
-            computed_next_run_at = self._compute_next_run_after(job.get("schedule", {}), base)
-        except ValueError as exc:
-            logger.warning("Skipping scheduled job '%s': %s", job.get("id"), exc)
-            return None
-        if job.get("next_run_at") != computed_next_run_at.isoformat() or job.get("status") != "active":
-            job["next_run_at"] = computed_next_run_at.isoformat()
-            job["updated_at"] = utc_now()
-            persist_job(dict(job))
-
-        return computed_next_run_at
 
     def _resolve_running_task_timeout_seconds(self, job: dict[str, Any]) -> int:
         parameters = self._build_task_parameters(job)
@@ -422,14 +444,21 @@ class JobScheduler:
             parameters["requires_task_id"] = requires_task_id
         return parameters
 
-    def _create_scheduled_tasks(self, job: dict[str, Any]) -> list[dict[str, Any]]:
+    def _create_scheduled_tasks(
+        self, job: dict[str, Any], *, scheduled_type: str = ""
+    ) -> list[dict[str, Any]]:
         resolved_targets = self._resolve_task_targets(job)
         if not resolved_targets:
             return []
 
         tasks: list[dict[str, Any]] = []
         for resource_type, resource_external_id, resource in resolved_targets:
-            execution_type, execution_reason = resolve_job_execution(job, vm_id=resource_external_id, force_full=False)
+            execution_type, execution_reason = resolve_job_execution(
+                job,
+                vm_id=resource_external_id,
+                force_full=False,
+                scheduled_type=scheduled_type or None,
+            )
             vm_name = str(resource.get("name") or resource_external_id)
             requires_task_id: str | None = None
             for phase_type, phase_reason in self._execution_phases(execution_type, execution_reason):

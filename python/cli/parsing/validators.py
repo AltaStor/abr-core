@@ -50,7 +50,7 @@ def parse_csv_values(raw: str) -> list[str]:
 
 def parse_strict_hhmm(value: str) -> str:
     if not STRICT_TIME_PATTERN.fullmatch(value):
-        raise argparse.ArgumentTypeError("`--at` must use strict HH:MM format")
+        raise argparse.ArgumentTypeError("must use strict HH:MM format")
     return value
 
 

@@ -90,6 +90,7 @@ class NameWhitespaceValidationTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             }
         )
 
@@ -146,6 +147,7 @@ class NameWhitespaceValidationTests(unittest.TestCase):
                             "name": name,
                             "source_job_id": source["id"],
                             "repo_id": "repo-1",
+                            "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                         }
                     )
                 self.assertEqual(ctx.exception.code, "invalid_job")

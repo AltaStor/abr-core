@@ -12,6 +12,23 @@ from ..parsing.validators import parse_csv_values, parse_duration, parse_strict_
 _NEW_SCHEDULE_TYPES = {"daily", "weekly", "monthly", "periodic"}
 
 
+class _ExecutionScheduleArgs:
+    _MAPPED = {"schedule", "time", "day_of_month", "every"}
+
+    def __init__(self, args: Any, prefix: str) -> None:
+        self._args = args
+        self._prefix = prefix
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "days":
+            return getattr(self._args, f"{self._prefix}_days", None)
+        if name in self._MAPPED:
+            return getattr(self._args, f"{self._prefix}_{name}", None)
+        if name in {"enabled", "disabled"}:
+            return bool(getattr(self._args, f"{self._prefix}_{name}", False))
+        return getattr(self._args, name, None)
+
+
 class JobService:
     def __init__(self, context: CliContext) -> None:
         self.context = context
@@ -106,6 +123,37 @@ class JobService:
         if getattr(args, "disabled", False):
             return False
         return None
+
+    EXECUTION_SCHEDULE_PREFIXES = ("active_full", "synthetic_full")
+
+    @classmethod
+    def build_execution_schedule_payloads(cls, args: Any, current: dict[str, Any] | None = None) -> dict[str, Any]:
+        payloads: dict[str, Any] = {}
+        job = current if isinstance(current, dict) else {}
+        for prefix in cls.EXECUTION_SCHEDULE_PREFIXES:
+            key = f"{prefix}_schedule"
+            requested = getattr(args, key, None)
+            state_only = bool(getattr(args, f"{prefix}_enabled", False) or getattr(args, f"{prefix}_disabled", False))
+            if cls._is_empty_value(requested) and not state_only:
+                continue
+            if not cls._is_empty_value(requested) and str(requested).strip().lower() in {"none", "off"}:
+                payloads[key] = None
+                continue
+            stored = job.get(key) if isinstance(job.get(key), dict) else None
+            try:
+                payloads[key] = cls.build_schedule_payload(
+                    _ExecutionScheduleArgs(args, prefix), current_schedule=stored
+                )
+            except ValueError as error:
+                raise cls._prefixed_schedule_error(error, prefix) from error
+        return payloads
+
+    @staticmethod
+    def _prefixed_schedule_error(error: ValueError, prefix: str) -> ValueError:
+        message = str(error)
+        for base_flag in ("--day-of-month", "--days", "--time", "--every", "--schedule"):
+            message = message.replace(base_flag, f"--{prefix.replace('_', '-')}{base_flag[1:]}")
+        return ValueError(message)
 
     @staticmethod
     def _gfs_enabled_override(args: Any) -> bool | None:
@@ -272,6 +320,7 @@ class JobService:
             },
             "active_full_days": getattr(args, "active_full_days", None) or [],
             "synthetic_full_days": getattr(args, "synthetic_full_days", None) or [],
+            **self.build_execution_schedule_payloads(args),
         }
         description = self._coalesce_string(getattr(args, "description", None))
         if description:
@@ -358,6 +407,7 @@ class JobService:
             payload["active_full_days"] = args.active_full_days
         if getattr(args, "synthetic_full_days", None) is not None:
             payload["synthetic_full_days"] = args.synthetic_full_days
+        payload.update(self.build_execution_schedule_payloads(args, job))
 
         description = getattr(args, "description", None)
         if description is not None:

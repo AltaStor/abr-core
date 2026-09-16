@@ -97,6 +97,7 @@ class InventoryDiscoveryAndJobStartEngineTests(unittest.TestCase):
                 "vms": ["vm-1"],
                 "inventory_id": inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             }
         )
 
@@ -117,6 +118,7 @@ class InventoryDiscoveryAndJobStartEngineTests(unittest.TestCase):
                     "vms": ["no-such-vm"],
                     "inventory_id": inventory["id"],
                     "repo_id": "repo-1",
+                    "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 }
             )
 
@@ -150,6 +152,7 @@ class InventoryDiscoveryAndJobStartEngineTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             }
         )
 

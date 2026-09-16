@@ -87,6 +87,7 @@ class UnicodeJobNameServiceLayerTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             }
         )
 
@@ -128,6 +129,7 @@ class UnicodeJobNameServiceLayerTests(unittest.TestCase):
                     "vms": ["web-01"],
                     "inventory_id": self.inventory["id"],
                     "repo_id": "repo-1",
+                    "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                     "description": "Резервная копия",
                 }
             )
@@ -143,6 +145,7 @@ class UnicodeJobNameServiceLayerTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "description": "Nightly @ 02:00 (prod / tier-1) -- keep 30d!",
             }
         )

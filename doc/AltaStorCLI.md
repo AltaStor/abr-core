@@ -330,7 +330,7 @@ abr job create
 
 Description: Create a backup job for one or more virtual machines and optionally attach an enabled or disabled schedule. Supported schedule types are daily, weekly, monthly, and periodic. 
 
-abr job create --name <name> (--repository <name> | --repository-id <id>) [--inventory <name> | --inventory-id <id>] (--vm <vm> ... | --vms "<vm1,vm2,...>") [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] 
+abr job create --name <name> (--repository <name> | --repository-id <id>) [--inventory <name> | --inventory-id <id>] (--vm <vm> ... | --vms "<vm1,vm2,...>") [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] 
 
 Examples: 
 abr job create --name "Production VMs" --inventory "vcenter-main" --vm "vm-101" --vm "vm-102" --repository "repo-local-01" --schedule daily --time "23:00" --enabled 
@@ -340,11 +340,23 @@ abr job create --name "Weekly Backup" --inventory "vcenter-main" --vm "db-01" --
 abr job create --name "Monthly Backup" --inventory "vcenter-main" --vm "vm-01" --repository "repo-01" --schedule monthly --day-of-month 1 --time "01:00" 
 
 abr job create --name "Periodic Backup" --inventory "vcenter-main" --vm "critical-01" --repository "repo-01" --schedule periodic --every 6h --disabled 
+
+abr job create --name "Nightly with Fulls" --inventory "vcenter-main" --vm "vm-01" --repository "repo-01" --schedule daily --time "22:00" --retention-days 30 --active-full-schedule monthly --active-full-day-of-month 1 --active-full-time "02:00" --synthetic-full-schedule weekly --synthetic-full-days sun --synthetic-full-time "03:00" 
+
+abr job edit --name "Nightly with Fulls" --synthetic-full-disabled 
+
+abr job edit --name "Nightly with Fulls" --synthetic-full-enabled 
+
+abr job edit --name "Nightly with Fulls" --synthetic-full-schedule none 
  
 
 Notes & Behavior: 
 --retention-days = operational rolling retention affecting non-GFS points 
 --gfs-* = extended lifecycle marks enforced during automated block evaluation. 
+A job carries three independent schedules: the base --schedule produces incrementals, --active-full-schedule reads the full VM again, and --synthetic-full-schedule takes an incremental and merges it into a new full on the repository. When more than one is due at the same moment the job runs a single session, with active full taking priority over synthetic full and synthetic full over the incremental. Each full schedule takes either form of switch-off: --active-full-schedule none / --synthetic-full-schedule none removes it and forgets its settings, while --active-full-disabled / --synthetic-full-disabled suspends it and keeps them for a later --active-full-enabled / --synthetic-full-enabled. 
+A backup job cannot be created without at least one enabled full backup schedule - an active full, a synthetic full, or the legacy day lists - because operational retention can only free a chain once a newer full starts the next one, and a job that only ever takes incrementals keeps a chain that retention can never prune. The same check runs on edit whenever retention or a full schedule is touched, so the last remaining full schedule cannot be removed or suspended. 
+The full schedules ride along with the job: a job whose base schedule is disabled, or which has no base schedule at all, runs nothing until it is enabled again. 
+Jobs that already use --active-full-days or --synthetic-full-days keep working: those day lists are read as weekly full schedules at the job's own schedule time. 
 
 abr job create-copy 
 
@@ -371,7 +383,7 @@ abr job edit
 
 Description: Update job configuration binding, scheduling, schedule state, or protected targets. 
 
-abr job edit --name <name> [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--repository <repo_name>] [--inventory <inventory_name>] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] 
+abr job edit --name <name> [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--repository <repo_name>] [--inventory <inventory_name>] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] 
 
 abr job delete 
 

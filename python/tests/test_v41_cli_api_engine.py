@@ -464,6 +464,7 @@ class AbrV41EngineTests(unittest.TestCase):
             "vm_ids": ["vm-1"],
             "vm_names": ["vm-1"],
             "repo_id": "repo-1",
+            "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             "repo_name": "Repo",
             "schedule": {"kind": "daily", "time": "22:00", "timezone": "UTC"},
             "retention_days": 30,
@@ -483,7 +484,7 @@ class AbrV41EngineTests(unittest.TestCase):
 
     def test_active_synthetic_priority_and_escalation(self) -> None:
         BACKUPS["p1"] = abr_v41.normalize_backup_point({"id": "p1", "job_id": "job-1", "vm_id": "vm-1", "repository_id": "repo-1", "execution_type": "ActiveFull"})
-        today = abr_v41.DAY_ORDER[datetime.now().astimezone().weekday()]
+        today = abr_v41.DAY_ORDER[datetime.now(timezone.utc).weekday()]
         self.assertEqual(
             abr_v41.resolve_job_execution(self._job(active_full_days=[today], synthetic_full_days=[today]), vm_id="vm-1", force_full=False),
             ("ActiveFull", "ActiveOverridesSynthetic"),
@@ -763,7 +764,7 @@ class AbrV41EngineTests(unittest.TestCase):
                 "vms": "vm-1",
                 "inventory_id": inventory["id"],
                 "repo_id": "repo-1",
-                "retention_days": 14,
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "task_parameters": {"encryption_enabled": True, "encryption_key": "hunter2"},
             }
         )
@@ -1576,6 +1577,344 @@ class AbrV41EngineTests(unittest.TestCase):
         self.assertEqual(JOBS["job-copy"]["job_type"], "backup-copy")
         self.assertEqual(JOBS["job-copy"]["vm_ids"], ["vm-uuid-new"])
 
+    def _inventory_with_vm(self, name: str, address: str) -> dict:
+        inventory = abr_v41.create_inventory_record(
+            {
+                "name": name,
+                "type": "hyper-v",
+                "address": address,
+                "username": "administrator",
+                "password": "secret",
+            }
+        )
+        RESOURCES_BY_HV[inventory["id"]]["vm-1"] = {
+            "resource_type": "virtual_machine",
+            "external_id": "vm-1",
+            "name": "vm-1",
+            "payload": {},
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return inventory
+
+    def test_create_backup_job_requires_a_full_backup_schedule(self) -> None:
+        inventory = self._inventory_with_vm("No Full", "192.168.12.50")
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.create_backup_job(
+                {
+                    "name": "No Full",
+                    "vms": "vm-1",
+                    "inventory_id": inventory["id"],
+                    "repo_id": "repo-1",
+                    "retention_days": 30,
+                    "schedule": "daily 20:00",
+                }
+            )
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(ctx.exception.code, "invalid_job")
+        self.assertIn("full backup schedule", ctx.exception.message)
+
+    def test_create_backup_job_accepts_an_active_full_schedule(self) -> None:
+        inventory = self._inventory_with_vm("Active Full", "192.168.12.51")
+
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Active Full",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "retention_days": 30,
+                "schedule": "daily 20:00",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00"},
+            }
+        )
+
+        self.assertEqual(job["active_full_schedule"]["type"], "weekly")
+        self.assertIsNone(job["synthetic_full_schedule"])
+
+    def test_create_backup_job_accepts_a_synthetic_full_schedule(self) -> None:
+        inventory = self._inventory_with_vm("Synthetic Full", "192.168.12.52")
+
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Synthetic Full",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "retention_days": 30,
+                "schedule": "daily 20:00",
+                "synthetic_full_schedule": {"type": "weekly", "days": ["saturday"], "time": "04:00"},
+            }
+        )
+
+        self.assertEqual(job["synthetic_full_schedule"]["type"], "weekly")
+        self.assertIsNone(job["active_full_schedule"])
+
+    def test_create_backup_job_accepts_legacy_full_days(self) -> None:
+        inventory = self._inventory_with_vm("Legacy Days", "192.168.12.53")
+
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Legacy Days",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "retention_days": 30,
+                "schedule": "daily 20:00",
+                "synthetic_full_days": ["sunday"],
+            }
+        )
+
+        self.assertEqual(job["synthetic_full_schedule"]["days"], ["sunday"])
+
+    def test_create_backup_job_rejects_a_disabled_full_schedule(self) -> None:
+        inventory = self._inventory_with_vm("Disabled Full", "192.168.12.54")
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.create_backup_job(
+                {
+                    "name": "Disabled Full",
+                    "vms": "vm-1",
+                    "inventory_id": inventory["id"],
+                    "repo_id": "repo-1",
+                    "retention_days": 30,
+                    "schedule": "daily 20:00",
+                    "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00", "enabled": False},
+                }
+            )
+
+        self.assertEqual(ctx.exception.code, "invalid_job")
+
+    def test_edit_job_record_rejects_dropping_the_only_full_schedule(self) -> None:
+        inventory = self._inventory_with_vm("Drop Only Full", "192.168.12.55")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Drop Only Full",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 20:00",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00"},
+            }
+        )
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.edit_job_record(job["id"], {"active_full_schedule": None})
+
+        self.assertEqual(ctx.exception.code, "invalid_job")
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.edit_job_record(
+                job["id"],
+                {"active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00", "enabled": False}},
+            )
+
+        self.assertEqual(ctx.exception.code, "invalid_job")
+
+    def test_edit_job_record_rejects_suspending_the_only_full_schedule_with_legacy_days(self) -> None:
+        inventory = self._inventory_with_vm("Suspend Only Full", "192.168.12.58")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Suspend Only Full",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 20:00",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00"},
+                "active_full_days": ["sunday"],
+            }
+        )
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.edit_job_record(
+                job["id"],
+                {"active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00", "enabled": False}},
+            )
+
+        self.assertEqual(ctx.exception.code, "invalid_job")
+
+    def test_edit_job_record_allows_dropping_one_of_two_full_schedules(self) -> None:
+        inventory = self._inventory_with_vm("Drop One Full", "192.168.12.56")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Drop One Full",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 20:00",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00"},
+                "synthetic_full_schedule": {"type": "weekly", "days": ["wednesday"], "time": "04:00"},
+            }
+        )
+
+        edited = abr_v41.edit_job_record(job["id"], {"active_full_schedule": None})
+
+        self.assertIsNone(edited["active_full_schedule"])
+        self.assertEqual(edited["synthetic_full_schedule"]["days"], ["wednesday"])
+
+    def test_edit_job_record_leaves_a_job_without_full_schedules_editable(self) -> None:
+        inventory = self._inventory_with_vm("Legacy Record", "192.168.12.57")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Legacy Record",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 20:00",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00"},
+            }
+        )
+        JOBS[job["id"]]["active_full_schedule"] = None
+
+        renamed = abr_v41.edit_job_record(job["id"], {"name": "Legacy Record Renamed"})
+
+        self.assertEqual(renamed["name"], "Legacy Record Renamed")
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.edit_job_record(job["id"], {"retention_days": 45})
+
+        self.assertEqual(ctx.exception.code, "invalid_job")
+
+    def test_disabling_a_job_parks_the_full_schedules_and_enabling_revives_them(self) -> None:
+        inventory = self._inventory_with_vm("Park Full Schedules", "192.168.12.59")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Park Full Schedules",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+                "schedule": "daily 20:00",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00"},
+            }
+        )
+
+        self.assertIsNotNone(job["active_full_next_run_at"])
+
+        disabled = abr_v41.edit_job_record(job["id"], {"schedule": {"type": "daily", "time": "20:00", "enabled": False}})
+
+        self.assertIsNone(disabled["next_run_at"])
+        self.assertIsNone(disabled["active_full_next_run_at"])
+        self.assertEqual(disabled["active_full_schedule"]["days"], ["sunday"])
+
+        enabled = abr_v41.edit_job_record(job["id"], {"schedule": {"type": "daily", "time": "20:00", "enabled": True}})
+
+        self.assertIsNotNone(enabled["next_run_at"])
+        self.assertIsNotNone(enabled["active_full_next_run_at"])
+
+    def test_edit_job_record_recomputes_full_schedule_next_runs(self) -> None:
+        inventory = self._inventory_with_vm("Full Next Run", "192.168.12.57")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Full Next Run",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+                "schedule": "daily 20:00",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00"},
+            }
+        )
+
+        self.assertIsNotNone(job["active_full_next_run_at"])
+
+        edited = abr_v41.edit_job_record(
+            job["id"],
+            {"active_full_schedule": {"type": "weekly", "days": ["saturday"], "time": "04:00"}},
+        )
+
+        self.assertEqual(edited["active_full_schedule"]["days"], ["saturday"])
+        self.assertNotEqual(edited["active_full_next_run_at"], job["active_full_next_run_at"])
+
+    def test_editing_the_day_list_retunes_the_weekly_full_schedule(self) -> None:
+        inventory = self._inventory_with_vm("Retune Days", "192.168.12.60")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Retune Days",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 20:00",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00"},
+                "active_full_days": ["sunday"],
+                "synthetic_full_schedule": {"type": "weekly", "days": ["wednesday"], "time": "04:00"},
+            }
+        )
+
+        self.assertEqual(job["active_full_schedule"]["days"], ["sunday"])
+
+        moved = abr_v41.edit_job_record(job["id"], {"active_full_days": ["saturday"]})
+
+        self.assertEqual(moved["active_full_schedule"]["days"], ["saturday"])
+        self.assertEqual(moved["active_full_days"], ["Sat"])
+
+        cleared = abr_v41.edit_job_record(job["id"], {"active_full_days": []})
+
+        self.assertIsNone(cleared["active_full_schedule"])
+        self.assertIsNone(cleared["active_full_next_run_at"])
+        self.assertEqual(cleared["active_full_days"], [])
+
+    def test_clearing_the_day_list_of_the_only_full_schedule_is_rejected(self) -> None:
+        inventory = self._inventory_with_vm("Clear Only Full Days", "192.168.12.62")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Clear Only Full Days",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 20:00",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00"},
+                "active_full_days": ["sunday"],
+            }
+        )
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.edit_job_record(job["id"], {"active_full_days": []})
+
+        self.assertEqual(ctx.exception.code, "invalid_job")
+
+    def test_editing_the_day_list_leaves_a_monthly_full_schedule_alone(self) -> None:
+        inventory = self._inventory_with_vm("Monthly Untouched", "192.168.12.61")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Monthly Untouched",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+                "schedule": "daily 20:00",
+                "active_full_schedule": {"type": "monthly", "day_of_month": 1, "time": "02:00"},
+            }
+        )
+
+        edited = abr_v41.edit_job_record(job["id"], {"active_full_days": ["saturday"]})
+
+        self.assertEqual(edited["active_full_schedule"]["type"], "monthly")
+        self.assertEqual(edited["active_full_days"], ["Sat"])
+
+    def test_edit_job_record_clearing_a_full_schedule_clears_its_legacy_days(self) -> None:
+        inventory = self._inventory_with_vm("Clear Full Schedule", "192.168.12.58")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Clear Full Schedule",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+                "schedule": "daily 20:00",
+                "synthetic_full_days": ["sunday"],
+            }
+        )
+
+        self.assertIsNotNone(job["synthetic_full_schedule"])
+
+        edited = abr_v41.edit_job_record(job["id"], {"synthetic_full_schedule": None})
+
+        self.assertIsNone(edited["synthetic_full_schedule"])
+        self.assertIsNone(edited["synthetic_full_next_run_at"])
+        self.assertEqual(edited["synthetic_full_days"], [])
+
     def test_create_backup_job_without_schedule_is_planned(self) -> None:
         inventory = abr_v41.create_inventory_record(
             {
@@ -1600,7 +1939,7 @@ class AbrV41EngineTests(unittest.TestCase):
                 "vms": "vm-1",
                 "inventory_id": inventory["id"],
                 "repo_id": "repo-1",
-                "retention_days": 14,
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             }
         )
 
@@ -1771,6 +2110,7 @@ class AbrV41EngineTests(unittest.TestCase):
             "name": "Nightly",
             "job_type": "backup",
             "repo_id": repository["id"],
+            "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             "repo_name": repository["name"],
             "retention_days": 14,
         }
@@ -1828,7 +2168,7 @@ class AbrV41EngineTests(unittest.TestCase):
                 "vms": "vm-1",
                 "inventory_id": inventory["id"],
                 "repo_id": "repo-1",
-                "retention_days": 14,
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": "daily 20:00",
             }
         )
@@ -1860,7 +2200,7 @@ class AbrV41EngineTests(unittest.TestCase):
                 "vms": "vm-1",
                 "inventory_id": inventory["id"],
                 "repo_id": "repo-1",
-                "retention_days": 14,
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             }
         )
 
@@ -1869,6 +2209,7 @@ class AbrV41EngineTests(unittest.TestCase):
                 "name": "Archive Job",
                 "source_job_id": source_job["id"],
                 "repo_id": "repo-2",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "retention_days": 21,
             }
         )

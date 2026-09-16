@@ -48,7 +48,11 @@ class JobCommands:
                 '  abr job create --name "Weekly-Full" --inventory "vCenter-Prod" --vms "sql-01,sql-02" '
                 '--repository "S3-Repo" --schedule weekly --days mon,thu --time 02:00\n'
                 '  abr job create --name "Encrypted-Job" --inventory "vCenter-Prod" --vm "sql-01" '
-                '--repository "S3-Repo" --set-encryption --encryption-key "correct-horse-battery-staple"'
+                '--repository "S3-Repo" --set-encryption --encryption-key "correct-horse-battery-staple"\n'
+                '  abr job create --name "Nightly-With-Fulls" --inventory "vCenter-Prod" --vm "sql-01" '
+                '--repository "Local-Repo-1" --schedule daily --time 22:00 --retention-days 30 '
+                '--active-full-schedule monthly --active-full-day-of-month 1 --active-full-time 02:00 '
+                '--synthetic-full-schedule weekly --synthetic-full-days sun --synthetic-full-time 03:00'
             ),
             formatter_class=CompactHelpFormatter,
         )
@@ -269,6 +273,44 @@ class JobCommands:
                 type=parse_optional_weekday_csv,
                 help="Active full weekdays, comma-separated Mon-Sun; pass none to turn it off",
             )
+            for prefix, label in (("active-full", "Active full"), ("synthetic-full", "Synthetic full")):
+                dest = prefix.replace("-", "_")
+                parser.add_argument(
+                    f"--{prefix}-schedule",
+                    dest=f"{dest}_schedule",
+                    help=f"{label} schedule type: daily, weekly, monthly, or periodic; none turns it off",
+                )
+                parser.add_argument(
+                    f"--{prefix}-time",
+                    dest=f"{dest}_time",
+                    type=parse_strict_hhmm,
+                    help=f"{label} schedule time in HH:MM",
+                )
+                parser.add_argument(
+                    f"--{prefix}-day-of-month",
+                    dest=f"{dest}_day_of_month",
+                    type=parse_day_of_month,
+                    help=f"{label} monthly schedule day from 1 to 31",
+                )
+                parser.add_argument(
+                    f"--{prefix}-every",
+                    dest=f"{dest}_every",
+                    type=parse_duration,
+                    help=f"{label} periodic interval like 15m, 1h, 6h, or 1d",
+                )
+                full_state = parser.add_mutually_exclusive_group()
+                full_state.add_argument(
+                    f"--{prefix}-enabled",
+                    dest=f"{dest}_enabled",
+                    action="store_true",
+                    help=f"Enable the {label.lower()} schedule, keeping its settings",
+                )
+                full_state.add_argument(
+                    f"--{prefix}-disabled",
+                    dest=f"{dest}_disabled",
+                    action="store_true",
+                    help=f"Suspend the {label.lower()} schedule, keeping its settings",
+                )
 
     @staticmethod
     def _resolve_id(deps: CommandDependencies, args: argparse.Namespace) -> str:

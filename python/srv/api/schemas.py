@@ -47,6 +47,10 @@ class JobDTO(_LenientModel):
     gfs: dict[str, Any] | None = None
     active_full_days: list[Any] | None = None
     synthetic_full_days: list[Any] | None = None
+    active_full_schedule: dict[str, Any] | None = None
+    synthetic_full_schedule: dict[str, Any] | None = None
+    active_full_next_run_at: str | None = None
+    synthetic_full_next_run_at: str | None = None
     compression_level: Any = None
     encryption: dict[str, Any] | None = None
     task_parameters: dict[str, Any] = {}
@@ -358,6 +362,8 @@ class CreateJobRequest(_LenientModel):
     active_full_days_csv: LaxStr | None = None
     synthetic_full_days: list[Any] | LaxStr | None = None
     synthetic_full_days_csv: LaxStr | None = None
+    active_full_schedule: dict[str, Any] | LaxStr | None = None
+    synthetic_full_schedule: dict[str, Any] | LaxStr | None = None
     description: LaxStr | None = None
     task_parameters: dict[str, Any] | None = None
     backup_options: dict[str, Any] | None = None
@@ -389,6 +395,8 @@ class UpdateJobRequest(_LenientModel):
     gfs_enabled: LaxBool | None = None
     active_full_days: list[Any] | LaxStr | None = None
     synthetic_full_days: list[Any] | LaxStr | None = None
+    active_full_schedule: dict[str, Any] | LaxStr | None = None
+    synthetic_full_schedule: dict[str, Any] | LaxStr | None = None
     description: LaxStr | None = None
     task_parameters: dict[str, Any] | None = None
     repo: LaxStr | None = None

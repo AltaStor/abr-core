@@ -570,6 +570,7 @@ class JobApiEditTests(unittest.TestCase):
                 "inventory_id": inventory["id"],
                 "repo_id": repository["id"],
                 "schedule": {"type": "daily", "time": "01:00", "enabled": True},
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             },
         )
         self.assertEqual(created.status_code, 200, created.text)
@@ -604,6 +605,7 @@ class JobApiEditTests(unittest.TestCase):
                 "vms": ["vm-1"],
                 "inventory_id": inventory_a["id"],
                 "repo_id": repository["id"],
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             },
         )
         self.assertEqual(created.status_code, 200, created.text)

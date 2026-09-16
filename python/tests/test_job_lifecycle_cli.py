@@ -178,6 +178,95 @@ class JobPayloadBuilderTests(unittest.TestCase):
         context = CliContext(base_url="http://example.test", output="json", api_client=_FakeApiClient(), output_renderer=CliOutputRenderer())
         self.service = JobService(context)
 
+    def test_execution_schedule_payloads_build_both_full_schedules(self) -> None:
+        args = SimpleNamespace(
+            active_full_schedule="monthly",
+            active_full_time="02:00",
+            active_full_day_of_month=1,
+            active_full_every=None,
+            active_full_days=None,
+            synthetic_full_schedule="weekly",
+            synthetic_full_time="03:00",
+            synthetic_full_day_of_month=None,
+            synthetic_full_every=None,
+            synthetic_full_days=["sunday"],
+        )
+
+        payloads = JobService.build_execution_schedule_payloads(args)
+
+        self.assertEqual(
+            payloads["active_full_schedule"],
+            {"type": "monthly", "day_of_month": 1, "time": "02:00", "enabled": True},
+        )
+        self.assertEqual(
+            payloads["synthetic_full_schedule"],
+            {"type": "weekly", "days": ["sunday"], "time": "03:00", "enabled": True},
+        )
+
+    def test_execution_schedule_payloads_turn_off_a_schedule_with_none(self) -> None:
+        args = SimpleNamespace(
+            active_full_schedule="none",
+            active_full_time=None,
+            active_full_day_of_month=None,
+            active_full_every=None,
+            active_full_days=None,
+            synthetic_full_schedule=None,
+        )
+
+        payloads = JobService.build_execution_schedule_payloads(args)
+
+        self.assertEqual(payloads, {"active_full_schedule": None})
+
+    def test_execution_schedule_state_flag_keeps_the_stored_settings(self) -> None:
+        args = SimpleNamespace(
+            active_full_schedule=None,
+            active_full_time=None,
+            active_full_day_of_month=None,
+            active_full_every=None,
+            active_full_days=None,
+            active_full_enabled=False,
+            active_full_disabled=True,
+            synthetic_full_schedule=None,
+        )
+        current = {"active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00", "enabled": True}}
+
+        payloads = JobService.build_execution_schedule_payloads(args, current)
+
+        self.assertEqual(
+            payloads["active_full_schedule"],
+            {"type": "weekly", "days": ["sunday"], "time": "03:00", "enabled": False},
+        )
+
+    def test_execution_schedule_state_flag_without_a_stored_schedule_is_rejected(self) -> None:
+        args = SimpleNamespace(
+            active_full_schedule=None,
+            active_full_time=None,
+            active_full_day_of_month=None,
+            active_full_every=None,
+            active_full_days=None,
+            active_full_enabled=True,
+            active_full_disabled=False,
+            synthetic_full_schedule=None,
+        )
+
+        with self.assertRaises(ValueError):
+            JobService.build_execution_schedule_payloads(args, {})
+
+    def test_execution_schedule_errors_name_the_prefixed_flag(self) -> None:
+        args = SimpleNamespace(
+            active_full_schedule="weekly",
+            active_full_time="03:00",
+            active_full_day_of_month=None,
+            active_full_every=None,
+            active_full_days=None,
+            synthetic_full_schedule=None,
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            JobService.build_execution_schedule_payloads(args)
+
+        self.assertEqual(str(ctx.exception), "Weekly schedules require --active-full-days")
+
     def test_create_backup_job_payload_supports_multiple_vms_and_daily_schedule(self) -> None:
         args = SimpleNamespace(
             name="Production VMs",
@@ -554,6 +643,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01", "/Production/db-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {"type": "daily", "time": "22:30", "enabled": True},
             }
         )
@@ -563,6 +653,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {"type": "weekly", "days": ["monday", "friday"], "time": "23:00", "enabled": True},
             }
         )
@@ -572,6 +663,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {"type": "monthly", "day_of_month": 1, "time": "01:00", "enabled": True},
             }
         )
@@ -581,6 +673,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {"type": "periodic", "every": "6h", "enabled": True},
             }
         )
@@ -597,6 +690,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01", "db-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {"type": "weekly", "days": ["monday", "wednesday"], "time": "23:00", "enabled": False},
                 "description": "Protect prod VMs",
                 "task_parameters": {"tool_timeout_seconds": 600},
@@ -621,6 +715,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {"type": "daily", "time": "22:00", "enabled": True},
             }
         )
@@ -629,6 +724,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
             job["id"],
             {
                 "repo_id": "repo-2",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {"type": "weekly", "days": ["saturday", "sunday"], "time": "02:00", "enabled": False},
             },
         )
@@ -646,6 +742,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "gfs": {"weekly": 8, "monthly": 6, "yearly": 2},
             }
         )
@@ -681,6 +778,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "gfs": {"weekly": 4, "monthly": 0, "yearly": 0},
             }
         )
@@ -721,6 +819,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "gfs": {"weekly": 8, "monthly": 6, "yearly": 2},
             }
         )
@@ -732,7 +831,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
 
     def test_create_job_defaults_compression_and_encryption_when_unset(self) -> None:
         job = abr_v41.create_backup_job(
-            {"name": "Defaults Job", "vms": ["web-01"], "inventory_id": self.inventory["id"], "repo_id": "repo-1"}
+            {"name": "Defaults Job", "vms": ["web-01"], "inventory_id": self.inventory["id"], "repo_id": "repo-1", "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"}}
         )
 
         self.assertEqual(job["compression_level"], DEFAULT_COMPRESSION_LEVEL)
@@ -745,6 +844,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "task_parameters": {"compression_level": 7, "encryption_enabled": True, "encryption_key": "s3cr3t"},
             }
         )
@@ -766,6 +866,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                     "vms": ["web-01"],
                     "inventory_id": self.inventory["id"],
                     "repo_id": "repo-1",
+                    "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                     "task_parameters": {"compression_level": 10},
                 }
             )
@@ -780,6 +881,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "task_parameters": {"encryption_enabled": True},
             }
         )
@@ -804,6 +906,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                     "vms": ["web-01"],
                     "inventory_id": self.inventory["id"],
                     "repo_id": "repo-1",
+                    "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                     "task_parameters": {"encryption_enabled": True},
                 }
             )
@@ -817,6 +920,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "task_parameters": {"encryption_enabled": True},
             }
         )
@@ -830,7 +934,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
 
     def test_edit_job_updates_compression_level_and_sets_encryption(self) -> None:
         job = abr_v41.create_backup_job(
-            {"name": "Editable Options Job", "vms": ["web-01"], "inventory_id": self.inventory["id"], "repo_id": "repo-1"}
+            {"name": "Editable Options Job", "vms": ["web-01"], "inventory_id": self.inventory["id"], "repo_id": "repo-1", "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"}}
         )
 
         updated = abr_v41.edit_job_record(job["id"], {"task_parameters": {"compression_level": 9}})
@@ -856,6 +960,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "task_parameters": {"compression_level": 8, "encryption_enabled": True, "encryption_key": "hunter2"},
             }
         )
@@ -878,6 +983,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {"type": "daily", "time": "22:00", "enabled": False},
             }
         )
@@ -901,6 +1007,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
                 "schedule": {"type": "periodic", "every": "6h", "enabled": True},
             }
         )
@@ -928,6 +1035,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "vms": ["web-01"],
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
             }
         )
 
