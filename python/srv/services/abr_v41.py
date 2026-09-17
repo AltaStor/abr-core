@@ -3343,6 +3343,20 @@ def _coerce_gfs_enabled(value: Any, *, default: bool = True) -> bool:
     return default if value is None else bool(value)
 
 
+def _ensure_encryption_key_strength(task_parameters: Any) -> None:
+    if not isinstance(task_parameters, dict):
+        return
+    key = task_parameters.get("encryption_key")
+    if not isinstance(key, str) or not key.strip():
+        return
+    _ensure(
+        len(key.strip()) >= MIN_PASSWORD_LENGTH,
+        422,
+        "invalid_job",
+        f"Encryption key must be at least {MIN_PASSWORD_LENGTH} characters.",
+    )
+
+
 def _validate_task_parameters(params: dict[str, Any]) -> dict[str, Any]:
     result = dict(params)
     if "compression_level" in result and result["compression_level"] is not None:
@@ -3522,6 +3536,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     if task_parameters is None:
         task_parameters = {}
     _ensure(isinstance(task_parameters, dict), 422, "invalid_job", "task_parameters must be an object")
+    _ensure_encryption_key_strength(task_parameters)
     task_parameters = _validate_task_parameters(task_parameters)
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
@@ -3746,6 +3761,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         changed = True
     if "task_parameters" in payload and payload["task_parameters"] is not None:
         _ensure(isinstance(payload["task_parameters"], dict), 422, "invalid_job", "task_parameters must be an object")
+        _ensure_encryption_key_strength(payload["task_parameters"])
         merged = _merge_task_parameters(updated.get("task_parameters"), payload["task_parameters"])
         updated["task_parameters"] = _validate_task_parameters(merged)
         changed = True

@@ -765,7 +765,7 @@ class AbrV41EngineTests(unittest.TestCase):
                 "inventory_id": inventory["id"],
                 "repo_id": "repo-1",
                 "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
-                "task_parameters": {"encryption_enabled": True, "encryption_key": "hunter2"},
+                "task_parameters": {"encryption_enabled": True, "encryption_key": "hunter2-key"},
             }
         )
 
@@ -798,7 +798,102 @@ class AbrV41EngineTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(TASKS[session["id"]]["parameters"]["encryption_key"], "hunter2")
+        self.assertEqual(TASKS[session["id"]]["parameters"]["encryption_key"], "hunter2-key")
+
+    def _job_with_key(self, name: str, key: str, address: str):
+        inventory = abr_v41.create_inventory_record(
+            {
+                "name": name,
+                "type": "hyper-v",
+                "address": address,
+                "username": "administrator",
+                "password": "secret",
+            }
+        )
+        RESOURCES_BY_HV[inventory["id"]]["vm-1"] = {
+            "resource_type": "virtual_machine",
+            "external_id": "vm-1",
+            "name": "vm-1",
+            "payload": {},
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return abr_v41.create_backup_job(
+            {
+                "name": name,
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+                "task_parameters": {"encryption_enabled": True, "encryption_key": key},
+            }
+        )
+
+    def test_a_short_encryption_key_is_refused_on_create(self) -> None:
+        for key in ("a", "abcd", "seven77"):
+            with self.subTest(key=key):
+                JOBS.clear()
+                with self.assertRaises(ApiError) as ctx:
+                    self._job_with_key(f"Short Key {len(key)}", key, "192.168.12.7%d" % len(key))
+                self.assertEqual(ctx.exception.status_code, 422)
+                self.assertEqual(ctx.exception.code, "invalid_job")
+                self.assertIn("at least 8 characters", ctx.exception.message)
+
+    def test_a_key_of_the_minimum_length_is_accepted(self) -> None:
+        job = self._job_with_key("Minimum Key", "eightch8", "192.168.12.80")
+
+        self.assertEqual(job["encryption"], {"enabled": True, "key_set": True})
+
+    def test_a_short_encryption_key_is_refused_on_edit(self) -> None:
+        job = self._job_with_key("Edit Short Key", "long-enough-key", "192.168.12.81")
+
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.edit_job_record(
+                job["id"], {"task_parameters": {"encryption_enabled": True, "encryption_key": "a"}}
+            )
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("at least 8 characters", ctx.exception.message)
+
+    def test_encryption_without_a_key_still_generates_a_strong_one(self) -> None:
+        inventory = abr_v41.create_inventory_record(
+            {
+                "name": "Generated Key",
+                "type": "hyper-v",
+                "address": "192.168.12.82",
+                "username": "administrator",
+                "password": "secret",
+            }
+        )
+        RESOURCES_BY_HV[inventory["id"]]["vm-1"] = {
+            "resource_type": "virtual_machine",
+            "external_id": "vm-1",
+            "name": "vm-1",
+            "payload": {},
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Generated Key",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+                "task_parameters": {"encryption_enabled": True},
+            }
+        )
+
+        stored = JOBS[job["id"]]["task_parameters"]["encryption_key"]
+        self.assertGreaterEqual(len(stored), 8)
+
+    def test_an_edit_that_does_not_touch_the_key_leaves_an_older_short_key_alone(self) -> None:
+        job = self._job_with_key("Legacy Short Key", "long-enough-key", "192.168.12.83")
+        JOBS[job["id"]]["task_parameters"]["encryption_key"] = "old"
+
+        edited = abr_v41.edit_job_record(job["id"], {"task_parameters": {"compression_level": 5}})
+
+        self.assertEqual(edited["compression_level"], 5)
+        self.assertEqual(JOBS[job["id"]]["task_parameters"]["encryption_key"], "old")
 
     def test_restore_start_rejects_duplicate_target_vm_name(self) -> None:
         inventory = abr_v41.create_inventory_record(
