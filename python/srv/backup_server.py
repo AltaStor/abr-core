@@ -234,6 +234,12 @@ async def lifespan(_: FastAPI):
                 logger.info("Backfilled compression/encryption details for %d backup point(s).", backfilled)
         except Exception:
             logger.exception("Backup detail backfill failed; continuing startup without it.")
+        try:
+            keyed = backup_catalog.backfill_backup_encryption_keys()
+            if keyed:
+                logger.info("Backfilled the encryption key onto %d encrypted backup point(s).", keyed)
+        except Exception:
+            logger.exception("Encryption key backfill failed; continuing startup without it.")
         TASKS.clear()
         TASKS.update(load_tasks())
         RESOURCES_BY_HV.clear()

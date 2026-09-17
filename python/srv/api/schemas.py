@@ -466,6 +466,10 @@ class StartRestoreNetworkMapping(_LenientModel):
     target_network_id: LaxStr | None = None
 
 
+class VerifyBackupRequest(_LenientModel):
+    encryption_key: LaxStr | None = None
+
+
 class StartRestoreRequest(_LenientModel):
     restore_point_id: LaxStr | None = None
     point_id: LaxStr | None = None
@@ -496,6 +500,7 @@ class StartRestoreRequest(_LenientModel):
     connect_nics: LaxBool | None = None
     disk_provisioning: LaxStr | None = None
     disk_type: LaxStr | None = None
+    encryption_key: LaxStr | None = None
     force: LaxBool | None = None
 
 

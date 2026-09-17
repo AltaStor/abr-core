@@ -127,6 +127,7 @@ class RestoreService:
             "repo": repo_name,
             "repo_id": repo_id,
             "power_on": bool(getattr(args, "power_on", False)),
+            "encryption_key": str(getattr(args, "encryption_key", None) or "").strip() or None,
             "force": force,
         }
         return {key: value for key, value in payload.items() if value not in (None, [], "")}

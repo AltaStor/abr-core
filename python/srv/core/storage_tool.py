@@ -468,6 +468,7 @@ def verify_disk_tool_backup(
     abr_path: str | None,
     backup_name: str,
     *,
+    encryption_key: str = "",
     timeout: int | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> None:
@@ -477,6 +478,7 @@ def verify_disk_tool_backup(
             "verify",
             "--name",
             backup_name,
+            *(["--key", encryption_key] if encryption_key else []),
             *disk_tool_storage_args(repository, abr_path=abr_path),
         ],
         timeout=timeout,

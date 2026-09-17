@@ -88,6 +88,82 @@ class RegisterBackupFieldsTests(unittest.TestCase):
         self.assertIsNone(record["compression_level"])
 
 
+class BackupEncryptionKeyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        BACKUPS.clear()
+        HYPERVISORS.clear()
+        JOBS.clear()
+        self.addCleanup(BACKUPS.clear)
+        self.addCleanup(HYPERVISORS.clear)
+        self.addCleanup(JOBS.clear)
+
+    def _job(self, key: str = "job-key") -> dict:
+        JOBS["job-1"] = {
+            "id": "job-1",
+            "name": "Encrypted",
+            "job_type": "backup",
+            "task_parameters": {"encryption_enabled": True, "encryption_key": key},
+        }
+        return JOBS["job-1"]
+
+    def test_a_new_point_keeps_the_key_the_backup_was_written_with(self) -> None:
+        self._job()
+        task = _completed_backup_task(job_id="job-1")
+        task["parameters"] = {"encryption_enabled": True, "encryption_key": "key-used-by-this-run"}
+
+        record = backup_catalog.register_backup_from_completed_task(task)
+
+        self.assertEqual(record["encryption_key"], "key-used-by-this-run")
+
+    def test_a_new_point_falls_back_to_the_job_key(self) -> None:
+        self._job("job-key")
+        record = backup_catalog.register_backup_from_completed_task(_completed_backup_task(job_id="job-1"))
+
+        self.assertEqual(record["encryption_key"], "job-key")
+
+    def test_an_unencrypted_point_stores_no_key(self) -> None:
+        task = _completed_backup_task()
+        task["result"]["encryption_enabled"] = False
+        task["parameters"] = {"encryption_key": "leftover"}
+
+        record = backup_catalog.register_backup_from_completed_task(task)
+
+        self.assertIsNone(record["encryption_key"])
+
+    def test_the_backfill_copies_the_job_key_onto_older_points(self) -> None:
+        self._job("job-key")
+        BACKUPS["old-encrypted"] = {"id": "old-encrypted", "job_id": "job-1", "encryption_enabled": True}
+        BACKUPS["old-plain"] = {"id": "old-plain", "job_id": "job-1", "encryption_enabled": False}
+
+        updated = backup_catalog.backfill_backup_encryption_keys()
+
+        self.assertEqual(updated, 1)
+        self.assertEqual(BACKUPS["old-encrypted"]["encryption_key"], "job-key")
+        self.assertNotIn("encryption_key", BACKUPS["old-plain"])
+
+    def test_the_backfill_leaves_a_point_that_already_has_a_key_alone(self) -> None:
+        self._job("job-key")
+        BACKUPS["kept"] = {
+            "id": "kept",
+            "job_id": "job-1",
+            "encryption_enabled": True,
+            "encryption_key": "written-with-this",
+        }
+
+        updated = backup_catalog.backfill_backup_encryption_keys()
+
+        self.assertEqual(updated, 0)
+        self.assertEqual(BACKUPS["kept"]["encryption_key"], "written-with-this")
+
+    def test_the_backfill_skips_a_point_whose_job_is_gone(self) -> None:
+        BACKUPS["orphan"] = {"id": "orphan", "job_id": "job-that-is-gone", "encryption_enabled": True}
+
+        updated = backup_catalog.backfill_backup_encryption_keys()
+
+        self.assertEqual(updated, 0)
+        self.assertNotIn("encryption_key", BACKUPS["orphan"])
+
+
 class BackfillDetailFieldsTests(unittest.TestCase):
     def setUp(self) -> None:
         BACKUPS.clear()

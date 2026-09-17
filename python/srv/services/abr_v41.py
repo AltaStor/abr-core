@@ -4955,6 +4955,7 @@ class _VerifyProgressTracker:
 def verify_backup_chain(
     backup_id: str,
     *,
+    encryption_key: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -4964,16 +4965,28 @@ def verify_backup_chain(
 
     warnings: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
-    work_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    work_items: list[tuple[dict[str, Any], dict[str, Any], str]] = []
 
     for point in points:
         if point["execution_type"] == "Incremental" and not point.get("parent_point_id"):
             warnings.append({"point_id": point["id"], "message": "Incremental restore point does not have a recorded parent"})
 
+        point_key = str(encryption_key or "").strip() or _resolve_restore_encryption_key(point) or ""
+        if not point_key and _point_is_encrypted(point):
+            errors.append(
+                {
+                    "point_id": point["id"],
+                    "disk_key": None,
+                    "message": (
+                        "Restore point is encrypted and no decryption key is available for it, so it cannot be "
+                        "restored; the data itself was not checked against a key"
+                    ),
+                }
+            )
         artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
         for disk in artifact.get("disks", []):
             if isinstance(disk, dict):
-                work_items.append((point, disk))
+                work_items.append((point, disk, point_key))
 
     def _emit(progress: int, message: str) -> None:
         if progress_callback is not None:
@@ -4995,9 +5008,10 @@ def verify_backup_chain(
                     _verify_disk_artifact,
                     point,
                     disk,
+                    encryption_key=point_key,
                     on_progress=_verify_artifact_progress_reporter(tracker, index),
                 ): (point, index)
-                for index, (point, disk) in enumerate(work_items)
+                for index, (point, disk, point_key) in enumerate(work_items)
             }
 
             for future in as_completed(futures):
@@ -5124,10 +5138,11 @@ def _verify_session_cancel_requested(task_id: str) -> bool:
         return bool(task and task.get("cancel_requested"))
 
 
-def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
+def _run_verify_session(backup_id: str, task_id: str, *, encryption_key: str | None = None) -> dict[str, Any]:
     try:
         report = verify_backup_chain(
             backup_id,
+            encryption_key=encryption_key,
             progress_callback=lambda update: _update_session_result(
                 task_id,
                 {**update, "log_entry": False},
@@ -5169,7 +5184,9 @@ def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
     return report
 
 
-def verify_backup_chain_request(backup_id: str, *, wait: bool = True) -> dict[str, Any]:
+def verify_backup_chain_request(
+    backup_id: str, *, wait: bool = True, encryption_key: str | None = None
+) -> dict[str, Any]:
     points = grouped_backup_points().get(backup_id)
     if not points:
         raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
@@ -5178,12 +5195,13 @@ def verify_backup_chain_request(backup_id: str, *, wait: bool = True) -> dict[st
     task_id = str(task["id"])
 
     if wait:
-        report = _run_verify_session(backup_id, task_id)
+        report = _run_verify_session(backup_id, task_id, encryption_key=encryption_key)
         return {**report, "session_id": task_id}
 
     thread = threading.Thread(
         target=_run_verify_session,
         args=(backup_id, task_id),
+        kwargs={"encryption_key": encryption_key},
         name=f"verify-{task_id}",
         daemon=True,
     )
@@ -6902,7 +6920,20 @@ def _inventory_vm_name_exists(inventory_id: str, vm_name: str) -> bool:
     return any(str(resource.get("name") or "").lower() == lowered for resource in _resolve_inventory_vm_records(inventory_id))
 
 
+def _point_is_encrypted(point: dict[str, Any]) -> bool:
+    if point.get("encryption_enabled") is not None:
+        return bool(point.get("encryption_enabled"))
+    job_id = str(point.get("job_id") or "")
+    if not job_id or job_id not in JOBS:
+        return False
+    task_parameters = resolve_job(record_id=job_id).get("task_parameters")
+    return bool(isinstance(task_parameters, dict) and task_parameters.get("encryption_enabled"))
+
+
 def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
+    own_key = str(point.get("encryption_key") or "").strip()
+    if own_key:
+        return own_key
     job_id = str(point.get("job_id") or "")
     if not job_id or job_id not in JOBS:
         return None
@@ -7096,7 +7127,15 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     power_on = bool(request.get("power_on_after_restore"))
     connect_nics = bool(request.get("connect_nics"))
     disk_provisioning = str(request.get("disk_provisioning") or "").strip() or None
-    encryption_key = _resolve_restore_encryption_key(point)
+    encryption_key = str(payload.get("encryption_key") or "").strip() or _resolve_restore_encryption_key(point)
+    _ensure(
+        bool(encryption_key) or not _point_is_encrypted(point),
+        409,
+        "encryption_key_unavailable",
+        "This restore point is encrypted and no decryption key is available for it: the job that held the key was deleted "
+        "or its key was replaced. Repeat the restore with an explicit encryption key.",
+        point_id=point_id,
+    )
     task = {
         "id": str(uuid4()),
         "job_id": None,
@@ -7421,6 +7460,7 @@ def _verify_disk_artifact(
     point: dict[str, Any],
     disk: dict[str, Any],
     *,
+    encryption_key: str = "",
     on_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     disk_key = disk.get("disk_key") or disk.get("index")
@@ -7463,6 +7503,7 @@ def _verify_disk_artifact(
             repository,
             abr_path,
             abr_backup_name,
+            encryption_key=encryption_key,
             timeout=VERIFY_ARTIFACT_TIMEOUT_SECONDS,
             on_progress=on_progress,
         )
