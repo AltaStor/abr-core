@@ -27,6 +27,7 @@ ALWAYS_SENT = (
     "Content-Security-Policy",
     "X-Content-Type-Options",
     "Referrer-Policy",
+    "Cache-Control",
 )
 
 
@@ -36,8 +37,12 @@ class SecurityHeaderResolutionTests(unittest.TestCase):
         self.assertEqual(headers["X-Frame-Options"], "DENY")
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
         self.assertIn("max-age=", headers["Strict-Transport-Security"])
+
+    def test_api_answers_are_not_left_in_the_browser_cache(self) -> None:
+        self.assertEqual(security_headers_for("https")["Cache-Control"], "no-store")
 
     def test_hsts_is_withheld_from_plain_http(self) -> None:
         """RFC 6797 makes a browser ignore HSTS on a non-secure response, so

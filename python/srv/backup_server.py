@@ -330,6 +330,7 @@ SECURITY_HEADER_KEYS: tuple[tuple[str, str], ...] = (
     ("Content-Security-Policy", "ABR_SECURITY_HEADER_CSP"),
     ("X-Content-Type-Options", "ABR_SECURITY_HEADER_CONTENT_TYPE_OPTIONS"),
     ("Referrer-Policy", "ABR_SECURITY_HEADER_REFERRER_POLICY"),
+    ("Cache-Control", "ABR_SECURITY_HEADER_CACHE_CONTROL"),
 )
 HSTS_HEADER_KEY = ("Strict-Transport-Security", "ABR_SECURITY_HEADER_HSTS")
 
