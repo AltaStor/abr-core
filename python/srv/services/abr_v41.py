@@ -62,6 +62,7 @@ from python.srv.core.secure_archive import (
 )
 from python.srv.core.storage_tool import (
     IMMUTABILITY_MODES,
+    IMMUTABILITY_RETENTION_SCOPES,
     StorageToolError,
     apply_repository_immutability,
     build_s3_location,
@@ -76,11 +77,13 @@ from python.srv.core.storage_tool import (
     mask_credential_fields,
     normalize_immutability_config,
     normalize_immutability_mode,
+    normalize_immutability_retention_scope,
     normalize_s3_prefix,
     probe_repository_access,
     probe_repository_immutability,
     read_storage_folder_info,
     remove_disk_tool_backup,
+    s3_block_generation_days,
     s3_endpoint_connect_error,
     sanitize_s3_config,
     verify_disk_tool_backup,
@@ -270,7 +273,7 @@ NO_CONTROL_CHARS_PATTERN = re.compile(r"^[^\x00-\x1f\x7f]*$")
 MAX_NAME_LENGTH = 125
 MAX_TEXT_LENGTH = 255
 MAX_LONG_TEXT_LENGTH = 1024
-MAX_IMMUTABILITY_RETENTION_DAYS = 36500
+MAX_IMMUTABILITY_RETENTION_DAYS = 999
 NFS_PATTERN = re.compile(r"^[^:/]+:.+$")
 SMB_PATTERN = re.compile(r"^(//|\\\\)[^/\\\\]+[/\\\\].+$")
 ZONEINFO_ROOT = Path("/usr/share/zoneinfo")
@@ -1887,6 +1890,16 @@ def _normalize_s3_configuration(payload: dict[str, Any], *, existing: dict[str, 
                 merged_immutability["retention_days"] = 0
         if "retention_days" in requested:
             merged_immutability["retention_days"] = requested.get("retention_days")
+        if "retention_scope" in requested:
+            scope = str(requested.get("retention_scope") or "").strip().lower().replace("-", "_")
+            _ensure(
+                scope in IMMUTABILITY_RETENTION_SCOPES,
+                422,
+                "invalid_repository",
+                "S3 immutability retention scope must be one of: " + ", ".join(IMMUTABILITY_RETENTION_SCOPES),
+                immutability_retention_scope=requested.get("retention_scope"),
+            )
+            merged_immutability["retention_scope"] = scope
     current["immutability"] = normalize_immutability_config(merged_immutability)
 
     return current
@@ -2588,13 +2601,9 @@ def _s3_immutability_probe_timeout() -> int:
     return env_int("ALTASTOR_S3_IMMUTABILITY_PROBE_TIMEOUT_SECONDS")
 
 
-def _s3_immutability_generation_days() -> int:
-    return env_int("ALTASTOR_S3_IMMUTABILITY_GENERATION_DAYS")
-
-
 def repository_actual_retention_days(job: dict[str, Any] | None, immutability: dict[str, Any]) -> int:
     return object_lock_actual_retention_days(
-        job, immutability, default_generation_days=_s3_immutability_generation_days()
+        job, immutability, block_generation_days=s3_block_generation_days()
     )
 
 
@@ -2837,6 +2846,8 @@ def validate_s3_immutability_config(config: dict[str, Any], *, write_probe: bool
 def _immutability_job_retention_warnings(repository_id: str, immutability: dict[str, Any]) -> list[str]:
     if not immutability_is_enabled(immutability):
         return []
+    configured_days = int(immutability["retention_days"])
+    scope = normalize_immutability_retention_scope(immutability.get("retention_scope"))
     warnings: list[str] = []
     for job in normalized_job_records():
         if str(job.get("repo_id") or "") != repository_id:
@@ -2845,16 +2856,17 @@ def _immutability_job_retention_warnings(repository_id: str, immutability: dict[
         if job_days <= 0:
             continue
         lock_days = repository_actual_retention_days(job, immutability)
-        if job_days < lock_days:
+        if configured_days > job_days:
             warnings.append(
-                f"Job '{job.get('name')}' keeps restore points for {job_days} day(s), but backups written to this "
-                f"repository stay locked for {lock_days} day(s); retention cannot delete them until the lock expires."
+                f"Job '{job.get('name')}' keeps restore points for {job_days} day(s), but its backups stay locked for "
+                f"{lock_days} day(s); the storage is paid for the whole lock, so keep the immutability period at or "
+                "below the job retention unless the lock is what you are after."
             )
-        elif lock_days < job_days:
+        elif scope == "minimum_only" and lock_days < job_days:
             warnings.append(
                 f"Job '{job.get('name')}' keeps restore points for {job_days} day(s), but they are locked for only "
                 f"{lock_days} day(s); from day {lock_days} to day {job_days} its backups are still needed but can be "
-                "deleted. Raise the immutability period to cover the whole retention."
+                "deleted. Switch this repository to job_retention scope, or raise the immutability period."
             )
     return warnings
 
@@ -2875,9 +2887,16 @@ def _immutability_effect_report(
     limitations: list[str] = []
 
     if immutability_is_enabled(current):
+        generation_days = s3_block_generation_days()
         effect.append(
-            f"Backups created from now on are written under {current['mode']} Object Lock retention and cannot be "
-            f"deleted or overwritten for {current['retention_days']} day(s), counted from each backup's own creation time."
+            f"Backups created from now on are written under {current['mode']} Object Lock retention, counted from each "
+            "backup's own creation time. The period written is "
+            + (
+                f"the longer of the job's retention and {current['retention_days']} day(s)"
+                if normalize_immutability_retention_scope(current.get("retention_scope")) == "job_retention"
+                else f"{current['retention_days']} day(s)"
+            )
+            + f", plus a {generation_days}-day block generation period."
         )
     else:
         effect.append("Immutability is disabled: new backups are written without Object Lock retention and stay deletable.")
@@ -2889,9 +2908,10 @@ def _immutability_effect_report(
         )
         if immutability_is_enabled(previous):
             limitations.append(
-                f"Each keeps the retention it was written with: {previous['mode']} for "
-                f"{previous['retention_days']} day(s) from its own creation for those written under that setting, "
-                "none for any written before immutability was enabled. AltaStor does not track this per restore point."
+                f"Each keeps the {previous['mode']} retention it was written under, counted from its own creation: "
+                "the period configured at the time plus the block generation period, and the job's retention instead "
+                "where that was longer. AltaStor does not track the resulting date per restore point, so read it from "
+                "the storage."
             )
         else:
             limitations.append(
@@ -2968,7 +2988,7 @@ def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:
         return f"for {configured} day(s)"
     low, high = min(applied_days), max(applied_days)
     span = f"{low} day(s)" if low == high else f"{low}-{high} day(s)"
-    return f"for {span} ({configured} configured plus the job's full-backup cycle)"
+    return f"for {span} ({configured} configured plus job retention and the block generation period)"
 
 
 def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:

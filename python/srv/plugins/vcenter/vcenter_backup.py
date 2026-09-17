@@ -32,6 +32,7 @@ from ...core.storage_tool import (
     remove_disk_tool_backup,
     repository_cache_root,
     run_disk_tool,
+    s3_block_generation_days,
     with_immutability_retention_days,
     safe_path_component,
 )
@@ -113,10 +114,6 @@ def _resolve_repository_backup_root(task: dict[str, Any]) -> Path | None:
     return None
 
 
-def _immutability_generation_days() -> int:
-    return env_int("ALTASTOR_S3_IMMUTABILITY_GENERATION_DAYS")
-
-
 def _resolve_repository(task: dict[str, Any]) -> dict[str, Any] | None:
     for repository_id in _resolve_repository_ids(task):
         repository = REPOSITORIES.get(repository_id)
@@ -129,7 +126,7 @@ def _resolve_repository(task: dict[str, Any]) -> dict[str, Any] | None:
         actual_days = object_lock_actual_retention_days(
             job if isinstance(job, dict) else None,
             extract_s3_config(repository).get("immutability") or {},
-            default_generation_days=_immutability_generation_days(),
+            block_generation_days=s3_block_generation_days(),
         )
         if actual_days < 1:
             return repository

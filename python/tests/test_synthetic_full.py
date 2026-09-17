@@ -436,6 +436,37 @@ class SyntheticFullRunTests(unittest.TestCase):
         self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 40)
         self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 40)
 
+    @patch("python.srv.services.synthetic_full.apply_repository_immutability")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_synthetic_full_is_locked_for_the_job_retention_when_that_is_longer(self, copy_mock, lock_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
+        REPOSITORIES[REPO_ID] = {
+            "id": REPO_ID, "name": "S3", "type": "s3",
+            "metadata": {"s3": {"bucket": "b", "region": "us-east-1",
+                                "immutability": {"mode": "governance", "retention_days": 5}}},
+        }
+
+        synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 24)
+        self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 24)
+
+    @patch("python.srv.services.synthetic_full.apply_repository_immutability")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_synthetic_full_ignores_the_job_retention_under_minimum_scope(self, copy_mock, lock_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
+        REPOSITORIES[REPO_ID] = {
+            "id": REPO_ID, "name": "S3", "type": "s3",
+            "metadata": {"s3": {"bucket": "b", "region": "us-east-1",
+                                "immutability": {"mode": "governance", "retention_days": 5,
+                                                 "retention_scope": "minimum_only"}}},
+        }
+
+        synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 15)
+        self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 15)
+
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_an_unreadable_source_manifest_stops_the_merge(self, copy_mock) -> None:
         copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
