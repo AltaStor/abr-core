@@ -521,6 +521,7 @@ Example: abr restore start --point-id rp-2026-05-16-0200-f1 --in-place --force -
 
 --in-place selects this mode explicitly. It cannot be combined with --target-inventory/--target-host/--datastore/--new-name -- in-place restore always uses the source VM's own placement, never a caller-supplied one. It can be combined with --repo for a backup-copy source (scenario 3 below). 
 
+An in-place restore keeps the VM's identity: the restored machine carries the original's SMBIOS uuid and vSphere instanceUuid, so guest licensing, vCenter tags, monitoring and this product's own backup jobs and backup chains keep matching it. Only vCenter's internal moRef changes. A restore to a new name is the opposite by design: it creates a separate VM with its own identity, which is what cloning a machine alongside the original calls for. 
 --force authorizes the overwrite once --in-place has been selected; it has no effect and no meaning without --in-place. Omitting --in-place leaves the flag rejected outright, since there is nothing for it to authorize. 
 
 Requires that the backup captured the VM's original host and datastore -- if the source VM's placement is unknown, in-place restore is refused with restore_mode_unsupported. 

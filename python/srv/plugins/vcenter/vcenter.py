@@ -1544,6 +1544,50 @@ class VCenterNode(Hypervisor):
             "changed": True,
         }
 
+    def read_vm_identity(self, vm_name: str, vm_moref: str | None = None) -> dict[str, str]:
+        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
+        if vm is None:
+            vm = self._get_vm(vm_name)
+        if not vm:
+            raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
+        config = getattr(vm, "config", None)
+        return {
+            "uuid": str(getattr(config, "uuid", "") or ""),
+            "instance_uuid": str(getattr(config, "instanceUuid", "") or ""),
+        }
+
+    def set_vm_identity(
+        self,
+        vm_name: str,
+        *,
+        uuid: str = "",
+        instance_uuid: str = "",
+        vm_moref: str | None = None,
+    ) -> dict[str, Any]:
+        if not uuid and not instance_uuid:
+            return {"changed": False}
+        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
+        if vm is None:
+            vm = self._get_vm(vm_name)
+        if not vm:
+            raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
+
+        spec = vim.vm.ConfigSpec()
+        if uuid:
+            spec.uuid = uuid
+        if instance_uuid:
+            spec.instanceUuid = instance_uuid
+        task = vm.ReconfigVM_Task(spec=spec)
+        self._wait_for_task(task)
+        logger.info(
+            "Restored the original identity of VM '%s' on %s: uuid=%s instanceUuid=%s.",
+            vm_name,
+            self.host,
+            uuid or "unchanged",
+            instance_uuid or "unchanged",
+        )
+        return {"changed": True, "uuid": uuid, "instance_uuid": instance_uuid}
+
     def rename_vm(self, vm_name: str, new_name: str, vm_moref: str | None = None) -> dict[str, Any]:
         """Rename a VM in place via Rename_Task — promotes an in-place
         restore's staging VM to the original's exact name once the original

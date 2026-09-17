@@ -90,6 +90,44 @@ def _build_disk_file_name(index: int, source_name: str) -> str:
     return _name_with_suffix(f"{index:02d}-{source.stem}", extension, RESTORED_DISK_FILE_NAME_LIMIT)
 
 
+def _read_original_identity(node: Any, vm_name: str) -> dict[str, str]:
+    try:
+        identity = node.read_vm_identity(vm_name)
+    except Exception:
+        logger.warning(
+            "Could not read the vSphere identifiers of '%s' before replacing it; the restored VM will carry "
+            "new ones and anything keyed on the old identity will stop matching.",
+            vm_name,
+            exc_info=True,
+        )
+        return {}
+    return {key: value for key, value in identity.items() if value}
+
+
+def _restore_original_identity(
+    node: Any, vm_name: str, identity: dict[str, str], *, vm_moref: str = ""
+) -> bool:
+    if not identity:
+        return False
+    try:
+        node.set_vm_identity(
+            vm_name,
+            uuid=identity.get("uuid", ""),
+            instance_uuid=identity.get("instance_uuid", ""),
+            vm_moref=vm_moref or None,
+        )
+    except Exception:
+        logger.warning(
+            "In-place restore of '%s' finished, but the original vSphere identifiers could not be applied to it. "
+            "The data is intact; guest licensing, vCenter tags, monitoring and backup jobs keyed on the old "
+            "identity will not recognise this VM until it is corrected.",
+            vm_name,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
 def _build_staging_vm_name(target_vm_name: str, task_id: str) -> str:
     return _name_with_suffix(
         target_vm_name, f"-restoring-{task_id[:8]}", VSPHERE_VM_NAME_LIMIT
@@ -719,6 +757,8 @@ def run_vcenter_restore(
                 created_vm.get("requested_secure_boot"),
             )
             original_destroyed = False
+            original_identity: dict[str, str] = {}
+            identity_preserved = False
             try:
                 thumbprint = node.get_thumbprint()
                 created_disk_paths = created_vm.get("disk_paths", [])
@@ -950,10 +990,17 @@ def run_vcenter_restore(
                         create_vm_name,
                         target_vm_name,
                     )
+                    original_identity = _read_original_identity(node, target_vm_name)
                     node.power_off_vm(target_vm_name)
                     node.destroy_vm(target_vm_name)
                     original_destroyed = True  # point of no return: the original is gone
                     node.rename_vm(create_vm_name, target_vm_name, vm_moref=str(created_vm.get("vm_moref") or ""))
+                    identity_preserved = _restore_original_identity(
+                        node,
+                        target_vm_name,
+                        original_identity,
+                        vm_moref=str(created_vm.get("vm_moref") or ""),
+                    )
                     try:
                         from ...services.abr_v41 import schedule_inventory_discovery
 
@@ -1028,6 +1075,8 @@ def run_vcenter_restore(
             "worker_mode": "vcenter-abr-vmdk-tool",
             "hypervisor_kind": "vcenter",
             "restore_mode": restore_mode,
+            "identity_preserved": identity_preserved,
+            "original_identity": original_identity or None,
             "source_vm_name": source_vm_name,
             "target_vm_name": target_vm_name,
             "target_host_name": target_host_name,
