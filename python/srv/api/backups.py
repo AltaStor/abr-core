@@ -15,6 +15,7 @@ from .schemas import (
     BackupVerifyResult,
     ImportBackupRequest,
     TreeResponse,
+    VerifyBackupRequest,
     unset_excluded,
 )
 
@@ -42,8 +43,17 @@ def delete_backup(
     return abr_v41.delete_backup_chain_request(backup_id, segment_id=segment, force=force, wait=wait)
 
 
-def verify_backup(backup_id: str, wait: bool = Query(default=True)) -> BackupVerifyResult:
-    return abr_v41.verify_backup_chain_request(backup_id, wait=wait)
+def verify_backup(
+    backup_id: str,
+    wait: bool = Query(default=True),
+    payload: VerifyBackupRequest = Body(default_factory=VerifyBackupRequest),
+) -> BackupVerifyResult:
+    body = unset_excluded(payload)
+    return abr_v41.verify_backup_chain_request(
+        backup_id,
+        wait=wait,
+        encryption_key=str(body.get("encryption_key") or "").strip() or None,
+    )
 
 
 def import_backup(payload: ImportBackupRequest = Body(default_factory=ImportBackupRequest)) -> BackupChainDTO:

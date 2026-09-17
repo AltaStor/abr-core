@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -232,6 +234,186 @@ class RegisterBackupFromCompletedTaskRetentionFailureTests(unittest.TestCase):
         ):
             with self.assertRaises(TypeError):
                 backup_catalog.register_backup_from_completed_task(self._task())
+
+
+class RetentionAcrossASyntheticFullTests(unittest.TestCase):
+    def setUp(self) -> None:
+        BACKUPS.clear()
+        self.addCleanup(BACKUPS.clear)
+
+    @staticmethod
+    def _point(point_id: str, execution_type: str, created_at: str, parent: str | None) -> dict:
+        return abr_v41.normalize_backup_point(
+            {
+                "id": point_id,
+                "job_id": "job-1",
+                "vm_id": "vm-1",
+                "repository_id": "repo-1",
+                "execution_type": execution_type,
+                "execution_reason": "SyntheticFullWindow"
+                if execution_type == "SyntheticFull"
+                else "ActiveFullWindow",
+                "created_at": created_at,
+                "parent_point_id": parent,
+                "full_backup": execution_type in {"ActiveFull", "SyntheticFull"},
+                "artifact": {"backup_root": "/does/not/matter"},
+            }
+        )
+
+    def test_the_merged_chain_ages_out_without_touching_the_synthetic_full(self) -> None:
+        points = [
+            self._point("old-full", "ActiveFull", "2020-01-01T00:00:00+00:00", None),
+            self._point("old-incr", "Incremental", "2020-01-02T00:00:00+00:00", "old-full"),
+            self._point("synthetic", "SyntheticFull", "2020-01-03T00:00:00+00:00", None),
+            self._point("new-incr", "Incremental", "2020-01-04T00:00:00+00:00", "synthetic"),
+        ]
+        for point in points:
+            BACKUPS[point["id"]] = point
+        job = _retention_job(retention_days=0)
+
+        with patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True):
+            abr_v41.apply_retention_to_chain(job, vm_id="vm-1", repository_id="repo-1")
+
+        self.assertNotIn("old-full", BACKUPS)
+        self.assertNotIn("old-incr", BACKUPS)
+
+    def test_a_synthetic_full_that_is_still_in_retention_keeps_its_own_increment(self) -> None:
+        recent = datetime.now(timezone.utc)
+        points = [
+            self._point("old-full", "ActiveFull", "2020-01-01T00:00:00+00:00", None),
+            self._point("synthetic", "SyntheticFull", recent.isoformat(), None),
+            self._point(
+                "new-incr",
+                "Incremental",
+                (recent + timedelta(minutes=1)).isoformat(),
+                "synthetic",
+            ),
+        ]
+        for point in points:
+            BACKUPS[point["id"]] = point
+        job = _retention_job(retention_days=7)
+
+        with patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True):
+            abr_v41.apply_retention_to_chain(job, vm_id="vm-1", repository_id="repo-1")
+
+        self.assertNotIn("old-full", BACKUPS)
+        self.assertIn("synthetic", BACKUPS)
+        self.assertIn("new-incr", BACKUPS)
+
+    def test_several_synthetic_cycles_keep_only_what_retention_still_needs(self) -> None:
+        points = [
+            self._point("full-1", "ActiveFull", "2020-01-01T00:00:00+00:00", None),
+            self._point("incr-1", "Incremental", "2020-01-02T00:00:00+00:00", "full-1"),
+            self._point("synth-1", "SyntheticFull", "2020-01-03T00:00:00+00:00", None),
+            self._point("incr-2", "Incremental", "2020-01-04T00:00:00+00:00", "synth-1"),
+            self._point("synth-2", "SyntheticFull", "2020-01-05T00:00:00+00:00", None),
+            self._point("incr-3", "Incremental", "2020-01-06T00:00:00+00:00", "synth-2"),
+        ]
+        for point in points:
+            BACKUPS[point["id"]] = point
+        job = _retention_job(retention_days=0)
+
+        with patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True):
+            abr_v41.apply_retention_to_chain(job, vm_id="vm-1", repository_id="repo-1")
+
+        self.assertEqual(BACKUPS, {}, "every segment was expired, so none may survive")
+
+    def test_only_the_expired_cycles_go_and_the_newest_one_stays_restorable(self) -> None:
+        recent = datetime.now(timezone.utc)
+        points = [
+            self._point("full-1", "ActiveFull", "2020-01-01T00:00:00+00:00", None),
+            self._point("incr-1", "Incremental", "2020-01-02T00:00:00+00:00", "full-1"),
+            self._point("synth-1", "SyntheticFull", "2020-01-03T00:00:00+00:00", None),
+            self._point("incr-2", "Incremental", "2020-01-04T00:00:00+00:00", "synth-1"),
+            self._point("synth-2", "SyntheticFull", recent.isoformat(), None),
+            self._point(
+                "incr-3", "Incremental", (recent + timedelta(minutes=1)).isoformat(), "synth-2"
+            ),
+        ]
+        for point in points:
+            BACKUPS[point["id"]] = point
+        job = _retention_job(retention_days=7)
+
+        with patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True):
+            abr_v41.apply_retention_to_chain(job, vm_id="vm-1", repository_id="repo-1")
+
+        self.assertEqual(sorted(BACKUPS), ["incr-3", "synth-2"])
+
+    def test_what_survives_still_resolves_into_a_complete_restore_chain(self) -> None:
+        from python.srv.plugins.vcenter import vcenter_restore
+
+        recent = datetime.now(timezone.utc)
+        points = [
+            self._point("full-1", "ActiveFull", "2020-01-01T00:00:00+00:00", None),
+            self._point("incr-1", "Incremental", "2020-01-02T00:00:00+00:00", "full-1"),
+            self._point("synth-1", "SyntheticFull", recent.isoformat(), None),
+            self._point(
+                "incr-2", "Incremental", (recent + timedelta(minutes=1)).isoformat(), "synth-1"
+            ),
+        ]
+        for point in points:
+            BACKUPS[point["id"]] = point
+        job = _retention_job(retention_days=7)
+
+        with patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True):
+            abr_v41.apply_retention_to_chain(job, vm_id="vm-1", repository_id="repo-1")
+
+        chain = vcenter_restore._resolve_point_chain(BACKUPS["incr-2"])
+
+        self.assertEqual([item["id"] for item in chain], ["synth-1", "incr-2"])
+
+    def test_a_synthetic_segment_expires_exactly_like_an_active_full_one(self) -> None:
+        def run(base_type: str) -> list[str]:
+            BACKUPS.clear()
+            recent = datetime.now(timezone.utc)
+            for point in (
+                self._point("old-full", "ActiveFull", "2020-01-01T00:00:00+00:00", None),
+                self._point("base", base_type, recent.isoformat(), None),
+                self._point(
+                    "incr", "Incremental", (recent + timedelta(minutes=1)).isoformat(), "base"
+                ),
+            ):
+                BACKUPS[point["id"]] = point
+            with patch(
+                "python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True
+            ):
+                abr_v41.apply_retention_to_chain(
+                    _retention_job(retention_days=7), vm_id="vm-1", repository_id="repo-1"
+                )
+            return sorted(BACKUPS)
+
+        self.assertEqual(run("SyntheticFull"), run("ActiveFull"))
+
+    def test_a_gfs_protected_synthetic_full_outlives_its_own_expired_increments(self) -> None:
+        points = [
+            self._point("synth-1", "SyntheticFull", "2020-01-01T00:00:00+00:00", None),
+            self._point("incr-1", "Incremental", "2020-01-02T00:00:00+00:00", "synth-1"),
+            self._point("incr-2", "Incremental", "2020-01-03T00:00:00+00:00", "synth-1"),
+        ]
+        for point in points:
+            BACKUPS[point["id"]] = point
+        job = _retention_job(retention_days=0, gfs={"weekly": 4, "monthly": 0, "yearly": 0, "enabled": True})
+
+        with patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True):
+            abr_v41.apply_retention_to_chain(job, vm_id="vm-1", repository_id="repo-1")
+
+        self.assertEqual(sorted(BACKUPS), ["synth-1"])
+
+    def test_a_gfs_protected_old_chain_survives_a_newer_synthetic_full(self) -> None:
+        recent = datetime.now(timezone.utc)
+        points = [
+            self._point("old-full", "ActiveFull", "2020-01-01T00:00:00+00:00", None),
+            self._point("synth-1", "SyntheticFull", recent.isoformat(), None),
+        ]
+        for point in points:
+            BACKUPS[point["id"]] = point
+        job = _retention_job(retention_days=0, gfs={"weekly": 4, "monthly": 0, "yearly": 0, "enabled": True})
+
+        with patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True):
+            abr_v41.apply_retention_to_chain(job, vm_id="vm-1", repository_id="repo-1")
+
+        self.assertIn("old-full", BACKUPS, "a GFS keeper must survive even after a synthetic full replaced it as the base")
+        self.assertIn("synth-1", BACKUPS)
 
 
 if __name__ == "__main__":

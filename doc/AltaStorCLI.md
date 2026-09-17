@@ -176,7 +176,7 @@ Description: Create a backup repository.
 
 abr repo add --name <name> --type <local|nfs|smb|s3> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password <pass>] [--description <text>] 
 
-For --type s3: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] 
+For --type s3: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] 
 
 Example: 
 abr repo add --name MyLocal --type local --path /mnt/backup 
@@ -192,9 +192,11 @@ S3 OBJECT STORAGE IMMUTABILITY
 
 Object Lock can only be enabled when a bucket is created - never added later, and never on a bucket AltaStor provisions itself. Enabling immutability on a bucket that cannot deliver it is refused, naming the failing check. 
 
-The lock written is longer than --immutability-days: a full must outlive the last incremental chained onto it, so AltaStor adds one full-backup cycle - the widest gap between the job's full days, or ALTASTOR_S3_IMMUTABILITY_GENERATION_DAYS when the job schedules none. --immutability-days 30 on a weekly-full job writes a 37-day lock. 
+The lock written is longer than --immutability-days. AltaStor adds a block generation period - ALTASTOR_S3_BLOCK_GENERATION_DAYS, ten days by default - so that blocks arriving within one generation share a single expiry instead of the lock being rewritten for every increment. --immutability-days must be between 1 and 999. 
 
-The period runs from each backup's own creation, and stored restore points keep the lock they were written with - repo apply-immutability puts them under the current setting. Retention can be lengthened, never shortened or removed. Keep the job's --retention-days at or above --immutability-days, or operational retention keeps failing until locks expire; repo add/edit warn when it is shorter. 
+--immutability-retention decides what the period counts from. job, the default, follows the job's --retention-days whenever that is longer than --immutability-days; minimum ignores the job and uses --immutability-days alone. A job keeping 13 days on a repository set to 7 writes a 23-day lock under job, and a 17-day lock under minimum. 
+
+The period runs from each backup's own creation, and stored restore points keep the lock they were written with - repo apply-immutability puts them under the current setting. Retention can be lengthened, never shortened or removed. An --immutability-days longer than the job's --retention-days locks data past the point the job still needs it and is paid for either way; repo add/edit warn when that happens. 
 
 abr repo list 
 
@@ -214,13 +216,13 @@ Description: Update repository settings.
 
 abr repo edit --name <name> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password <pass>] [--description <text>] 
 
-For an s3 repository: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] 
+For an s3 repository: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] 
 
 Example: 
 abr repo edit --name MyWorm --immutability-days 60 
 abr repo edit --name MyWorm --immutable none 
 
---immutability-days alone changes the period; --immutable alone switches mode and keeps the period; --immutable none turns it off. A repository holding non-immutable backups can be switched at any time - existing restore points stay unprotected until repo apply-immutability. 
+--immutability-days alone changes the period; --immutable alone switches mode and keeps the period; --immutability-retention alone switches what the period counts from; --immutable none turns it off. A repository holding non-immutable backups can be switched at any time - existing restore points stay unprotected until repo apply-immutability. 
 
 abr repo remove 
 
@@ -521,6 +523,7 @@ Example: abr restore start --point-id rp-2026-05-16-0200-f1 --in-place --force -
 
 --in-place selects this mode explicitly. It cannot be combined with --target-inventory/--target-host/--datastore/--new-name -- in-place restore always uses the source VM's own placement, never a caller-supplied one. It can be combined with --repo for a backup-copy source (scenario 3 below). 
 
+An in-place restore keeps the VM's identity: the restored machine carries the original's SMBIOS uuid and vSphere instanceUuid, so guest licensing, vCenter tags, monitoring and this product's own backup jobs and backup chains keep matching it. Only vCenter's internal moRef changes. A restore to a new name is the opposite by design: it creates a separate VM with its own identity, which is what cloning a machine alongside the original calls for. 
 --force authorizes the overwrite once --in-place has been selected; it has no effect and no meaning without --in-place. Omitting --in-place leaves the flag rejected outright, since there is nothing for it to authorize. 
 
 Requires that the backup captured the VM's original host and datastore -- if the source VM's placement is unknown, in-place restore is refused with restore_mode_unsupported. 

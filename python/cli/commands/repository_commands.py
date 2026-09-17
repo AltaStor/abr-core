@@ -32,7 +32,10 @@ def _parse_remote_address(repo_type: str, address: str | None) -> dict[str, str]
 
 
 def _configures_immutability(args: argparse.Namespace) -> bool:
-    return getattr(args, "immutable", None) is not None or getattr(args, "immutability_days", None) is not None
+    return any(
+        getattr(args, name, None) is not None
+        for name in ("immutable", "immutability_days", "immutability_retention")
+    )
 
 
 def _build_immutability_payload(args: argparse.Namespace) -> dict[str, object]:
@@ -43,6 +46,9 @@ def _build_immutability_payload(args: argparse.Namespace) -> dict[str, object]:
         payload["mode"] = str(mode).strip().lower()
     if days is not None:
         payload["retention_days"] = int(days)
+    scope = getattr(args, "immutability_retention", None)
+    if scope is not None:
+        payload["retention_scope"] = "job_retention" if str(scope) == "job" else "minimum_only"
     return payload
 
 
@@ -89,10 +95,13 @@ def _validate_immutability_args(
 ) -> None:
     mode = getattr(args, "immutable", None)
     days = getattr(args, "immutability_days", None)
-    if mode is None and days is None:
+    scope = getattr(args, "immutability_retention", None)
+    if mode is None and days is None and scope is None:
         return
     if repo_type != "s3":
-        raise ValueError("--immutable and --immutability-days are only available for s3 repositories")
+        raise ValueError(
+            "--immutable, --immutability-days and --immutability-retention are only available for s3 repositories"
+        )
     if days is not None and int(days) < 1:
         raise ValueError("--immutability-days must be at least 1")
 
@@ -105,6 +114,8 @@ def _validate_immutability_args(
             raise ValueError("--immutable none cannot be combined with --immutability-days")
         if days is not None:
             raise ValueError("--immutability-days requires --immutable governance or --immutable compliance")
+        if scope is not None:
+            raise ValueError("--immutability-retention requires --immutable governance or --immutable compliance")
         return
     if effective_days < 1:
         raise ValueError(f"--immutable {effective_mode} requires --immutability-days")
@@ -249,6 +260,15 @@ class RepositoryCommands:
             type=int,
             help="Days S3 Object Lock holds each new backup; required with --immutable governance/compliance",
         )
+        add.add_argument(
+            "--immutability-retention",
+            dest="immutability_retention",
+            choices=("job", "minimum"),
+            help=(
+                "Whether the Object Lock period follows the job retention when that is longer (job, the default) "
+                "or only --immutability-days (minimum)"
+            ),
+        )
         add.set_defaults(handler=self.create)
 
         list_parser = commands.add_parser(
@@ -320,6 +340,12 @@ class RepositoryCommands:
             dest="immutability_days",
             type=int,
             help="Updated number of days S3 Object Lock holds each new backup",
+        )
+        edit.add_argument(
+            "--immutability-retention",
+            dest="immutability_retention",
+            choices=("job", "minimum"),
+            help="Updated rule for the Object Lock period: follow the job retention when longer (job) or only --immutability-days (minimum)",
         )
         edit.set_defaults(handler=self.edit)
 

@@ -168,6 +168,70 @@ class VerifyChainProgressTests(_VerifyFixture):
         self.assertLess(report["checked_artifacts"], 8)
 
 
+class VerifyEncryptionKeyTests(_VerifyFixture):
+    def _encrypt_chain(self, chain_id: str, *, key: str | None) -> None:
+        for point in list(BACKUPS.values()):
+            if str(point.get("chain_id")) != chain_id:
+                continue
+            record = dict(point)
+            record["encryption_enabled"] = True
+            if key is not None:
+                record["encryption_key"] = key
+            abr_v41.persist_backup(record)
+
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_the_stored_key_is_handed_to_the_mover(self, run_disk_tool_mock) -> None:
+        run_disk_tool_mock.side_effect = _disk_tool_stub()
+        chain_id = self._chain_with_disks(1)
+        self._encrypt_chain(chain_id, key="stored-key")
+
+        report = abr_v41.verify_backup_chain(chain_id)
+
+        self.assertEqual(report["result"], "valid")
+        verify_calls = [call for call in run_disk_tool_mock.call_args_list if call.args[0][0] == "verify"]
+        self.assertTrue(verify_calls)
+        for call in verify_calls:
+            command = call.args[0]
+            self.assertIn("--key", command)
+            self.assertEqual(command[command.index("--key") + 1], "stored-key")
+
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_an_explicit_key_overrides_the_stored_one(self, run_disk_tool_mock) -> None:
+        run_disk_tool_mock.side_effect = _disk_tool_stub()
+        chain_id = self._chain_with_disks(1)
+        self._encrypt_chain(chain_id, key="stored-key")
+
+        abr_v41.verify_backup_chain(chain_id, encryption_key="typed-by-hand")
+
+        verify_calls = [call for call in run_disk_tool_mock.call_args_list if call.args[0][0] == "verify"]
+        for call in verify_calls:
+            command = call.args[0]
+            self.assertEqual(command[command.index("--key") + 1], "typed-by-hand")
+
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_an_encrypted_chain_without_a_key_is_not_reported_as_valid(self, run_disk_tool_mock) -> None:
+        run_disk_tool_mock.side_effect = _disk_tool_stub()
+        chain_id = self._chain_with_disks(1)
+        self._encrypt_chain(chain_id, key=None)
+
+        report = abr_v41.verify_backup_chain(chain_id)
+
+        self.assertNotEqual(report["result"], "valid")
+        self.assertTrue(any("no decryption key" in str(error.get("message")) for error in report["errors"]), report)
+
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_a_plain_chain_is_verified_without_a_key(self, run_disk_tool_mock) -> None:
+        run_disk_tool_mock.side_effect = _disk_tool_stub()
+        chain_id = self._chain_with_disks(1)
+
+        report = abr_v41.verify_backup_chain(chain_id)
+
+        self.assertEqual(report["result"], "valid")
+        verify_calls = [call for call in run_disk_tool_mock.call_args_list if call.args[0][0] == "verify"]
+        for call in verify_calls:
+            self.assertNotIn("--key", call.args[0])
+
+
 class VerifySessionTests(_VerifyFixture):
     @patch("python.srv.core.storage_tool.run_disk_tool")
     def test_a_waiting_call_returns_the_report_and_a_finished_session(self, run_disk_tool_mock) -> None:

@@ -62,6 +62,7 @@ from python.srv.core.secure_archive import (
 )
 from python.srv.core.storage_tool import (
     IMMUTABILITY_MODES,
+    IMMUTABILITY_RETENTION_SCOPES,
     StorageToolError,
     apply_repository_immutability,
     build_s3_location,
@@ -76,11 +77,13 @@ from python.srv.core.storage_tool import (
     mask_credential_fields,
     normalize_immutability_config,
     normalize_immutability_mode,
+    normalize_immutability_retention_scope,
     normalize_s3_prefix,
     probe_repository_access,
     probe_repository_immutability,
     read_storage_folder_info,
     remove_disk_tool_backup,
+    s3_block_generation_days,
     s3_endpoint_connect_error,
     sanitize_s3_config,
     verify_disk_tool_backup,
@@ -270,7 +273,7 @@ NO_CONTROL_CHARS_PATTERN = re.compile(r"^[^\x00-\x1f\x7f]*$")
 MAX_NAME_LENGTH = 125
 MAX_TEXT_LENGTH = 255
 MAX_LONG_TEXT_LENGTH = 1024
-MAX_IMMUTABILITY_RETENTION_DAYS = 36500
+MAX_IMMUTABILITY_RETENTION_DAYS = 999
 NFS_PATTERN = re.compile(r"^[^:/]+:.+$")
 SMB_PATTERN = re.compile(r"^(//|\\\\)[^/\\\\]+[/\\\\].+$")
 ZONEINFO_ROOT = Path("/usr/share/zoneinfo")
@@ -1887,6 +1890,16 @@ def _normalize_s3_configuration(payload: dict[str, Any], *, existing: dict[str, 
                 merged_immutability["retention_days"] = 0
         if "retention_days" in requested:
             merged_immutability["retention_days"] = requested.get("retention_days")
+        if "retention_scope" in requested:
+            scope = str(requested.get("retention_scope") or "").strip().lower().replace("-", "_")
+            _ensure(
+                scope in IMMUTABILITY_RETENTION_SCOPES,
+                422,
+                "invalid_repository",
+                "S3 immutability retention scope must be one of: " + ", ".join(IMMUTABILITY_RETENTION_SCOPES),
+                immutability_retention_scope=requested.get("retention_scope"),
+            )
+            merged_immutability["retention_scope"] = scope
     current["immutability"] = normalize_immutability_config(merged_immutability)
 
     return current
@@ -2588,13 +2601,9 @@ def _s3_immutability_probe_timeout() -> int:
     return env_int("ALTASTOR_S3_IMMUTABILITY_PROBE_TIMEOUT_SECONDS")
 
 
-def _s3_immutability_generation_days() -> int:
-    return env_int("ALTASTOR_S3_IMMUTABILITY_GENERATION_DAYS")
-
-
 def repository_actual_retention_days(job: dict[str, Any] | None, immutability: dict[str, Any]) -> int:
     return object_lock_actual_retention_days(
-        job, immutability, default_generation_days=_s3_immutability_generation_days()
+        job, immutability, block_generation_days=s3_block_generation_days()
     )
 
 
@@ -2837,6 +2846,8 @@ def validate_s3_immutability_config(config: dict[str, Any], *, write_probe: bool
 def _immutability_job_retention_warnings(repository_id: str, immutability: dict[str, Any]) -> list[str]:
     if not immutability_is_enabled(immutability):
         return []
+    configured_days = int(immutability["retention_days"])
+    scope = normalize_immutability_retention_scope(immutability.get("retention_scope"))
     warnings: list[str] = []
     for job in normalized_job_records():
         if str(job.get("repo_id") or "") != repository_id:
@@ -2845,16 +2856,17 @@ def _immutability_job_retention_warnings(repository_id: str, immutability: dict[
         if job_days <= 0:
             continue
         lock_days = repository_actual_retention_days(job, immutability)
-        if job_days < lock_days:
+        if configured_days > job_days:
             warnings.append(
-                f"Job '{job.get('name')}' keeps restore points for {job_days} day(s), but backups written to this "
-                f"repository stay locked for {lock_days} day(s); retention cannot delete them until the lock expires."
+                f"Job '{job.get('name')}' keeps restore points for {job_days} day(s), but its backups stay locked for "
+                f"{lock_days} day(s); the storage is paid for the whole lock, so keep the immutability period at or "
+                "below the job retention unless the lock is what you are after."
             )
-        elif lock_days < job_days:
+        elif scope == "minimum_only" and lock_days < job_days:
             warnings.append(
                 f"Job '{job.get('name')}' keeps restore points for {job_days} day(s), but they are locked for only "
                 f"{lock_days} day(s); from day {lock_days} to day {job_days} its backups are still needed but can be "
-                "deleted. Raise the immutability period to cover the whole retention."
+                "deleted. Switch this repository to job_retention scope, or raise the immutability period."
             )
     return warnings
 
@@ -2875,9 +2887,16 @@ def _immutability_effect_report(
     limitations: list[str] = []
 
     if immutability_is_enabled(current):
+        generation_days = s3_block_generation_days()
         effect.append(
-            f"Backups created from now on are written under {current['mode']} Object Lock retention and cannot be "
-            f"deleted or overwritten for {current['retention_days']} day(s), counted from each backup's own creation time."
+            f"Backups created from now on are written under {current['mode']} Object Lock retention, counted from each "
+            "backup's own creation time. The period written is "
+            + (
+                f"the longer of the job's retention and {current['retention_days']} day(s)"
+                if normalize_immutability_retention_scope(current.get("retention_scope")) == "job_retention"
+                else f"{current['retention_days']} day(s)"
+            )
+            + f", plus a {generation_days}-day block generation period."
         )
     else:
         effect.append("Immutability is disabled: new backups are written without Object Lock retention and stay deletable.")
@@ -2889,9 +2908,10 @@ def _immutability_effect_report(
         )
         if immutability_is_enabled(previous):
             limitations.append(
-                f"Each keeps the retention it was written with: {previous['mode']} for "
-                f"{previous['retention_days']} day(s) from its own creation for those written under that setting, "
-                "none for any written before immutability was enabled. AltaStor does not track this per restore point."
+                f"Each keeps the {previous['mode']} retention it was written under, counted from its own creation: "
+                "the period configured at the time plus the block generation period, and the job's retention instead "
+                "where that was longer. AltaStor does not track the resulting date per restore point, so read it from "
+                "the storage."
             )
         else:
             limitations.append(
@@ -2968,7 +2988,7 @@ def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:
         return f"for {configured} day(s)"
     low, high = min(applied_days), max(applied_days)
     span = f"{low} day(s)" if low == high else f"{low}-{high} day(s)"
-    return f"for {span} ({configured} configured plus the job's full-backup cycle)"
+    return f"for {span} ({configured} configured plus job retention and the block generation period)"
 
 
 def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
@@ -3343,6 +3363,20 @@ def _coerce_gfs_enabled(value: Any, *, default: bool = True) -> bool:
     return default if value is None else bool(value)
 
 
+def _ensure_encryption_key_strength(task_parameters: Any) -> None:
+    if not isinstance(task_parameters, dict):
+        return
+    key = task_parameters.get("encryption_key")
+    if not isinstance(key, str) or not key.strip():
+        return
+    _ensure(
+        len(key.strip()) >= MIN_PASSWORD_LENGTH,
+        422,
+        "invalid_job",
+        f"Encryption key must be at least {MIN_PASSWORD_LENGTH} characters.",
+    )
+
+
 def _validate_task_parameters(params: dict[str, Any]) -> dict[str, Any]:
     result = dict(params)
     if "compression_level" in result and result["compression_level"] is not None:
@@ -3522,6 +3556,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     if task_parameters is None:
         task_parameters = {}
     _ensure(isinstance(task_parameters, dict), 422, "invalid_job", "task_parameters must be an object")
+    _ensure_encryption_key_strength(task_parameters)
     task_parameters = _validate_task_parameters(task_parameters)
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
@@ -3746,6 +3781,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         changed = True
     if "task_parameters" in payload and payload["task_parameters"] is not None:
         _ensure(isinstance(payload["task_parameters"], dict), 422, "invalid_job", "task_parameters must be an object")
+        _ensure_encryption_key_strength(payload["task_parameters"])
         merged = _merge_task_parameters(updated.get("task_parameters"), payload["task_parameters"])
         updated["task_parameters"] = _validate_task_parameters(merged)
         changed = True
@@ -4263,6 +4299,30 @@ def _session_vm_names(task: dict[str, Any]) -> tuple[str | None, str | None]:
     return str(parameters.get("vm_name") or "").strip() or None, None
 
 
+def _repository_name_for(repository_id: str) -> str | None:
+    record = REPOSITORIES.get(repository_id) if repository_id else None
+    return str(record.get("name") or "") or None if isinstance(record, dict) else None
+
+
+def _synthetic_full_report(result: dict[str, Any]) -> dict[str, Any] | None:
+    if not bool(result.get("synthetic_full")):
+        return None
+    merged_ids = result.get("merged_restore_point_ids")
+    target_id = str(result.get("repository_id") or "")
+    source_id = str(result.get("source_repository_id") or "") or target_id
+    return {
+        "merged_from": _safe_int(result.get("merged_from")),
+        "merged_restore_point_ids": list(merged_ids) if isinstance(merged_ids, list) else [],
+        "source_repository_id": source_id or None,
+        "source_repository_name": _repository_name_for(source_id),
+        "target_repository_id": target_id or None,
+        "target_repository_name": _repository_name_for(target_id),
+        "disk_count": _safe_int(result.get("disk_count")),
+        "logical_bytes": _safe_int(result.get("logical_bytes")),
+        "stored_bytes": _safe_int(result.get("transferred_bytes")),
+    }
+
+
 def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[str, Any]:
     result = task.get("result") if isinstance(task.get("result"), dict) else {}
     error = task.get("error") if isinstance(task.get("error"), dict) else {}
@@ -4298,6 +4358,12 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     }
     if result.get("failure_kind"):
         dto["failure_kind"] = result.get("failure_kind")
+    if result.get("restore_point_id"):
+        dto["restore_point_id"] = result.get("restore_point_id")
+        dto["backup_id"] = result.get("backup_id")
+    synthetic = _synthetic_full_report(result)
+    if synthetic is not None:
+        dto["synthetic_full"] = synthetic
     if str(task.get("task_type") or "") == "verify":
         dto["verify"] = result.get("verify")
     if str(task.get("task_type") or "") == "delete":
@@ -4909,6 +4975,7 @@ class _VerifyProgressTracker:
 def verify_backup_chain(
     backup_id: str,
     *,
+    encryption_key: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -4918,16 +4985,28 @@ def verify_backup_chain(
 
     warnings: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
-    work_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    work_items: list[tuple[dict[str, Any], dict[str, Any], str]] = []
 
     for point in points:
         if point["execution_type"] == "Incremental" and not point.get("parent_point_id"):
             warnings.append({"point_id": point["id"], "message": "Incremental restore point does not have a recorded parent"})
 
+        point_key = str(encryption_key or "").strip() or _resolve_restore_encryption_key(point) or ""
+        if not point_key and _point_is_encrypted(point):
+            errors.append(
+                {
+                    "point_id": point["id"],
+                    "disk_key": None,
+                    "message": (
+                        "Restore point is encrypted and no decryption key is available for it, so it cannot be "
+                        "restored; the data itself was not checked against a key"
+                    ),
+                }
+            )
         artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
         for disk in artifact.get("disks", []):
             if isinstance(disk, dict):
-                work_items.append((point, disk))
+                work_items.append((point, disk, point_key))
 
     def _emit(progress: int, message: str) -> None:
         if progress_callback is not None:
@@ -4949,9 +5028,10 @@ def verify_backup_chain(
                     _verify_disk_artifact,
                     point,
                     disk,
+                    encryption_key=point_key,
                     on_progress=_verify_artifact_progress_reporter(tracker, index),
                 ): (point, index)
-                for index, (point, disk) in enumerate(work_items)
+                for index, (point, disk, point_key) in enumerate(work_items)
             }
 
             for future in as_completed(futures):
@@ -5078,10 +5158,11 @@ def _verify_session_cancel_requested(task_id: str) -> bool:
         return bool(task and task.get("cancel_requested"))
 
 
-def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
+def _run_verify_session(backup_id: str, task_id: str, *, encryption_key: str | None = None) -> dict[str, Any]:
     try:
         report = verify_backup_chain(
             backup_id,
+            encryption_key=encryption_key,
             progress_callback=lambda update: _update_session_result(
                 task_id,
                 {**update, "log_entry": False},
@@ -5123,7 +5204,9 @@ def _run_verify_session(backup_id: str, task_id: str) -> dict[str, Any]:
     return report
 
 
-def verify_backup_chain_request(backup_id: str, *, wait: bool = True) -> dict[str, Any]:
+def verify_backup_chain_request(
+    backup_id: str, *, wait: bool = True, encryption_key: str | None = None
+) -> dict[str, Any]:
     points = grouped_backup_points().get(backup_id)
     if not points:
         raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
@@ -5132,12 +5215,13 @@ def verify_backup_chain_request(backup_id: str, *, wait: bool = True) -> dict[st
     task_id = str(task["id"])
 
     if wait:
-        report = _run_verify_session(backup_id, task_id)
+        report = _run_verify_session(backup_id, task_id, encryption_key=encryption_key)
         return {**report, "session_id": task_id}
 
     thread = threading.Thread(
         target=_run_verify_session,
         args=(backup_id, task_id),
+        kwargs={"encryption_key": encryption_key},
         name=f"verify-{task_id}",
         daemon=True,
     )
@@ -6856,7 +6940,20 @@ def _inventory_vm_name_exists(inventory_id: str, vm_name: str) -> bool:
     return any(str(resource.get("name") or "").lower() == lowered for resource in _resolve_inventory_vm_records(inventory_id))
 
 
+def _point_is_encrypted(point: dict[str, Any]) -> bool:
+    if point.get("encryption_enabled") is not None:
+        return bool(point.get("encryption_enabled"))
+    job_id = str(point.get("job_id") or "")
+    if not job_id or job_id not in JOBS:
+        return False
+    task_parameters = resolve_job(record_id=job_id).get("task_parameters")
+    return bool(isinstance(task_parameters, dict) and task_parameters.get("encryption_enabled"))
+
+
 def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
+    own_key = str(point.get("encryption_key") or "").strip()
+    if own_key:
+        return own_key
     job_id = str(point.get("job_id") or "")
     if not job_id or job_id not in JOBS:
         return None
@@ -7050,7 +7147,15 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     power_on = bool(request.get("power_on_after_restore"))
     connect_nics = bool(request.get("connect_nics"))
     disk_provisioning = str(request.get("disk_provisioning") or "").strip() or None
-    encryption_key = _resolve_restore_encryption_key(point)
+    encryption_key = str(payload.get("encryption_key") or "").strip() or _resolve_restore_encryption_key(point)
+    _ensure(
+        bool(encryption_key) or not _point_is_encrypted(point),
+        409,
+        "encryption_key_unavailable",
+        "This restore point is encrypted and no decryption key is available for it: the job that held the key was deleted "
+        "or its key was replaced. Repeat the restore with an explicit encryption key.",
+        point_id=point_id,
+    )
     task = {
         "id": str(uuid4()),
         "job_id": None,
@@ -7375,6 +7480,7 @@ def _verify_disk_artifact(
     point: dict[str, Any],
     disk: dict[str, Any],
     *,
+    encryption_key: str = "",
     on_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     disk_key = disk.get("disk_key") or disk.get("index")
@@ -7417,6 +7523,7 @@ def _verify_disk_artifact(
             repository,
             abr_path,
             abr_backup_name,
+            encryption_key=encryption_key,
             timeout=VERIFY_ARTIFACT_TIMEOUT_SECONDS,
             on_progress=on_progress,
         )

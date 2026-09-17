@@ -234,6 +234,12 @@ async def lifespan(_: FastAPI):
                 logger.info("Backfilled compression/encryption details for %d backup point(s).", backfilled)
         except Exception:
             logger.exception("Backup detail backfill failed; continuing startup without it.")
+        try:
+            keyed = backup_catalog.backfill_backup_encryption_keys()
+            if keyed:
+                logger.info("Backfilled the encryption key onto %d encrypted backup point(s).", keyed)
+        except Exception:
+            logger.exception("Encryption key backfill failed; continuing startup without it.")
         TASKS.clear()
         TASKS.update(load_tasks())
         RESOURCES_BY_HV.clear()
@@ -330,6 +336,7 @@ SECURITY_HEADER_KEYS: tuple[tuple[str, str], ...] = (
     ("Content-Security-Policy", "ABR_SECURITY_HEADER_CSP"),
     ("X-Content-Type-Options", "ABR_SECURITY_HEADER_CONTENT_TYPE_OPTIONS"),
     ("Referrer-Policy", "ABR_SECURITY_HEADER_REFERRER_POLICY"),
+    ("Cache-Control", "ABR_SECURITY_HEADER_CACHE_CONTROL"),
 )
 HSTS_HEADER_KEY = ("Strict-Transport-Security", "ABR_SECURITY_HEADER_HSTS")
 

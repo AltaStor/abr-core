@@ -82,6 +82,21 @@ def _resolve_repository_ids(task: dict[str, Any]) -> list[str]:
     return []
 
 
+def _resolve_point_encryption_key(
+    task: dict[str, Any], normalized_job: dict[str, Any] | None, result: dict[str, Any]
+) -> str | None:
+    if not result.get("encryption_enabled"):
+        return None
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    key = str(parameters.get("encryption_key") or "").strip()
+    if key:
+        return key
+    job_parameters = normalized_job.get("task_parameters") if isinstance(normalized_job, dict) else None
+    if isinstance(job_parameters, dict):
+        return str(job_parameters.get("encryption_key") or "").strip() or None
+    return None
+
+
 def _build_placements(task: dict[str, Any], result: dict[str, Any]) -> list[dict[str, Any]]:
     finished_at = result.get("finished_at") or utc_now()
     disk_paths = [
@@ -291,6 +306,7 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
         "compression_ratio": resolve_compression_ratio(result),
         "compression_level": _resolve_compression_level(result),
         "encryption_enabled": bool(result.get("encryption_enabled")),
+        "encryption_key": _resolve_point_encryption_key(task, normalized_job, result),
         "execution_type": execution_type,
         "execution_reason": execution_reason,
         "full_backup": full_backup,
@@ -409,6 +425,25 @@ def _load_backup_manifest_payload(record: dict[str, Any], artifact: dict[str, An
         logger.warning("Unable to read manifest for backup %s from %s", record.get("id"), path)
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def backfill_backup_encryption_keys() -> int:
+    updated = 0
+    for record in catalog_records(BACKUPS):
+        if not record.get("encryption_enabled"):
+            continue
+        if str(record.get("encryption_key") or "").strip():
+            continue
+        job = JOBS.get(str(record.get("job_id") or "")) or {}
+        parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else {}
+        key = str(parameters.get("encryption_key") or "").strip()
+        if not key:
+            continue
+        enriched = dict(record)
+        enriched["encryption_key"] = key
+        persist_backup(enriched)
+        updated += 1
+    return updated
 
 
 def backfill_backup_detail_fields() -> int:

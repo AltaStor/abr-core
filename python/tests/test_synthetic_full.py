@@ -14,7 +14,7 @@ from python.srv.core.mongo_db_wrapper import BACKUPS, JOBS, REPOSITORIES, TASKS
 from python.srv.core.storage_tool import StorageToolError
 from python.srv.core.subprocess_util import ProcessCancelled
 from python.srv.core.task_executor import TaskStopRequested
-from python.srv.services import synthetic_full
+from python.srv.services import abr_v41, synthetic_full
 from python.srv.services.synthetic_full import (
     SyntheticFullError,
     SyntheticFullValidationError,
@@ -436,6 +436,37 @@ class SyntheticFullRunTests(unittest.TestCase):
         self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 40)
         self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 40)
 
+    @patch("python.srv.services.synthetic_full.apply_repository_immutability")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_synthetic_full_is_locked_for_the_job_retention_when_that_is_longer(self, copy_mock, lock_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
+        REPOSITORIES[REPO_ID] = {
+            "id": REPO_ID, "name": "S3", "type": "s3",
+            "metadata": {"s3": {"bucket": "b", "region": "us-east-1",
+                                "immutability": {"mode": "governance", "retention_days": 5}}},
+        }
+
+        synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 24)
+        self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 24)
+
+    @patch("python.srv.services.synthetic_full.apply_repository_immutability")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_synthetic_full_ignores_the_job_retention_under_minimum_scope(self, copy_mock, lock_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
+        REPOSITORIES[REPO_ID] = {
+            "id": REPO_ID, "name": "S3", "type": "s3",
+            "metadata": {"s3": {"bucket": "b", "region": "us-east-1",
+                                "immutability": {"mode": "governance", "retention_days": 5,
+                                                 "retention_scope": "minimum_only"}}},
+        }
+
+        synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 15)
+        self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 15)
+
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_an_unreadable_source_manifest_stops_the_merge(self, copy_mock) -> None:
         copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
@@ -569,6 +600,119 @@ class FullBackupParentTests(unittest.TestCase):
 
         self.assertIsNone(synthetic.get("parent_point_id"))
         self.assertIsNone(second_full.get("parent_point_id"))
+
+    def test_a_completed_backup_session_names_the_restore_point_it_created(self) -> None:
+        from concurrent.futures import Future
+
+        from python.srv.core.task_pool import TaskProcessPool
+
+        task = {"id": "task-1", "task_type": "backup", "status": "queued", "result": {}, "logs": []}
+        TASKS["task-1"] = task
+        self.addCleanup(TASKS.pop, "task-1", None)
+        outcome = {
+            "task_id": "task-1",
+            "status": "completed",
+            "result": {"operation": "backup"},
+            "updated_at": "2026-09-14T00:00:00+00:00",
+        }
+        pool = TaskProcessPool(worker_count=1)
+
+        future: Future = Future()
+        future.set_result(outcome)
+        pool._futures[future] = ("task-1", "backup", None)
+
+        with patch(
+            "python.srv.core.task_pool.register_backup_from_completed_task",
+            return_value={"id": "point-9", "chain_id": "chain-9"},
+        ):
+            pool._complete_task(future)
+
+        self.assertEqual(TASKS["task-1"]["result"]["restore_point_id"], "point-9")
+        self.assertEqual(TASKS["task-1"]["result"]["backup_id"], "chain-9")
+
+    def test_the_session_passes_the_created_restore_point_through(self) -> None:
+        task = {
+            "id": "task-1",
+            "task_type": "backup",
+            "status": "completed",
+            "result": {"restore_point_id": "point-9", "backup_id": "chain-9"},
+        }
+
+        dto = abr_v41.session_to_dto(task)
+
+        self.assertEqual(dto["restore_point_id"], "point-9")
+        self.assertEqual(dto["backup_id"], "chain-9")
+
+    def test_a_synthetic_full_session_reports_what_it_merged(self) -> None:
+        REPOSITORIES["repo-src"] = {"id": "repo-src", "name": "Nightly", "type": "local"}
+        REPOSITORIES["repo-dst"] = {"id": "repo-dst", "name": "Archive", "type": "s3"}
+        self.addCleanup(REPOSITORIES.pop, "repo-src", None)
+        self.addCleanup(REPOSITORIES.pop, "repo-dst", None)
+        task = {
+            "id": "task-1",
+            "task_type": "backup",
+            "status": "completed",
+            "result": {
+                "synthetic_full": True,
+                "resolved_backup_type": "SyntheticFull",
+                "merged_from": 3,
+                "merged_restore_point_ids": ["p1", "p2", "p3"],
+                "source_repository_id": "repo-src",
+                "repository_id": "repo-dst",
+                "disk_count": 2,
+                "logical_bytes": 2048,
+                "transferred_bytes": 512,
+            },
+        }
+
+        report = abr_v41.session_to_dto(task)["synthetic_full"]
+
+        self.assertEqual(report["merged_from"], 3)
+        self.assertEqual(report["merged_restore_point_ids"], ["p1", "p2", "p3"])
+        self.assertEqual(report["source_repository_name"], "Nightly")
+        self.assertEqual(report["target_repository_name"], "Archive")
+        self.assertEqual(report["disk_count"], 2)
+        self.assertEqual(report["stored_bytes"], 512)
+
+    def test_a_merge_inside_one_repository_reports_it_as_both_source_and_target(self) -> None:
+        previous = REPOSITORIES.get("repo-1")
+        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Nightly", "type": "local"}
+        self.addCleanup(lambda: REPOSITORIES.__setitem__("repo-1", previous) if previous else REPOSITORIES.pop("repo-1", None))
+        task = {
+            "id": "task-1",
+            "task_type": "backup",
+            "status": "completed",
+            "result": {
+                "synthetic_full": True,
+                "merged_from": 2,
+                "repository_id": "repo-1",
+                "source_repository_id": "",
+            },
+        }
+
+        report = abr_v41.session_to_dto(task)["synthetic_full"]
+
+        self.assertEqual(report["source_repository_id"], "repo-1")
+        self.assertEqual(report["target_repository_id"], "repo-1")
+
+    def test_an_ordinary_backup_session_carries_no_synthetic_report(self) -> None:
+        task = {
+            "id": "task-1",
+            "task_type": "backup",
+            "status": "completed",
+            "result": {"resolved_backup_type": "ActiveFull"},
+        }
+
+        self.assertNotIn("synthetic_full", abr_v41.session_to_dto(task))
+
+    def test_a_synthetic_full_registers_as_a_full_and_opens_its_own_segment(self) -> None:
+        first = self._register("ActiveFull", "task-1")
+        self._register("Incremental", "task-2")
+        synthetic = self._register("SyntheticFull", "task-3")
+
+        self.assertTrue(synthetic.get("full_backup"))
+        self.assertEqual(synthetic.get("segment_id"), synthetic.get("id"))
+        self.assertNotEqual(synthetic.get("segment_id"), first.get("segment_id"))
 
     def test_an_incremental_still_records_its_parent(self) -> None:
         first = self._register("ActiveFull", "task-1")

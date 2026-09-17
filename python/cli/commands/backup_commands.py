@@ -64,6 +64,15 @@ class BackupCommands:
                 )
             parser = commands.add_parser(name, help=help_text, description=description, formatter_class=CompactHelpFormatter)
             parser.add_argument("--id", required=True, help="Backup chain ID")
+            if name == "verify":
+                parser.add_argument(
+                    "--encryption-key",
+                    dest="encryption_key",
+                    help=(
+                        "Decryption key to check against the chain. Overrides the key stored with the job and with "
+                        "the restore points; the data checksums are verified either way."
+                    ),
+                )
             if name == "delete":
                 parser.add_argument(
                     "--force",
@@ -149,8 +158,12 @@ class BackupCommands:
         if not str(args.id or "").strip():
             raise ValueError("Backup selection requires a non-empty --id")
         deps = CommandDependencies(args)
+        encryption_key = str(getattr(args, "encryption_key", None) or "").strip()
         started = deps.context.api_client.post(
-            f"api/v1/backups/{args.id}/verify", params={"wait": "false"}, timeout=21600
+            f"api/v1/backups/{args.id}/verify",
+            json={"encryption_key": encryption_key} if encryption_key else None,
+            params={"wait": "false"},
+            timeout=21600,
         )
         session_id = started.get("session_id") if isinstance(started, dict) else None
         session: dict[str, Any] | None = None

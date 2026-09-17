@@ -77,6 +77,14 @@ class RestoreCommands:
         start.add_argument("--repo-id", help="Repository ID for backup-copy restore")
         start.add_argument("--power-on", action="store_true", help="Power on after restore")
         start.add_argument(
+            "--encryption-key",
+            dest="encryption_key",
+            help=(
+                "Decryption key for this restore. Overrides the key stored with the job and with the restore point; "
+                "needed when the job that held the key is gone."
+            ),
+        )
+        start.add_argument(
             "--in-place",
             dest="in_place",
             action="store_true",

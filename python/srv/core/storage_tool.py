@@ -26,6 +26,7 @@ SECRET_MASK = "********"
 _SAFE_PATH_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 VERIFY_PROGRESS_POLL_SECONDS = 0.25
 IMMUTABILITY_MODES = ("none", "governance", "compliance")
+IMMUTABILITY_RETENTION_SCOPES = ("job_retention", "minimum_only")
 _IMMUTABILITY_RANKS = {"none": 0, "governance": 1, "compliance": 2}
 IMMUTABILITY_PROBE_FOLDER = ".abr-immutability-probe"
 IMMUTABILITY_PROBE_NAME_PREFIX = "immutability-probe-"
@@ -72,6 +73,11 @@ def immutability_rank(mode: Any) -> int:
     return _IMMUTABILITY_RANKS.get(normalize_immutability_mode(mode), 0)
 
 
+def normalize_immutability_retention_scope(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    return normalized if normalized in IMMUTABILITY_RETENTION_SCOPES else IMMUTABILITY_RETENTION_SCOPES[0]
+
+
 def normalize_immutability_config(raw: Any) -> dict[str, Any]:
     source = raw if isinstance(raw, dict) else {}
     try:
@@ -81,6 +87,7 @@ def normalize_immutability_config(raw: Any) -> dict[str, Any]:
     return {
         "mode": normalize_immutability_mode(source.get("mode")),
         "retention_days": max(retention_days, 0),
+        "retention_scope": normalize_immutability_retention_scope(source.get("retention_scope")),
     }
 
 
@@ -184,6 +191,10 @@ def is_abr_repository(repository: dict[str, Any] | None) -> bool:
     if not isinstance(repository, dict):
         return False
     return str(repository.get("type") or "").strip().lower() in {"local", "s3"}
+
+
+def s3_block_generation_days() -> int:
+    return env_int("ALTASTOR_S3_BLOCK_GENERATION_DAYS")
 
 
 def s3_endpoint_connect_timeout() -> int:
@@ -468,6 +479,7 @@ def verify_disk_tool_backup(
     abr_path: str | None,
     backup_name: str,
     *,
+    encryption_key: str = "",
     timeout: int | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> None:
@@ -477,6 +489,7 @@ def verify_disk_tool_backup(
             "verify",
             "--name",
             backup_name,
+            *(["--key", encryption_key] if encryption_key else []),
             *disk_tool_storage_args(repository, abr_path=abr_path),
         ],
         timeout=timeout,

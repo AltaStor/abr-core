@@ -70,10 +70,79 @@ def _parse_datastore_path(datastore_path: str) -> tuple[str, str, str]:
     return datastore_name, folder, filename
 
 
+VSPHERE_VM_NAME_LIMIT = 80
+
+VSPHERE_DISK_FILE_NAME_LIMIT = 122
+
+SNAPSHOT_DELTA_NAME_EXTRA = 16
+
+RESTORED_DISK_FILE_NAME_LIMIT = VSPHERE_DISK_FILE_NAME_LIMIT - SNAPSHOT_DELTA_NAME_EXTRA
+
+
+def _name_with_suffix(base: str, suffix: str, limit: int) -> str:
+    room = max(limit - len(suffix), 0)
+    return f"{base[:room]}{suffix}"
+
+
+def _build_disk_file_name(index: int, source_name: str) -> str:
+    source = Path(source_name)
+    extension = source.suffix or ".vmdk"
+    return _name_with_suffix(f"{index:02d}-{source.stem}", extension, RESTORED_DISK_FILE_NAME_LIMIT)
+
+
+def _read_original_identity(node: Any, vm_name: str) -> dict[str, str]:
+    try:
+        identity = node.read_vm_identity(vm_name)
+    except Exception:
+        logger.warning(
+            "Could not read the vSphere identifiers of '%s' before replacing it; the restored VM will carry "
+            "new ones and anything keyed on the old identity will stop matching.",
+            vm_name,
+            exc_info=True,
+        )
+        return {}
+    return {key: value for key, value in identity.items() if value}
+
+
+def _restore_original_identity(
+    node: Any, vm_name: str, identity: dict[str, str], *, vm_moref: str = ""
+) -> bool:
+    if not identity:
+        return False
+    try:
+        node.set_vm_identity(
+            vm_name,
+            uuid=identity.get("uuid", ""),
+            instance_uuid=identity.get("instance_uuid", ""),
+            vm_moref=vm_moref or None,
+        )
+    except Exception:
+        logger.warning(
+            "In-place restore of '%s' finished, but the original vSphere identifiers could not be applied to it. "
+            "The data is intact; guest licensing, vCenter tags, monitoring and backup jobs keyed on the old "
+            "identity will not recognise this VM until it is corrected.",
+            vm_name,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def _build_staging_vm_name(target_vm_name: str, task_id: str) -> str:
+    return _name_with_suffix(
+        target_vm_name, f"-restoring-{task_id[:8]}", VSPHERE_VM_NAME_LIMIT
+    )
+
+
 def _build_restore_target_path(original_datastore_path: str, task_id: str) -> str:
     datastore_name, folder, filename = _parse_datastore_path(original_datastore_path)
     source_path = Path(filename)
-    restored_name = f"{source_path.stem}-restored-{task_id[:8]}{source_path.suffix or '.vmdk'}"
+    extension = source_path.suffix or ".vmdk"
+    restored_name = _name_with_suffix(
+        source_path.stem,
+        f"-restored-{task_id[:8]}{extension}",
+        RESTORED_DISK_FILE_NAME_LIMIT,
+    )
     relative = f"{folder}/{restored_name}" if folder else restored_name
     return f"[{datastore_name}] {relative}"
 
@@ -103,7 +172,7 @@ def _build_disk_layout(disk_entries: list[dict[str, Any]]) -> list[dict[str, Any
             {
                 "label": str(disk.get("disk_label") or f"Hard disk {index}"),
                 "capacity_gb": max(capacity_gb, 1.0),
-                "file_name": f"{index:02d}-{source_name}",
+                "file_name": _build_disk_file_name(index, source_name),
                 "disk_uuid": disk.get("uuid"),
             }
         )
@@ -353,7 +422,7 @@ def _resolve_abr_restore_layers(
                 "manifest_path": _manifest_path_for_point(point),
                 "abr_path": abr_path,
                 "abr_backup_name": abr_backup_name,
-                "store_mode": store_mode or "full",
+                "store_mode": "incremental" if store_mode == "incremental" else "full",
                 "source": source,
             }
         )
@@ -629,7 +698,11 @@ def run_vcenter_restore(
         # datastore folder, never touching the still-live original until the
         # swap below. For every other restore mode create_vm_name is simply
         # target_vm_name — zero behavior change.
-        create_vm_name = f"{target_vm_name}-restoring-{str(task.get('id') or '')[:8]}" if is_in_place else target_vm_name
+        create_vm_name = (
+            _build_staging_vm_name(target_vm_name, str(task.get("id") or ""))
+            if is_in_place
+            else target_vm_name
+        )
 
         _emit_progress(
             progress_callback,
@@ -684,6 +757,8 @@ def run_vcenter_restore(
                 created_vm.get("requested_secure_boot"),
             )
             original_destroyed = False
+            original_identity: dict[str, str] = {}
+            identity_preserved = False
             try:
                 thumbprint = node.get_thumbprint()
                 created_disk_paths = created_vm.get("disk_paths", [])
@@ -915,10 +990,17 @@ def run_vcenter_restore(
                         create_vm_name,
                         target_vm_name,
                     )
+                    original_identity = _read_original_identity(node, target_vm_name)
                     node.power_off_vm(target_vm_name)
                     node.destroy_vm(target_vm_name)
                     original_destroyed = True  # point of no return: the original is gone
                     node.rename_vm(create_vm_name, target_vm_name, vm_moref=str(created_vm.get("vm_moref") or ""))
+                    identity_preserved = _restore_original_identity(
+                        node,
+                        target_vm_name,
+                        original_identity,
+                        vm_moref=str(created_vm.get("vm_moref") or ""),
+                    )
                     try:
                         from ...services.abr_v41 import schedule_inventory_discovery
 
@@ -993,6 +1075,8 @@ def run_vcenter_restore(
             "worker_mode": "vcenter-abr-vmdk-tool",
             "hypervisor_kind": "vcenter",
             "restore_mode": restore_mode,
+            "identity_preserved": identity_preserved,
+            "original_identity": original_identity or None,
             "source_vm_name": source_vm_name,
             "target_vm_name": target_vm_name,
             "target_host_name": target_host_name,
