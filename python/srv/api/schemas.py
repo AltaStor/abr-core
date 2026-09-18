@@ -485,6 +485,8 @@ class StartRestoreRequest(_LenientModel):
     options: SkipValidation[StartRestoreOptions] | None = None
     network_mappings: SkipValidation[list[StartRestoreNetworkMapping]] | None = None
     network_map: DocStrArray = None
+    datastore_map: DocStrArray = None
+    datastore_mappings: DocArray = None
     target_inventory: LaxStr | None = None
     target_inventory_id: LaxStr | None = None
     target_host: LaxStr | None = None

@@ -6271,6 +6271,18 @@ def get_restore_context(restore_point_id: str) -> dict[str, Any]:
             }
         )
 
+    source_datastore_names: list[str] = []
+    for disk in source_vm.get("disks", []):
+        if not isinstance(disk, dict):
+            continue
+        name = _source_disk_datastore(disk)
+        if name and name not in source_datastore_names:
+            source_datastore_names.append(name)
+    default_datastore_mappings = [
+        {"source_datastore": name, "target_datastore_id": default_datastore_id}
+        for name in source_datastore_names
+    ]
+
     source_firmware = str(source_vm.get("firmware") or "").strip().lower()
     supports_disk_provisioning = any(
         str(disk.get("provisioning") or "").strip()
@@ -6321,10 +6333,12 @@ def get_restore_context(restore_point_id: str) -> dict[str, Any]:
             "connect_nics": True,
             "disk_provisioning": "original" if supports_disk_provisioning else None,
             "network_mappings": default_network_mappings,
+            "datastore_mappings": default_datastore_mappings,
         },
         "capabilities": {
             "supports_in_place_restore": supports_in_place_restore,
             "supports_network_mapping": bool(source_vm.get("nics")),
+            "supports_datastore_mapping": len(source_datastore_names) > 1,
             "supports_preserve_mac": False,
             "supports_power_on_after_restore": True,
             "supports_folder_selection": False,
@@ -6387,7 +6401,7 @@ def _restore_disk_target_is_thin(disk: dict[str, Any], disk_provisioning: str | 
 
 
 def _ensure_restore_target_capacity(
-    source_vm: dict[str, Any],
+    disks: list[dict[str, Any]],
     datastore: dict[str, Any],
     restore_mode: str,
     disk_provisioning: str | None = None,
@@ -6403,7 +6417,6 @@ def _ensure_restore_target_capacity(
     safety margin (thin-disk growth during write, buffer before the original
     is destroyed), not a strict minimum.
     """
-    disks = source_vm.get("disks") if isinstance(source_vm.get("disks"), list) else []
     requirements: list[int | None] = []
     thin_target = False
     for disk in disks:
@@ -6423,7 +6436,7 @@ def _ensure_restore_target_capacity(
         required_total is None or free_bytes is None or free_bytes >= required_total,
         409,
         "insufficient_datastore_space",
-        "Target datastore does not have enough free space for this restore"
+        f"Datastore '{datastore.get('name')}' does not have enough free space for the disks that land on it"
         + (
             " — thin-provisioned disks are measured by the data the backup holds, "
             "not by their provisioned size"
@@ -6440,6 +6453,60 @@ def _ensure_restore_target_capacity(
         free_bytes=free_bytes,
         required_bytes=required_total,
     )
+
+
+def _source_disk_datastore(disk: dict[str, Any]) -> str:
+    datastore_name, _folder, _filename = _parse_datastore_path_parts(disk.get("datastore_path"))
+    return str(datastore_name or "").strip()
+
+
+def _resolve_restore_datastore_placement(
+    source_vm: dict[str, Any],
+    *,
+    inventory_id: str,
+    host: dict[str, Any],
+    default_datastore: dict[str, Any],
+    requested: Any,
+    restore_mode: str,
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    disks = [disk for disk in (source_vm.get("disks") or []) if isinstance(disk, dict)]
+    source_names: list[str] = []
+    for disk in disks:
+        name = _source_disk_datastore(disk)
+        if name and name not in source_names:
+            source_names.append(name)
+
+    default_name = str(default_datastore.get("name") or "").strip()
+    placement = {name: default_name for name in source_names}
+    resolved = {default_name: default_datastore} if default_name else {}
+
+    overrides = _parse_restore_datastore_map(requested)
+    if restore_mode == "in_place":
+        _ensure(
+            not overrides,
+            422,
+            "invalid_restore",
+            "In-place restore keeps every disk on its own datastore and cannot take a datastore mapping",
+        )
+        overrides = {name: name for name in source_names}
+
+    by_lowercase = {name.lower(): name for name in source_names}
+    for requested_source, target_identifier in overrides.items():
+        source_name = by_lowercase.get(requested_source.lower(), "")
+        _ensure(
+            bool(source_name),
+            422,
+            "invalid_restore",
+            "Datastore mapping names a datastore this VM does not use",
+            source_datastore=requested_source,
+            source_datastores=source_names,
+        )
+        datastore = _resolve_restore_target_datastore(inventory_id, target_identifier, host=host)
+        target_name = str(datastore.get("name") or "").strip()
+        placement[source_name] = target_name
+        resolved[target_name] = datastore
+
+    return placement, resolved
 
 
 def _resolve_restore_target_network(
@@ -6537,6 +6604,7 @@ def _normalize_restore_request_payload(payload: dict[str, Any], point: dict[str,
         "disk_provisioning": str(options.get("disk_provisioning") or payload.get("disk_provisioning") or payload.get("disk_type") or "").strip() or None,
         "network_mappings": [item for item in network_mappings if isinstance(item, dict)],
         "legacy_network_map": payload.get("network_map"),
+        "datastore_map": payload.get("datastore_map") or payload.get("datastore_mappings"),
         "force": force,
     }
 
@@ -6699,6 +6767,50 @@ def _parse_restore_network_map(value: Any) -> dict[str, str]:
             "invalid_restore",
             "Each --network-map value must use the form <source>=<target> or <source>:<target>",
             value=text,
+        )
+        mappings[source_name] = target_name
+    return mappings
+
+
+def _parse_restore_datastore_map(value: Any) -> dict[str, str]:
+    if isinstance(value, dict):
+        pairs = [(source, target) for source, target in value.items()]
+    elif not value:
+        return {}
+    elif isinstance(value, list):
+        pairs = []
+        for raw in value:
+            if isinstance(raw, dict):
+                pairs.append((raw.get("source_datastore"), raw.get("target_datastore") or raw.get("target_datastore_id")))
+                continue
+            text = str(raw or "")
+            left, separator, right = text.partition("=")
+            if separator != "=":
+                left, separator, right = text.partition(":")
+            _ensure(
+                separator in {"=", ":"} and bool(left.strip()) and bool(right.strip()),
+                422,
+                "invalid_restore",
+                "Each --datastore-map value must use the form <source>=<target> or <source>:<target>",
+                value=text,
+            )
+            pairs.append((left, right))
+    else:
+        raise api_error(
+            422,
+            "invalid_restore",
+            "Each --datastore-map value must use the form <source>=<target> or <source>:<target>",
+        )
+
+    mappings: dict[str, str] = {}
+    for source, target in pairs:
+        source_name = str(source or "").strip()
+        target_name = str(target or "").strip()
+        _ensure(
+            bool(source_name) and bool(target_name),
+            422,
+            "invalid_restore",
+            "Each datastore mapping requires a source datastore and a target datastore",
         )
         mappings[source_name] = target_name
     return mappings
@@ -7087,12 +7199,24 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     datastore = _resolve_restore_target_datastore(str(target_inventory["id"]), target_datastore_identifier, host=host)
     resolved_target_datastore_id = str(datastore.get("id") or "").strip() or None
     target_datastore_name = str(datastore.get("name") or "").strip()
-    _ensure_restore_target_capacity(
+    datastore_placement, placement_datastores = _resolve_restore_datastore_placement(
         source_vm,
-        datastore,
-        restore_mode,
-        str(request.get("disk_provisioning") or "").strip() or None,
+        inventory_id=str(target_inventory["id"]),
+        host=host,
+        default_datastore=datastore,
+        requested=request.get("datastore_map"),
+        restore_mode=restore_mode,
     )
+    disk_provisioning = str(request.get("disk_provisioning") or "").strip() or None
+    for target_name, target_datastore in placement_datastores.items():
+        landing = [
+            disk
+            for disk in (source_vm.get("disks") or [])
+            if isinstance(disk, dict)
+            and datastore_placement.get(_source_disk_datastore(disk), target_datastore_name) == target_name
+        ]
+        if landing:
+            _ensure_restore_target_capacity(landing, target_datastore, restore_mode, disk_provisioning)
 
     if restore_mode == "in_place":
         target_vm_name = str(source_vm.get("name") or point.get("vm_name") or "").strip()
@@ -7146,7 +7270,6 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     scenario = "backup_copy" if repo is not None and str(repo.get("id") or "") != str(point.get("repository_id") or "") else "out_of_place"
     power_on = bool(request.get("power_on_after_restore"))
     connect_nics = bool(request.get("connect_nics"))
-    disk_provisioning = str(request.get("disk_provisioning") or "").strip() or None
     encryption_key = str(payload.get("encryption_key") or "").strip() or _resolve_restore_encryption_key(point)
     _ensure(
         bool(encryption_key) or not _point_is_encrypted(point),
@@ -7176,6 +7299,7 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             "target_host_name": resolved_target_host_name,
             "target_datastore_id": resolved_target_datastore_id,
             "target_datastore_name": target_datastore_name,
+            "datastore_map": datastore_placement or None,
             "target_vm_name": target_vm_name,
             # The VM the restore point was taken from -- kept alongside the
             # target so a restore session can name both ends (see

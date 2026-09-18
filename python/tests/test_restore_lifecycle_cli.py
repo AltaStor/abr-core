@@ -239,6 +239,55 @@ class RestorePayloadBuilderTests(unittest.TestCase):
         )
 
 
+    def test_restore_start_carries_repeated_datastore_mappings(self) -> None:
+        args = SimpleNamespace(
+            restore_point="rp-1",
+            point_id=None,
+            backup=None,
+            vm=None,
+            new_name="vm-restored",
+            name=None,
+            target_inventory="vc-1",
+            target_inventory_id=None,
+            target_host="esx-1",
+            datastore="restore-target",
+            target_datastore=None,
+            network_map=[],
+            datastore_map=["sata-bulk=sata-restore", "nvme=nvme-restore"],
+            repo=None,
+            repo_id=None,
+            power_on=False,
+            force=False,
+        )
+
+        payload = self.service.build_start_payload(args)
+
+        self.assertEqual(payload["datastore_map"], ["sata-bulk=sata-restore", "nvme=nvme-restore"])
+
+    def test_restore_start_omits_an_empty_datastore_map(self) -> None:
+        args = SimpleNamespace(
+            restore_point="rp-1",
+            point_id=None,
+            backup=None,
+            vm=None,
+            new_name="vm-restored",
+            name=None,
+            target_inventory="vc-1",
+            target_inventory_id=None,
+            target_host="esx-1",
+            datastore="restore-target",
+            target_datastore=None,
+            network_map=[],
+            datastore_map=[],
+            repo=None,
+            repo_id=None,
+            power_on=False,
+            force=False,
+        )
+
+        self.assertNotIn("datastore_map", self.service.build_start_payload(args))
+
+
 class RestoreStartInPlaceTests(unittest.TestCase):
     def setUp(self) -> None:
         context = CliContext(base_url="http://example.test", output="json", api_client=_FakeApiClient(), output_renderer=CliOutputRenderer())

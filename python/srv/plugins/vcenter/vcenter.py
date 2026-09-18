@@ -1030,15 +1030,13 @@ class VCenterNode(Hypervisor):
         if datacenter is None:
             raise ValueError(f"Unable to determine datacenter for host '{host_name}'.")
 
-        datastore = None
-        for candidate in getattr(host, "datastore", []) or []:
-            if getattr(candidate, "name", None) == datastore_name:
-                datastore = candidate
-                break
-        if datastore is None:
-            raise ValueError(
-                f"Datastore '{datastore_name}' is not accessible from host '{host_name}'."
-            )
+        def _datastore_on_host(name: str) -> Any:
+            for candidate in getattr(host, "datastore", []) or []:
+                if getattr(candidate, "name", None) == name:
+                    return candidate
+            raise ValueError(f"Datastore '{name}' is not accessible from host '{host_name}'.")
+
+        datastore = _datastore_on_host(datastore_name)
 
         compute_resource = getattr(host, "parent", None)
         resource_pool = getattr(compute_resource, "resourcePool", None)
@@ -1075,7 +1073,9 @@ class VCenterNode(Hypervisor):
 
             capacity_gb = float(disk.get("capacity_gb") or 1)
             disk_name = str(disk.get("file_name") or f"{index:02d}-disk.vmdk")
-            disk_path = f"[{datastore_name}] {_sanitize_path_segment(vm_name)}/{disk_name}"
+            disk_datastore_name = str(disk.get("datastore_name") or "").strip() or datastore_name
+            disk_datastore = datastore if disk_datastore_name == datastore_name else _datastore_on_host(disk_datastore_name)
+            disk_path = f"[{disk_datastore_name}] {_sanitize_path_segment(vm_name)}/{disk_name}"
 
             disk_spec = vim.vm.device.VirtualDeviceSpec()
             disk_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
@@ -1092,7 +1092,7 @@ class VCenterNode(Hypervisor):
 
             backing = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
             backing.fileName = disk_path
-            backing.datastore = datastore
+            backing.datastore = disk_datastore
             backing.diskMode = "persistent"
             backing.thinProvisioned = True
             source_disk_uuid = _normalize_disk_uuid(disk.get("disk_uuid"))
