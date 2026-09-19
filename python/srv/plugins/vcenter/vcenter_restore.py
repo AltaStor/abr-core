@@ -158,7 +158,28 @@ def _build_new_vm_disk_target_path(
     return f"[{datastore_name}] {safe_vm_name}/{index:02d}-{source_name}"
 
 
-def _build_disk_layout(disk_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _disk_target_datastore_name(
+    disk: dict[str, Any],
+    datastore_map: dict[str, Any] | None,
+    default_name: str,
+) -> str:
+    if not isinstance(datastore_map, dict) or not datastore_map:
+        return default_name
+    datastore_path = str(disk.get("datastore_path") or "").strip()
+    if not datastore_path:
+        return default_name
+    try:
+        source_name, _folder, _filename = _parse_datastore_path(datastore_path)
+    except VCenterBackupError:
+        return default_name
+    return str(datastore_map.get(source_name) or default_name).strip() or default_name
+
+
+def _build_disk_layout(
+    disk_entries: list[dict[str, Any]],
+    datastore_map: dict[str, Any] | None = None,
+    default_datastore_name: str = "",
+) -> list[dict[str, Any]]:
     layout: list[dict[str, Any]] = []
     for index, disk in enumerate(disk_entries, start=1):
         source_path = str(disk.get("datastore_path") or disk.get("destination_path") or "")
@@ -174,6 +195,7 @@ def _build_disk_layout(disk_entries: list[dict[str, Any]]) -> list[dict[str, Any
                 "capacity_gb": max(capacity_gb, 1.0),
                 "file_name": _build_disk_file_name(index, source_name),
                 "disk_uuid": disk.get("uuid"),
+                "datastore_name": _disk_target_datastore_name(disk, datastore_map, default_datastore_name),
             }
         )
     return layout
@@ -678,6 +700,7 @@ def run_vcenter_restore(
         target_datastore_name = str(
             parameters.get("target_datastore_name") or _derive_manifest_datastore_name(disk_entries)
         ).strip()
+        datastore_map = parameters.get("datastore_map") if isinstance(parameters.get("datastore_map"), dict) else {}
         logger.info(
             "Preparing %s from %s to target VM %s on host %s datastore %s",
             recovery_label.lower(),
@@ -738,7 +761,11 @@ def run_vcenter_restore(
                     disk_index=index,
                 )
 
-            disk_layout = _build_disk_layout(disk_entries) if is_virtual_center else None
+            disk_layout = (
+                _build_disk_layout(disk_entries, datastore_map, target_datastore_name)
+                if is_virtual_center
+                else None
+            )
             created_vm = node.create_vm_shell(
                 vm_name=create_vm_name,
                 host_name=target_host_name,
@@ -815,11 +842,12 @@ def run_vcenter_restore(
                             disk_read_bytes = int(disk_capacity_gb * 1024**3)
 
                     source_datastore_path = str(disk.get("datastore_path") or "")
+                    disk_datastore_name = _disk_target_datastore_name(disk, datastore_map, target_datastore_name)
                     restore_target = (
                         str(created_disk_paths[index - 1])
                         if is_virtual_center and len(created_disk_paths) >= index
                         else _build_new_vm_disk_target_path(
-                            target_datastore_name,
+                            disk_datastore_name,
                             create_vm_name,
                             source_datastore_path or f"disk-{index}.vmdk",
                             index,
@@ -841,7 +869,7 @@ def run_vcenter_restore(
                     attachment: dict[str, Any] | None = None
                     if not is_virtual_center:
                         node.create_managed_disk(
-                            datastore_name=target_datastore_name,
+                            datastore_name=disk_datastore_name,
                             disk_path=restore_target,
                             capacity_gb=disk_capacity_gb,
                             disk_type_code=resolved_disk_type_code,

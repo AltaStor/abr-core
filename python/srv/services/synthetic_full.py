@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import json
 import logging
 import time
@@ -20,9 +22,11 @@ from python.srv.core.storage_tool import (
     is_abr_repository,
     join_s3_prefix,
     run_disk_tool,
+    s3_block_generation_days,
 )
 from python.srv.core.subprocess_util import ProcessCancelled
 from python.srv.core.utils import utc_now
+from python.srv.services.backup_mode import object_lock_generation_plan
 
 logger = logging.getLogger(__name__)
 
@@ -291,10 +295,20 @@ def run_synthetic_full(
     timeout_seconds = _resolve_tool_timeout_seconds(parameters)
     job = JOBS.get(job_id) if job_id else None
     retention_days = None
+    generation: dict[str, Any] | None = None
     if is_s3_repository(repository):
         immutability = extract_s3_config(repository).get("immutability") or {}
         computed = repository_actual_retention_days(job if isinstance(job, dict) else None, immutability)
         retention_days = computed or None
+        if retention_days:
+            generation = object_lock_generation_plan(
+                f"backup::{job_id or '-'}::{vm_id or '-'}::{repository_id or '-'}",
+                actual_retention_days=int(retention_days),
+                block_generation_days=s3_block_generation_days(),
+                now=datetime.now(timezone.utc),
+                starts_segment=True,
+            )
+            retention_days = int(generation["lock_days"])
 
     total = len(merges)
     disk_outputs: list[dict[str, Any]] = []
@@ -452,6 +466,7 @@ def run_synthetic_full(
         "merged_restore_point_ids": [str(point.get("id") or "") for point in points],
         "merged_from": len(points),
         "source_repository_id": source_repository_id,
+        "immutability_generation": generation,
         "backup_root": str(task_root),
         "manifest_path": str(manifest_path),
         "vm_config": manifest_payload.get("vm_config"),

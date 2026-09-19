@@ -506,13 +506,13 @@ abr restore start
 
 Description: Start a full VM restore workflow from a selected restore point or backup chain. 
 
-abr restore start --restore-point <id> --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--power-on] [--wait] 
+abr restore start --restore-point <id> --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--datastore-map <src=dst>] [--power-on] [--wait] 
 
 Alternate source resolution:
-abr restore start --backup <backup-id> [--vm <name-or-id>] --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--power-on] [--wait] 
+abr restore start --backup <backup-id> [--vm <name-or-id>] --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--datastore-map <src=dst>] [--power-on] [--wait] 
 
 Legacy compatibility:
-abr restore start --point-id <id> [--name <new-name>] [--target-inventory <name>] [--target-host <host>] [--target-datastore <name>] [--network-map <src=dst>] [--repo <name>] [--power-on] [--in-place] [--force] [--wait] 
+abr restore start --point-id <id> [--name <new-name>] [--target-inventory <name>] [--target-host <host>] [--target-datastore <name>] [--network-map <src=dst>] [--datastore-map <src=dst>] [--repo <name>] [--power-on] [--in-place] [--force] [--wait] 
 
 Targeted Restore Scenarios: 
  
@@ -530,8 +530,16 @@ Requires that the backup captured the VM's original host and datastore -- if the
  
 2. Out-of-Place / Advanced DR (Restore as a new VM on another host) 
 Description: A duplicate VM is deployed on a secondary host or recovery site for testing or disaster recovery. 
-Syntax: abr restore start --restore-point <id> --new-name <new-name> --target-inventory <name> --target-host <host> --datastore <name> [--network-map <src=dst>] [--power-on] 
-Example: abr restore start --restore-point rp-2026-05-16-0200-f1 --new-name VM-SQL-01-DR --target-inventory DR-Inventory --target-host esxi-dr-01.company.local --datastore DR-SSD --network-map Production=DR-Network --power-on 
+Syntax: abr restore start --restore-point <id> --new-name <new-name> --target-inventory <name> --target-host <host> --datastore <name> [--network-map <src=dst>] [--datastore-map <src=dst>] [--power-on] 
+Example: abr restore start --restore-point rp-2026-05-16-0200-f1 --new-name VM-SQL-01-DR --target-inventory DR-Inventory --target-host esxi-dr-01.company.local --datastore DR-SSD --network-map Production=DR-Network --datastore-map SATA-BULK=DR-SATA --power-on 
+
+DATASTORE PLACEMENT 
+
+--datastore is the target for the whole VM: every disk lands there, whatever datastore it came from. --datastore-map overrides that for one source datastore, which is what a VM spread over several datastores needs -- a system disk on SSD and a 2 TB database on bulk storage should not both land on the SSD. Repeat the flag per source datastore; disks whose datastore is not named keep going to --datastore. 
+
+The source datastore is read from the restore point's own manifest, so mapping works for restore points taken before this option existed, and even when the source VM no longer exists. A mapping that names a datastore the VM does not use is rejected rather than silently ignored, and each target is checked for free space against only the disks that actually land on it. 
+
+In-place restore takes no mapping: it returns every disk to the datastore it came from, so a VM spread over several datastores stays spread. 
 
 JSON output:
 - `abr --output json restore list` returns `{ "items": [...] }`

@@ -10,6 +10,7 @@ import logging
 import shutil
 import time
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,7 +38,11 @@ from ...core.storage_tool import (
     safe_path_component,
 )
 from ...core.utils import utc_now
-from ...services.backup_mode import object_lock_actual_retention_days, resolve_job_backup_mode
+from ...services.backup_mode import (
+    object_lock_actual_retention_days,
+    object_lock_generation_plan,
+    resolve_job_backup_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +119,42 @@ def _resolve_repository_backup_root(task: dict[str, Any]) -> Path | None:
     return None
 
 
+def _task_chain_id(task: dict[str, Any], repository_id: str) -> str:
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    vm_id = str(parameters.get("vm_external_id") or task.get("resource_external_id") or "-")
+    return f"backup::{task.get('job_id') or '-'}::{vm_id}::{repository_id or '-'}"
+
+
+def _resolve_immutability_plan(task: dict[str, Any], repository: dict[str, Any]) -> dict[str, Any]:
+    job_id = task.get("job_id")
+    job = JOBS.get(str(job_id)) if isinstance(job_id, str) else None
+    actual_days = object_lock_actual_retention_days(
+        job if isinstance(job, dict) else None,
+        extract_s3_config(repository).get("immutability") or {},
+        block_generation_days=s3_block_generation_days(),
+    )
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    return object_lock_generation_plan(
+        _task_chain_id(task, str(repository.get("id") or "")),
+        actual_retention_days=actual_days,
+        block_generation_days=s3_block_generation_days(),
+        now=_parse_task_start(task),
+        starts_segment=resolve_job_backup_mode(task, parameters) == "full",
+    )
+
+
+def _parse_task_start(task: dict[str, Any]) -> datetime:
+    text = str(task.get("started_at") or "").strip()
+    if text:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
+
+
 def _resolve_repository(task: dict[str, Any]) -> dict[str, Any] | None:
     for repository_id in _resolve_repository_ids(task):
         repository = REPOSITORIES.get(repository_id)
@@ -121,16 +162,10 @@ def _resolve_repository(task: dict[str, Any]) -> dict[str, Any] | None:
             continue
         if not is_s3_repository(repository):
             return repository
-        job_id = task.get("job_id")
-        job = JOBS.get(str(job_id)) if isinstance(job_id, str) else None
-        actual_days = object_lock_actual_retention_days(
-            job if isinstance(job, dict) else None,
-            extract_s3_config(repository).get("immutability") or {},
-            block_generation_days=s3_block_generation_days(),
-        )
-        if actual_days < 1:
+        plan = _resolve_immutability_plan(task, repository)
+        if int(plan.get("lock_days") or 0) < 1:
             return repository
-        return with_immutability_retention_days(repository, actual_days)
+        return with_immutability_retention_days(repository, int(plan["lock_days"]))
     return None
 
 
@@ -2555,6 +2590,11 @@ def run_vcenter_backup(
             "repository_type": repository_type or "local",
             "storage_mode": "s3" if repository_type == "s3" else "local",
             "repository_storage_path": repository_abr_path if repository_type == "s3" else str(task_root),
+            "immutability_generation": (
+                _resolve_immutability_plan(task, REPOSITORIES[str(repository.get("id") or "")])
+                if repository_type == "s3" and str(repository.get("id") or "") in REPOSITORIES
+                else None
+            ),
             "vm_config": vm_config,
             "disk_count": len(disk_outputs),
             "disks": disk_outputs,

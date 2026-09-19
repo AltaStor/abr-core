@@ -73,6 +73,7 @@ class RestoreCommands:
         start.add_argument("--datastore", help="Target datastore name or ID")
         start.add_argument("--target-datastore", help="Target datastore name (legacy alias)")
         start.add_argument("--network-map", action="append", default=[], help="Network mapping source=destination. Repeat as needed.")
+        start.add_argument("--datastore-map", dest="datastore_map", action="append", default=[], help="Datastore mapping source=destination for disks that must not land on --datastore. Repeat as needed.")
         start.add_argument("--repo", help="Repository name for backup-copy restore")
         start.add_argument("--repo-id", help="Repository ID for backup-copy restore")
         start.add_argument("--power-on", action="store_true", help="Power on after restore")
