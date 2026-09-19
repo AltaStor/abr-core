@@ -2982,6 +2982,56 @@ def _restore_point_abr_targets(point: dict[str, Any]) -> list[tuple[str, str]]:
     return targets
 
 
+def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_ids: set[str] | None = None) -> dict[str, Any]:
+    target = _parse_dt(expires_at)
+    remaining_days = max(int(-(-(target - _now_utc()).total_seconds() // 86400)), 1)
+    skip = skip_point_ids or set()
+    extended: list[str] = []
+    failures: list[dict[str, Any]] = []
+
+    for point in normalized_backup_points():
+        if str(point.get("segment_id") or "") != segment_id or str(point.get("id") or "") in skip:
+            continue
+        repository = REPOSITORIES.get(str(point.get("repository_id") or ""))
+        if not isinstance(repository, dict) or not is_s3_repository(repository):
+            continue
+        config = normalize_immutability_config(extract_s3_config(repository).get("immutability"))
+        if not immutability_is_enabled(config):
+            continue
+        stored_expiry = str(point.get("immutability_expires_at") or "").strip()
+        if stored_expiry and _parse_dt(stored_expiry) >= target:
+            continue
+        point_failed = False
+        for abr_path, backup_name in _restore_point_abr_targets(point):
+            try:
+                apply_repository_immutability(
+                    repository,
+                    abr_path,
+                    backup_name,
+                    retention_days=remaining_days,
+                    timeout=_s3_immutability_probe_timeout(),
+                )
+            except StorageToolError as exc:
+                point_failed = True
+                failures.append(
+                    {
+                        "restore_point_id": str(point.get("id") or ""),
+                        "backup_name": backup_name,
+                        "message": condense_disk_tool_message(exc),
+                    }
+                )
+        if point_failed:
+            continue
+        stored = BACKUPS.get(str(point.get("id") or ""))
+        if isinstance(stored, dict):
+            stored = dict(stored)
+            stored["immutability_expires_at"] = expires_at
+            persist_backup(stored)
+        extended.append(str(point.get("id") or ""))
+
+    return {"extended_restore_points": extended, "failures": failures, "retention_days": remaining_days}
+
+
 def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:
     configured = int(config.get("retention_days") or 0)
     if not applied_days:
@@ -3034,6 +3084,11 @@ def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
         if not point_failed:
             updated.append(str(point.get("id") or ""))
             applied_days.add(actual_days)
+            stored = BACKUPS.get(str(point.get("id") or ""))
+            if isinstance(stored, dict) and actual_days > 0:
+                stored = dict(stored)
+                stored["immutability_expires_at"] = (_now_utc() + timedelta(days=actual_days)).isoformat()
+                persist_backup(stored)
 
     result = {
         "id": record_id,

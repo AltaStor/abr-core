@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from python.srv.core.mongo_db_wrapper import BACKUPS, catalog_records
@@ -96,3 +97,64 @@ def object_lock_actual_retention_days(
     if scope == "job_retention":
         base = max(base, int((job or {}).get("retention_days") or 0))
     return base + max(int(block_generation_days), 0)
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _chain_generation(chain_id: str) -> tuple[datetime | None, datetime | None]:
+    newest: dict[str, Any] | None = None
+    newest_created = ""
+    for record in catalog_records(BACKUPS):
+        if str(record.get("chain_id") or "") != chain_id:
+            continue
+        created = str(record.get("created_at") or "")
+        if newest is None or created > newest_created:
+            newest, newest_created = record, created
+    if newest is None:
+        return None, None
+    return (
+        _parse_timestamp(newest.get("immutability_generation_started_at")),
+        _parse_timestamp(newest.get("immutability_expires_at")),
+    )
+
+
+def object_lock_generation_plan(
+    chain_id: str,
+    *,
+    actual_retention_days: int,
+    block_generation_days: int,
+    now: datetime,
+    starts_segment: bool = False,
+) -> dict[str, Any]:
+    actual_retention_days = int(actual_retention_days)
+    if actual_retention_days < 1:
+        return {"lock_days": 0, "generation_started_at": None, "expires_at": None, "starts_new_generation": False}
+
+    started, expires = (None, None) if starts_segment else _chain_generation(chain_id)
+    promised = max(actual_retention_days - max(int(block_generation_days), 0), 1)
+    if started is not None and expires is not None:
+        remaining = (expires - now).total_seconds() / 86400
+        if remaining >= promised:
+            return {
+                "lock_days": max(int(-(-remaining // 1)), 1),
+                "generation_started_at": started.isoformat(),
+                "expires_at": expires.isoformat(),
+                "starts_new_generation": False,
+            }
+
+    expires_at = now + timedelta(days=actual_retention_days)
+    return {
+        "lock_days": actual_retention_days,
+        "generation_started_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "starts_new_generation": True,
+    }

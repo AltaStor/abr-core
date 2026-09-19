@@ -19,11 +19,16 @@ from python.srv.core.mongo_db_wrapper import (
     catalog_records,
     persist_backup,
 )
-from python.srv.core.storage_tool import hydrate_manifest_via_disk_tool
+from python.srv.core.storage_tool import (
+    extract_s3_config,
+    hydrate_manifest_via_disk_tool,
+    immutability_is_enabled,
+)
 from python.srv.core.utils import utc_now
 from python.srv.services.abr_v41 import (
     _append_task_log,
     apply_retention_to_chain,
+    extend_segment_object_lock,
     normalize_backup_point,
     normalize_job_record,
 )
@@ -297,6 +302,15 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
         segment_id = None
         parent_point_id = None
 
+    generation = result.get("immutability_generation") if isinstance(result.get("immutability_generation"), dict) else {}
+    if not generation and repository_type == "s3" and immutability_is_enabled(
+        extract_s3_config(REPOSITORIES.get(str(repository_id or ""), {})).get("immutability")
+    ):
+        logger.warning(
+            "Backup %s went to an immutable repository but reported no block generation, so its Object Lock "
+            "cannot be kept in step with the rest of the chain",
+            task.get("id"),
+        )
     record = {
         "id": str(uuid4()),
         "status": "available",
@@ -329,6 +343,8 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
         "repository_type": repository_type,
         "gfs_marks": {"weekly": False, "monthly": False, "yearly": False},
         "gfs_protected": False,
+        "immutability_generation_started_at": generation.get("generation_started_at"),
+        "immutability_expires_at": generation.get("expires_at"),
         "source": {
             "hypervisor_id": hypervisor_id,
             "hypervisor_name": hypervisor.get("name"),
@@ -361,6 +377,27 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
     if not normalized_record.get("segment_id"):
         normalized_record["segment_id"] = normalized_record["id"]
     persist_backup(normalized_record)
+    if generation.get("starts_new_generation") and generation.get("expires_at"):
+        try:
+            report = extend_segment_object_lock(
+                str(normalized_record.get("segment_id") or ""),
+                expires_at=str(generation["expires_at"]),
+                skip_point_ids={str(normalized_record.get("id") or "")},
+            )
+        except (OSError, ApiError):
+            logger.exception(
+                "Could not extend the Object Lock of segment %s to the new block generation",
+                normalized_record.get("segment_id"),
+            )
+        else:
+            for failure in report["failures"]:
+                _record_session_warning(
+                    task,
+                    "Object Lock could not be extended to the new block generation for restore point "
+                    f"{failure.get('restore_point_id')}; the backup it belongs to may lose protection before "
+                    "the newer backups that depend on it",
+                    **failure,
+                )
     if normalized_job is not None:
         retention_vm_id = str(normalized_record.get("vm_id") or "")
         retention_repository_id = str(normalized_record.get("repository_id") or "") or None

@@ -438,6 +438,23 @@ class SyntheticFullRunTests(unittest.TestCase):
 
     @patch("python.srv.services.synthetic_full.apply_repository_immutability")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_synthetic_full_opens_a_block_generation_of_its_own(self, copy_mock, lock_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
+        REPOSITORIES[REPO_ID] = {
+            "id": REPO_ID, "name": "S3", "type": "s3",
+            "metadata": {"s3": {"bucket": "b", "region": "us-east-1",
+                                "immutability": {"mode": "governance", "retention_days": 30}}},
+        }
+
+        result = synthetic_full.run_synthetic_full(self._task())
+
+        generation = result["immutability_generation"]
+        self.assertTrue(generation["starts_new_generation"])
+        self.assertEqual(generation["lock_days"], 40)
+        self.assertTrue(generation["expires_at"])
+
+    @patch("python.srv.services.synthetic_full.apply_repository_immutability")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_a_synthetic_full_is_locked_for_the_job_retention_when_that_is_longer(self, copy_mock, lock_mock) -> None:
         copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
         REPOSITORIES[REPO_ID] = {
