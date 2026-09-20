@@ -176,7 +176,7 @@ Description: Create a backup repository.
 
 abr repo add --name <name> --type <local|nfs|smb|s3> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password <pass>] [--description <text>] 
 
-For --type s3: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] 
+For --type s3: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] [--create-bucket] 
 
 Example: 
 abr repo add --name MyLocal --type local --path /mnt/backup 
@@ -185,6 +185,20 @@ abr repo add --name MyWorm --type s3 --bucket altastor-objectlock --region us-ea
 Note: a local path that is world-writable is refused - its directory mode is the 
 only thing keeping other accounts on the host away from the backup data. Restrict 
 it to 750, the mode the product uses for its own storage, and add it again. 
+
+A repository is checked against its storage before it is registered, and refused if it 
+cannot be used: the endpoint has to answer, the credentials have to authenticate, and the 
+target has to survive a write, a read-back and a delete. A local path has to exist and be 
+readable and writable by the service account. Nothing is created when a check fails, and 
+the outcome is kept on the repository - repo list and repo info report a repository whose 
+last check failed as unavailable rather than as healthy, until repo verify passes again. 
+
+--create-bucket creates the S3 bucket when it does not exist; without it a missing bucket 
+is refused. Object Lock can only be turned on while a bucket is being created and --create-bucket 
+does not turn it on, so a bucket created this way can never hold immutable backups, and 
+--create-bucket is refused together with --immutable. Outside of --create-bucket a bucket is 
+never created: a backup written to a repository whose bucket has disappeared fails instead of 
+silently starting a new empty one. 
 
 S3 OBJECT STORAGE IMMUTABILITY 
 

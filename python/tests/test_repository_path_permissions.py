@@ -101,15 +101,15 @@ class LocalRepositoryPathPermissionTests(unittest.TestCase):
         self.assertEqual(record["warnings"], [])
 
     @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permission checks")
-    def test_a_directory_the_service_account_cannot_write_is_accepted_but_warned_about(self) -> None:
+    def test_a_directory_the_service_account_cannot_write_is_refused(self) -> None:
         path = self._dir("read-only", 0o555)
 
-        record = self._add("ReadOnly", path)
+        with self.assertRaises(ApiError) as ctx:
+            self._add("ReadOnly", path)
 
-        self.assertEqual(record["status"], "available")
-        self.assertEqual(len(record["warnings"]), 1)
-        self.assertIn("not writable by the service account", record["warnings"][0])
-        self.assertIn("0555", record["warnings"][0])
+        self.assertEqual(ctx.exception.code, "repository_validation_failed")
+        self.assertIn("not readable and writable", ctx.exception.message)
+        self.assertEqual(list(REPOSITORIES), [])
 
     def test_a_world_writable_parent_is_warned_about_but_not_refused(self) -> None:
         parent = self._dir("open-parent", 0o777)

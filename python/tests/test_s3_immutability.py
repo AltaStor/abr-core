@@ -202,7 +202,10 @@ class S3ImmutabilityRepositoryTests(unittest.TestCase):
             settings["immutability"] = immutability
         return abr_v41.create_repository_record({"name": "ObjectRepo", "type": "s3", "s3": settings})
 
-    def test_repository_without_immutability_stays_disabled(self) -> None:
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_repository_without_immutability_stays_disabled(self, run_mock, _connect) -> None:
+        run_mock.side_effect = _disk_tool_stub()
         repository = self._create_repository()
         self.assertEqual(repository["immutability"], {"mode": "none", "retention_days": 0, "retention_scope": "job_retention"})
         self.assertTrue(repository["capabilities"]["supports_immutability"])
@@ -585,7 +588,12 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
 
         self.assertEqual(result["immutability"], {"mode": "none", "retention_days": 0, "retention_scope": "job_retention"})
 
-    def test_empty_edit_of_a_record_written_before_immutability_is_still_rejected(self) -> None:
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_empty_edit_of_a_record_written_before_immutability_is_still_rejected(
+        self, run_mock, _connect
+    ) -> None:
+        run_mock.side_effect = _disk_tool_stub()
         REPOSITORIES["legacy"] = {
             "id": "legacy",
             "name": "Legacy",

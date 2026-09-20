@@ -43,6 +43,9 @@ def _disk_tool_stub(*backup_names: str):
     def _side_effect(command: list[str], **kwargs: object) -> CompletedProcess:
         if command and command[0] == "list":
             return CompletedProcess(args=command, returncode=0, stdout=listing, stderr="")
+        if command and command[0] == "info":
+            document = '{"command": "info", "status": "ok", "immutability_supported": "compliance", "immutability": "none", "retention_days": 0}'
+            return CompletedProcess(args=command, returncode=0, stdout=document, stderr="")
         return CompletedProcess(args=command, returncode=0, stdout="", stderr="")
 
     return _side_effect
@@ -72,7 +75,10 @@ class S3RepositorySupportTests(unittest.TestCase):
         path.mkdir(parents=True, exist_ok=True)
         return str(path)
 
-    def test_create_s3_repository_masks_secrets_in_response(self) -> None:
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.services.abr_v41.s3_bucket_is_reachable", return_value=True)
+    @patch("python.srv.services.abr_v41.probe_repository_access")
+    def test_create_s3_repository_masks_secrets_in_response(self, _probe, _bucket, _connect) -> None:
         repository = abr_v41.create_repository_record(
             {
                 "name": "ObjectRepo",
@@ -106,8 +112,11 @@ class S3RepositorySupportTests(unittest.TestCase):
         stored = REPOSITORIES[repository["id"]]
         self.assertEqual(extract_s3_config(stored)["secret_key"], "super-secret-key")
 
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.services.abr_v41.s3_bucket_is_reachable", return_value=True)
+    @patch("python.srv.services.abr_v41.probe_repository_access")
     def test_resolve_s3_repository_keeps_stored_credentials_while_masking_response(
-        self,
+        self, _probe, _bucket, _connect
     ) -> None:
         repository = abr_v41.create_repository_record(
             {
@@ -182,9 +191,10 @@ class S3RepositorySupportTests(unittest.TestCase):
         self.assertIsNone(repository["metadata"].get("password"))
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.services.abr_v41.s3_bucket_is_reachable", return_value=True)
     @patch("python.srv.core.storage_tool.run_disk_tool")
     def test_verify_s3_repository_uses_native_disk_tool(
-        self, run_disk_tool_mock: object, _connect_probe: object
+        self, run_disk_tool_mock: object, _bucket: object, _connect_probe: object
     ) -> None:
         repository = abr_v41.create_repository_record(
             {
@@ -201,6 +211,7 @@ class S3RepositorySupportTests(unittest.TestCase):
             }
         )
 
+        run_disk_tool_mock.reset_mock()
         payload = abr_v41.verify_repository(repository["id"])
 
         self.assertEqual(payload["status"], "success")
@@ -217,9 +228,10 @@ class S3RepositorySupportTests(unittest.TestCase):
         self.assertIn("--force", commands[2])
         self.assertEqual(commands[0][commands[0].index("--name") + 1], commands[2][commands[2].index("--name") + 1])
 
+    @patch("python.srv.services.abr_v41.s3_bucket_is_reachable", return_value=True)
     @patch("python.srv.core.storage_tool.run_disk_tool")
     def test_delete_backup_artifacts_from_s3_point_deletes_remote_and_local_cache(
-        self, run_disk_tool_mock: object
+        self, run_disk_tool_mock: object, _bucket: object
     ) -> None:
         repository = abr_v41.create_repository_record(
             {
@@ -264,6 +276,7 @@ class S3RepositorySupportTests(unittest.TestCase):
                 }
             )
 
+            run_disk_tool_mock.reset_mock()
             abr_v41._delete_backup_artifacts_from_point(point)
 
             self.assertEqual(run_disk_tool_mock.call_count, 2)
@@ -316,6 +329,7 @@ class S3RepositorySupportTests(unittest.TestCase):
             }
         )
 
+        run_disk_tool_mock.reset_mock()
         abr_v41._delete_backup_artifacts_from_point(point)
 
         # Previously local disks skipped the backup tool entirely and
@@ -754,6 +768,7 @@ class S3RepositorySupportTests(unittest.TestCase):
             ],
         )
 
+        run_disk_tool_mock.reset_mock()
         payload = abr_v41.verify_repository(repository["id"])
 
         self.assertEqual(payload["status"], "success")
@@ -909,11 +924,13 @@ class S3EndpointReachabilityTests(unittest.TestCase):
         self.assertEqual(clock[0] - 1000.0, float(budget))
         self.assertEqual(granted, [float(budget)])
 
+    @patch("python.srv.services.abr_v41.s3_bucket_is_reachable", return_value=True)
     @patch("python.srv.core.storage_tool.run_disk_tool")
     def test_verify_fails_fast_without_handing_a_dead_endpoint_to_the_mover(
-        self, run_disk_tool_mock: object
+        self, run_disk_tool_mock: object, _bucket: object
     ) -> None:
-        repository = abr_v41.create_repository_record(
+        with patch.object(abr_v41, "s3_endpoint_connect_error", return_value=None):
+            repository = abr_v41.create_repository_record(
             {
                 "name": "DeadObjectRepo",
                 "type": "s3",
@@ -927,7 +944,8 @@ class S3EndpointReachabilityTests(unittest.TestCase):
                     "verify_tls": False,
                 },
             }
-        )
+            )
+        run_disk_tool_mock.reset_mock()
 
         payload = abr_v41.verify_repository(repository["id"])
 

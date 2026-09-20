@@ -1758,6 +1758,14 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         if not storage["available"]:
             item["status"] = "unavailable"
             item["health"] = "unavailable"
+    last_verify = item.get("last_verify") if isinstance(item.get("last_verify"), dict) else None
+    if last_verify is not None:
+        item["last_verify_at"] = last_verify.get("checked_at")
+        if str(last_verify.get("status") or "") != "success":
+            storage["available"] = False
+            storage["error"] = str(last_verify.get("message") or "Repository verification failed")
+            item["status"] = "unavailable"
+            item["health"] = "unavailable"
     item["storage"] = storage
     item["warnings"] = warnings
     item["capacity_bytes"] = storage["capacity_bytes"]
@@ -2164,8 +2172,6 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
                 conflicting_repository=conflict.get("name"),
                 path=path,
             )
-    if repo_type == "s3" and immutability_is_enabled(s3_config.get("immutability")):
-        _assert_immutability_is_usable(s3_config)
     now = utc_now()
     record = {
         "id": str(uuid4()),
@@ -2205,8 +2211,23 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
             }
         ),
     }
+    create_bucket = bool(payload.get("create_bucket"))
+    bucket_was_missing = (
+        repo_type == "s3" and create_bucket and not s3_bucket_is_reachable(s3_config)
+    )
+    registration_check = _assert_repository_is_usable(record, create_bucket=create_bucket)
+    if registration_check is not None:
+        record["last_verify"] = registration_check
+    if repo_type == "s3" and immutability_is_enabled(s3_config.get("immutability")):
+        _assert_immutability_is_usable(s3_config)
     persist_repository(record)
     created = normalize_repository_record(record)
+    if bucket_was_missing:
+        created["warnings"] = [
+            *created.get("warnings", []),
+            f"S3 bucket '{s3_config['bucket']}' did not exist and was created. Object Lock cannot be "
+            "turned on after a bucket is created, so this bucket can never hold immutable backups.",
+        ]
     if repo_type == "s3":
         created["immutability_effect"] = _immutability_effect_report(
             str(record["id"]),
@@ -2347,6 +2368,12 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
                     path=updated.get("path"),
                 )
     _ensure(changed, 422, "invalid_repository", "repo edit requires at least one editable option")
+    if _repository_connection_identity(updated) != _repository_connection_identity(record):
+        registration_check = _assert_repository_is_usable(
+            updated, create_bucket=bool(payload.get("create_bucket"))
+        )
+        if registration_check is not None:
+            updated["last_verify"] = registration_check
     if (
         next_s3_config is not None
         and next_immutability != previous_immutability
@@ -2523,11 +2550,35 @@ def _s3_format_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]], str
     return checks, None
 
 
-def _s3_connectivity_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+def s3_bucket_is_reachable(config: dict[str, Any]) -> bool:
+    try:
+        read_storage_folder_info(
+            {"type": "s3", "s3": config},
+            str(config.get("prefix") or "").strip(),
+            timeout=_s3_probe_timeout(),
+        )
+    except StorageToolError:
+        return False
+    return True
+
+
+def _s3_connectivity_checks(
+    config: dict[str, Any], *, create_bucket: bool = True
+) -> tuple[list[dict[str, Any]], str | None]:
     checks, error = _s3_format_checks(config)
     if error is not None:
         return checks, error
     prefix = str(config.get("prefix") or "").strip()
+    bucket = str(config.get("bucket") or "").strip()
+
+    if not create_bucket and not s3_bucket_is_reachable(config):
+        checks.append({"name": "bucket_exists", "status": "failed", "message": bucket})
+        return checks, (
+            f"S3 bucket '{bucket}' could not be opened. Check that it exists and that these "
+            "credentials can use it; if it has not been created yet, pass --create-bucket. A bucket "
+            "created that way cannot hold immutable backups, because Object Lock can only be turned "
+            "on while a bucket is being created."
+        )
 
     try:
         probe_repository_access(
@@ -2535,12 +2586,13 @@ def _s3_connectivity_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]
             abr_path=prefix,
             backup_name=f"repo-probe-{uuid4().hex[:12]}",
             timeout=_s3_probe_timeout(),
+            create_folder=create_bucket,
         )
     except StorageToolError as exc:
         checks.append({"name": "connectivity", "status": "failed", "message": str(exc)})
         return checks, "S3 repository validation failed"
 
-    checks.append({"name": "connectivity", "status": "ok", "message": "Bucket/prefix access validated (bucket auto-created if missing) through native storage tool"})
+    checks.append({"name": "connectivity", "status": "ok", "message": "Bucket/prefix access validated through native storage tool"})
     return checks, None
 
 
@@ -3152,16 +3204,114 @@ def test_s3_connection(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "success", "checks": checks, "message": "S3 connection succeeded"}
 
 
-def verify_repository(record_id: str) -> dict[str, Any]:
-    repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+def _repository_verification_result(repository: dict[str, Any]) -> dict[str, Any]:
     repo_type = str(repository.get("type") or "")
     if repo_type == "local":
-        result = _verify_local_repository(repository)
-    elif repo_type == "s3":
-        result = _verify_s3_repository(repository)
-    else:
-        result = _verify_remote_repository(repository)
-    payload = normalize_repository_record(repository)
+        return _verify_local_repository(repository)
+    if repo_type == "s3":
+        return _verify_s3_repository(repository)
+    return _verify_remote_repository(repository)
+
+
+def _repository_connection_identity(record: dict[str, Any]) -> tuple[str, ...]:
+    if str(record.get("type") or "") == "s3":
+        config = extract_s3_config(record)
+        return tuple(
+            str(config.get(key) or "")
+            for key in (
+                "bucket",
+                "prefix",
+                "region",
+                "endpoint_url",
+                "access_key",
+                "secret_key",
+                "profile",
+                "path_style",
+                "verify_tls",
+            )
+        )
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    return (
+        str(record.get("path") or ""),
+        str(metadata.get("server") or ""),
+        str(metadata.get("share") or ""),
+        str(metadata.get("username") or ""),
+        str(metadata.get("password") or ""),
+    )
+
+
+def _verification_summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": str(result.get("status") or "error"),
+        "message": str(result.get("message") or ""),
+        "checked_at": utc_now(),
+    }
+
+
+def _repository_registration_checks(
+    record: dict[str, Any], *, create_bucket: bool = False
+) -> dict[str, Any] | None:
+    repo_type = str(record.get("type") or "")
+    if repo_type == "local":
+        return _verify_local_repository(record)
+    if repo_type != "s3":
+        return None
+    config = extract_s3_config(record)
+    if immutability_is_enabled(normalize_immutability_config(config.get("immutability"))):
+        checks, error = _s3_format_checks(config)
+        if error is not None:
+            return {"status": "error", "checks": checks, "message": error}
+        return {"status": "success", "checks": checks, "message": "S3 endpoint is reachable"}
+    checks, error = _s3_connectivity_checks(config, create_bucket=create_bucket)
+    if error is not None:
+        return {"status": "error", "checks": checks, "message": error}
+    return {
+        "status": "success",
+        "checks": checks,
+        "message": "S3 repository is available; immutability: disabled, backups stay deletable",
+    }
+
+
+def _assert_bucket_creation_is_sensible(record: dict[str, Any], *, create_bucket: bool) -> None:
+    if not create_bucket or str(record.get("type") or "") != "s3":
+        return
+    config = extract_s3_config(record)
+    if not immutability_is_enabled(normalize_immutability_config(config.get("immutability"))):
+        return
+    raise api_error(
+        422,
+        "repository_bucket_cannot_be_created",
+        "Object Lock can only be turned on while a bucket is being created, and --create-bucket "
+        "cannot turn it on, so a bucket created that way could never hold immutable backups. Create "
+        "the bucket with Object Lock enabled first, then add the repository without --create-bucket.",
+        bucket=config.get("bucket"),
+    )
+
+
+def _assert_repository_is_usable(
+    record: dict[str, Any], *, create_bucket: bool = False
+) -> dict[str, Any] | None:
+    _assert_bucket_creation_is_sensible(record, create_bucket=create_bucket)
+    result = _repository_registration_checks(record, create_bucket=create_bucket)
+    if result is None:
+        return None
+    if str(result.get("status") or "") != "success":
+        raise api_error(
+            422,
+            "repository_validation_failed",
+            str(result.get("message") or "Repository cannot be used for backups"),
+            checks=result.get("checks") or [],
+        )
+    return _verification_summary(result)
+
+
+def verify_repository(record_id: str) -> dict[str, Any]:
+    repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    result = _repository_verification_result(repository)
+    stored = _json_clone(repository)
+    stored["last_verify"] = _verification_summary(result)
+    persist_repository(stored)
+    payload = normalize_repository_record(stored)
     payload.update(result)
     return payload
 

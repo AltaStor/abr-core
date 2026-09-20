@@ -324,6 +324,7 @@ class CreateRepositoryRequest(_LenientModel):
     path_style: LaxBool | None = None
     verify_tls: LaxBool | None = None
     immutability: dict[str, Any] | None = None
+    create_bucket: LaxBool | None = None
 
 
 class UpdateRepositoryRequest(_LenientModel):
@@ -346,6 +347,7 @@ class UpdateRepositoryRequest(_LenientModel):
     path_style: LaxBool | None = None
     verify_tls: LaxBool | None = None
     immutability: dict[str, Any] | None = None
+    create_bucket: LaxBool | None = None
 
 
 class CreateJobRequest(_LenientModel):

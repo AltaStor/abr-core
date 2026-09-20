@@ -660,7 +660,9 @@ def _build_backup_command(
         "--json",
         "--name",
         backup_name,
-        *disk_tool_storage_args(repository, abr_path=abr_path, create_folder=True),
+        *disk_tool_storage_args(
+            repository, abr_path=abr_path, create_folder=not is_s3_repository(repository)
+        ),
         *disk_tool_immutability_args(repository),
         "--compression",
         str(compression_level),
