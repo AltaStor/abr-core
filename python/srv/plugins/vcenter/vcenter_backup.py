@@ -374,7 +374,10 @@ def _get_resource(task: dict[str, Any]) -> dict[str, Any]:
     resource = RESOURCES_BY_HV.get(hypervisor_id, {}).get((resource_type, resource_external_id))
     if not resource:
         raise VCenterBackupError(
-            f"Discovered resource not found for task: {resource_type}:{resource_external_id}"
+            f"{resource_type} {resource_external_id} is no longer in the inventory of this "
+            "hypervisor, so it cannot be read from the source side. Run inventory rescan if the "
+            "object is still there; if it has been deleted, this operation needs the object itself "
+            "and cannot proceed"
         )
     return resource
 
@@ -382,7 +385,11 @@ def _get_resource(task: dict[str, Any]) -> dict[str, Any]:
 def _get_vm_resource(hypervisor_id: str, vm_id: str) -> dict[str, Any]:
     resource = RESOURCES_BY_HV.get(hypervisor_id, {}).get(("virtual_machine", vm_id))
     if not resource:
-        raise VCenterBackupError(f"Virtual machine resource not found: {vm_id}")
+        raise VCenterBackupError(
+            f"Virtual machine {vm_id} is no longer in the inventory of this hypervisor. Run "
+            "inventory rescan if it is still there; a disk-level restore rebuilds one disk of an "
+            "existing machine and cannot proceed without it"
+        )
     return resource
 
 

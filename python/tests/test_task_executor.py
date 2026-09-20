@@ -6511,7 +6511,7 @@ class TaskExecutorTests(unittest.TestCase):
 
         self.assertEqual(command[1], "restore")
 
-    def test_vcenter_vm_restore_still_fails_for_undiscovered_non_imported_source(self) -> None:
+    def test_vcenter_vm_restore_does_not_need_the_source_to_still_be_discovered(self) -> None:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",
             "kind": "vcenter",
@@ -6539,8 +6539,8 @@ class TaskExecutorTests(unittest.TestCase):
         result = run_task(task)
 
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["result"]["error_type"], "VCenterBackupError")
-        self.assertIn("Discovered resource not found", result["result"]["message"])
+        self.assertNotIn("no longer in the inventory", result["result"]["message"])
+        self.assertIn("manifest", result["result"]["message"].lower())
 
 
     def _write_chain_manifest(
