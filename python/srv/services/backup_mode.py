@@ -65,6 +65,50 @@ def has_previous_successful_backup(task: dict[str, Any]) -> bool:
     return False
 
 
+def _newest_point_of_chain(task: dict[str, Any]) -> dict[str, Any] | None:
+    job_id = str(task.get("job_id") or "").strip()
+    hypervisor_id = str(task.get("hypervisor_id") or "").strip()
+    resource_type = str(task.get("resource_type") or "").strip()
+    resource_external_id = str(task.get("resource_external_id") or "").strip()
+    newest: dict[str, Any] | None = None
+    newest_created = ""
+    for backup in catalog_records(BACKUPS):
+        if str(backup.get("status") or "") not in {"available", "completed", "healthy"}:
+            continue
+        origin = backup.get("origin") if isinstance(backup.get("origin"), dict) else {}
+        source = backup.get("source") if isinstance(backup.get("source"), dict) else {}
+        matches = bool(job_id) and str(origin.get("job_id") or "").strip() == job_id
+        if not matches:
+            matches = (
+                str(source.get("hypervisor_id") or "").strip() == hypervisor_id
+                and str(source.get("resource_type") or "").strip() == resource_type
+                and str(source.get("resource_external_id") or "").strip() == resource_external_id
+            )
+        if not matches:
+            continue
+        created = str(backup.get("created_at") or "")
+        if newest is None or created > newest_created:
+            newest, newest_created = backup, created
+    return newest
+
+
+def encryption_changed_since_last_backup(task: dict[str, Any], parameters: dict[str, Any]) -> bool:
+    newest = _newest_point_of_chain(task)
+    if newest is None:
+        return False
+    previous_enabled = bool(newest.get("encryption_enabled"))
+    previous_key = str(newest.get("encryption_key") or "").strip()
+    current_key = str(parameters.get("encryption_key") or "").strip()
+    current_enabled = bool(parameters.get("encryption_enabled")) and bool(current_key)
+    if previous_enabled != current_enabled:
+        return True
+    if not current_enabled:
+        return False
+    if not previous_key:
+        return False
+    return previous_key != current_key
+
+
 def resolve_job_backup_mode(task: dict[str, Any], parameters: dict[str, Any]) -> EffectiveBackupMode | None:
     normalized_execution_type = _normalized_execution_type(parameters)
     if normalized_execution_type == "incremental":
@@ -79,6 +123,8 @@ def resolve_job_backup_mode(task: dict[str, Any], parameters: dict[str, Any]) ->
     if not has_previous_successful_backup(task):
         return "full"
     if requested_mode == "full":
+        return "full"
+    if encryption_changed_since_last_backup(task, parameters):
         return "full"
     return "incremental"
 

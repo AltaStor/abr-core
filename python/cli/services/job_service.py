@@ -80,15 +80,16 @@ class JobService:
         return deduped
 
     @staticmethod
-    def _build_task_parameter_updates(args: Any) -> dict[str, Any]:
+    def _build_task_parameter_updates(args: Any, *, creating: bool = False) -> dict[str, Any]:
         set_encryption = bool(getattr(args, "set_encryption", False))
         reset_encryption = bool(getattr(args, "reset_encryption", False))
         encryption_key = getattr(args, "encryption_key", None)
+        has_key = isinstance(encryption_key, str) and bool(encryption_key.strip())
 
         if encryption_key is not None and not set_encryption:
             raise ValueError("--encryption-key requires --set-encryption")
-        if set_encryption and not (isinstance(encryption_key, str) and encryption_key.strip()):
-            raise ValueError("--set-encryption requires --encryption-key")
+        if set_encryption and creating and not has_key:
+            raise ValueError("--set-encryption requires --encryption-key when creating a job")
 
         updates: dict[str, Any] = {}
         compression_level = getattr(args, "compression_level", None)
@@ -97,7 +98,8 @@ class JobService:
 
         if set_encryption:
             updates["encryption_enabled"] = True
-            updates["encryption_key"] = encryption_key.strip()
+            if has_key:
+                updates["encryption_key"] = encryption_key.strip()
         elif reset_encryption:
             # None marks these keys for removal when merged against a stored job.
             updates["encryption_enabled"] = None
@@ -327,7 +329,7 @@ class JobService:
             payload["description"] = description
         if schedule is not None:
             payload["schedule"] = schedule
-        task_parameter_updates = self._build_task_parameter_updates(args)
+        task_parameter_updates = self._build_task_parameter_updates(args, creating=True)
         # Nothing exists yet to clear, so drop any None (reset) markers.
         non_null_updates = {key: value for key, value in task_parameter_updates.items() if value is not None}
         if non_null_updates:

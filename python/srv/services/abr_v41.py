@@ -74,6 +74,7 @@ from python.srv.core.storage_tool import (
     is_abr_repository,
     is_s3_repository,
     list_disk_tool_backups,
+    SECRET_MASK,
     mask_credential_fields,
     normalize_immutability_config,
     normalize_immutability_mode,
@@ -3582,7 +3583,36 @@ def _ensure_encryption_key_strength(task_parameters: Any) -> None:
     )
 
 
-def _validate_task_parameters(params: dict[str, Any]) -> dict[str, Any]:
+def _normalized_encryption_keys(raw: Any) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        try:
+            key_id = int(item.get("key_id"))
+        except (TypeError, ValueError):
+            continue
+        if key_id < 0 or key_id in seen:
+            continue
+        seen.add(key_id)
+        entries.append({"key_id": key_id, "key": key})
+    entries.sort(key=lambda entry: entry["key_id"])
+    return entries
+
+
+def _record_encryption_key(keys: list[dict[str, Any]], key: str) -> tuple[list[dict[str, Any]], int]:
+    for entry in keys:
+        if entry["key"] == key:
+            return keys, int(entry["key_id"])
+    next_id = max((int(entry["key_id"]) for entry in keys), default=-1) + 1
+    return [*keys, {"key_id": next_id, "key": key}], next_id
+
+
+def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] | None = None) -> dict[str, Any]:
     result = dict(params)
     if "compression_level" in result and result["compression_level"] is not None:
         try:
@@ -3597,16 +3627,21 @@ def _validate_task_parameters(params: dict[str, Any]) -> dict[str, Any]:
         if isinstance(key, str) and key.strip():
             result["encryption_key"] = key.strip()
         else:
-            # Encryption is a switch, not a key-management exercise: a caller
-            # that just turns it on (the web UI has no passphrase field) gets a
-            # key generated here and stored on the job, which is already where
-            # both the backup task parameters and restore look for one
-            # (_resolve_restore_encryption_key). An explicit key still wins, so
-            # `abr job create --set-encryption --encryption-key ...` is
-            # unchanged. On an update the merge carries the stored key through
-            # ahead of this, so a key is only ever minted once per job -- never
-            # rotated out from under the restore points written with it.
             result["encryption_key"] = secrets.token_urlsafe(_GENERATED_ENCRYPTION_KEY_BYTES)
+        known = _normalized_encryption_keys(
+            result.get("encryption_keys")
+            or (previous or {}).get("encryption_keys")
+        )
+        if not known:
+            carried = str((previous or {}).get("encryption_key") or "").strip()
+            if carried:
+                known = [{"key_id": 0, "key": carried}]
+        known, current_id = _record_encryption_key(known, str(result["encryption_key"]))
+        result["encryption_keys"] = known
+        result["encryption_key_id"] = current_id
+    else:
+        result.pop("encryption_keys", None)
+        result.pop("encryption_key_id", None)
     return result
 
 
@@ -3643,7 +3678,13 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         compression_level = DEFAULT_COMPRESSION_LEVEL
     encryption_enabled = bool(task_parameters.get("encryption_enabled"))
     has_encryption_key = bool(str(task_parameters.get("encryption_key") or "").strip())
+    encryption_keys = _normalized_encryption_keys(task_parameters.get("encryption_keys"))
+    current_key_id = task_parameters.get("encryption_key_id")
     task_parameters_view = mask_credential_fields(dict(task_parameters))
+    if "encryption_keys" in task_parameters_view:
+        task_parameters_view["encryption_keys"] = [
+            {"key_id": entry["key_id"], "key": SECRET_MASK} for entry in encryption_keys
+        ]
     return {
         "id": normalized["id"],
         "name": normalized["name"],
@@ -3681,7 +3722,13 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "active_full_next_run_at": normalized.get("active_full_next_run_at"),
         "synthetic_full_next_run_at": normalized.get("synthetic_full_next_run_at"),
         "compression_level": compression_level,
-        "encryption": {"enabled": encryption_enabled, "key_set": has_encryption_key},
+        "encryption": {
+            "enabled": encryption_enabled,
+            "key_set": has_encryption_key,
+            "key_id": current_key_id,
+            "key_ids": [entry["key_id"] for entry in encryption_keys],
+            "key_count": len(encryption_keys),
+        },
         "task_parameters": task_parameters_view,
         "backup_options": task_parameters_view,
         "effective_execution_policy": job_effective_policy(normalized),
@@ -3987,8 +4034,9 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     if "task_parameters" in payload and payload["task_parameters"] is not None:
         _ensure(isinstance(payload["task_parameters"], dict), 422, "invalid_job", "task_parameters must be an object")
         _ensure_encryption_key_strength(payload["task_parameters"])
-        merged = _merge_task_parameters(updated.get("task_parameters"), payload["task_parameters"])
-        updated["task_parameters"] = _validate_task_parameters(merged)
+        stored_parameters = updated.get("task_parameters") if isinstance(updated.get("task_parameters"), dict) else {}
+        merged = _merge_task_parameters(stored_parameters, payload["task_parameters"])
+        updated["task_parameters"] = _validate_task_parameters(merged, previous=stored_parameters)
         changed = True
     if updated["job_type"] == "backup":
         if "repo" in payload or "repo_id" in payload:
@@ -4131,6 +4179,21 @@ def _latest_successful_point(job_id: str, vm_id: str, repository_id: str | None)
     return points[-1] if points else None
 
 
+def _encryption_differs_from_point(job: dict[str, Any], point: dict[str, Any]) -> bool:
+    parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else {}
+    current_key = str(parameters.get("encryption_key") or "").strip()
+    current_enabled = bool(parameters.get("encryption_enabled")) and bool(current_key)
+    previous_enabled = bool(point.get("encryption_enabled"))
+    previous_key = str(point.get("encryption_key") or "").strip()
+    if current_enabled != previous_enabled:
+        return True
+    if not current_enabled:
+        return False
+    if not previous_key:
+        return False
+    return current_key != previous_key
+
+
 def resolve_job_execution(
     job: dict[str, Any],
     *,
@@ -4157,6 +4220,8 @@ def resolve_job_execution(
     previous = _latest_successful_point(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
     if previous is None:
         return "ActiveFull", "FirstRun"
+    if _encryption_differs_from_point(job, previous):
+        return "ActiveFull", "EncryptionKeyChanged"
     if scheduled_type == "ActiveFull":
         return "ActiveFull", "ActiveFullSchedule"
     if scheduled_type == "SyntheticFull":
@@ -7267,11 +7332,37 @@ def _point_is_encrypted(point: dict[str, Any]) -> bool:
     return bool(isinstance(task_parameters, dict) and task_parameters.get("encryption_enabled"))
 
 
+def _job_key_by_id(job_id: str, key_id: Any) -> str | None:
+    if key_id is None or not job_id or job_id not in JOBS:
+        return None
+    source_job = resolve_job(record_id=job_id)
+    task_parameters = source_job.get("task_parameters") if isinstance(source_job.get("task_parameters"), dict) else {}
+    if not task_parameters.get("encryption_enabled"):
+        return None
+    try:
+        wanted = int(key_id)
+    except (TypeError, ValueError):
+        return None
+    for entry in task_parameters.get("encryption_keys") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            entry_id = int(entry.get("key_id"))
+        except (TypeError, ValueError):
+            continue
+        if entry_id == wanted:
+            return str(entry.get("key") or "").strip() or None
+    return None
+
+
 def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
+    job_id = str(point.get("job_id") or "")
+    by_id = _job_key_by_id(job_id, point.get("encryption_key_id"))
+    if by_id:
+        return by_id
     own_key = str(point.get("encryption_key") or "").strip()
     if own_key:
         return own_key
-    job_id = str(point.get("job_id") or "")
     if not job_id or job_id not in JOBS:
         return None
     source_job = resolve_job(record_id=job_id)

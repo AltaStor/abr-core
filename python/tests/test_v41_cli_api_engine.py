@@ -841,7 +841,8 @@ class AbrV41EngineTests(unittest.TestCase):
     def test_a_key_of_the_minimum_length_is_accepted(self) -> None:
         job = self._job_with_key("Minimum Key", "eightch8", "192.168.12.80")
 
-        self.assertEqual(job["encryption"], {"enabled": True, "key_set": True})
+        self.assertEqual(job["encryption"]["enabled"], True)
+        self.assertEqual(job["encryption"]["key_set"], True)
 
     def test_a_short_encryption_key_is_refused_on_edit(self) -> None:
         job = self._job_with_key("Edit Short Key", "long-enough-key", "192.168.12.81")

@@ -18,6 +18,7 @@ from python.srv.core.mongo_db_wrapper import (
     catalog_entries,
     catalog_records,
     persist_backup,
+    persist_job,
 )
 from python.srv.core.storage_tool import (
     extract_s3_config,
@@ -99,6 +100,23 @@ def _resolve_point_encryption_key(
     job_parameters = normalized_job.get("task_parameters") if isinstance(normalized_job, dict) else None
     if isinstance(job_parameters, dict):
         return str(job_parameters.get("encryption_key") or "").strip() or None
+    return None
+
+
+def _resolve_point_encryption_key_id(
+    normalized_job: dict[str, Any] | None, key: str | None
+) -> int | None:
+    if not key:
+        return None
+    job_parameters = normalized_job.get("task_parameters") if isinstance(normalized_job, dict) else None
+    if not isinstance(job_parameters, dict):
+        return None
+    for entry in job_parameters.get("encryption_keys") or []:
+        if isinstance(entry, dict) and str(entry.get("key") or "") == key:
+            try:
+                return int(entry.get("key_id"))
+            except (TypeError, ValueError):
+                return None
     return None
 
 
@@ -311,6 +329,7 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
             "cannot be kept in step with the rest of the chain",
             task.get("id"),
         )
+    point_encryption_key = _resolve_point_encryption_key(task, normalized_job, result)
     record = {
         "id": str(uuid4()),
         "status": "available",
@@ -320,7 +339,8 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
         "compression_ratio": resolve_compression_ratio(result),
         "compression_level": _resolve_compression_level(result),
         "encryption_enabled": bool(result.get("encryption_enabled")),
-        "encryption_key": _resolve_point_encryption_key(task, normalized_job, result),
+        "encryption_key": point_encryption_key,
+        "encryption_key_id": _resolve_point_encryption_key_id(normalized_job, point_encryption_key),
         "execution_type": execution_type,
         "execution_reason": execution_reason,
         "full_backup": full_backup,
@@ -478,6 +498,47 @@ def backfill_backup_encryption_keys() -> int:
             continue
         enriched = dict(record)
         enriched["encryption_key"] = key
+        persist_backup(enriched)
+        updated += 1
+    return updated
+
+
+def backfill_job_encryption_keys() -> int:
+    from python.srv.services.abr_v41 import _normalized_encryption_keys
+
+    updated = 0
+    for job in catalog_records(JOBS):
+        parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else None
+        if not isinstance(parameters, dict) or not parameters.get("encryption_enabled"):
+            continue
+        if _normalized_encryption_keys(parameters.get("encryption_keys")):
+            continue
+        key = str(parameters.get("encryption_key") or "").strip()
+        if not key:
+            continue
+        enriched = dict(job)
+        enriched["task_parameters"] = {
+            **parameters,
+            "encryption_keys": [{"key_id": 0, "key": key}],
+            "encryption_key_id": 0,
+        }
+        persist_job(enriched)
+        updated += 1
+    return updated
+
+
+def backfill_backup_encryption_key_ids() -> int:
+    updated = 0
+    for record in catalog_records(BACKUPS):
+        key = str(record.get("encryption_key") or "").strip()
+        if not key or record.get("encryption_key_id") is not None:
+            continue
+        job = JOBS.get(str(record.get("job_id") or "")) or {}
+        key_id = _resolve_point_encryption_key_id({"task_parameters": job.get("task_parameters")}, key)
+        if key_id is None:
+            continue
+        enriched = dict(record)
+        enriched["encryption_key_id"] = key_id
         persist_backup(enriched)
         updated += 1
     return updated

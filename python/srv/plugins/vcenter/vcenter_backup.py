@@ -39,6 +39,7 @@ from ...core.storage_tool import (
 )
 from ...core.utils import utc_now
 from ...services.backup_mode import (
+    encryption_changed_since_last_backup,
     object_lock_actual_retention_days,
     object_lock_generation_plan,
     resolve_job_backup_mode,
@@ -1130,6 +1131,7 @@ def run_vcenter_backup(
     incremental = _resolve_incremental_flag(parameters)
     differential = _resolve_differential_flag(parameters)
     resolved_job_backup_mode = resolve_job_backup_mode(task, parameters)
+    encryption_rotated = encryption_changed_since_last_backup(task, parameters)
     if resolved_job_backup_mode is not None and not differential:
         incremental = resolved_job_backup_mode == "incremental"
     changed_block_backup = incremental or differential
@@ -2470,6 +2472,9 @@ def run_vcenter_backup(
             if vm_config_changed_full_required:
                 resolved_backup_type = "ActiveFull"
                 resolved_backup_reason = "VmConfigurationChanged"
+            if encryption_rotated and not incremental:
+                resolved_backup_type = "ActiveFull"
+                resolved_backup_reason = "EncryptionKeyChanged"
             manifest_payload = {
                 "format_version": 1,
                 "operation": "vm-backup",

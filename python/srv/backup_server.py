@@ -240,6 +240,18 @@ async def lifespan(_: FastAPI):
                 logger.info("Backfilled the encryption key onto %d encrypted backup point(s).", keyed)
         except Exception:
             logger.exception("Encryption key backfill failed; continuing startup without it.")
+        try:
+            listed = backup_catalog.backfill_job_encryption_keys()
+            if listed:
+                logger.info("Converted %d job(s) to the numbered encryption key list.", listed)
+        except Exception:
+            logger.exception("Job encryption key list backfill failed; continuing startup without it.")
+        try:
+            identified = backup_catalog.backfill_backup_encryption_key_ids()
+            if identified:
+                logger.info("Recorded the encryption key id on %d backup point(s).", identified)
+        except Exception:
+            logger.exception("Encryption key id backfill failed; continuing startup without it.")
         TASKS.clear()
         TASKS.update(load_tasks())
         RESOURCES_BY_HV.clear()
