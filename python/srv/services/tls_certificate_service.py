@@ -407,6 +407,59 @@ def _validate_pair(chain: list[x509.Certificate], key: Any) -> None:
             field="certificate",
         )
 
+    # An absent keyUsage leaves the key unrestricted, which browsers accept; a
+    # present one that allows neither signing nor key transport cannot carry a
+    # TLS handshake, and they refuse it outright.
+    try:
+        key_usage = leaf.extensions.get_extension_for_class(x509.KeyUsage).value
+    except x509.ExtensionNotFound:
+        key_usage = None
+    if key_usage is not None and not (key_usage.digital_signature or key_usage.key_encipherment):
+        raise _invalid(
+            "certificate_not_for_servers",
+            "The certificate cannot be used by a TLS server: its key usage allows neither "
+            "digitalSignature nor keyEncipherment. A certificate meant for signing other "
+            "certificates cannot serve the web console.",
+            field="certificate",
+        )
+
+    for position, certificate in enumerate(chain, start=1):
+        if certificate.not_valid_after_utc <= now:
+            raise _invalid(
+                "certificate_chain_expired",
+                f"Certificate {position} in the file expired on "
+                f"{certificate.not_valid_after_utc.isoformat()}. Every certificate in the chain has "
+                "to be current, or browsers refuse the whole chain.",
+                field="certificate",
+                position=position,
+                not_after=certificate.not_valid_after_utc.isoformat(),
+            )
+        if certificate.not_valid_before_utc > now + _NOT_BEFORE_TOLERANCE:
+            raise _invalid(
+                "certificate_chain_not_yet_valid",
+                f"Certificate {position} in the file is not valid until "
+                f"{certificate.not_valid_before_utc.isoformat()}.",
+                field="certificate",
+                position=position,
+                not_before=certificate.not_valid_before_utc.isoformat(),
+            )
+
+    for position, issuer in enumerate(chain[1:], start=2):
+        try:
+            constraints = issuer.extensions.get_extension_for_class(x509.BasicConstraints).value
+            is_ca = bool(constraints.ca)
+        except x509.ExtensionNotFound:
+            is_ca = False
+        if not is_ca:
+            raise _invalid(
+                "certificate_issuer_not_a_ca",
+                f"Certificate {position} in the file signs certificate {position - 1} but is not a "
+                "certificate authority (its basic constraints say CA:FALSE). Browsers refuse a chain "
+                "built on it.",
+                field="certificate",
+                position=position,
+            )
+
     for position, (child, parent) in enumerate(zip(chain, chain[1:]), start=1):
         try:
             child.verify_directly_issued_by(parent)
