@@ -270,8 +270,9 @@ class RepositoryCommands:
             dest="immutability_retention",
             choices=("job", "minimum"),
             help=(
-                "Whether the Object Lock period follows the job retention when that is longer (job, the default) "
-                "or only --immutability-days (minimum)"
+                "Whether the Object Lock period runs to the end of the job's full-backup cycle, so one "
+                "chain shares one date (job, the default), or is only --immutability-days counted from "
+                "each backup (minimum)"
             ),
         )
         add.add_argument(
@@ -361,7 +362,10 @@ class RepositoryCommands:
             "--immutability-retention",
             dest="immutability_retention",
             choices=("job", "minimum"),
-            help="Updated rule for the Object Lock period: follow the job retention when longer (job) or only --immutability-days (minimum)",
+            help=(
+                "Updated rule for the Object Lock period: run to the end of the full-backup cycle (job) "
+                "or only --immutability-days counted from each backup (minimum)"
+            ),
         )
         edit.add_argument(
             "--create-bucket",

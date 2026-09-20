@@ -646,7 +646,7 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
         warnings = result["immutability_effect"]["warnings"]
         self.assertTrue(any("Nightly" in warning for warning in warnings), warnings)
         self.assertTrue(any("the storage is paid for the whole lock" in warning for warning in warnings))
-        self.assertTrue(any("stay locked for 30 day(s)" in warning for warning in warnings), warnings)
+        self.assertTrue(any("stay locked for 40 day(s)" in warning for warning in warnings), warnings)
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")
@@ -811,15 +811,15 @@ class S3RetroactiveImmutabilityTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["updated_restore_points"], 2)
         self.assertEqual(result["failed_restore_points"], 0)
-        self.assertEqual(result["actual_retention_days"], [30])
-        self.assertIn("for 30 day(s) (30 configured", result["message"])
+        self.assertEqual(result["actual_retention_days"], [40])
+        self.assertIn("for 40 day(s) (its full-backup cycle plus the longer of the job retention and the 30 configured", result["message"])
         retention_calls = [command for command in stub.calls if command[0] == "retention"]
         self.assertEqual(len(retention_calls), 4)
         names = sorted(command[command.index("--name") + 1] for command in retention_calls)
         self.assertEqual(names, ["disk-0", "disk-1", "manifest", "manifest"])
         for command in retention_calls:
             self.assertEqual(command[command.index("--immutable") + 1], "governance")
-            self.assertEqual(command[command.index("--retention") + 1], "30")
+            self.assertEqual(command[command.index("--retention") + 1], "40")
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")
@@ -833,7 +833,7 @@ class S3RetroactiveImmutabilityTests(unittest.TestCase):
         self.assertEqual(result["updated_restore_points"], 0)
         self.assertEqual(result["failed_restore_points"], 2)
         self.assertTrue(all("already held" in f["message"] for f in result["failures"]))
-        self.assertIn("for 30 day(s)", result["message"])
+        self.assertIn("for 40 day(s)", result["message"])
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")
@@ -875,20 +875,18 @@ class S3ActualRetentionTests(unittest.TestCase):
             23,
         )
 
-    def test_the_configured_period_is_a_floor_rather_than_an_addend(self) -> None:
-        # The chain needs the cycle plus the job retention; the configured period
-        # only matters when it asks for longer than that.
+    def test_the_configured_period_runs_from_the_end_of_the_cycle(self) -> None:
         self.assertEqual(
             object_lock_actual_retention_days(
                 {"retention_days": 3}, {"retention_days": 7}, block_generation_days=10
             ),
-            13,
+            17,
         )
         self.assertEqual(
             object_lock_actual_retention_days(
                 {"retention_days": 3}, {"retention_days": 90}, block_generation_days=10
             ),
-            90,
+            100,
         )
 
     def test_minimum_only_scope_ignores_the_job_retention(self) -> None:
@@ -1060,7 +1058,7 @@ class S3ImmutabilityWarningBoundaryTests(unittest.TestCase):
 
     def test_warning_counts_the_block_generation_period(self) -> None:
         warnings = self._warnings(10, 30)
-        self.assertTrue(any("stay locked for 30 day(s)" in w for w in warnings), warnings)
+        self.assertTrue(any("stay locked for 40 day(s)" in w for w in warnings), warnings)
 
 
 class S3ImmutabilityBackupCommandTests(unittest.TestCase):

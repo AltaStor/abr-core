@@ -160,25 +160,16 @@ def object_lock_expiry(
     block_generation_days: int,
     now: datetime,
 ) -> datetime | None:
-    """When a backup taken at ``now`` stops having to be kept.
-
-    Every point of one chain resolves to the same instant: the chain is only
-    finished once its last increment has aged out, and that is the next full
-    plus the job's retention. Deriving the instant rather than a span is what
-    keeps two backups taken minutes apart on the same date, so neither rewrites
-    the other's lock.
-    """
     configured = int(immutability.get("retention_days") or 0)
     if configured < 1:
         return None
-    floor = now + timedelta(days=configured)
     if normalize_immutability_retention_scope(immutability.get("retention_scope")) != "job_retention":
-        return floor
+        return now + timedelta(days=configured)
     retention = int((job or {}).get("retention_days") or 0)
     due = next_full_due_at(job, now=now)
     if due is None:
         due = now + timedelta(days=max(int(block_generation_days), 0))
-    return max(due + timedelta(days=retention), floor)
+    return due + timedelta(days=max(retention, configured))
 
 
 def object_lock_actual_retention_days(

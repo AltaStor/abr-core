@@ -7,6 +7,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -433,8 +434,8 @@ class SyntheticFullRunTests(unittest.TestCase):
 
         synthetic_full.run_synthetic_full(self._task())
 
-        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 30)
-        self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 30)
+        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 40)
+        self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 40)
 
     @patch("python.srv.services.synthetic_full.apply_repository_immutability")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
@@ -450,8 +451,28 @@ class SyntheticFullRunTests(unittest.TestCase):
 
         generation = result["immutability_generation"]
         self.assertTrue(generation["starts_new_generation"])
-        self.assertEqual(generation["lock_days"], 30)
+        self.assertEqual(generation["lock_days"], 40)
         self.assertTrue(generation["expires_at"])
+
+    @patch("python.srv.services.synthetic_full.apply_repository_immutability")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_synthetic_full_lands_on_the_cycle_instant_not_its_own_clock(self, copy_mock, lock_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
+        REPOSITORIES[REPO_ID] = {
+            "id": REPO_ID, "name": "S3", "type": "s3",
+            "metadata": {"s3": {"bucket": "b", "region": "us-east-1",
+                                "immutability": {"mode": "governance", "retention_days": 30}}},
+        }
+        JOBS[JOB_ID]["active_full_schedule"] = {
+            "kind": "weekly", "enabled": True, "weekdays": ["wednesday"],
+            "time": "02:00", "timezone": "UTC",
+        }
+
+        result = synthetic_full.run_synthetic_full(self._task())
+
+        expires = datetime.fromisoformat(result["immutability_generation"]["expires_at"])
+        self.assertEqual((expires.hour, expires.minute, expires.second), (2, 0, 0))
+        self.assertEqual(expires.microsecond, 0)
 
     @patch("python.srv.services.synthetic_full.apply_repository_immutability")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")

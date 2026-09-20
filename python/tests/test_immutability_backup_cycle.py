@@ -78,12 +78,47 @@ class CycleDerivedLockTests(unittest.TestCase):
         self.assertGreater(days, 30 + 10)
         self.assertEqual(days, days_to_next_full(_monthly_job(), now=JAN_1) + 30)
 
-    def test_the_repository_period_is_a_floor_not_an_addend(self) -> None:
+    def test_the_configured_period_runs_from_the_end_of_the_cycle(self) -> None:
         days = object_lock_actual_retention_days(
             _job(retention=1), _immutability(days=90), block_generation_days=10, now=JAN_1
         )
 
-        self.assertEqual(days, 90)
+        self.assertEqual(days, 97)
+
+    def test_one_segment_keeps_one_date_when_the_configured_period_is_the_longer(self) -> None:
+        job, immutability = _job(retention=3), _immutability(days=10)
+        expiries = [
+            object_lock_expiry(
+                job, immutability, block_generation_days=10, now=JAN_1 + timedelta(days=offset)
+            )
+            for offset in range(0, 7)
+        ]
+
+        self.assertEqual(len(set(expiries)), 1)
+
+    def test_every_point_of_a_segment_gets_at_least_the_configured_period(self) -> None:
+        for retention in (1, 3, 7, 14, 30):
+            for configured in (1, 5, 10, 30, 90):
+                job, immutability = _job(retention=retention), _immutability(days=configured)
+                for offset in range(0, 7):
+                    moment = JAN_1 + timedelta(days=offset)
+                    expiry = object_lock_expiry(
+                        job, immutability, block_generation_days=10, now=moment
+                    )
+                    with self.subTest(retention=retention, configured=configured, offset=offset):
+                        self.assertGreaterEqual(expiry - moment, timedelta(days=configured))
+
+    def test_a_full_never_expires_before_the_increments_that_need_it(self) -> None:
+        job, immutability = _job(retention=3), _immutability(days=10)
+        full = object_lock_expiry(job, immutability, block_generation_days=10, now=JAN_1)
+
+        for offset in range(1, 7):
+            moment = JAN_1 + timedelta(days=offset)
+            increment = object_lock_expiry(
+                job, immutability, block_generation_days=10, now=moment
+            )
+            with self.subTest(offset=offset):
+                self.assertGreaterEqual(full, increment)
 
     def test_minimum_scope_still_means_the_configured_period_alone(self) -> None:
         days = object_lock_actual_retention_days(

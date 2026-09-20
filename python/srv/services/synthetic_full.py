@@ -26,7 +26,7 @@ from python.srv.core.storage_tool import (
 )
 from python.srv.core.subprocess_util import ProcessCancelled
 from python.srv.core.utils import utc_now
-from python.srv.services.backup_mode import object_lock_generation_plan
+from python.srv.services.backup_mode import object_lock_expiry, object_lock_generation_plan
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +298,7 @@ def run_synthetic_full(
     generation: dict[str, Any] | None = None
     if is_s3_repository(repository):
         immutability = extract_s3_config(repository).get("immutability") or {}
+        started_at = datetime.now(timezone.utc)
         computed = repository_actual_retention_days(job if isinstance(job, dict) else None, immutability)
         retention_days = computed or None
         if retention_days:
@@ -305,8 +306,14 @@ def run_synthetic_full(
                 f"backup::{job_id or '-'}::{vm_id or '-'}::{repository_id or '-'}",
                 actual_retention_days=int(retention_days),
                 block_generation_days=s3_block_generation_days(),
-                now=datetime.now(timezone.utc),
+                now=started_at,
                 starts_segment=True,
+                own_expiry=object_lock_expiry(
+                    job if isinstance(job, dict) else None,
+                    immutability,
+                    block_generation_days=s3_block_generation_days(),
+                    now=started_at,
+                ),
             )
             retention_days = int(generation["lock_days"])
 

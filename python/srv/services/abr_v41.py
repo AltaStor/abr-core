@@ -2949,17 +2949,17 @@ def _immutability_effect_report(
     limitations: list[str] = []
 
     if immutability_is_enabled(current):
-        effect.append(
-            f"Backups created from now on are written under {current['mode']} Object Lock retention, counted from each "
-            "backup's own creation time. The period written is "
-            + (
-                "the job's retention plus the days remaining until its next full backup, or "
-                f"{current['retention_days']} day(s) where that is longer"
-                if normalize_immutability_retention_scope(current.get("retention_scope")) == "job_retention"
-                else f"{current['retention_days']} day(s)"
+        if normalize_immutability_retention_scope(current.get("retention_scope")) == "job_retention":
+            effect.append(
+                f"Backups created from now on are written under {current['mode']} Object Lock retention. Every backup "
+                "of one chain is held to the same date: its job's next full backup, plus the longer of that job's "
+                f"retention and {current['retention_days']} day(s)."
             )
-            + "."
-        )
+        else:
+            effect.append(
+                f"Backups created from now on are written under {current['mode']} Object Lock retention for "
+                f"{current['retention_days']} day(s), counted from each backup's own creation time."
+            )
     else:
         effect.append("Immutability is disabled: new backups are written without Object Lock retention and stay deletable.")
 
@@ -3099,7 +3099,7 @@ def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:
         return f"for {configured} day(s)"
     low, high = min(applied_days), max(applied_days)
     span = f"{low} day(s)" if low == high else f"{low}-{high} day(s)"
-    return f"for {span} ({configured} configured, or the job retention plus its full-backup cycle when that is longer)"
+    return f"for {span} (its full-backup cycle plus the longer of the job retention and the {configured} configured)"
 
 
 def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
