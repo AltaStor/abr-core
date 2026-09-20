@@ -95,6 +95,7 @@ from python.srv.services.inventory_management import (
     EsxHostInClusterError,
     InventoryProviderRegistry,
     apply_inventory_updates,
+    InventoryUnreachableError,
     assert_inventory_registrable,
     creatable_inventory_types,
     default_port_for_type,
@@ -163,8 +164,11 @@ def schedule_inventory_discovery(inventory_id: str, *, force: bool = False) -> t
     def _run() -> None:
         try:
             discover_inventory_vms(inventory_id, force=force)
-        except Exception:
-            LOGGER.exception("Background inventory discovery failed for %s", inventory_id)
+        except Exception as exc:
+            LOGGER.warning(
+                "Background inventory discovery could not reach inventory %s: %s", inventory_id, exc
+            )
+            LOGGER.debug("Inventory discovery failure detail", exc_info=True)
 
     thread = threading.Thread(
         target=_run,
@@ -1475,10 +1479,6 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             "token": token or None,
         },
     }
-    # Refuse to register a standalone ESXi host that is part of a cluster --
-    # such a host must be backed up through its managing vCenter. Best-effort:
-    # an unreachable endpoint does not block registration here (re-checked at
-    # job-run time), only a positively detected cluster membership does.
     try:
         assert_inventory_registrable(record)
     except EsxHostInClusterError as exc:
@@ -1487,6 +1487,15 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             "esx_host_in_cluster",
             str(exc),
             cluster=exc.cluster_name,
+        ) from exc
+    except InventoryUnreachableError as exc:
+        raise api_error(
+            422,
+            "inventory_unreachable",
+            str(exc),
+            address=address,
+            port=effective_port,
+            reason=exc.reason,
         ) from exc
     persist_hypervisor(record)
     RESOURCES_BY_HV.setdefault(record["id"], {})

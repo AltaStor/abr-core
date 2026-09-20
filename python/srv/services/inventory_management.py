@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, TASKS, catalog_records, persist_hypervisor, replace_resources_for_hypervisor
+from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
 from python.srv.services.discovery import build_vcenter_resources, generate_inventory_discovery
 
@@ -333,6 +334,10 @@ def apply_inventory_updates(record: dict[str, Any], updates: dict[str, Any]) -> 
     return updated
 
 
+def inventory_connect_timeout() -> int:
+    return env_int("ALTASTOR_INVENTORY_CONNECT_TIMEOUT_SECONDS")
+
+
 def _endpoint_reachable(host: str, port: int, timeout: float = 1.0) -> bool:
     """Quick TCP reachability probe used to keep registration responsive.
 
@@ -348,30 +353,70 @@ def _endpoint_reachable(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
-def assert_inventory_registrable(record: dict[str, Any]) -> None:
-    """Reject registering a standalone ESXi host that is part of a cluster.
+class InventoryUnreachableError(RuntimeError):
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
-    Best-effort: only ``EsxHostInClusterError`` is propagated. A non-vSphere
-    inventory, an unreachable endpoint, or any other connection problem is
-    ignored here so offline registration keeps working -- cluster membership is
-    re-checked at job-run time, which is the hard gate.
+
+def _connection_failure(
+    exc: BaseException, host: str, port: int, *, verify_ssl: bool = True
+) -> InventoryUnreachableError:
+    chain: list[BaseException] = []
+    cursor: BaseException | None = exc
+    while cursor is not None and cursor not in chain:
+        chain.append(cursor)
+        cursor = cursor.__cause__ or cursor.__context__
+    rendered = " | ".join(str(item) for item in chain if str(item))
+    lowered = rendered.lower()
+
+    if "invalidlogin" in lowered or "incorrect user name or password" in lowered or "cannot complete login" in lowered:
+        return InventoryUnreachableError(
+            f"{host}:{port} rejected these credentials", reason="authentication"
+        )
+    if "certificate" in lowered or "ssl" in lowered or "tls" in lowered:
+        if verify_ssl:
+            return InventoryUnreachableError(
+                f"The TLS certificate of {host}:{port} was refused. Pass --insecure to register it anyway",
+                reason="certificate",
+            )
+        return InventoryUnreachableError(
+            f"{host}:{port} answered, but not with the TLS a vSphere endpoint speaks. Check the "
+            "address and port",
+            reason="certificate",
+        )
+    detail = str(exc) or rendered or "no further detail"
+    return InventoryUnreachableError(
+        f"{host}:{port} answered, but the connection could not be completed: {detail}",
+        reason="connection",
+    )
+
+
+def assert_inventory_registrable(record: dict[str, Any]) -> None:
+    """Refuse an inventory whose endpoint cannot be reached and authenticated.
+
+    This is a connectivity check, not discovery: it authenticates and asks the
+    endpoint what it is, which is sub-second against a live vCenter. Walking the
+    inventory still happens in the background after registration succeeds.
     """
     if inventory_type_from_record(record) != "vsphere":
         return
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     host = str(metadata.get("host") or "")
     port = int(metadata.get("port", 443) or 443)
-    # Only probe the cluster topology when the endpoint actually answers, so an
-    # offline/unreachable host never stalls registration.
-    if not _endpoint_reachable(host, port):
-        return
+    if not _endpoint_reachable(host, port, timeout=float(inventory_connect_timeout())):
+        raise InventoryUnreachableError(
+            f"{host}:{port} is not reachable from the backup server", reason="unreachable"
+        )
     provider = InventoryProviderRegistry.resolve(record)
     try:
         provider.test_connection(record)
     except EsxHostInClusterError:
         raise
-    except Exception:
-        return
+    except Exception as exc:
+        raise _connection_failure(
+            exc, host, port, verify_ssl=bool(metadata.get("verify_ssl", True))
+        ) from exc
 
 
 def test_inventory_connection(record: dict[str, Any]) -> dict[str, Any]:

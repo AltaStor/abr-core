@@ -172,7 +172,8 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
         self.assertNotIn(b"SuperSecretValue999", archive_bytes)
         self.assertNotIn(b"au:ap@", archive_bytes)
 
-    def test_inventory_token_is_redacted_in_the_catalog_section(self) -> None:
+    @patch("python.srv.services.abr_v41.assert_inventory_registrable", return_value=None)
+    def test_inventory_token_is_redacted_in_the_catalog_section(self, _reachable) -> None:
         from python.srv.core.mongo_db_wrapper import HYPERVISORS
         from python.srv.services import abr_v41
 

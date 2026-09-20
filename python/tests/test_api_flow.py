@@ -34,6 +34,11 @@ from python.srv.services import abr_v41
 
 class BackupServerApiFlowTests(unittest.TestCase):
     def setUp(self) -> None:
+        reachable = patch(
+            "python.srv.services.abr_v41.assert_inventory_registrable", return_value=None
+        )
+        reachable.start()
+        self.addCleanup(reachable.stop)
         app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user"}
         self.client_cm = TestClient(app)
         self.client = self.client_cm.__enter__()

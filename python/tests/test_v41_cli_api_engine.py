@@ -446,6 +446,11 @@ class AbrV41RepositoryCommandTests(unittest.TestCase):
 
 class AbrV41EngineTests(unittest.TestCase):
     def setUp(self) -> None:
+        reachable = patch(
+            "python.srv.services.abr_v41.assert_inventory_registrable", return_value=None
+        )
+        reachable.start()
+        self.addCleanup(reachable.stop)
         HYPERVISORS.clear()
         JOBS.clear()
         REPOSITORIES.clear()

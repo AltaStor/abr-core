@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 
 from python.srv.core.mongo_db_wrapper import (
@@ -23,6 +24,11 @@ MISSING_ID = "11111111-2222-3333-4444-555555555555"
 
 class RestoreRepositorySelectorTests(unittest.TestCase):
     def setUp(self) -> None:
+        reachable = patch(
+            "python.srv.services.abr_v41.assert_inventory_registrable", return_value=None
+        )
+        reachable.start()
+        self.addCleanup(reachable.stop)
         for catalog in (BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS):
             catalog.clear()
         self.inventory = abr_v41.create_inventory_record(
