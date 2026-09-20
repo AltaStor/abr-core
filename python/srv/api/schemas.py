@@ -25,6 +25,7 @@ DocObject = Annotated[Any, Field(json_schema_extra={"type": "object"})]
 DocArray = Annotated[Any, Field(json_schema_extra={"type": "array"})]
 DocStrArray = Annotated[Any, Field(json_schema_extra={"type": "array", "items": {"type": "string"}})]
 DocObjectArray = Annotated[Any, Field(json_schema_extra={"type": "array", "items": {"type": "object"}})]
+DocStrOrNull = Annotated[Any, Field(json_schema_extra={"anyOf": [{"type": "string"}, {"type": "null"}]})]
 
 
 class JobDTO(_LenientModel):
@@ -584,29 +585,84 @@ class TlsCertificateInstallRequest(_LenientModel):
     )
 
 
+TLS_WARNING_CODES = [
+    "expired",
+    "expires_soon",
+    "no_subject_alternative_names",
+    "appliance_names_not_covered",
+]
+
+DocTlsWarningArray = Annotated[
+    Any,
+    Field(
+        json_schema_extra={
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["code", "message"],
+                "properties": {
+                    "code": {"type": "string", "enum": TLS_WARNING_CODES},
+                    "message": {"type": "string"},
+                    "days_remaining": {
+                        "type": "integer",
+                        "description": 'Only on "expires_soon": days left before the certificate expires.',
+                    },
+                    "appliance_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            'Only on "appliance_names_not_covered": this appliance\'s own host '
+                            "names and addresses, none of which the certificate lists."
+                        ),
+                    },
+                },
+            },
+        }
+    ),
+]
+
+
 class TlsCertificateDTO(_LenientModel):
-    source: DocStr = None
-    auto_renew: DocBool = None
-    subject: DocStr = None
-    common_name: DocStr = None
-    issuer: DocStr = None
-    issuer_common_name: DocStr = None
-    self_signed: DocBool = None
-    dns_names: DocStrArray = None
-    ip_addresses: DocStrArray = None
-    serial_number: DocStr = None
-    fingerprint_sha256: DocStr = None
-    key_type: DocStr = None
-    not_before: DocStr = None
-    not_after: DocStr = None
-    days_remaining: DocInt = None
-    expired: DocBool = None
-    chain_length: DocInt = None
-    installed_at: DocStr = None
-    installed_by: DocStr = None
-    live_reload: DocBool = None
-    reloaded: DocBool = None
-    warnings: DocObjectArray = None
+    source: DocStr
+    auto_renew: DocBool
+    subject: DocStr
+    common_name: DocStrOrNull = Field(
+        description="Subject common name, or null when the certificate carries none."
+    )
+    issuer: DocStr
+    issuer_common_name: DocStrOrNull = Field(
+        description="Issuer common name, or null when the issuer carries none."
+    )
+    self_signed: DocBool
+    dns_names: DocStrArray
+    ip_addresses: DocStrArray
+    serial_number: DocStr
+    fingerprint_sha256: DocStr
+    key_type: DocStr
+    not_before: DocStr
+    not_after: DocStr
+    days_remaining: DocInt
+    expired: DocBool
+    chain_length: DocInt
+    installed_at: DocStrOrNull = Field(
+        description=(
+            "When an administrator installed this certificate, ISO 8601. Null for a "
+            'generated certificate, which nobody installed (source "generated", and for '
+            "an administrator certificate copied over the files by hand)."
+        )
+    )
+    installed_by: DocStrOrNull = Field(
+        description=(
+            "Who installed this certificate. Null for a generated certificate, for one "
+            "copied over the files by hand, and when the request carried no user."
+        )
+    )
+    live_reload: DocBool
+    warnings: DocTlsWarningArray
+
+
+class TlsCertificateChangeDTO(TlsCertificateDTO):
+    reloaded: DocBool
 
 
 class SystemHealthDTO(_LenientModel):
@@ -730,7 +786,10 @@ class SystemLogsDTO(_LenientModel):
     entries: DocObjectArray = None
     total: DocInt = None
     limit: DocInt = None
-    level: DocStr = None
+    level: DocStrOrNull = Field(
+        default=None,
+        description="The minimum level the entries were filtered to, or null when none was asked for.",
+    )
     has_more: DocBool = None
     files: DocStrArray = None
     searched: DocStrArray = None

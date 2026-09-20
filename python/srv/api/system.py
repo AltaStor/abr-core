@@ -23,6 +23,7 @@ from .schemas import (
     SystemInfoDTO,
     SystemLogsDTO,
     SystemVersionDTO,
+    TlsCertificateChangeDTO,
     TlsCertificateDTO,
     TlsCertificateInstallRequest,
     unset_excluded,
@@ -97,7 +98,7 @@ def get_tls_certificate() -> TlsCertificateDTO:
 def install_tls_certificate(
     request: Request,
     payload: TlsCertificateInstallRequest = Body(default_factory=TlsCertificateInstallRequest),
-) -> TlsCertificateDTO:
+) -> TlsCertificateChangeDTO:
     """Replace the HTTPS certificate and private key.
 
     Everything is validated before anything on disk changes: the PEM parses, the
@@ -116,7 +117,7 @@ def install_tls_certificate(
     )
 
 
-def revert_tls_certificate(request: Request) -> TlsCertificateDTO:
+def revert_tls_certificate(request: Request) -> TlsCertificateChangeDTO:
     """Remove the administrator's certificate and go back to a self-signed one.
 
     A new key and self-signed certificate are generated and loaded into the
