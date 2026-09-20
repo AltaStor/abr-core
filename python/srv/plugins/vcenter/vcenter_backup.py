@@ -41,6 +41,7 @@ from ...core.utils import utc_now
 from ...services.backup_mode import (
     encryption_changed_since_last_backup,
     object_lock_actual_retention_days,
+    object_lock_expiry,
     object_lock_generation_plan,
     resolve_job_backup_mode,
 )
@@ -129,18 +130,28 @@ def _task_chain_id(task: dict[str, Any], repository_id: str) -> str:
 def _resolve_immutability_plan(task: dict[str, Any], repository: dict[str, Any]) -> dict[str, Any]:
     job_id = task.get("job_id")
     job = JOBS.get(str(job_id)) if isinstance(job_id, str) else None
+    started_at = _parse_task_start(task)
+    immutability = extract_s3_config(repository).get("immutability") or {}
     actual_days = object_lock_actual_retention_days(
         job if isinstance(job, dict) else None,
-        extract_s3_config(repository).get("immutability") or {},
+        immutability,
         block_generation_days=s3_block_generation_days(),
+        now=started_at,
+    )
+    expiry = object_lock_expiry(
+        job if isinstance(job, dict) else None,
+        immutability,
+        block_generation_days=s3_block_generation_days(),
+        now=started_at,
     )
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     return object_lock_generation_plan(
         _task_chain_id(task, str(repository.get("id") or "")),
         actual_retention_days=actual_days,
         block_generation_days=s3_block_generation_days(),
-        now=_parse_task_start(task),
+        now=started_at,
         starts_segment=resolve_job_backup_mode(task, parameters) == "full",
+        own_expiry=expiry,
     )
 
 

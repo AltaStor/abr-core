@@ -2949,16 +2949,16 @@ def _immutability_effect_report(
     limitations: list[str] = []
 
     if immutability_is_enabled(current):
-        generation_days = s3_block_generation_days()
         effect.append(
             f"Backups created from now on are written under {current['mode']} Object Lock retention, counted from each "
             "backup's own creation time. The period written is "
             + (
-                f"the longer of the job's retention and {current['retention_days']} day(s)"
+                "the job's retention plus the days remaining until its next full backup, or "
+                f"{current['retention_days']} day(s) where that is longer"
                 if normalize_immutability_retention_scope(current.get("retention_scope")) == "job_retention"
                 else f"{current['retention_days']} day(s)"
             )
-            + f", plus a {generation_days}-day block generation period."
+            + "."
         )
     else:
         effect.append("Immutability is disabled: new backups are written without Object Lock retention and stay deletable.")
@@ -2970,10 +2970,9 @@ def _immutability_effect_report(
         )
         if immutability_is_enabled(previous):
             limitations.append(
-                f"Each keeps the {previous['mode']} retention it was written under, counted from its own creation: "
-                "the period configured at the time plus the block generation period, and the job's retention instead "
-                "where that was longer. AltaStor does not track the resulting date per restore point, so read it from "
-                "the storage."
+                f"Each keeps the {previous['mode']} retention it was written under, counted from its own creation "
+                "and derived from the settings in force at the time. The resulting date is recorded on the restore "
+                "point, and the storage holds the authoritative copy."
             )
         else:
             limitations.append(
@@ -3100,7 +3099,7 @@ def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:
         return f"for {configured} day(s)"
     low, high = min(applied_days), max(applied_days)
     span = f"{low} day(s)" if low == high else f"{low}-{high} day(s)"
-    return f"for {span} ({configured} configured plus job retention and the block generation period)"
+    return f"for {span} ({configured} configured, or the job retention plus its full-backup cycle when that is longer)"
 
 
 def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:

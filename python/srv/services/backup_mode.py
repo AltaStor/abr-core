@@ -129,20 +129,72 @@ def resolve_job_backup_mode(task: dict[str, Any], parameters: dict[str, Any]) ->
     return "incremental"
 
 
+def next_full_due_at(job: dict[str, Any] | None, *, now: datetime) -> datetime | None:
+    schedule = (job or {}).get("active_full_schedule")
+    if not isinstance(schedule, dict) or not bool(schedule.get("enabled", True)):
+        return None
+    from python.srv.services.abr_v41 import schedule_next_run
+
+    try:
+        due = schedule_next_run(schedule, after=now)
+    except Exception:
+        return None
+    return due if due.tzinfo else due.replace(tzinfo=timezone.utc)
+
+
+def days_to_next_full(job: dict[str, Any] | None, *, now: datetime) -> int | None:
+    due = next_full_due_at(job, now=now)
+    if due is None:
+        return None
+    return max(int(-(-((due - now).total_seconds() / 86400) // 1)), 1)
+
+
+def _ceil_days(span: timedelta) -> int:
+    return max(int(-(-(span.total_seconds() / 86400) // 1)), 1)
+
+
+def object_lock_expiry(
+    job: dict[str, Any] | None,
+    immutability: dict[str, Any],
+    *,
+    block_generation_days: int,
+    now: datetime,
+) -> datetime | None:
+    """When a backup taken at ``now`` stops having to be kept.
+
+    Every point of one chain resolves to the same instant: the chain is only
+    finished once its last increment has aged out, and that is the next full
+    plus the job's retention. Deriving the instant rather than a span is what
+    keeps two backups taken minutes apart on the same date, so neither rewrites
+    the other's lock.
+    """
+    configured = int(immutability.get("retention_days") or 0)
+    if configured < 1:
+        return None
+    floor = now + timedelta(days=configured)
+    if normalize_immutability_retention_scope(immutability.get("retention_scope")) != "job_retention":
+        return floor
+    retention = int((job or {}).get("retention_days") or 0)
+    due = next_full_due_at(job, now=now)
+    if due is None:
+        due = now + timedelta(days=max(int(block_generation_days), 0))
+    return max(due + timedelta(days=retention), floor)
+
+
 def object_lock_actual_retention_days(
     job: dict[str, Any] | None,
     immutability: dict[str, Any],
     *,
     block_generation_days: int,
+    now: datetime | None = None,
 ) -> int:
-    configured = int(immutability.get("retention_days") or 0)
-    if configured < 1:
+    moment = now or datetime.now(timezone.utc)
+    expiry = object_lock_expiry(
+        job, immutability, block_generation_days=block_generation_days, now=moment
+    )
+    if expiry is None:
         return 0
-    scope = normalize_immutability_retention_scope(immutability.get("retention_scope"))
-    base = configured
-    if scope == "job_retention":
-        base = max(base, int((job or {}).get("retention_days") or 0))
-    return base + max(int(block_generation_days), 0)
+    return _ceil_days(expiry - moment)
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -180,27 +232,25 @@ def object_lock_generation_plan(
     block_generation_days: int,
     now: datetime,
     starts_segment: bool = False,
+    own_expiry: datetime | None = None,
 ) -> dict[str, Any]:
-    actual_retention_days = int(actual_retention_days)
-    if actual_retention_days < 1:
+    if own_expiry is None:
+        own_expiry = now + timedelta(days=int(actual_retention_days))
+    if int(actual_retention_days) < 1:
         return {"lock_days": 0, "generation_started_at": None, "expires_at": None, "starts_new_generation": False}
 
     started, expires = (None, None) if starts_segment else _chain_generation(chain_id)
-    promised = max(actual_retention_days - max(int(block_generation_days), 0), 1)
-    if started is not None and expires is not None:
-        remaining = (expires - now).total_seconds() / 86400
-        if remaining >= promised:
-            return {
-                "lock_days": max(int(-(-remaining // 1)), 1),
-                "generation_started_at": started.isoformat(),
-                "expires_at": expires.isoformat(),
-                "starts_new_generation": False,
-            }
+    if started is not None and expires is not None and expires >= own_expiry:
+        return {
+            "lock_days": _ceil_days(expires - now),
+            "generation_started_at": started.isoformat(),
+            "expires_at": expires.isoformat(),
+            "starts_new_generation": False,
+        }
 
-    expires_at = now + timedelta(days=actual_retention_days)
     return {
-        "lock_days": actual_retention_days,
+        "lock_days": _ceil_days(own_expiry - now),
         "generation_started_at": now.isoformat(),
-        "expires_at": expires_at.isoformat(),
+        "expires_at": own_expiry.isoformat(),
         "starts_new_generation": True,
     }

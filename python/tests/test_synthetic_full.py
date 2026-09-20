@@ -433,8 +433,8 @@ class SyntheticFullRunTests(unittest.TestCase):
 
         synthetic_full.run_synthetic_full(self._task())
 
-        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 40)
-        self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 40)
+        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 30)
+        self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 30)
 
     @patch("python.srv.services.synthetic_full.apply_repository_immutability")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
@@ -450,7 +450,7 @@ class SyntheticFullRunTests(unittest.TestCase):
 
         generation = result["immutability_generation"]
         self.assertTrue(generation["starts_new_generation"])
-        self.assertEqual(generation["lock_days"], 40)
+        self.assertEqual(generation["lock_days"], 30)
         self.assertTrue(generation["expires_at"])
 
     @patch("python.srv.services.synthetic_full.apply_repository_immutability")
@@ -481,8 +481,8 @@ class SyntheticFullRunTests(unittest.TestCase):
 
         synthetic_full.run_synthetic_full(self._task())
 
-        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 15)
-        self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 15)
+        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 5)
+        self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 5)
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_an_unreadable_source_manifest_stops_the_merge(self, copy_mock) -> None:

@@ -74,9 +74,24 @@ class RegistrationRefusesAnEndpointItCannotUseTests(unittest.TestCase):
         self.assertIn("rejected these credentials", caught.exception.message)
         self.assertEqual(list(HYPERVISORS), [])
 
-    def test_a_refused_certificate_is_named_and_points_at_the_flag(self) -> None:
+    def test_a_refused_certificate_points_at_the_flag_when_verification_was_on(self) -> None:
         failure = RuntimeError("Unable to connect")
         failure.__cause__ = Exception("certificate verify failed: self signed certificate")
+        payload = dict(PAYLOAD)
+        payload.pop("insecure")
+
+        with patch.object(inventory_management, "_endpoint_reachable", return_value=True), patch.object(
+            inventory_management.VsphereInventoryProvider, "test_connection", side_effect=failure
+        ):
+            with self.assertRaises(ApiError) as caught:
+                abr_v41.create_inventory_record(payload)
+
+        self.assertEqual(caught.exception.details.get("reason"), "certificate")
+        self.assertIn("--insecure", caught.exception.message)
+
+    def test_a_tls_failure_with_insecure_already_set_does_not_suggest_it_again(self) -> None:
+        failure = RuntimeError("Unable to connect")
+        failure.__cause__ = Exception("ssl: wrong version number")
 
         with patch.object(inventory_management, "_endpoint_reachable", return_value=True), patch.object(
             inventory_management.VsphereInventoryProvider, "test_connection", side_effect=failure
@@ -85,7 +100,8 @@ class RegistrationRefusesAnEndpointItCannotUseTests(unittest.TestCase):
                 abr_v41.create_inventory_record(dict(PAYLOAD))
 
         self.assertEqual(caught.exception.details.get("reason"), "certificate")
-        self.assertIn("--insecure", caught.exception.message)
+        self.assertNotIn("--insecure", caught.exception.message)
+        self.assertIn("Check the address and port", caught.exception.message)
 
     def test_any_other_connection_failure_still_refuses_with_its_detail(self) -> None:
         with patch.object(inventory_management, "_endpoint_reachable", return_value=True), patch.object(
