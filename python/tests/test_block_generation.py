@@ -47,25 +47,21 @@ class BlockGenerationPlanTests(unittest.TestCase):
         self.assertEqual(plan["lock_days"], 40)
         self.assertEqual(plan["expires_at"], (START + timedelta(days=40)).isoformat())
 
-    def test_a_backup_inside_the_window_joins_the_generation_and_shares_its_expiry(self) -> None:
+    def test_a_backup_that_needs_no_more_than_the_chain_has_joins_it(self) -> None:
         BACKUPS["point-1"] = _point("point-1", started_at=START, expires_at=START + timedelta(days=40))
 
-        plan = self._plan(START + timedelta(days=9))
+        # Nine days into the cycle the next full is nine days nearer, so this
+        # point asks for nine days less and the chain's date already covers it.
+        plan = self._plan(START + timedelta(days=9), retention=31)
 
         self.assertFalse(plan["starts_new_generation"])
         self.assertEqual(plan["expires_at"], (START + timedelta(days=40)).isoformat())
         self.assertEqual(plan["lock_days"], 31)
 
-    def test_a_joined_backup_still_keeps_at_least_the_configured_period(self) -> None:
+    def test_a_backup_that_needs_longer_than_the_chain_has_pushes_it_out(self) -> None:
         BACKUPS["point-1"] = _point("point-1", started_at=START, expires_at=START + timedelta(days=40))
 
-        plan = self._plan(START + timedelta(days=10) - timedelta(seconds=1))
-
-        self.assertGreaterEqual(plan["lock_days"], 30)
-
-    def test_a_backup_past_the_window_opens_the_next_generation(self) -> None:
-        BACKUPS["point-1"] = _point("point-1", started_at=START, expires_at=START + timedelta(days=40))
-
+        # The full never came, so this point is still a whole cycle away from one.
         now = START + timedelta(days=11)
         plan = self._plan(now)
 
@@ -89,7 +85,7 @@ class BlockGenerationPlanTests(unittest.TestCase):
         self.assertTrue(plan["starts_new_generation"])
         self.assertEqual(plan["expires_at"], (now + timedelta(days=40)).isoformat())
 
-    def test_raising_the_period_mid_generation_cuts_the_generation_short(self) -> None:
+    def test_raising_the_period_mid_chain_pushes_the_chain_out(self) -> None:
         BACKUPS["point-1"] = _point("point-1", started_at=START, expires_at=START + timedelta(days=40))
 
         now = START + timedelta(days=2)
@@ -100,7 +96,7 @@ class BlockGenerationPlanTests(unittest.TestCase):
         self.assertTrue(plan["starts_new_generation"])
         self.assertEqual(plan["lock_days"], 70)
 
-    def test_lowering_the_period_mid_generation_still_joins(self) -> None:
+    def test_lowering_the_period_mid_chain_never_shortens_what_is_already_held(self) -> None:
         BACKUPS["point-1"] = _point("point-1", started_at=START, expires_at=START + timedelta(days=40))
 
         plan = object_lock_generation_plan(

@@ -39,7 +39,9 @@ from ...core.storage_tool import (
 )
 from ...core.utils import utc_now
 from ...services.backup_mode import (
+    encryption_changed_since_last_backup,
     object_lock_actual_retention_days,
+    object_lock_expiry,
     object_lock_generation_plan,
     resolve_job_backup_mode,
 )
@@ -128,18 +130,28 @@ def _task_chain_id(task: dict[str, Any], repository_id: str) -> str:
 def _resolve_immutability_plan(task: dict[str, Any], repository: dict[str, Any]) -> dict[str, Any]:
     job_id = task.get("job_id")
     job = JOBS.get(str(job_id)) if isinstance(job_id, str) else None
+    started_at = _parse_task_start(task)
+    immutability = extract_s3_config(repository).get("immutability") or {}
     actual_days = object_lock_actual_retention_days(
         job if isinstance(job, dict) else None,
-        extract_s3_config(repository).get("immutability") or {},
+        immutability,
         block_generation_days=s3_block_generation_days(),
+        now=started_at,
+    )
+    expiry = object_lock_expiry(
+        job if isinstance(job, dict) else None,
+        immutability,
+        block_generation_days=s3_block_generation_days(),
+        now=started_at,
     )
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     return object_lock_generation_plan(
         _task_chain_id(task, str(repository.get("id") or "")),
         actual_retention_days=actual_days,
         block_generation_days=s3_block_generation_days(),
-        now=_parse_task_start(task),
+        now=started_at,
         starts_segment=resolve_job_backup_mode(task, parameters) == "full",
+        own_expiry=expiry,
     )
 
 
@@ -374,7 +386,10 @@ def _get_resource(task: dict[str, Any]) -> dict[str, Any]:
     resource = RESOURCES_BY_HV.get(hypervisor_id, {}).get((resource_type, resource_external_id))
     if not resource:
         raise VCenterBackupError(
-            f"Discovered resource not found for task: {resource_type}:{resource_external_id}"
+            f"{resource_type} {resource_external_id} is no longer in the inventory of this "
+            "hypervisor, so it cannot be read from the source side. Run inventory rescan if the "
+            "object is still there; if it has been deleted, this operation needs the object itself "
+            "and cannot proceed"
         )
     return resource
 
@@ -382,7 +397,11 @@ def _get_resource(task: dict[str, Any]) -> dict[str, Any]:
 def _get_vm_resource(hypervisor_id: str, vm_id: str) -> dict[str, Any]:
     resource = RESOURCES_BY_HV.get(hypervisor_id, {}).get(("virtual_machine", vm_id))
     if not resource:
-        raise VCenterBackupError(f"Virtual machine resource not found: {vm_id}")
+        raise VCenterBackupError(
+            f"Virtual machine {vm_id} is no longer in the inventory of this hypervisor. Run "
+            "inventory rescan if it is still there; a disk-level restore rebuilds one disk of an "
+            "existing machine and cannot proceed without it"
+        )
     return resource
 
 
@@ -660,7 +679,9 @@ def _build_backup_command(
         "--json",
         "--name",
         backup_name,
-        *disk_tool_storage_args(repository, abr_path=abr_path, create_folder=True),
+        *disk_tool_storage_args(
+            repository, abr_path=abr_path, create_folder=not is_s3_repository(repository)
+        ),
         *disk_tool_immutability_args(repository),
         "--compression",
         str(compression_level),
@@ -1121,6 +1142,7 @@ def run_vcenter_backup(
     incremental = _resolve_incremental_flag(parameters)
     differential = _resolve_differential_flag(parameters)
     resolved_job_backup_mode = resolve_job_backup_mode(task, parameters)
+    encryption_rotated = encryption_changed_since_last_backup(task, parameters)
     if resolved_job_backup_mode is not None and not differential:
         incremental = resolved_job_backup_mode == "incremental"
     changed_block_backup = incremental or differential
@@ -2461,6 +2483,9 @@ def run_vcenter_backup(
             if vm_config_changed_full_required:
                 resolved_backup_type = "ActiveFull"
                 resolved_backup_reason = "VmConfigurationChanged"
+            if encryption_rotated and not incremental:
+                resolved_backup_type = "ActiveFull"
+                resolved_backup_reason = "EncryptionKeyChanged"
             manifest_payload = {
                 "format_version": 1,
                 "operation": "vm-backup",

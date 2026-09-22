@@ -65,6 +65,50 @@ def has_previous_successful_backup(task: dict[str, Any]) -> bool:
     return False
 
 
+def _newest_point_of_chain(task: dict[str, Any]) -> dict[str, Any] | None:
+    job_id = str(task.get("job_id") or "").strip()
+    hypervisor_id = str(task.get("hypervisor_id") or "").strip()
+    resource_type = str(task.get("resource_type") or "").strip()
+    resource_external_id = str(task.get("resource_external_id") or "").strip()
+    newest: dict[str, Any] | None = None
+    newest_created = ""
+    for backup in catalog_records(BACKUPS):
+        if str(backup.get("status") or "") not in {"available", "completed", "healthy"}:
+            continue
+        origin = backup.get("origin") if isinstance(backup.get("origin"), dict) else {}
+        source = backup.get("source") if isinstance(backup.get("source"), dict) else {}
+        matches = bool(job_id) and str(origin.get("job_id") or "").strip() == job_id
+        if not matches:
+            matches = (
+                str(source.get("hypervisor_id") or "").strip() == hypervisor_id
+                and str(source.get("resource_type") or "").strip() == resource_type
+                and str(source.get("resource_external_id") or "").strip() == resource_external_id
+            )
+        if not matches:
+            continue
+        created = str(backup.get("created_at") or "")
+        if newest is None or created > newest_created:
+            newest, newest_created = backup, created
+    return newest
+
+
+def encryption_changed_since_last_backup(task: dict[str, Any], parameters: dict[str, Any]) -> bool:
+    newest = _newest_point_of_chain(task)
+    if newest is None:
+        return False
+    previous_enabled = bool(newest.get("encryption_enabled"))
+    previous_key = str(newest.get("encryption_key") or "").strip()
+    current_key = str(parameters.get("encryption_key") or "").strip()
+    current_enabled = bool(parameters.get("encryption_enabled")) and bool(current_key)
+    if previous_enabled != current_enabled:
+        return True
+    if not current_enabled:
+        return False
+    if not previous_key:
+        return False
+    return previous_key != current_key
+
+
 def resolve_job_backup_mode(task: dict[str, Any], parameters: dict[str, Any]) -> EffectiveBackupMode | None:
     normalized_execution_type = _normalized_execution_type(parameters)
     if normalized_execution_type == "incremental":
@@ -80,7 +124,52 @@ def resolve_job_backup_mode(task: dict[str, Any], parameters: dict[str, Any]) ->
         return "full"
     if requested_mode == "full":
         return "full"
+    if encryption_changed_since_last_backup(task, parameters):
+        return "full"
     return "incremental"
+
+
+def next_full_due_at(job: dict[str, Any] | None, *, now: datetime) -> datetime | None:
+    schedule = (job or {}).get("active_full_schedule")
+    if not isinstance(schedule, dict) or not bool(schedule.get("enabled", True)):
+        return None
+    from python.srv.services.abr_v41 import schedule_next_run
+
+    try:
+        due = schedule_next_run(schedule, after=now)
+    except Exception:
+        return None
+    return due if due.tzinfo else due.replace(tzinfo=timezone.utc)
+
+
+def days_to_next_full(job: dict[str, Any] | None, *, now: datetime) -> int | None:
+    due = next_full_due_at(job, now=now)
+    if due is None:
+        return None
+    return max(int(-(-((due - now).total_seconds() / 86400) // 1)), 1)
+
+
+def _ceil_days(span: timedelta) -> int:
+    return max(int(-(-(span.total_seconds() / 86400) // 1)), 1)
+
+
+def object_lock_expiry(
+    job: dict[str, Any] | None,
+    immutability: dict[str, Any],
+    *,
+    block_generation_days: int,
+    now: datetime,
+) -> datetime | None:
+    configured = int(immutability.get("retention_days") or 0)
+    if configured < 1:
+        return None
+    if normalize_immutability_retention_scope(immutability.get("retention_scope")) != "job_retention":
+        return now + timedelta(days=configured)
+    retention = int((job or {}).get("retention_days") or 0)
+    due = next_full_due_at(job, now=now)
+    if due is None:
+        due = now + timedelta(days=max(int(block_generation_days), 0))
+    return due + timedelta(days=max(retention, configured))
 
 
 def object_lock_actual_retention_days(
@@ -88,15 +177,15 @@ def object_lock_actual_retention_days(
     immutability: dict[str, Any],
     *,
     block_generation_days: int,
+    now: datetime | None = None,
 ) -> int:
-    configured = int(immutability.get("retention_days") or 0)
-    if configured < 1:
+    moment = now or datetime.now(timezone.utc)
+    expiry = object_lock_expiry(
+        job, immutability, block_generation_days=block_generation_days, now=moment
+    )
+    if expiry is None:
         return 0
-    scope = normalize_immutability_retention_scope(immutability.get("retention_scope"))
-    base = configured
-    if scope == "job_retention":
-        base = max(base, int((job or {}).get("retention_days") or 0))
-    return base + max(int(block_generation_days), 0)
+    return _ceil_days(expiry - moment)
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -134,27 +223,25 @@ def object_lock_generation_plan(
     block_generation_days: int,
     now: datetime,
     starts_segment: bool = False,
+    own_expiry: datetime | None = None,
 ) -> dict[str, Any]:
-    actual_retention_days = int(actual_retention_days)
-    if actual_retention_days < 1:
+    if own_expiry is None:
+        own_expiry = now + timedelta(days=int(actual_retention_days))
+    if int(actual_retention_days) < 1:
         return {"lock_days": 0, "generation_started_at": None, "expires_at": None, "starts_new_generation": False}
 
     started, expires = (None, None) if starts_segment else _chain_generation(chain_id)
-    promised = max(actual_retention_days - max(int(block_generation_days), 0), 1)
-    if started is not None and expires is not None:
-        remaining = (expires - now).total_seconds() / 86400
-        if remaining >= promised:
-            return {
-                "lock_days": max(int(-(-remaining // 1)), 1),
-                "generation_started_at": started.isoformat(),
-                "expires_at": expires.isoformat(),
-                "starts_new_generation": False,
-            }
+    if started is not None and expires is not None and expires >= own_expiry:
+        return {
+            "lock_days": _ceil_days(expires - now),
+            "generation_started_at": started.isoformat(),
+            "expires_at": expires.isoformat(),
+            "starts_new_generation": False,
+        }
 
-    expires_at = now + timedelta(days=actual_retention_days)
     return {
-        "lock_days": actual_retention_days,
+        "lock_days": _ceil_days(own_expiry - now),
         "generation_started_at": now.isoformat(),
-        "expires_at": expires_at.isoformat(),
+        "expires_at": own_expiry.isoformat(),
         "starts_new_generation": True,
     }

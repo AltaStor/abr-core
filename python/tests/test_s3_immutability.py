@@ -202,7 +202,10 @@ class S3ImmutabilityRepositoryTests(unittest.TestCase):
             settings["immutability"] = immutability
         return abr_v41.create_repository_record({"name": "ObjectRepo", "type": "s3", "s3": settings})
 
-    def test_repository_without_immutability_stays_disabled(self) -> None:
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_repository_without_immutability_stays_disabled(self, run_mock, _connect) -> None:
+        run_mock.side_effect = _disk_tool_stub()
         repository = self._create_repository()
         self.assertEqual(repository["immutability"], {"mode": "none", "retention_days": 0, "retention_scope": "job_retention"})
         self.assertTrue(repository["capabilities"]["supports_immutability"])
@@ -544,7 +547,7 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
         self.assertTrue(any("60 day(s)" in line for line in effect["effect"]))
         self.assertTrue(any("run 'repo apply-immutability'" in line for line in effect["limitations"]))
         self.assertTrue(
-            any("does not track the resulting date per restore point" in line for line in effect["limitations"])
+            any("recorded on the restore point" in line for line in effect["limitations"])
         )
         self.assertFalse(
             any("30 day(s)" in line for line in effect["limitations"]),
@@ -585,7 +588,12 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
 
         self.assertEqual(result["immutability"], {"mode": "none", "retention_days": 0, "retention_scope": "job_retention"})
 
-    def test_empty_edit_of_a_record_written_before_immutability_is_still_rejected(self) -> None:
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_empty_edit_of_a_record_written_before_immutability_is_still_rejected(
+        self, run_mock, _connect
+    ) -> None:
+        run_mock.side_effect = _disk_tool_stub()
         REPOSITORIES["legacy"] = {
             "id": "legacy",
             "name": "Legacy",
@@ -659,8 +667,8 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
         )
 
         warnings = result["immutability_effect"]["warnings"]
-        self.assertTrue(any("locked for only 40 day(s)" in warning for warning in warnings), warnings)
-        self.assertTrue(any("from day 40 to day 90" in warning for warning in warnings), warnings)
+        self.assertTrue(any("locked for only 30 day(s)" in warning for warning in warnings), warnings)
+        self.assertTrue(any("from day 30 to day 90" in warning for warning in warnings), warnings)
 
 
 class S3ImmutabilityDeletionReportingTests(unittest.TestCase):
@@ -804,7 +812,7 @@ class S3RetroactiveImmutabilityTests(unittest.TestCase):
         self.assertEqual(result["updated_restore_points"], 2)
         self.assertEqual(result["failed_restore_points"], 0)
         self.assertEqual(result["actual_retention_days"], [40])
-        self.assertIn("for 40 day(s) (30 configured", result["message"])
+        self.assertIn("for 40 day(s) (its full-backup cycle plus the longer of the job retention and the 30 configured", result["message"])
         retention_calls = [command for command in stub.calls if command[0] == "retention"]
         self.assertEqual(len(retention_calls), 4)
         names = sorted(command[command.index("--name") + 1] for command in retention_calls)
@@ -867,12 +875,18 @@ class S3ActualRetentionTests(unittest.TestCase):
             23,
         )
 
-    def test_actual_retention_uses_the_configured_period_when_the_job_is_shorter(self) -> None:
+    def test_the_configured_period_runs_from_the_end_of_the_cycle(self) -> None:
         self.assertEqual(
             object_lock_actual_retention_days(
                 {"retention_days": 3}, {"retention_days": 7}, block_generation_days=10
             ),
             17,
+        )
+        self.assertEqual(
+            object_lock_actual_retention_days(
+                {"retention_days": 3}, {"retention_days": 90}, block_generation_days=10
+            ),
+            100,
         )
 
     def test_minimum_only_scope_ignores_the_job_retention(self) -> None:
@@ -882,7 +896,7 @@ class S3ActualRetentionTests(unittest.TestCase):
                 {"retention_days": 7, "retention_scope": "minimum_only"},
                 block_generation_days=10,
             ),
-            17,
+            7,
         )
 
     def test_actual_retention_is_zero_when_immutability_is_disabled(self) -> None:
@@ -1040,7 +1054,7 @@ class S3ImmutabilityWarningBoundaryTests(unittest.TestCase):
 
     def test_minimum_only_scope_warns_about_the_unprotected_gap(self) -> None:
         warnings = self._warnings(90, 7, scope="minimum_only")
-        self.assertTrue(any("from day 17 to day 90" in w for w in warnings), warnings)
+        self.assertTrue(any("from day 7 to day 90" in w for w in warnings), warnings)
 
     def test_warning_counts_the_block_generation_period(self) -> None:
         warnings = self._warnings(10, 30)

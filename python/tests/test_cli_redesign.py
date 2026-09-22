@@ -495,12 +495,15 @@ class RepositoryApiEditTests(unittest.TestCase):
         self.assertEqual(created.status_code, 200)
         repository = created.json()
 
+        moved_path = os.path.join(self._repo_root, "backup-new")
+        os.makedirs(moved_path, exist_ok=True)
+        os.chmod(moved_path, 0o750)
         updated = self.client.patch(
             f"/api/v1/repositories/{repository['id']}",
-            json={"path": "/mnt/backup-new", "metadata": {}},
+            json={"path": moved_path, "metadata": {}},
         )
         self.assertEqual(updated.status_code, 200)
-        self.assertEqual(updated.json()["path"], "/mnt/backup-new")
+        self.assertEqual(updated.json()["path"], moved_path)
 
     def test_delete_repository_with_unknown_id_returns_404(self) -> None:
         response = self.client.delete("/api/v1/repositories/00000000-0000-0000-0000-000000000000")

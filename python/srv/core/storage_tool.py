@@ -389,7 +389,11 @@ def copy_disk_tool_chain(
         "--json",
         "--name",
         backup_name,
-        *disk_tool_storage_args(destination_repository, abr_path=destination_abr_path, create_folder=True),
+        *disk_tool_storage_args(
+            destination_repository,
+            abr_path=destination_abr_path,
+            create_folder=not is_s3_repository(destination_repository),
+        ),
         *disk_tool_source_storage_args(source_repository, abr_path=source_abr_path),
         "--source-names",
         ",".join(source_names),
@@ -526,6 +530,7 @@ def probe_repository_access(
     abr_path: str | None = None,
     backup_name: str,
     timeout: int = 120,
+    create_folder: bool = True,
 ) -> None:
     """Prove read/write/delete access by round-tripping a throwaway backup.
 
@@ -545,7 +550,7 @@ def probe_repository_access(
                 "backup",
                 "--name",
                 backup_name,
-                *disk_tool_storage_args(repository, abr_path=abr_path, create_folder=True),
+                *disk_tool_storage_args(repository, abr_path=abr_path, create_folder=create_folder),
                 "--source",
                 probe.name,
             ],

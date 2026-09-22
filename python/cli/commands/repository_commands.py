@@ -15,6 +15,7 @@ from .base import CommandDependencies
 
 IMMUTABILITY_MODES = ("none", "governance", "compliance")
 IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS = 21600
+STORAGE_VALIDATION_TIMEOUT_SECONDS = 900
 
 
 def _parse_remote_address(repo_type: str, address: str | None) -> dict[str, str]:
@@ -124,6 +125,8 @@ def _validate_immutability_args(
 def _validate_create_args(args: argparse.Namespace) -> None:
     repo_type = str(args.type or "").lower()
     _validate_immutability_args(args, repo_type=repo_type)
+    if getattr(args, "create_bucket", None) and repo_type != "s3":
+        raise ValueError("--create-bucket is only available for s3 repositories")
     if repo_type == "local":
         if not getattr(args, "path", None):
             raise ValueError("local repositories require --path")
@@ -157,6 +160,8 @@ def _validate_create_args(args: argparse.Namespace) -> None:
 def _validate_edit_args(current: dict[str, object], args: argparse.Namespace) -> None:
     repo_type = str(current.get("type") or "").lower()
     _validate_immutability_args(args, repo_type=repo_type, current=current)
+    if getattr(args, "create_bucket", None) and repo_type != "s3":
+        raise ValueError("--create-bucket is only available for s3 repositories")
     if repo_type != "s3":
         return
     s3_payload = _build_s3_payload(args)
@@ -265,8 +270,20 @@ class RepositoryCommands:
             dest="immutability_retention",
             choices=("job", "minimum"),
             help=(
-                "Whether the Object Lock period follows the job retention when that is longer (job, the default) "
-                "or only --immutability-days (minimum)"
+                "Whether the Object Lock period runs to the end of the job's full-backup cycle, so one "
+                "chain shares one date (job, the default), or is only --immutability-days counted from "
+                "each backup (minimum)"
+            ),
+        )
+        add.add_argument(
+            "--create-bucket",
+            dest="create_bucket",
+            action="store_true",
+            default=None,
+            help=(
+                "Create the S3 bucket when it does not exist. Without this the repository is refused. "
+                "A bucket created this way cannot hold immutable backups, because Object Lock is only "
+                "settable while a bucket is being created"
             ),
         )
         add.set_defaults(handler=self.create)
@@ -345,7 +362,21 @@ class RepositoryCommands:
             "--immutability-retention",
             dest="immutability_retention",
             choices=("job", "minimum"),
-            help="Updated rule for the Object Lock period: follow the job retention when longer (job) or only --immutability-days (minimum)",
+            help=(
+                "Updated rule for the Object Lock period: run to the end of the full-backup cycle (job) "
+                "or only --immutability-days counted from each backup (minimum)"
+            ),
+        )
+        edit.add_argument(
+            "--create-bucket",
+            dest="create_bucket",
+            action="store_true",
+            default=None,
+            help=(
+                "Create the S3 bucket when it does not exist. Without this the repository is refused. "
+                "A bucket created this way cannot hold immutable backups, because Object Lock is only "
+                "settable while a bucket is being created"
+            ),
         )
         edit.set_defaults(handler=self.edit)
 
@@ -420,12 +451,25 @@ class RepositoryCommands:
         payload.update({k: v for k, v in _parse_remote_address(args.type, args.address).items() if payload.get(k) in {None, ""}})
         if args.type == "s3":
             payload["s3"] = _build_s3_payload(args)
-        if _configures_immutability(args):
+            if getattr(args, "create_bucket", None):
+                payload["create_bucket"] = True
+        if args.type == "s3":
+            immutability = _configures_immutability(args)
             result = run_with_elapsed_indicator(
                 lambda: deps.context.api_client.post(
-                    "api/v1/repositories", json=payload, timeout=IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS
+                    "api/v1/repositories",
+                    json=payload,
+                    timeout=(
+                        IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS
+                        if immutability
+                        else STORAGE_VALIDATION_TIMEOUT_SECONDS
+                    ),
                 ),
-                label="Validating repository immutability",
+                label=(
+                    "Validating repository immutability"
+                    if immutability
+                    else "Validating repository storage"
+                ),
             )
         else:
             result = deps.context.api_client.post("api/v1/repositories", json=payload)
@@ -465,6 +509,8 @@ class RepositoryCommands:
             s3_payload = _build_s3_payload(args)
             if s3_payload:
                 payload["s3"] = s3_payload
+            if getattr(args, "create_bucket", None):
+                payload["create_bucket"] = True
         if _configures_immutability(args):
             result = run_with_elapsed_indicator(
                 lambda: deps.context.api_client.patch(

@@ -74,6 +74,7 @@ from python.srv.core.storage_tool import (
     is_abr_repository,
     is_s3_repository,
     list_disk_tool_backups,
+    SECRET_MASK,
     mask_credential_fields,
     normalize_immutability_config,
     normalize_immutability_mode,
@@ -94,6 +95,7 @@ from python.srv.services.inventory_management import (
     EsxHostInClusterError,
     InventoryProviderRegistry,
     apply_inventory_updates,
+    InventoryUnreachableError,
     assert_inventory_registrable,
     creatable_inventory_types,
     default_port_for_type,
@@ -162,8 +164,11 @@ def schedule_inventory_discovery(inventory_id: str, *, force: bool = False) -> t
     def _run() -> None:
         try:
             discover_inventory_vms(inventory_id, force=force)
-        except Exception:
-            LOGGER.exception("Background inventory discovery failed for %s", inventory_id)
+        except Exception as exc:
+            LOGGER.warning(
+                "Background inventory discovery could not reach inventory %s: %s", inventory_id, exc
+            )
+            LOGGER.debug("Inventory discovery failure detail", exc_info=True)
 
     thread = threading.Thread(
         target=_run,
@@ -1474,10 +1479,6 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             "token": token or None,
         },
     }
-    # Refuse to register a standalone ESXi host that is part of a cluster --
-    # such a host must be backed up through its managing vCenter. Best-effort:
-    # an unreachable endpoint does not block registration here (re-checked at
-    # job-run time), only a positively detected cluster membership does.
     try:
         assert_inventory_registrable(record)
     except EsxHostInClusterError as exc:
@@ -1486,6 +1487,15 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             "esx_host_in_cluster",
             str(exc),
             cluster=exc.cluster_name,
+        ) from exc
+    except InventoryUnreachableError as exc:
+        raise api_error(
+            422,
+            "inventory_unreachable",
+            str(exc),
+            address=address,
+            port=effective_port,
+            reason=exc.reason,
         ) from exc
     persist_hypervisor(record)
     RESOURCES_BY_HV.setdefault(record["id"], {})
@@ -1756,6 +1766,14 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         else:
             storage["error"] = "Repository path is empty"
         if not storage["available"]:
+            item["status"] = "unavailable"
+            item["health"] = "unavailable"
+    last_verify = item.get("last_verify") if isinstance(item.get("last_verify"), dict) else None
+    if last_verify is not None:
+        item["last_verify_at"] = last_verify.get("checked_at")
+        if str(last_verify.get("status") or "") != "success":
+            storage["available"] = False
+            storage["error"] = str(last_verify.get("message") or "Repository verification failed")
             item["status"] = "unavailable"
             item["health"] = "unavailable"
     item["storage"] = storage
@@ -2164,8 +2182,6 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
                 conflicting_repository=conflict.get("name"),
                 path=path,
             )
-    if repo_type == "s3" and immutability_is_enabled(s3_config.get("immutability")):
-        _assert_immutability_is_usable(s3_config)
     now = utc_now()
     record = {
         "id": str(uuid4()),
@@ -2205,8 +2221,23 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
             }
         ),
     }
+    create_bucket = bool(payload.get("create_bucket"))
+    bucket_was_missing = (
+        repo_type == "s3" and create_bucket and not s3_bucket_is_reachable(s3_config)
+    )
+    registration_check = _assert_repository_is_usable(record, create_bucket=create_bucket)
+    if registration_check is not None:
+        record["last_verify"] = registration_check
+    if repo_type == "s3" and immutability_is_enabled(s3_config.get("immutability")):
+        _assert_immutability_is_usable(s3_config)
     persist_repository(record)
     created = normalize_repository_record(record)
+    if bucket_was_missing:
+        created["warnings"] = [
+            *created.get("warnings", []),
+            f"S3 bucket '{s3_config['bucket']}' did not exist and was created. Object Lock cannot be "
+            "turned on after a bucket is created, so this bucket can never hold immutable backups.",
+        ]
     if repo_type == "s3":
         created["immutability_effect"] = _immutability_effect_report(
             str(record["id"]),
@@ -2347,6 +2378,12 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
                     path=updated.get("path"),
                 )
     _ensure(changed, 422, "invalid_repository", "repo edit requires at least one editable option")
+    if _repository_connection_identity(updated) != _repository_connection_identity(record):
+        registration_check = _assert_repository_is_usable(
+            updated, create_bucket=bool(payload.get("create_bucket"))
+        )
+        if registration_check is not None:
+            updated["last_verify"] = registration_check
     if (
         next_s3_config is not None
         and next_immutability != previous_immutability
@@ -2523,11 +2560,35 @@ def _s3_format_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]], str
     return checks, None
 
 
-def _s3_connectivity_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+def s3_bucket_is_reachable(config: dict[str, Any]) -> bool:
+    try:
+        read_storage_folder_info(
+            {"type": "s3", "s3": config},
+            str(config.get("prefix") or "").strip(),
+            timeout=_s3_probe_timeout(),
+        )
+    except StorageToolError:
+        return False
+    return True
+
+
+def _s3_connectivity_checks(
+    config: dict[str, Any], *, create_bucket: bool = True
+) -> tuple[list[dict[str, Any]], str | None]:
     checks, error = _s3_format_checks(config)
     if error is not None:
         return checks, error
     prefix = str(config.get("prefix") or "").strip()
+    bucket = str(config.get("bucket") or "").strip()
+
+    if not create_bucket and not s3_bucket_is_reachable(config):
+        checks.append({"name": "bucket_exists", "status": "failed", "message": bucket})
+        return checks, (
+            f"S3 bucket '{bucket}' could not be opened. Check that it exists and that these "
+            "credentials can use it; if it has not been created yet, pass --create-bucket. A bucket "
+            "created that way cannot hold immutable backups, because Object Lock can only be turned "
+            "on while a bucket is being created."
+        )
 
     try:
         probe_repository_access(
@@ -2535,12 +2596,13 @@ def _s3_connectivity_checks(config: dict[str, Any]) -> tuple[list[dict[str, Any]
             abr_path=prefix,
             backup_name=f"repo-probe-{uuid4().hex[:12]}",
             timeout=_s3_probe_timeout(),
+            create_folder=create_bucket,
         )
     except StorageToolError as exc:
         checks.append({"name": "connectivity", "status": "failed", "message": str(exc)})
         return checks, "S3 repository validation failed"
 
-    checks.append({"name": "connectivity", "status": "ok", "message": "Bucket/prefix access validated (bucket auto-created if missing) through native storage tool"})
+    checks.append({"name": "connectivity", "status": "ok", "message": "Bucket/prefix access validated through native storage tool"})
     return checks, None
 
 
@@ -2887,17 +2949,17 @@ def _immutability_effect_report(
     limitations: list[str] = []
 
     if immutability_is_enabled(current):
-        generation_days = s3_block_generation_days()
-        effect.append(
-            f"Backups created from now on are written under {current['mode']} Object Lock retention, counted from each "
-            "backup's own creation time. The period written is "
-            + (
-                f"the longer of the job's retention and {current['retention_days']} day(s)"
-                if normalize_immutability_retention_scope(current.get("retention_scope")) == "job_retention"
-                else f"{current['retention_days']} day(s)"
+        if normalize_immutability_retention_scope(current.get("retention_scope")) == "job_retention":
+            effect.append(
+                f"Backups created from now on are written under {current['mode']} Object Lock retention. Every backup "
+                "of one chain is held to the same date: its job's next full backup, plus the longer of that job's "
+                f"retention and {current['retention_days']} day(s)."
             )
-            + f", plus a {generation_days}-day block generation period."
-        )
+        else:
+            effect.append(
+                f"Backups created from now on are written under {current['mode']} Object Lock retention for "
+                f"{current['retention_days']} day(s), counted from each backup's own creation time."
+            )
     else:
         effect.append("Immutability is disabled: new backups are written without Object Lock retention and stay deletable.")
 
@@ -2908,10 +2970,9 @@ def _immutability_effect_report(
         )
         if immutability_is_enabled(previous):
             limitations.append(
-                f"Each keeps the {previous['mode']} retention it was written under, counted from its own creation: "
-                "the period configured at the time plus the block generation period, and the job's retention instead "
-                "where that was longer. AltaStor does not track the resulting date per restore point, so read it from "
-                "the storage."
+                f"Each keeps the {previous['mode']} retention it was written under, counted from its own creation "
+                "and derived from the settings in force at the time. The resulting date is recorded on the restore "
+                "point, and the storage holds the authoritative copy."
             )
         else:
             limitations.append(
@@ -3038,7 +3099,7 @@ def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:
         return f"for {configured} day(s)"
     low, high = min(applied_days), max(applied_days)
     span = f"{low} day(s)" if low == high else f"{low}-{high} day(s)"
-    return f"for {span} ({configured} configured plus job retention and the block generation period)"
+    return f"for {span} (its full-backup cycle plus the longer of the job retention and the {configured} configured)"
 
 
 def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
@@ -3152,16 +3213,114 @@ def test_s3_connection(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "success", "checks": checks, "message": "S3 connection succeeded"}
 
 
-def verify_repository(record_id: str) -> dict[str, Any]:
-    repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+def _repository_verification_result(repository: dict[str, Any]) -> dict[str, Any]:
     repo_type = str(repository.get("type") or "")
     if repo_type == "local":
-        result = _verify_local_repository(repository)
-    elif repo_type == "s3":
-        result = _verify_s3_repository(repository)
-    else:
-        result = _verify_remote_repository(repository)
-    payload = normalize_repository_record(repository)
+        return _verify_local_repository(repository)
+    if repo_type == "s3":
+        return _verify_s3_repository(repository)
+    return _verify_remote_repository(repository)
+
+
+def _repository_connection_identity(record: dict[str, Any]) -> tuple[str, ...]:
+    if str(record.get("type") or "") == "s3":
+        config = extract_s3_config(record)
+        return tuple(
+            str(config.get(key) or "")
+            for key in (
+                "bucket",
+                "prefix",
+                "region",
+                "endpoint_url",
+                "access_key",
+                "secret_key",
+                "profile",
+                "path_style",
+                "verify_tls",
+            )
+        )
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    return (
+        str(record.get("path") or ""),
+        str(metadata.get("server") or ""),
+        str(metadata.get("share") or ""),
+        str(metadata.get("username") or ""),
+        str(metadata.get("password") or ""),
+    )
+
+
+def _verification_summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": str(result.get("status") or "error"),
+        "message": str(result.get("message") or ""),
+        "checked_at": utc_now(),
+    }
+
+
+def _repository_registration_checks(
+    record: dict[str, Any], *, create_bucket: bool = False
+) -> dict[str, Any] | None:
+    repo_type = str(record.get("type") or "")
+    if repo_type == "local":
+        return _verify_local_repository(record)
+    if repo_type != "s3":
+        return None
+    config = extract_s3_config(record)
+    if immutability_is_enabled(normalize_immutability_config(config.get("immutability"))):
+        checks, error = _s3_format_checks(config)
+        if error is not None:
+            return {"status": "error", "checks": checks, "message": error}
+        return {"status": "success", "checks": checks, "message": "S3 endpoint is reachable"}
+    checks, error = _s3_connectivity_checks(config, create_bucket=create_bucket)
+    if error is not None:
+        return {"status": "error", "checks": checks, "message": error}
+    return {
+        "status": "success",
+        "checks": checks,
+        "message": "S3 repository is available; immutability: disabled, backups stay deletable",
+    }
+
+
+def _assert_bucket_creation_is_sensible(record: dict[str, Any], *, create_bucket: bool) -> None:
+    if not create_bucket or str(record.get("type") or "") != "s3":
+        return
+    config = extract_s3_config(record)
+    if not immutability_is_enabled(normalize_immutability_config(config.get("immutability"))):
+        return
+    raise api_error(
+        422,
+        "repository_bucket_cannot_be_created",
+        "Object Lock can only be turned on while a bucket is being created, and --create-bucket "
+        "cannot turn it on, so a bucket created that way could never hold immutable backups. Create "
+        "the bucket with Object Lock enabled first, then add the repository without --create-bucket.",
+        bucket=config.get("bucket"),
+    )
+
+
+def _assert_repository_is_usable(
+    record: dict[str, Any], *, create_bucket: bool = False
+) -> dict[str, Any] | None:
+    _assert_bucket_creation_is_sensible(record, create_bucket=create_bucket)
+    result = _repository_registration_checks(record, create_bucket=create_bucket)
+    if result is None:
+        return None
+    if str(result.get("status") or "") != "success":
+        raise api_error(
+            422,
+            "repository_validation_failed",
+            str(result.get("message") or "Repository cannot be used for backups"),
+            checks=result.get("checks") or [],
+        )
+    return _verification_summary(result)
+
+
+def verify_repository(record_id: str) -> dict[str, Any]:
+    repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    result = _repository_verification_result(repository)
+    stored = _json_clone(repository)
+    stored["last_verify"] = _verification_summary(result)
+    persist_repository(stored)
+    payload = normalize_repository_record(stored)
     payload.update(result)
     return payload
 
@@ -3432,7 +3591,36 @@ def _ensure_encryption_key_strength(task_parameters: Any) -> None:
     )
 
 
-def _validate_task_parameters(params: dict[str, Any]) -> dict[str, Any]:
+def _normalized_encryption_keys(raw: Any) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        try:
+            key_id = int(item.get("key_id"))
+        except (TypeError, ValueError):
+            continue
+        if key_id < 0 or key_id in seen:
+            continue
+        seen.add(key_id)
+        entries.append({"key_id": key_id, "key": key})
+    entries.sort(key=lambda entry: entry["key_id"])
+    return entries
+
+
+def _record_encryption_key(keys: list[dict[str, Any]], key: str) -> tuple[list[dict[str, Any]], int]:
+    for entry in keys:
+        if entry["key"] == key:
+            return keys, int(entry["key_id"])
+    next_id = max((int(entry["key_id"]) for entry in keys), default=-1) + 1
+    return [*keys, {"key_id": next_id, "key": key}], next_id
+
+
+def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] | None = None) -> dict[str, Any]:
     result = dict(params)
     if "compression_level" in result and result["compression_level"] is not None:
         try:
@@ -3447,16 +3635,21 @@ def _validate_task_parameters(params: dict[str, Any]) -> dict[str, Any]:
         if isinstance(key, str) and key.strip():
             result["encryption_key"] = key.strip()
         else:
-            # Encryption is a switch, not a key-management exercise: a caller
-            # that just turns it on (the web UI has no passphrase field) gets a
-            # key generated here and stored on the job, which is already where
-            # both the backup task parameters and restore look for one
-            # (_resolve_restore_encryption_key). An explicit key still wins, so
-            # `abr job create --set-encryption --encryption-key ...` is
-            # unchanged. On an update the merge carries the stored key through
-            # ahead of this, so a key is only ever minted once per job -- never
-            # rotated out from under the restore points written with it.
             result["encryption_key"] = secrets.token_urlsafe(_GENERATED_ENCRYPTION_KEY_BYTES)
+        known = _normalized_encryption_keys(
+            result.get("encryption_keys")
+            or (previous or {}).get("encryption_keys")
+        )
+        if not known:
+            carried = str((previous or {}).get("encryption_key") or "").strip()
+            if carried:
+                known = [{"key_id": 0, "key": carried}]
+        known, current_id = _record_encryption_key(known, str(result["encryption_key"]))
+        result["encryption_keys"] = known
+        result["encryption_key_id"] = current_id
+    else:
+        result.pop("encryption_keys", None)
+        result.pop("encryption_key_id", None)
     return result
 
 
@@ -3493,7 +3686,13 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         compression_level = DEFAULT_COMPRESSION_LEVEL
     encryption_enabled = bool(task_parameters.get("encryption_enabled"))
     has_encryption_key = bool(str(task_parameters.get("encryption_key") or "").strip())
+    encryption_keys = _normalized_encryption_keys(task_parameters.get("encryption_keys"))
+    current_key_id = task_parameters.get("encryption_key_id")
     task_parameters_view = mask_credential_fields(dict(task_parameters))
+    if "encryption_keys" in task_parameters_view:
+        task_parameters_view["encryption_keys"] = [
+            {"key_id": entry["key_id"], "key": SECRET_MASK} for entry in encryption_keys
+        ]
     return {
         "id": normalized["id"],
         "name": normalized["name"],
@@ -3531,7 +3730,13 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "active_full_next_run_at": normalized.get("active_full_next_run_at"),
         "synthetic_full_next_run_at": normalized.get("synthetic_full_next_run_at"),
         "compression_level": compression_level,
-        "encryption": {"enabled": encryption_enabled, "key_set": has_encryption_key},
+        "encryption": {
+            "enabled": encryption_enabled,
+            "key_set": has_encryption_key,
+            "key_id": current_key_id,
+            "key_ids": [entry["key_id"] for entry in encryption_keys],
+            "key_count": len(encryption_keys),
+        },
         "task_parameters": task_parameters_view,
         "backup_options": task_parameters_view,
         "effective_execution_policy": job_effective_policy(normalized),
@@ -3837,8 +4042,9 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     if "task_parameters" in payload and payload["task_parameters"] is not None:
         _ensure(isinstance(payload["task_parameters"], dict), 422, "invalid_job", "task_parameters must be an object")
         _ensure_encryption_key_strength(payload["task_parameters"])
-        merged = _merge_task_parameters(updated.get("task_parameters"), payload["task_parameters"])
-        updated["task_parameters"] = _validate_task_parameters(merged)
+        stored_parameters = updated.get("task_parameters") if isinstance(updated.get("task_parameters"), dict) else {}
+        merged = _merge_task_parameters(stored_parameters, payload["task_parameters"])
+        updated["task_parameters"] = _validate_task_parameters(merged, previous=stored_parameters)
         changed = True
     if updated["job_type"] == "backup":
         if "repo" in payload or "repo_id" in payload:
@@ -3981,6 +4187,21 @@ def _latest_successful_point(job_id: str, vm_id: str, repository_id: str | None)
     return points[-1] if points else None
 
 
+def _encryption_differs_from_point(job: dict[str, Any], point: dict[str, Any]) -> bool:
+    parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else {}
+    current_key = str(parameters.get("encryption_key") or "").strip()
+    current_enabled = bool(parameters.get("encryption_enabled")) and bool(current_key)
+    previous_enabled = bool(point.get("encryption_enabled"))
+    previous_key = str(point.get("encryption_key") or "").strip()
+    if current_enabled != previous_enabled:
+        return True
+    if not current_enabled:
+        return False
+    if not previous_key:
+        return False
+    return current_key != previous_key
+
+
 def resolve_job_execution(
     job: dict[str, Any],
     *,
@@ -4007,6 +4228,8 @@ def resolve_job_execution(
     previous = _latest_successful_point(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
     if previous is None:
         return "ActiveFull", "FirstRun"
+    if _encryption_differs_from_point(job, previous):
+        return "ActiveFull", "EncryptionKeyChanged"
     if scheduled_type == "ActiveFull":
         return "ActiveFull", "ActiveFullSchedule"
     if scheduled_type == "SyntheticFull":
@@ -7117,11 +7340,37 @@ def _point_is_encrypted(point: dict[str, Any]) -> bool:
     return bool(isinstance(task_parameters, dict) and task_parameters.get("encryption_enabled"))
 
 
+def _job_key_by_id(job_id: str, key_id: Any) -> str | None:
+    if key_id is None or not job_id or job_id not in JOBS:
+        return None
+    source_job = resolve_job(record_id=job_id)
+    task_parameters = source_job.get("task_parameters") if isinstance(source_job.get("task_parameters"), dict) else {}
+    if not task_parameters.get("encryption_enabled"):
+        return None
+    try:
+        wanted = int(key_id)
+    except (TypeError, ValueError):
+        return None
+    for entry in task_parameters.get("encryption_keys") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            entry_id = int(entry.get("key_id"))
+        except (TypeError, ValueError):
+            continue
+        if entry_id == wanted:
+            return str(entry.get("key") or "").strip() or None
+    return None
+
+
 def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
+    job_id = str(point.get("job_id") or "")
+    by_id = _job_key_by_id(job_id, point.get("encryption_key_id"))
+    if by_id:
+        return by_id
     own_key = str(point.get("encryption_key") or "").strip()
     if own_key:
         return own_key
-    job_id = str(point.get("job_id") or "")
     if not job_id or job_id not in JOBS:
         return None
     source_job = resolve_job(record_id=job_id)

@@ -287,7 +287,7 @@ class AbrV41RepositoryCommandTests(unittest.TestCase):
                 },
             },
             params=None,
-            timeout=30,
+            timeout=900,
             headers={"X-Client-Type": "cli", "X-ABR-API-Version": "1.0"},
             verify=False,
         )
@@ -446,6 +446,11 @@ class AbrV41RepositoryCommandTests(unittest.TestCase):
 
 class AbrV41EngineTests(unittest.TestCase):
     def setUp(self) -> None:
+        reachable = patch(
+            "python.srv.services.abr_v41.assert_inventory_registrable", return_value=None
+        )
+        reachable.start()
+        self.addCleanup(reachable.stop)
         HYPERVISORS.clear()
         JOBS.clear()
         REPOSITORIES.clear()
@@ -841,7 +846,8 @@ class AbrV41EngineTests(unittest.TestCase):
     def test_a_key_of_the_minimum_length_is_accepted(self) -> None:
         job = self._job_with_key("Minimum Key", "eightch8", "192.168.12.80")
 
-        self.assertEqual(job["encryption"], {"enabled": True, "key_set": True})
+        self.assertEqual(job["encryption"]["enabled"], True)
+        self.assertEqual(job["encryption"]["key_set"], True)
 
     def test_a_short_encryption_key_is_refused_on_edit(self) -> None:
         job = self._job_with_key("Edit Short Key", "long-enough-key", "192.168.12.81")
@@ -2242,7 +2248,9 @@ class AbrV41EngineTests(unittest.TestCase):
 
         self.assertEqual(updated["path"], new_path)
 
-    def test_edit_repository_record_blocks_s3_bucket_change_when_backups_exist(self) -> None:
+    @patch("python.srv.services.abr_v41.s3_bucket_is_reachable", return_value=True)
+    @patch("python.srv.services.abr_v41.probe_repository_access")
+    def test_edit_repository_record_blocks_s3_bucket_change_when_backups_exist(self, _probe, _bucket) -> None:
         REPOSITORIES.clear()
         BACKUPS.clear()
         repository = abr_v41.create_repository_record(

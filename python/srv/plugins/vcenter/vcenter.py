@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar
 
 from pyVim.connect import Disconnect, SmartConnect
-from pyVmomi import vim
+from pyVmomi import vim, vmodl
 from ...core.server_defaults import env_int
 from ..hypervisor import Hypervisor
 from .vcenter_disk_types import VddkDiskType, classify_vmware_disk_type, hostagent_disk_type_from_code
@@ -159,16 +159,49 @@ class VCenterNode(Hypervisor):
         # thread below can never swap self.si out from under a caller.
         self._session_lock = threading.RLock()
 
-    @_retry_on_expired_session
-    def _list_vms(self) -> List[Any]:
+    def _named_objects(self, object_types: Any, root: Any = None) -> List[tuple]:
+        types = list(object_types) if isinstance(object_types, (list, tuple)) else [object_types]
         content = self.si.RetrieveContent()
         container = content.viewManager.CreateContainerView(
-            content.rootFolder, [vim.VirtualMachine], True
+            root if root is not None else content.rootFolder, types, True
         )
         try:
-            return [vm for vm in container.view if not vm.name.startswith("vCLS-")]
+            collector = content.propertyCollector
+            traversal = vmodl.query.PropertyCollector.TraversalSpec(
+                name="viewToObject", type=vim.view.ContainerView, path="view", skip=False
+            )
+            object_spec = vmodl.query.PropertyCollector.ObjectSpec(
+                obj=container, skip=True, selectSet=[traversal]
+            )
+            filter_spec = vmodl.query.PropertyCollector.FilterSpec(
+                objectSet=[object_spec],
+                propSet=[
+                    vmodl.query.PropertyCollector.PropertySpec(
+                        type=object_type, pathSet=["name"], all=False
+                    )
+                    for object_type in types
+                ],
+            )
+            options = vmodl.query.PropertyCollector.RetrieveOptions()
+            found: List[tuple] = []
+            batch = collector.RetrievePropertiesEx([filter_spec], options)
+            while batch is not None:
+                for entry in batch.objects or []:
+                    name = next(
+                        (prop.val for prop in (entry.propSet or []) if prop.name == "name"),
+                        None,
+                    )
+                    if isinstance(name, str):
+                        found.append((entry.obj, name))
+                token = getattr(batch, "token", None)
+                batch = collector.ContinueRetrievePropertiesEx(token) if token else None
+            return found
         finally:
             container.Destroy()
+
+    @_retry_on_expired_session
+    def _list_vms(self) -> List[Any]:
+        return [vm for vm, name in self._named_objects(vim.VirtualMachine) if not name.startswith("vCLS-")]
 
     def connect(self) -> None:
         context = ssl.create_default_context() if self.verify_ssl else ssl._create_unverified_context()
@@ -364,17 +397,10 @@ class VCenterNode(Hypervisor):
 
     @_retry_on_expired_session
     def _get_vm(self, vm_name: str) -> Optional[Any]:
-        content = self.si.RetrieveContent()
-        container = content.viewManager.CreateContainerView(
-            content.rootFolder, [vim.VirtualMachine], True
-        )
-        try:
-            for vm in container.view:
-                if vm.name == vm_name:
-                    return vm
-            return None
-        finally:
-            container.Destroy()
+        for vm, name in self._named_objects(vim.VirtualMachine):
+            if name == vm_name:
+                return vm
+        return None
 
     def _get_vm_by_moref(self, vm_moref: str) -> Optional[Any]:
         if not vm_moref:
@@ -386,31 +412,17 @@ class VCenterNode(Hypervisor):
 
     @_retry_on_expired_session
     def _get_host(self, host_name: str) -> Optional[Any]:
-        content = self.si.RetrieveContent()
-        container = content.viewManager.CreateContainerView(
-            content.rootFolder, [vim.HostSystem], True
-        )
-        try:
-            for host in container.view:
-                if host.name == host_name:
-                    return host
-            return None
-        finally:
-            container.Destroy()
+        for host, name in self._named_objects(vim.HostSystem):
+            if name == host_name:
+                return host
+        return None
 
     @_retry_on_expired_session
     def _get_datastore(self, datastore_name: str) -> Optional[Any]:
-        content = self.si.RetrieveContent()
-        container = content.viewManager.CreateContainerView(
-            content.rootFolder, [vim.Datastore], True
-        )
-        try:
-            for datastore in container.view:
-                if getattr(datastore, "name", None) == datastore_name:
-                    return datastore
-            return None
-        finally:
-            container.Destroy()
+        for datastore, name in self._named_objects(vim.Datastore):
+            if name == datastore_name:
+                return datastore
+        return None
 
     def _get_datacenter(self, entity: Any) -> Optional[Any]:
         current = entity
@@ -425,17 +437,12 @@ class VCenterNode(Hypervisor):
             if getattr(network, "name", None) == network_name:
                 return network
 
-        content = self.si.RetrieveContent()
-        container = content.viewManager.CreateContainerView(
-            datacenter.networkFolder, [vim.Network, vim.dvs.DistributedVirtualPortgroup], True
-        )
-        try:
-            for network in container.view:
-                if getattr(network, "name", None) == network_name:
-                    return network
-            return None
-        finally:
-            container.Destroy()
+        for network, name in self._named_objects(
+            [vim.Network, vim.dvs.DistributedVirtualPortgroup], root=datacenter.networkFolder
+        ):
+            if name == network_name:
+                return network
+        return None
 
     def _build_nic_spec(self, datacenter: Any, host: Any, adapter: dict[str, Any]) -> Optional[Any]:
         network_name = str(adapter.get("network") or "").strip()

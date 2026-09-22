@@ -531,11 +531,18 @@ class JobPayloadBuilderTests(unittest.TestCase):
 
         self.assertEqual(payload["task_parameters"], {"encryption_enabled": None, "encryption_key": None})
 
-    def test_edit_payload_set_encryption_requires_key(self) -> None:
+    def test_edit_payload_set_encryption_without_a_key_re_affirms_the_stored_one(self) -> None:
         args = self._base_edit_args(set_encryption=True)
 
-        with self.assertRaisesRegex(ValueError, "--set-encryption requires --encryption-key"):
-            self.service.build_edit_payload({"id": "job-1"}, args)
+        payload = self.service.build_edit_payload({"id": "job-1"}, args)
+
+        self.assertEqual(payload["task_parameters"], {"encryption_enabled": True})
+
+    def test_create_payload_still_requires_a_key_with_set_encryption(self) -> None:
+        args = self._base_create_args(set_encryption=True)
+
+        with self.assertRaisesRegex(ValueError, "requires --encryption-key"):
+            self.service.create_backup_job_payload(args)
 
     def test_edit_payload_passes_through_preparsed_full_days(self) -> None:
         args = self._base_edit_args(active_full_days=["Sun"], synthetic_full_days=["Mon", "Wed"])
@@ -835,7 +842,8 @@ class JobEngineLifecycleTests(unittest.TestCase):
         )
 
         self.assertEqual(job["compression_level"], DEFAULT_COMPRESSION_LEVEL)
-        self.assertEqual(job["encryption"], {"enabled": False, "key_set": False})
+        self.assertEqual(job["encryption"]["enabled"], False)
+        self.assertEqual(job["encryption"]["key_set"], False)
 
     def test_create_job_stores_compression_and_masks_encryption_key(self) -> None:
         job = abr_v41.create_backup_job(
@@ -850,7 +858,8 @@ class JobEngineLifecycleTests(unittest.TestCase):
         )
 
         self.assertEqual(job["compression_level"], 7)
-        self.assertEqual(job["encryption"], {"enabled": True, "key_set": True})
+        self.assertEqual(job["encryption"]["enabled"], True)
+        self.assertEqual(job["encryption"]["key_set"], True)
         self.assertEqual(job["backup_options"]["encryption_key"], SECRET_MASK)
         self.assertEqual(job["task_parameters"]["encryption_key"], SECRET_MASK)
 
@@ -886,7 +895,8 @@ class JobEngineLifecycleTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(job["encryption"], {"enabled": True, "key_set": True})
+        self.assertEqual(job["encryption"]["enabled"], True)
+        self.assertEqual(job["encryption"]["key_set"], True)
         self.assertEqual(job["task_parameters"]["encryption_key"], SECRET_MASK)
         generated = JOBS[job["id"]]["task_parameters"]["encryption_key"]
         self.assertTrue(generated.strip())
@@ -894,7 +904,8 @@ class JobEngineLifecycleTests(unittest.TestCase):
         # A later edit must not rotate it: the restore points already written
         # under the generated key have to stay decryptable.
         edited = abr_v41.edit_job_record(job["id"], {"task_parameters": {"compression_level": 5}})
-        self.assertEqual(edited["encryption"], {"enabled": True, "key_set": True})
+        self.assertEqual(edited["encryption"]["enabled"], True)
+        self.assertEqual(edited["encryption"]["key_set"], True)
         self.assertEqual(JOBS[job["id"]]["task_parameters"]["encryption_key"], generated)
 
     def test_generated_encryption_keys_differ_between_jobs(self) -> None:
@@ -929,7 +940,8 @@ class JobEngineLifecycleTests(unittest.TestCase):
             job["id"], {"task_parameters": {"encryption_enabled": False, "encryption_key": None}}
         )
 
-        self.assertEqual(disabled["encryption"], {"enabled": False, "key_set": False})
+        self.assertEqual(disabled["encryption"]["enabled"], False)
+        self.assertEqual(disabled["encryption"]["key_set"], False)
         self.assertNotIn("encryption_key", JOBS[job["id"]]["task_parameters"])
 
     def test_edit_job_updates_compression_level_and_sets_encryption(self) -> None:
@@ -939,18 +951,21 @@ class JobEngineLifecycleTests(unittest.TestCase):
 
         updated = abr_v41.edit_job_record(job["id"], {"task_parameters": {"compression_level": 9}})
         self.assertEqual(updated["compression_level"], 9)
-        self.assertEqual(updated["encryption"], {"enabled": False, "key_set": False})
+        self.assertEqual(updated["encryption"]["enabled"], False)
+        self.assertEqual(updated["encryption"]["key_set"], False)
 
         encrypted = abr_v41.edit_job_record(
             job["id"],
             {"task_parameters": {"encryption_enabled": True, "encryption_key": "top-secret"}},
         )
-        self.assertEqual(encrypted["encryption"], {"enabled": True, "key_set": True})
+        self.assertEqual(encrypted["encryption"]["enabled"], True)
+        self.assertEqual(encrypted["encryption"]["key_set"], True)
         # Compression level set by the earlier edit must survive an unrelated update.
         self.assertEqual(encrypted["compression_level"], 9)
 
         reset = abr_v41.edit_job_record(job["id"], {"task_parameters": {"encryption_enabled": None, "encryption_key": None}})
-        self.assertEqual(reset["encryption"], {"enabled": False, "key_set": False})
+        self.assertEqual(reset["encryption"]["enabled"], False)
+        self.assertEqual(reset["encryption"]["key_set"], False)
         self.assertNotIn("encryption_key", JOBS[job["id"]]["task_parameters"])
 
     def test_start_job_forwards_compression_and_encryption_into_session_parameters(self) -> None:

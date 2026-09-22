@@ -71,6 +71,7 @@ from .core.mongo_db_wrapper import (
     load_users,
 )
 from .services import auth_service, backup_catalog, tls_certificate_service
+from .services.abr_v41 import PRODUCT_NAME, PRODUCT_VERSION
 from .core.server_defaults import env_int
 from .core.task_pool import TaskProcessPool
 from .services.api_errors import (
@@ -240,6 +241,18 @@ async def lifespan(_: FastAPI):
                 logger.info("Backfilled the encryption key onto %d encrypted backup point(s).", keyed)
         except Exception:
             logger.exception("Encryption key backfill failed; continuing startup without it.")
+        try:
+            listed = backup_catalog.backfill_job_encryption_keys()
+            if listed:
+                logger.info("Converted %d job(s) to the numbered encryption key list.", listed)
+        except Exception:
+            logger.exception("Job encryption key list backfill failed; continuing startup without it.")
+        try:
+            identified = backup_catalog.backfill_backup_encryption_key_ids()
+            if identified:
+                logger.info("Recorded the encryption key id on %d backup point(s).", identified)
+        except Exception:
+            logger.exception("Encryption key id backfill failed; continuing startup without it.")
         TASKS.clear()
         TASKS.update(load_tasks())
         RESOURCES_BY_HV.clear()
@@ -355,9 +368,13 @@ def security_headers_for(scheme: str) -> dict[str, str]:
 
 
 app = FastAPI(
-    title="BackupServer",
-    version="0.3.0",
-    description="Mock FastAPI backup orchestration service (database-backed task queue, polled worker pool).",
+    title=PRODUCT_NAME,
+    version=PRODUCT_VERSION,
+    description=(
+        f"{PRODUCT_NAME} {PRODUCT_VERSION}. Backup, replication and restore of virtual "
+        f"machines. API v{SERVER_API_MAJOR}.{SERVER_API_MINOR}, served under "
+        f"/api/v{SERVER_API_MAJOR} and answered with the {API_VERSION_HEADER} header."
+    ),
     lifespan=lifespan,
 )
 

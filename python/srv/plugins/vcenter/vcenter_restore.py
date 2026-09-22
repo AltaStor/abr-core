@@ -253,6 +253,20 @@ def _derive_manifest_datastore_name(disk_entries: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _restore_source_resource(task: dict[str, Any]) -> dict[str, Any]:
+    resource_type = str(task.get("resource_type") or "")
+    if resource_type != "virtual_machine":
+        return _get_resource(task)
+    try:
+        return _get_resource(task)
+    except VCenterBackupError:
+        return {
+            "resource_type": resource_type,
+            "external_id": task.get("resource_external_id"),
+            "name": None,
+        }
+
+
 def _resolve_manifest_disk_entry_for_resource(
     manifest: dict[str, Any],
     *,
@@ -570,14 +584,7 @@ def run_vcenter_restore(
         raise
 
     hypervisor = _get_hypervisor(task)
-    if task.get("source_resource_available", True):
-        resource = _get_resource(task)
-    else:
-        resource = {
-            "resource_type": task.get("resource_type"),
-            "external_id": task.get("resource_external_id"),
-            "name": None,
-        }
+    resource = _restore_source_resource(task)
 
     logger.info(
         "Starting vCenter restore task %s for hypervisor=%s resource=%s/%s",

@@ -176,7 +176,7 @@ Description: Create a backup repository.
 
 abr repo add --name <name> --type <local|nfs|smb|s3> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password <pass>] [--description <text>] 
 
-For --type s3: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] 
+For --type s3: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] [--create-bucket] 
 
 Example: 
 abr repo add --name MyLocal --type local --path /mnt/backup 
@@ -186,15 +186,48 @@ Note: a local path that is world-writable is refused - its directory mode is the
 only thing keeping other accounts on the host away from the backup data. Restrict 
 it to 750, the mode the product uses for its own storage, and add it again. 
 
+A repository is checked against its storage before it is registered, and refused if it 
+cannot be used: the endpoint has to answer, the credentials have to authenticate, and the 
+target has to survive a write, a read-back and a delete. A local path has to exist and be 
+readable and writable by the service account. Nothing is created when a check fails, and 
+the outcome is kept on the repository - repo list and repo info report a repository whose 
+last check failed as unavailable rather than as healthy, until repo verify passes again. 
+
+--create-bucket creates the S3 bucket when it does not exist; without it a missing bucket 
+is refused. Object Lock can only be turned on while a bucket is being created and --create-bucket 
+does not turn it on, so a bucket created this way can never hold immutable backups, and 
+--create-bucket is refused together with --immutable. Outside of --create-bucket a bucket is 
+never created: a backup written to a repository whose bucket has disappeared fails instead of 
+silently starting a new empty one. 
+
 S3 OBJECT STORAGE IMMUTABILITY 
 
 --immutable and --immutability-days hold every new backup under S3 Object Lock; both are required together. governance can be lifted with the BypassGovernanceRetention permission, compliance by nobody at all until it expires. 
 
 Object Lock can only be enabled when a bucket is created - never added later, and never on a bucket AltaStor provisions itself. Enabling immutability on a bucket that cannot deliver it is refused, naming the failing check. 
 
-The lock written is longer than --immutability-days. AltaStor adds a block generation period - ALTASTOR_S3_BLOCK_GENERATION_DAYS, ten days by default - so that blocks arriving within one generation share a single expiry instead of the lock being rewritten for every increment. --immutability-days must be between 1 and 999. 
+The lock a backup is written under is derived from the job, not from --immutability-days 
+alone. A restore point stays valid only while the rest of its chain does, so the lock has to 
+reach the moment the whole chain stops being needed: the next full backup, plus the job's 
+--retention-days. Every point of one chain therefore lands on the same date, and the chain is 
+freed in a single pass. --immutability-days is the floor under that figure, for an environment 
+with a fixed minimum of its own; it is not added to it. --immutability-days must be between 1 
+and 999. 
 
---immutability-retention decides what the period counts from. job, the default, follows the job's --retention-days whenever that is longer than --immutability-days; minimum ignores the job and uses --immutability-days alone. A job keeping 13 days on a repository set to 7 writes a 23-day lock under job, and a 17-day lock under minimum. 
+A job with weekly full backups keeping 30 days writes a 37-day lock on the day of the full and 
+a 31-day lock on the day before the next one - both expiring on the same date. With monthly 
+full backups the same job writes 61 days, because the chain genuinely lives that long. 
+
+The lock is only ever recalculated when the answer grows: a full backup that did not run when 
+it was due, a longer --retention-days, a changed full-backup schedule, or a raised 
+--immutability-days. A job running to schedule with settings left alone never has its stored 
+locks rewritten. ALTASTOR_S3_BLOCK_GENERATION_DAYS is the fallback used in place of the cycle 
+when the date of the next full backup cannot be determined. 
+
+--immutability-retention decides what the period counts from. job, the default, uses the 
+figure above; minimum ignores both the job retention and its cycle and uses --immutability-days 
+alone. A job keeping 13 days with weekly full backups on a repository set to 7 writes a 20-day 
+lock under job, and a 7-day lock under minimum. 
 
 The period runs from each backup's own creation, and stored restore points keep the lock they were written with - repo apply-immutability puts them under the current setting. Retention can be lengthened, never shortened or removed. An --immutability-days longer than the job's --retention-days locks data past the point the job still needs it and is paid for either way; repo add/edit warn when that happens. 
 

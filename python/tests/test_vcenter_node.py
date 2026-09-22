@@ -22,27 +22,73 @@ except ModuleNotFoundError:
 from pyVmomi import vim, vmodl
 
 
-class _FakeContainer:
-    def __init__(self, view: list[object]) -> None:
-        self.view = view
-        self.destroyed = False
+class _FakeContainer(vim.view.ContainerView):
+    """A real ContainerView MoRef, so the property-collector specs accept it."""
+
+    @property
+    def view(self) -> list:
+        return self._rows
 
     def Destroy(self) -> None:
-        self.destroyed = True
+        return None
 
 
 class _FakeViewManager:
     def __init__(self, view: list[object]) -> None:
         self._view = view
+        self.created = 0
 
     def CreateContainerView(self, root: object, types: object, recursive: bool) -> _FakeContainer:
-        return _FakeContainer(self._view)
+        self.created += 1
+        container = _FakeContainer("session[fake]view-1")
+        object.__setattr__(container, "_rows", list(self._view))
+        return container
+
+
+class _FakePropertyCollector:
+    """Stands in for the real collector: one call, names for the whole view.
+
+    An object whose name cannot be read comes back without a propSet, the way
+    vCenter reports one that was destroyed or is still being created.
+    """
+
+    def __init__(self, view: list[object]) -> None:
+        self._view = view
+        self.calls = 0
+
+    def RetrievePropertiesEx(self, filter_specs: object, options: object) -> object:
+        self.calls += 1
+        entries = []
+        for member in self._view:
+            name = getattr(member, "_collector_name", _MISSING)
+            if name is _MISSING:
+                try:
+                    name = member.name
+                except Exception:
+                    entries.append(types.SimpleNamespace(obj=member, propSet=[]))
+                    continue
+            if name is None:
+                entries.append(types.SimpleNamespace(obj=member, propSet=[]))
+                continue
+            entries.append(
+                types.SimpleNamespace(
+                    obj=member, propSet=[types.SimpleNamespace(name="name", val=name)]
+                )
+            )
+        return types.SimpleNamespace(objects=entries, token=None)
+
+    def ContinueRetrievePropertiesEx(self, token: object) -> object:
+        return None
+
+
+_MISSING = object()
 
 
 class _FakeContent:
     def __init__(self, view: list[object]) -> None:
         self.rootFolder = object()
         self.viewManager = _FakeViewManager(view)
+        self.propertyCollector = _FakePropertyCollector(view)
 
 
 class _FakeServiceInstance:
