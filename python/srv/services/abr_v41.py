@@ -416,12 +416,17 @@ def _load_timezone(name: str | None) -> ZoneInfo:
 def _title_day(value: str) -> str:
     normalized = DAY_ALIASES.get(str(value or "").strip().lower())
     if normalized is None:
+        # What the refusal lists has to be what the parser takes. DAY_ALIASES
+        # accepts the full day names and the short forms, in any case ("saturday"
+        # is what the console sends), so a refusal naming only Mon-Sun told a
+        # client its working request was invalid.
         raise api_error(
             422,
             "invalid_weekday",
-            "Weekdays must use Mon-Sun values",
+            f"Unknown weekday {str(value)!r}: use a short (Mon-Sun) or full (monday-sunday) day name",
             value=value,
             valid_values=list(DAY_ORDER),
+            accepted_values=sorted(DAY_ALIASES),
         )
     return normalized
 
