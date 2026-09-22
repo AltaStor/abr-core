@@ -263,7 +263,11 @@ class RepositoryCommands:
             "--immutability-days",
             dest="immutability_days",
             type=int,
-            help="Days S3 Object Lock holds each new backup; required with --immutable governance/compliance",
+            help=(
+                "Minimum days S3 Object Lock holds each new backup. The period actually written "
+                "follows the job's full-backup cycle and its retention, and is never shorter than "
+                "this. Required with --immutable governance/compliance."
+            ),
         )
         add.add_argument(
             "--immutability-retention",
@@ -356,7 +360,10 @@ class RepositoryCommands:
             "--immutability-days",
             dest="immutability_days",
             type=int,
-            help="Updated number of days S3 Object Lock holds each new backup",
+            help=(
+                "Updated minimum days S3 Object Lock holds each new backup; the period actually "
+                "written follows the job's backup cycle and is never shorter than this"
+            ),
         )
         edit.add_argument(
             "--immutability-retention",
