@@ -7,10 +7,12 @@ from datetime import datetime, timedelta, timezone
 import pathlib
 import sys
 import unittest
+from unittest.mock import patch
 
 try:
     from python.srv.core.job_scheduler import JobScheduler
     from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS
+    from python.srv.services import abr_v41
     from python.srv.services.abr_v41 import normalize_job_record
     from python.srv.services.synthetic_full import is_synthetic_full_task
 except ModuleNotFoundError:
@@ -20,6 +22,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(site_packages))
     from python.srv.core.job_scheduler import JobScheduler
     from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS
+    from python.srv.services import abr_v41
     from python.srv.services.abr_v41 import normalize_job_record
     from python.srv.services.synthetic_full import is_synthetic_full_task
 
@@ -719,6 +722,52 @@ class LegacyFullDayMigrationTests(unittest.TestCase):
 
         self.assertEqual(job["synthetic_full_schedule"]["weekdays"], ["Fri"])
         self.assertEqual(job["synthetic_full_schedule"]["time"], "23:00")
+
+    def test_a_job_with_no_schedule_of_its_own_derives_a_fixed_time_and_zone(self) -> None:
+        job = self._job(None, synthetic_full_days=["wednesday"])
+
+        self.assertEqual(job["synthetic_full_schedule"]["weekdays"], ["Wed"])
+        self.assertEqual(job["synthetic_full_schedule"]["time"], "00:00")
+        self.assertEqual(job["synthetic_full_schedule"]["timezone"], "UTC")
+
+    def test_the_derived_time_does_not_depend_on_the_server_timezone(self) -> None:
+        with patch.object(abr_v41, "_server_timezone_name", return_value="Pacific/Auckland"):
+            job = self._job(None, synthetic_full_days=["wednesday"])
+
+        self.assertEqual(job["synthetic_full_schedule"]["timezone"], "UTC")
+        self.assertEqual(job["synthetic_full_schedule"]["time"], "00:00")
+
+    def test_a_day_list_reports_when_it_fires_next(self) -> None:
+        job = self._job(
+            {"type": "daily", "time": "02:00", "timezone": "UTC", "enabled": True},
+            synthetic_full_days=["wednesday"],
+        )
+
+        self.assertTrue(job["synthetic_full_next_run_at"])
+        self.assertTrue(job["synthetic_full_next_run_at"].endswith("02:00:00+00:00"))
+
+    def test_a_stored_next_run_is_not_recomputed(self) -> None:
+        job = self._job(
+            {"type": "daily", "time": "02:00", "timezone": "UTC", "enabled": True},
+            synthetic_full_days=["wednesday"],
+            synthetic_full_next_run_at="2026-12-31T00:00:00+00:00",
+        )
+
+        self.assertEqual(job["synthetic_full_next_run_at"], "2026-12-31T00:00:00+00:00")
+
+    def test_a_job_that_never_runs_on_its_own_promises_no_next_run(self) -> None:
+        for label, schedule in (
+            ("no schedule", None),
+            ("disabled schedule", {"type": "daily", "time": "02:00", "timezone": "UTC", "enabled": False}),
+        ):
+            with self.subTest(schedule=label):
+                job = self._job(
+                    schedule,
+                    synthetic_full_days=["wednesday"],
+                    synthetic_full_next_run_at="2026-12-31T00:00:00+00:00",
+                )
+                self.assertTrue(job["synthetic_full_schedule"]["enabled"])
+                self.assertIsNone(job["synthetic_full_next_run_at"])
 
     def test_a_job_with_no_day_lists_has_no_extra_schedules(self) -> None:
         job = self._job({"type": "daily", "time": "02:00", "timezone": "UTC"})

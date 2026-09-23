@@ -3430,31 +3430,37 @@ def _resolve_vm_selection(
     return vm_ids, vm_names
 
 
-def _schedule_from_legacy_days(
-    days: list[str], base_schedule: Any, created_at: Any
-) -> dict[str, Any] | None:
-    if not days:
-        return None
-    base = base_schedule if isinstance(base_schedule, dict) else {}
-    time_value = str(base.get("time") or "")
-    if not time_value:
-        time_value = _time_of_day_in_schedule_timezone(created_at, base)
-    return normalize_schedule_payload(
-        {
-            "type": "weekly",
-            "days": list(days),
-            "time": time_value,
-            "timezone": base.get("timezone"),
-            "enabled": True,
-        }
-    )
+DERIVED_FULL_SCHEDULE_TIME = "00:00"
+DERIVED_FULL_SCHEDULE_TIMEZONE = "UTC"
 
 
 def _time_of_day_in_schedule_timezone(created_at: Any, schedule: dict[str, Any]) -> str:
     moment = _parse_dt(created_at) if created_at else None
     if moment is None:
-        return "00:00"
+        return DERIVED_FULL_SCHEDULE_TIME
     return _localize(moment, schedule).strftime("%H:%M")
+
+
+def _schedule_from_legacy_days(
+    days: list[str], base_schedule: Any, created_at: Any = None
+) -> dict[str, Any] | None:
+    if not days:
+        return None
+    base = base_schedule if isinstance(base_schedule, dict) else None
+    if base is None:
+        time_value, timezone_name = DERIVED_FULL_SCHEDULE_TIME, DERIVED_FULL_SCHEDULE_TIMEZONE
+    else:
+        time_value = str(base.get("time") or "") or _time_of_day_in_schedule_timezone(created_at, base)
+        timezone_name = base.get("timezone") or DERIVED_FULL_SCHEDULE_TIMEZONE
+    return normalize_schedule_payload(
+        {
+            "type": "weekly",
+            "days": list(days),
+            "time": time_value,
+            "timezone": timezone_name,
+            "enabled": True,
+        }
+    )
 
 
 def _normalize_execution_schedule(
@@ -3528,6 +3534,12 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
         item["schedule"],
         item.get("created_at"),
     )
+    base_is_enabled = _base_schedule_is_enabled(item)
+    for schedule_key, _days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
+        if not base_is_enabled:
+            item[next_run_key] = None
+        elif not item.get(next_run_key):
+            item[next_run_key] = _execution_schedule_next_run(item.get(schedule_key))
     item["description"] = str(item.get("description") or metadata.get("description") or "")
     task_parameters = item.get("task_parameters")
     if not isinstance(task_parameters, dict):
@@ -3816,6 +3828,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         active_full_days = []
     if "synthetic_full_schedule" in payload and synthetic_full_schedule is None:
         synthetic_full_days = []
+    base_is_enabled = isinstance(schedule, dict) and bool(schedule.get("enabled", True))
     description = str(payload.get("description") or "").strip()
     task_parameters = payload.get("task_parameters") if isinstance(payload.get("task_parameters"), dict) else payload.get("backup_options")
     if task_parameters is None:
@@ -3876,8 +3889,8 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_days": synthetic_full_days,
         "active_full_schedule": active_full_schedule,
         "synthetic_full_schedule": synthetic_full_schedule,
-        "active_full_next_run_at": _execution_schedule_next_run(active_full_schedule),
-        "synthetic_full_next_run_at": _execution_schedule_next_run(synthetic_full_schedule),
+        "active_full_next_run_at": _execution_schedule_next_run(active_full_schedule) if base_is_enabled else None,
+        "synthetic_full_next_run_at": _execution_schedule_next_run(synthetic_full_schedule) if base_is_enabled else None,
         "description": description,
         "task_parameters": dict(task_parameters),
         "status": "active" if schedule and bool(schedule.get("enabled", True)) else "disabled" if schedule else "planned",
