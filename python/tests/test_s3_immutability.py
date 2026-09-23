@@ -628,6 +628,43 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_changing_only_the_period_does_not_write_a_probe(self, run_mock, _connect) -> None:
+        run_mock.side_effect = _disk_tool_stub()
+        repository = abr_v41.create_repository_record(
+            {"name": "ObjectRepo", "type": "s3", "s3": {**S3_SETTINGS,
+             "immutability": {"mode": "governance", "retention_days": 1}}}
+        )
+
+        with patch.object(
+            abr_v41, "validate_s3_immutability_config", wraps=abr_v41.validate_s3_immutability_config
+        ) as validate:
+            abr_v41.edit_repository_record(
+                repository["id"], {"s3": {"immutability": {"retention_days": 5}}}
+            )
+
+        self.assertEqual(validate.call_args.kwargs["write_probe"], False)
+
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_changing_the_mode_still_writes_a_probe(self, run_mock, _connect) -> None:
+        run_mock.side_effect = _disk_tool_stub()
+        repository = abr_v41.create_repository_record(
+            {"name": "ObjectRepo", "type": "s3", "s3": {**S3_SETTINGS,
+             "immutability": {"mode": "none", "retention_days": 0}}}
+        )
+
+        with patch.object(
+            abr_v41, "validate_s3_immutability_config", wraps=abr_v41.validate_s3_immutability_config
+        ) as validate:
+            abr_v41.edit_repository_record(
+                repository["id"],
+                {"s3": {"immutability": {"mode": "governance", "retention_days": 5}}},
+            )
+
+        self.assertEqual(validate.call_args.kwargs["write_probe"], True)
+
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
     def test_shorter_job_retention_than_the_lock_is_warned_about(self, run_mock, _connect) -> None:
         run_mock.side_effect = _disk_tool_stub()
         repository = abr_v41.create_repository_record({"name": "ObjectRepo", "type": "s3", "s3": dict(S3_SETTINGS)})

@@ -2383,6 +2383,7 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
                     path=updated.get("path"),
                 )
     _ensure(changed, 422, "invalid_repository", "repo edit requires at least one editable option")
+    registration_check = None
     if _repository_connection_identity(updated) != _repository_connection_identity(record):
         registration_check = _assert_repository_is_usable(
             updated, create_bucket=bool(payload.get("create_bucket"))
@@ -2394,7 +2395,11 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         and next_immutability != previous_immutability
         and immutability_is_enabled(next_immutability)
     ):
-        _assert_immutability_is_usable(next_s3_config)
+        mode_changed = previous_immutability.get("mode") != next_immutability.get("mode")
+        _assert_immutability_is_usable(
+            next_s3_config,
+            write_probe=mode_changed or registration_check is not None,
+        )
     updated["updated_at"] = utc_now()
     persist_repository(updated)
     edited = normalize_repository_record(updated)
@@ -3019,8 +3024,8 @@ def _assert_repository_supports_immutability(repository: dict[str, Any]) -> None
     )
 
 
-def _assert_immutability_is_usable(config: dict[str, Any]) -> None:
-    result = validate_s3_immutability_config(config)
+def _assert_immutability_is_usable(config: dict[str, Any], *, write_probe: bool = True) -> None:
+    result = validate_s3_immutability_config(config, write_probe=write_probe)
     if result.get("status") == "success":
         return
     raise api_error(
