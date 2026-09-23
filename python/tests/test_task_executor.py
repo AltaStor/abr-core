@@ -2289,6 +2289,41 @@ class TaskExecutorTests(unittest.TestCase):
         _accumulate_tool_sizes(totals, "no document here")
         self.assertFalse(totals["complete"])
 
+    def test_a_disk_with_nothing_allocated_still_counts_as_reported(self) -> None:
+        totals = {"logical": 0, "stored": 0, "complete": True}
+
+        logical, stored = _accumulate_tool_sizes(
+            totals, json.dumps({"status": "ok", "raw_data_size": 0, "stored_data_size": 0})
+        )
+
+        self.assertEqual((logical, stored), (0, 0))
+        self.assertEqual((totals["logical"], totals["stored"], totals["complete"]), (0, 0, True))
+
+    def test_an_empty_disk_beside_one_with_data_contributes_nothing_and_breaks_nothing(self) -> None:
+        totals = {"logical": 0, "stored": 0, "complete": True}
+
+        for raw, stored in ((0, 0), (5_724_823_552, 2_090_978_456)):
+            _accumulate_tool_sizes(
+                totals,
+                json.dumps({"status": "ok", "raw_data_size": raw, "stored_data_size": stored}),
+            )
+
+        self.assertEqual(
+            (totals["logical"], totals["stored"], totals["complete"]),
+            (5_724_823_552, 2_090_978_456, True),
+        )
+        self.assertAlmostEqual(_compression_ratio(totals["logical"], totals["stored"]), 0.365248, places=6)
+
+    def test_a_silent_disk_still_withholds_the_tool_counts(self) -> None:
+        totals = {"logical": 0, "stored": 0, "complete": True}
+
+        _accumulate_tool_sizes(
+            totals, json.dumps({"status": "ok", "raw_data_size": 0, "stored_data_size": 0})
+        )
+        _accumulate_tool_sizes(totals, json.dumps({"status": "ok"}))
+
+        self.assertFalse(totals["complete"])
+
     def test_compression_ratio_is_stored_over_logical_and_none_when_unknowable(self) -> None:
         self.assertAlmostEqual(_compression_ratio(1_000, 250), 0.25)
         # An incompressible backup can store as much as it read; that is a real

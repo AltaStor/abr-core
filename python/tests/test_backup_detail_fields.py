@@ -88,6 +88,35 @@ class RegisterBackupFieldsTests(unittest.TestCase):
         self.assertIsNone(record["compression_level"])
 
 
+class EmptySourceSizeTests(unittest.TestCase):
+    def test_a_source_with_nothing_allocated_reports_a_logical_size_of_zero(self) -> None:
+        self.assertEqual(backup_catalog.resolve_logical_size_bytes({"logical_bytes": 0}), 0)
+
+    def test_an_engine_that_reports_nothing_still_has_no_logical_size(self) -> None:
+        for raw in (None, "", "not a number"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(backup_catalog.resolve_logical_size_bytes({"logical_bytes": raw}))
+        self.assertIsNone(backup_catalog.resolve_logical_size_bytes({}))
+
+    def test_a_negative_count_is_not_a_size(self) -> None:
+        self.assertIsNone(backup_catalog.resolve_logical_size_bytes({"logical_bytes": -1}))
+
+    def test_a_real_count_is_kept(self) -> None:
+        self.assertEqual(backup_catalog.resolve_logical_size_bytes({"logical_bytes": 5724823552}), 5724823552)
+
+    def test_nothing_stored_over_nothing_logical_yields_no_ratio(self) -> None:
+        self.assertIsNone(
+            backup_catalog.resolve_compression_ratio({"logical_bytes": 0, "transferred_bytes": 0})
+        )
+
+    def test_a_ratio_is_still_derived_when_both_counts_are_real(self) -> None:
+        ratio = backup_catalog.resolve_compression_ratio(
+            {"logical_bytes": 5724823552, "transferred_bytes": 2090978456}
+        )
+
+        self.assertEqual(ratio, 0.365248)
+
+
 class BackupEncryptionKeyTests(unittest.TestCase):
     def setUp(self) -> None:
         BACKUPS.clear()

@@ -2447,7 +2447,7 @@ def run_vcenter_backup(
             # size behind this backup -- what a restore would write back --
             # against which the stored size gives the compression ratio.
             total_logical_bytes: int | None = None
-            if tool_sizes["complete"] and tool_sizes["logical"] > 0:
+            if tool_sizes["complete"]:
                 total_logical_bytes = int(tool_sizes["logical"])
                 total_transferred_bytes = int(tool_sizes["stored"])
             backup_compression_ratio = _compression_ratio(
