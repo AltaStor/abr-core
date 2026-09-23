@@ -7225,6 +7225,28 @@ def _create_backup_session(
     return session_to_dto(task)
 
 
+def _ensure_chain_can_be_merged(job: dict[str, Any]) -> None:
+    from python.srv.services.synthetic_full import (
+        SyntheticFullValidationError,
+        resolve_source_chain,
+        validate_chain,
+    )
+
+    repository_id = str(job.get("repo_id") or "") or None
+    for vm_id, vm_name in zip(job.get("vm_ids") or [], job.get("vm_names") or []):
+        try:
+            validate_chain(resolve_source_chain(str(job["id"]), str(vm_id), repository_id))
+        except SyntheticFullValidationError as exc:
+            raise api_error(
+                422,
+                "chain_cannot_be_merged",
+                str(exc),
+                job_id=str(job.get("id") or ""),
+                vm_id=str(vm_id),
+                vm_name=str(vm_name),
+            ) from exc
+
+
 def start_job_record(
     job_id: str,
     *,
@@ -7255,6 +7277,8 @@ def start_job_record(
             f"Repository '{target_repository.get('name')}' cannot hold a merged backup",
             repository_id=target_repository_id,
         )
+    if force_synthetic and job["job_type"] != "backup-copy":
+        _ensure_chain_can_be_merged(job)
     sessions = []
     if job["job_type"] == "backup-copy":
         sessions.append(_create_completed_copy_session(job))

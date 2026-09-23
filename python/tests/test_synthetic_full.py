@@ -570,6 +570,89 @@ class SyntheticFullJobStartTests(unittest.TestCase):
             ("SyntheticFull", "ForceSynthetic"),
         )
 
+    def _seed_chain(self, *, incrementals: int, vm_ids: tuple[str, ...] = (VM_ID,)) -> None:
+        from python.srv.services.abr_v41 import normalize_backup_point
+
+        for vm in vm_ids:
+            points = [("ActiveFull", "2026-01-01T00:00:00+00:00")] + [
+                ("Incremental", f"2026-01-0{index + 2}T00:00:00+00:00") for index in range(incrementals)
+            ]
+            for index, (execution_type, created_at) in enumerate(points):
+                point_id = f"seed-{vm}-{index}"
+                BACKUPS[point_id] = normalize_backup_point(
+                    {
+                        "id": point_id,
+                        "job_id": JOB_ID,
+                        "vm_id": vm,
+                        "vm_name": f"web-{vm}",
+                        "repository_id": REPO_ID,
+                        "status": "available",
+                        "execution_type": execution_type,
+                        "created_at": created_at,
+                        "artifact": {"disks": [_disk(point_id)]},
+                    }
+                )
+
+    def _job(self, *vm_ids: str) -> None:
+        REPOSITORIES[REPO_ID] = {"id": REPO_ID, "name": "Local", "type": "local", "path": "/srv/backups"}
+        ids = list(vm_ids or (VM_ID,))
+        JOBS[JOB_ID] = {"id": JOB_ID, "name": "Nightly", "job_type": "backup", "repo_id": REPO_ID,
+                        "vm_ids": ids, "vm_names": [f"web-{vm}" for vm in ids]}
+
+    def test_a_manual_synthetic_run_is_refused_on_a_chain_with_no_incrementals(self) -> None:
+        from python.srv.services.abr_v41 import start_job_record
+        from python.srv.services.api_errors import ApiError
+
+        self._job()
+        self._seed_chain(incrementals=0)
+
+        with self.assertRaises(ApiError) as error:
+            start_job_record(JOB_ID, force_synthetic=True)
+
+        self.assertEqual(error.exception.status_code, 422)
+        self.assertEqual(error.exception.code, "chain_cannot_be_merged")
+        self.assertIn("no incrementals", error.exception.message)
+        self.assertEqual(TASKS, {})
+
+    def test_a_manual_synthetic_run_is_refused_when_there_is_no_chain_at_all(self) -> None:
+        from python.srv.services.abr_v41 import start_job_record
+        from python.srv.services.api_errors import ApiError
+
+        self._job()
+
+        with self.assertRaises(ApiError) as error:
+            start_job_record(JOB_ID, force_synthetic=True)
+
+        self.assertEqual(error.exception.status_code, 422)
+        self.assertIn("run a full backup first", error.exception.message)
+        self.assertEqual(TASKS, {})
+
+    def test_a_manual_synthetic_run_is_accepted_once_an_increment_exists(self) -> None:
+        from python.srv.services.abr_v41 import start_job_record
+
+        self._job()
+        self._seed_chain(incrementals=1)
+
+        items = start_job_record(JOB_ID, force_synthetic=True)["items"]
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["resolved_backup_type"], "SyntheticFull")
+        self.assertEqual(items[0]["resolved_backup_reason"], "ForceSynthetic")
+
+    def test_one_vm_without_increments_refuses_the_whole_request(self) -> None:
+        from python.srv.services.abr_v41 import start_job_record
+        from python.srv.services.api_errors import ApiError
+
+        self._job(VM_ID, "vm-2")
+        self._seed_chain(incrementals=1, vm_ids=(VM_ID,))
+        self._seed_chain(incrementals=0, vm_ids=("vm-2",))
+
+        with self.assertRaises(ApiError) as error:
+            start_job_record(JOB_ID, force_synthetic=True)
+
+        self.assertEqual(error.exception.details.get("vm_id"), "vm-2")
+        self.assertEqual(TASKS, {})
+
     def test_a_target_repository_needs_the_synthetic_flag(self) -> None:
         from python.srv.services.abr_v41 import start_job_record
         from python.srv.services.api_errors import ApiError
