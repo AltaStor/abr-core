@@ -6701,6 +6701,12 @@ def _restore_disk_target_is_thin(disk: dict[str, Any], disk_provisioning: str | 
     return str(disk.get("provisioning") or "").strip().lower() in _THIN_SOURCE_DISK_TYPES
 
 
+def _gib(value: int | None) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value / (1024 ** 3):.2f} GiB"
+
+
 def _ensure_restore_target_capacity(
     disks: list[dict[str, Any]],
     datastore: dict[str, Any],
@@ -6737,7 +6743,8 @@ def _ensure_restore_target_capacity(
         required_total is None or free_bytes is None or free_bytes >= required_total,
         409,
         "insufficient_datastore_space",
-        f"Datastore '{datastore.get('name')}' does not have enough free space for the disks that land on it"
+        f"Datastore '{datastore.get('name')}' does not have enough free space for the disks that land on it: "
+        f"{_gib(required_total)} required, {_gib(free_bytes)} free"
         + (
             " — thin-provisioned disks are measured by the data the backup holds, "
             "not by their provisioned size"
