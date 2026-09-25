@@ -673,7 +673,14 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")
-    def test_changing_only_the_period_does_not_write_a_probe(self, run_mock, _connect) -> None:
+    def test_changing_only_the_period_does_not_touch_the_bucket(self, run_mock, _connect) -> None:
+        """A period change is one integer in the catalog.
+
+        Nothing the bucket could answer depends on it -- whether Object Lock is
+        on, how strong it is, what its default rule says are all properties of
+        the bucket -- so the edit must not put a round trip to the object store
+        (and its timeouts) in front of itself.
+        """
         run_mock.side_effect = _disk_tool_stub()
         repository = abr_v41.create_repository_record(
             {"name": "ObjectRepo", "type": "s3", "s3": {**S3_SETTINGS,
@@ -683,11 +690,12 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
         with patch.object(
             abr_v41, "validate_s3_immutability_config", wraps=abr_v41.validate_s3_immutability_config
         ) as validate:
-            abr_v41.edit_repository_record(
+            result = abr_v41.edit_repository_record(
                 repository["id"], {"s3": {"immutability": {"retention_days": 5}}}
             )
 
-        self.assertEqual(validate.call_args.kwargs["write_probe"], False)
+        validate.assert_not_called()
+        self.assertEqual(result["immutability"]["retention_days"], 5)
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")

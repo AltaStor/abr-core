@@ -2396,10 +2396,21 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         and immutability_is_enabled(next_immutability)
     ):
         mode_changed = previous_immutability.get("mode") != next_immutability.get("mode")
-        _assert_immutability_is_usable(
-            next_s3_config,
-            write_probe=mode_changed or registration_check is not None,
-        )
+        connection_changed = registration_check is not None
+        # Only when the answer can have changed. The bucket probe reads the
+        # bucket's own Object Lock configuration -- whether it has one, how
+        # strong it is, what its default rule says -- and none of that depends
+        # on the retention period this repository asks for. Re-reading the
+        # bucket to change "lock for 1 day" into "lock for 5 days" put a
+        # round trip to the object store (and its timeouts) in front of an edit
+        # that only rewrites one integer in the catalog. Turning the lock on,
+        # changing its mode or repointing the repository still probe, and
+        # "Validate" re-runs the whole thing on demand.
+        if mode_changed or connection_changed:
+            _assert_immutability_is_usable(
+                next_s3_config,
+                write_probe=mode_changed or connection_changed,
+            )
     updated["updated_at"] = utc_now()
     persist_repository(updated)
     edited = normalize_repository_record(updated)
