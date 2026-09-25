@@ -7,6 +7,7 @@ import argparse
 import json
 import pathlib
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -38,6 +39,7 @@ from python.srv.core.storage_tool import (
 from python.srv.core.subprocess_util import CompletedProcess
 from python.cli.commands import repository_commands
 from python.srv.plugins.vcenter import vcenter_backup
+from python.srv.core import storage_tool
 from python.srv.services import abr_v41
 from python.srv.services.abr_v41 import DAY_ORDER
 from python.srv.services.backup_mode import object_lock_actual_retention_days
@@ -393,6 +395,49 @@ class S3ImmutabilityValidationFlowTests(unittest.TestCase):
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_a_probe_whose_lock_still_holds_is_not_even_attempted(self, run_mock, _connect) -> None:
+        still_locked = storage_tool.immutability_probe_name(30)
+        stub = _disk_tool_stub(leftover_probes=(still_locked,))
+        run_mock.side_effect = stub
+
+        abr_v41.test_s3_immutability(
+            {"s3": dict(S3_SETTINGS, immutability={"mode": "governance", "retention_days": 30})}
+        )
+
+        removed = [command[command.index("--name") + 1] for command in stub.calls if command[0] == "remove"]
+        self.assertNotIn(still_locked, removed)
+
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_a_probe_whose_lock_expired_is_swept(self, run_mock, _connect) -> None:
+        expired = storage_tool.immutability_probe_name(1, now=time.time() - 30 * 86400)
+        stub = _disk_tool_stub(leftover_probes=(expired,))
+        run_mock.side_effect = stub
+
+        abr_v41.test_s3_immutability(
+            {"s3": dict(S3_SETTINGS, immutability={"mode": "governance", "retention_days": 30})}
+        )
+
+        removed = [command[command.index("--name") + 1] for command in stub.calls if command[0] == "remove"]
+        self.assertIn(expired, removed)
+
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_probes_from_before_the_name_carried_a_date_are_capped_per_sweep(self, run_mock, _connect) -> None:
+        legacy = tuple(f"immutability-probe-{index:02d}legacy" for index in range(10))
+        stub = _disk_tool_stub(leftover_probes=legacy)
+        run_mock.side_effect = stub
+
+        abr_v41.test_s3_immutability(
+            {"s3": dict(S3_SETTINGS, immutability={"mode": "governance", "retention_days": 30})}
+        )
+
+        removed = [command[command.index("--name") + 1] for command in stub.calls if command[0] == "remove"]
+        attempted = [name for name in removed if name in legacy]
+        self.assertEqual(len(attempted), storage_tool._IMMUTABILITY_PROBE_UNDATED_SWEEP_LIMIT)
+
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
     def test_validation_sweeps_probes_an_earlier_run_left_behind(self, run_mock, _connect) -> None:
         stub = _disk_tool_stub(leftover_probes=("immutability-probe-old", "real-backup"))
         run_mock.side_effect = stub
@@ -625,6 +670,43 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
 
         self.assertIn("at least one editable option", error.exception.message)
         self.assertEqual(abr_v41.edit_repository_record("legacy", {"s3": {"prefix": "lab2"}})["prefix"], "lab2")
+
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_changing_only_the_period_does_not_write_a_probe(self, run_mock, _connect) -> None:
+        run_mock.side_effect = _disk_tool_stub()
+        repository = abr_v41.create_repository_record(
+            {"name": "ObjectRepo", "type": "s3", "s3": {**S3_SETTINGS,
+             "immutability": {"mode": "governance", "retention_days": 1}}}
+        )
+
+        with patch.object(
+            abr_v41, "validate_s3_immutability_config", wraps=abr_v41.validate_s3_immutability_config
+        ) as validate:
+            abr_v41.edit_repository_record(
+                repository["id"], {"s3": {"immutability": {"retention_days": 5}}}
+            )
+
+        self.assertEqual(validate.call_args.kwargs["write_probe"], False)
+
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_changing_the_mode_still_writes_a_probe(self, run_mock, _connect) -> None:
+        run_mock.side_effect = _disk_tool_stub()
+        repository = abr_v41.create_repository_record(
+            {"name": "ObjectRepo", "type": "s3", "s3": {**S3_SETTINGS,
+             "immutability": {"mode": "none", "retention_days": 0}}}
+        )
+
+        with patch.object(
+            abr_v41, "validate_s3_immutability_config", wraps=abr_v41.validate_s3_immutability_config
+        ) as validate:
+            abr_v41.edit_repository_record(
+                repository["id"],
+                {"s3": {"immutability": {"mode": "governance", "retention_days": 5}}},
+            )
+
+        self.assertEqual(validate.call_args.kwargs["write_probe"], True)
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")

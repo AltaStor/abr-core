@@ -48,6 +48,21 @@ class RestoreCommands:
         point_list.add_argument("--vm-id", required=True, help="Unique VM ID")
         point_list.set_defaults(handler=self.point_list)
 
+        context = commands.add_parser(
+            "context",
+            help="Show what a restore point can be mapped to.",
+            description=(
+                "List the source datastores and networks a restore point carries, with the target\n"
+                "each one falls back to. These are the names --datastore-map and --network-map take.\n\n"
+                "Examples:\n"
+                "  abr restore context --restore-point <point-id>\n"
+                "  abr restore context --restore-point <point-id> --output json"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        context.add_argument("--restore-point", dest="restore_point", required=True, help="Restore point ID")
+        context.set_defaults(handler=self.context)
+
         start = commands.add_parser(
             "start",
             help="Start restore.",
@@ -161,6 +176,65 @@ class RestoreCommands:
         if isinstance(items, list):
             payload = {**payload, "items": [self._decorate_restore_point(item) for item in items]}
         deps.context.print_output(payload, self._point_columns())
+        return 0
+
+    @staticmethod
+    def _context_columns() -> list[tuple[str, str]]:
+        return [
+            ("kind", "KIND"),
+            ("source", "SOURCE"),
+            ("target", "DEFAULT TARGET"),
+        ]
+
+    @staticmethod
+    def _mappable_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        source_vm = payload.get("source_vm") if isinstance(payload.get("source_vm"), dict) else {}
+        targets = payload.get("targets") if isinstance(payload.get("targets"), dict) else {}
+        defaults = payload.get("defaults") if isinstance(payload.get("defaults"), dict) else {}
+        datastore_names = {
+            str(item.get("id") or ""): str(item.get("name") or "")
+            for item in targets.get("datastores", [])
+            if isinstance(item, dict)
+        }
+        network_names = {
+            str(item.get("id") or ""): str(item.get("name") or "")
+            for item in targets.get("networks", [])
+            if isinstance(item, dict)
+        }
+        rows: list[dict[str, Any]] = []
+        for mapping in defaults.get("datastore_mappings", []):
+            if not isinstance(mapping, dict):
+                continue
+            rows.append(
+                {
+                    "kind": "datastore",
+                    "source": str(mapping.get("source_datastore") or ""),
+                    "target": datastore_names.get(str(mapping.get("target_datastore_id") or ""), ""),
+                }
+            )
+        nics = {str(nic.get("id") or ""): nic for nic in source_vm.get("nics", []) if isinstance(nic, dict)}
+        for mapping in defaults.get("network_mappings", []):
+            if not isinstance(mapping, dict):
+                continue
+            nic = nics.get(str(mapping.get("source_nic_id") or "")) or {}
+            rows.append(
+                {
+                    "kind": "network",
+                    "source": str(nic.get("source_network") or ""),
+                    "target": network_names.get(str(mapping.get("target_network_id") or ""), ""),
+                }
+            )
+        return rows
+
+    def context(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        payload = deps.context.api_client.get(
+            "api/v1/restore/context", params={"restore_point_id": args.restore_point}
+        )
+        if str(getattr(args, "output", "table")) == "table":
+            deps.context.print_output({"items": self._mappable_rows(payload)}, self._context_columns())
+        else:
+            deps.context.print_output(payload)
         return 0
 
     def start(self, args: argparse.Namespace) -> int:

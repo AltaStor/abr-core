@@ -106,6 +106,44 @@ class InventoryDiscoveryAndJobStartEngineTests(unittest.TestCase):
         # Discovery results were persisted, so the inventory is now scanned.
         self.assertTrue(abr_v41._resolve_inventory_vm_records(str(inventory["id"])))
 
+    def test_a_day_list_is_stored_as_a_schedule_with_a_next_run(self) -> None:
+        inventory = self._create_inventory()
+
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Days Only",
+                "vms": ["vm-1"],
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": {"type": "daily", "time": "02:00", "timezone": "UTC"},
+                "synthetic_full_days": ["Wed"],
+            }
+        )
+
+        self.assertEqual(job["synthetic_full_schedule"]["days"], ["wednesday"])
+        self.assertEqual(job["synthetic_full_schedule"]["time"], "02:00")
+        self.assertEqual(job["synthetic_full_schedule"]["timezone"], "UTC")
+        self.assertTrue(job["synthetic_full_next_run_at"])
+
+    def test_adding_a_day_list_by_edit_also_reports_a_next_run(self) -> None:
+        inventory = self._create_inventory()
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Grows Days",
+                "vms": ["vm-1"],
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": {"type": "daily", "time": "02:00", "timezone": "UTC"},
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+            }
+        )
+        self.assertIsNone(job["synthetic_full_schedule"])
+
+        edited = abr_v41.edit_job_record(job["id"], {"synthetic_full_days": ["Wed"]})
+
+        self.assertEqual(edited["synthetic_full_schedule"]["days"], ["wednesday"])
+        self.assertTrue(edited["synthetic_full_next_run_at"])
+
     def test_job_create_unknown_vm_fails_without_rescan_guidance(self) -> None:
         # A VM name that does not exist even after automatic discovery must fail
         # clearly, and must not tell the user to run a manual rescan.

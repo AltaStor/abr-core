@@ -203,7 +203,7 @@ def resolve_logical_size_bytes(result: dict[str, Any]) -> int | None:
         value = int(raw)
     except (TypeError, ValueError):
         return None
-    return value if value > 0 else None
+    return value if value >= 0 else None
 
 
 def resolve_compression_ratio(result: dict[str, Any]) -> float | None:

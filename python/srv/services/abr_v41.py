@@ -2383,6 +2383,7 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
                     path=updated.get("path"),
                 )
     _ensure(changed, 422, "invalid_repository", "repo edit requires at least one editable option")
+    registration_check = None
     if _repository_connection_identity(updated) != _repository_connection_identity(record):
         registration_check = _assert_repository_is_usable(
             updated, create_bucket=bool(payload.get("create_bucket"))
@@ -2394,7 +2395,11 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         and next_immutability != previous_immutability
         and immutability_is_enabled(next_immutability)
     ):
-        _assert_immutability_is_usable(next_s3_config)
+        mode_changed = previous_immutability.get("mode") != next_immutability.get("mode")
+        _assert_immutability_is_usable(
+            next_s3_config,
+            write_probe=mode_changed or registration_check is not None,
+        )
     updated["updated_at"] = utc_now()
     persist_repository(updated)
     edited = normalize_repository_record(updated)
@@ -3019,8 +3024,8 @@ def _assert_repository_supports_immutability(repository: dict[str, Any]) -> None
     )
 
 
-def _assert_immutability_is_usable(config: dict[str, Any]) -> None:
-    result = validate_s3_immutability_config(config)
+def _assert_immutability_is_usable(config: dict[str, Any], *, write_probe: bool = True) -> None:
+    result = validate_s3_immutability_config(config, write_probe=write_probe)
     if result.get("status") == "success":
         return
     raise api_error(
@@ -3430,31 +3435,37 @@ def _resolve_vm_selection(
     return vm_ids, vm_names
 
 
-def _schedule_from_legacy_days(
-    days: list[str], base_schedule: Any, created_at: Any
-) -> dict[str, Any] | None:
-    if not days:
-        return None
-    base = base_schedule if isinstance(base_schedule, dict) else {}
-    time_value = str(base.get("time") or "")
-    if not time_value:
-        time_value = _time_of_day_in_schedule_timezone(created_at, base)
-    return normalize_schedule_payload(
-        {
-            "type": "weekly",
-            "days": list(days),
-            "time": time_value,
-            "timezone": base.get("timezone"),
-            "enabled": True,
-        }
-    )
+DERIVED_FULL_SCHEDULE_TIME = "00:00"
+DERIVED_FULL_SCHEDULE_TIMEZONE = "UTC"
 
 
 def _time_of_day_in_schedule_timezone(created_at: Any, schedule: dict[str, Any]) -> str:
     moment = _parse_dt(created_at) if created_at else None
     if moment is None:
-        return "00:00"
+        return DERIVED_FULL_SCHEDULE_TIME
     return _localize(moment, schedule).strftime("%H:%M")
+
+
+def _schedule_from_legacy_days(
+    days: list[str], base_schedule: Any, created_at: Any = None
+) -> dict[str, Any] | None:
+    if not days:
+        return None
+    base = base_schedule if isinstance(base_schedule, dict) else None
+    if base is None:
+        time_value, timezone_name = DERIVED_FULL_SCHEDULE_TIME, DERIVED_FULL_SCHEDULE_TIMEZONE
+    else:
+        time_value = str(base.get("time") or "") or _time_of_day_in_schedule_timezone(created_at, base)
+        timezone_name = base.get("timezone") or DERIVED_FULL_SCHEDULE_TIMEZONE
+    return normalize_schedule_payload(
+        {
+            "type": "weekly",
+            "days": list(days),
+            "time": time_value,
+            "timezone": timezone_name,
+            "enabled": True,
+        }
+    )
 
 
 def _normalize_execution_schedule(
@@ -3528,6 +3539,12 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
         item["schedule"],
         item.get("created_at"),
     )
+    base_is_enabled = _base_schedule_is_enabled(item)
+    for schedule_key, _days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
+        if not base_is_enabled:
+            item[next_run_key] = None
+        elif not item.get(next_run_key):
+            item[next_run_key] = _execution_schedule_next_run(item.get(schedule_key))
     item["description"] = str(item.get("description") or metadata.get("description") or "")
     task_parameters = item.get("task_parameters")
     if not isinstance(task_parameters, dict):
@@ -3816,6 +3833,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         active_full_days = []
     if "synthetic_full_schedule" in payload and synthetic_full_schedule is None:
         synthetic_full_days = []
+    base_is_enabled = isinstance(schedule, dict) and bool(schedule.get("enabled", True))
     description = str(payload.get("description") or "").strip()
     task_parameters = payload.get("task_parameters") if isinstance(payload.get("task_parameters"), dict) else payload.get("backup_options")
     if task_parameters is None:
@@ -3876,8 +3894,8 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_days": synthetic_full_days,
         "active_full_schedule": active_full_schedule,
         "synthetic_full_schedule": synthetic_full_schedule,
-        "active_full_next_run_at": _execution_schedule_next_run(active_full_schedule),
-        "synthetic_full_next_run_at": _execution_schedule_next_run(synthetic_full_schedule),
+        "active_full_next_run_at": _execution_schedule_next_run(active_full_schedule) if base_is_enabled else None,
+        "synthetic_full_next_run_at": _execution_schedule_next_run(synthetic_full_schedule) if base_is_enabled else None,
         "description": description,
         "task_parameters": dict(task_parameters),
         "status": "active" if schedule and bool(schedule.get("enabled", True)) else "disabled" if schedule else "planned",
@@ -6683,6 +6701,12 @@ def _restore_disk_target_is_thin(disk: dict[str, Any], disk_provisioning: str | 
     return str(disk.get("provisioning") or "").strip().lower() in _THIN_SOURCE_DISK_TYPES
 
 
+def _gib(value: int | None) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value / (1024 ** 3):.2f} GiB"
+
+
 def _ensure_restore_target_capacity(
     disks: list[dict[str, Any]],
     datastore: dict[str, Any],
@@ -6719,7 +6743,8 @@ def _ensure_restore_target_capacity(
         required_total is None or free_bytes is None or free_bytes >= required_total,
         409,
         "insufficient_datastore_space",
-        f"Datastore '{datastore.get('name')}' does not have enough free space for the disks that land on it"
+        f"Datastore '{datastore.get('name')}' does not have enough free space for the disks that land on it: "
+        f"{_gib(required_total)} required, {_gib(free_bytes)} free"
         + (
             " — thin-provisioned disks are measured by the data the backup holds, "
             "not by their provisioned size"
@@ -7225,6 +7250,28 @@ def _create_backup_session(
     return session_to_dto(task)
 
 
+def _ensure_chain_can_be_merged(job: dict[str, Any]) -> None:
+    from python.srv.services.synthetic_full import (
+        SyntheticFullValidationError,
+        resolve_source_chain,
+        validate_chain,
+    )
+
+    repository_id = str(job.get("repo_id") or "") or None
+    for vm_id, vm_name in zip(job.get("vm_ids") or [], job.get("vm_names") or []):
+        try:
+            validate_chain(resolve_source_chain(str(job["id"]), str(vm_id), repository_id))
+        except SyntheticFullValidationError as exc:
+            raise api_error(
+                422,
+                "chain_cannot_be_merged",
+                str(exc),
+                job_id=str(job.get("id") or ""),
+                vm_id=str(vm_id),
+                vm_name=str(vm_name),
+            ) from exc
+
+
 def start_job_record(
     job_id: str,
     *,
@@ -7255,6 +7302,8 @@ def start_job_record(
             f"Repository '{target_repository.get('name')}' cannot hold a merged backup",
             repository_id=target_repository_id,
         )
+    if force_synthetic and job["job_type"] != "backup-copy":
+        _ensure_chain_can_be_merged(job)
     sessions = []
     if job["job_type"] == "backup-copy":
         sessions.append(_create_completed_copy_session(job))

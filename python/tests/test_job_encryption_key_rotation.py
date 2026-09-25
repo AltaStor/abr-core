@@ -286,9 +286,7 @@ class JobViewTests(unittest.TestCase):
             "task_parameters": parameters,
         }
 
-        view = abr_v41._job_dto(job) if hasattr(abr_v41, "_job_dto") else None
-        if view is None:
-            self.skipTest("job dto helper is not exposed under this name")
+        view = abr_v41.job_to_dto(job)
 
         self.assertEqual(view["encryption"]["key_id"], 1)
         self.assertEqual(view["encryption"]["key_ids"], [0, 1])

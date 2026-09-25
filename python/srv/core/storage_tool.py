@@ -30,6 +30,8 @@ IMMUTABILITY_RETENTION_SCOPES = ("job_retention", "minimum_only")
 _IMMUTABILITY_RANKS = {"none": 0, "governance": 1, "compliance": 2}
 IMMUTABILITY_PROBE_FOLDER = ".abr-immutability-probe"
 IMMUTABILITY_PROBE_NAME_PREFIX = "immutability-probe-"
+_IMMUTABILITY_PROBE_CLOCK_MARGIN_SECONDS = 3600
+_IMMUTABILITY_PROBE_UNDATED_SWEEP_LIMIT = 3
 IMMUTABILITY_PROBE_RETENTION_DAYS = 1
 
 
@@ -708,20 +710,49 @@ def immutability_probe_path(prefix: Any) -> str:
     return join_s3_prefix(prefix, IMMUTABILITY_PROBE_FOLDER)
 
 
+def immutability_probe_name(retention_days: int, *, now: float | None = None) -> str:
+    moment = int(now if now is not None else time.time())
+    unlocks_at = (
+        moment
+        + max(int(retention_days), 1) * 86400
+        + _IMMUTABILITY_PROBE_CLOCK_MARGIN_SECONDS
+    )
+    return f"{IMMUTABILITY_PROBE_NAME_PREFIX}{unlocks_at}-{uuid4().hex[:12]}"
+
+
+def immutability_probe_unlocks_at(name: str) -> int | None:
+    if not name.startswith(IMMUTABILITY_PROBE_NAME_PREFIX):
+        return None
+    head, separator, tail = name[len(IMMUTABILITY_PROBE_NAME_PREFIX):].partition("-")
+    if not separator or not tail or not head.isdigit():
+        return None
+    return int(head)
+
+
 def sweep_immutability_probes(
     repository: dict[str, Any],
     probe_path: str,
     *,
     timeout: int = 60,
+    now: float | None = None,
 ) -> int:
     try:
         leftovers = list_disk_tool_backups(repository, probe_path, timeout=timeout)
     except StorageToolError:
         return 0
-    swept = 0
+    moment = int(now if now is not None else time.time())
+    unlocked: list[str] = []
+    undated: list[str] = []
     for name in sorted(leftovers):
         if not name.startswith(IMMUTABILITY_PROBE_NAME_PREFIX):
             continue
+        unlocks_at = immutability_probe_unlocks_at(name)
+        if unlocks_at is None:
+            undated.append(name)
+        elif unlocks_at <= moment:
+            unlocked.append(name)
+    swept = 0
+    for name in unlocked + undated[:_IMMUTABILITY_PROBE_UNDATED_SWEEP_LIMIT]:
         try:
             remove_disk_tool_backup(repository, probe_path, name, timeout=timeout)
         except StorageToolError:
@@ -740,7 +771,7 @@ def probe_repository_immutability(
 ) -> dict[str, Any]:
     probe_path = immutability_probe_path(prefix)
     sweep_immutability_probes(repository, probe_path, timeout=timeout)
-    backup_name = f"{IMMUTABILITY_PROBE_NAME_PREFIX}{uuid4().hex[:12]}"
+    backup_name = immutability_probe_name(retention_days)
 
     with tempfile.NamedTemporaryFile(prefix="abr-immutability-probe-", suffix=".bin") as probe:
         probe.write(b"\xa5" * 512)

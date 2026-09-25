@@ -82,6 +82,47 @@ class RestoreLifecycleParserTests(unittest.TestCase):
         return stream.getvalue()
 
 
+class RestoreContextRowsTests(unittest.TestCase):
+    CONTEXT = {
+        "source_vm": {
+            "nics": [
+                {"id": "nic-1", "source_network": "VM Network"},
+                {"id": "nic-2", "source_network": "Storage"},
+            ]
+        },
+        "targets": {
+            "datastores": [{"id": "ds-a", "name": "fast-ssd"}, {"id": "ds-b", "name": "bulk"}],
+            "networks": [{"id": "net-1", "name": "VM Network"}],
+        },
+        "defaults": {
+            "datastore_mappings": [
+                {"source_datastore": "src-ssd", "target_datastore_id": "ds-a"},
+                {"source_datastore": "src-bulk", "target_datastore_id": "ds-b"},
+            ],
+            "network_mappings": [
+                {"source_nic_id": "nic-1", "target_network_id": "net-1"},
+                {"source_nic_id": "nic-2", "target_network_id": None},
+            ],
+        },
+    }
+
+    def test_every_source_a_mapping_flag_takes_is_listed(self) -> None:
+        rows = RestoreCommands._mappable_rows(self.CONTEXT)
+
+        self.assertEqual(
+            rows,
+            [
+                {"kind": "datastore", "source": "src-ssd", "target": "fast-ssd"},
+                {"kind": "datastore", "source": "src-bulk", "target": "bulk"},
+                {"kind": "network", "source": "VM Network", "target": "VM Network"},
+                {"kind": "network", "source": "Storage", "target": ""},
+            ],
+        )
+
+    def test_a_context_with_nothing_to_map_lists_nothing(self) -> None:
+        self.assertEqual(RestoreCommands._mappable_rows({}), [])
+
+
 class RestorePayloadBuilderTests(unittest.TestCase):
     def setUp(self) -> None:
         context = CliContext(base_url="http://example.test", output="json", api_client=_FakeApiClient(), output_renderer=CliOutputRenderer())

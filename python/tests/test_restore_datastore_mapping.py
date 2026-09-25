@@ -111,6 +111,21 @@ class RestoreDatastoreCapacityTests(unittest.TestCase):
             )
         self.assertEqual(error.exception.code, "insufficient_datastore_space")
 
+    def test_the_refusal_states_both_the_required_and_the_free_space(self) -> None:
+        small = _datastore("sata-restore", free_bytes=15 * 1024**3)
+
+        with self.assertRaises(ApiError) as error:
+            abr_v41._ensure_restore_target_capacity(
+                [_disk("disk-2", "sata-bulk"), _disk("disk-3", "sata-bulk")], small, "new_vm", None
+            )
+
+        message = error.exception.message
+        self.assertIn("sata-restore", message)
+        self.assertIn("required", message)
+        self.assertIn("15.00 GiB free", message)
+        self.assertEqual(error.exception.details["free_bytes"], 15 * 1024**3)
+        self.assertIsNotNone(error.exception.details["required_bytes"])
+
 
 class RestoreDiskLayoutTests(unittest.TestCase):
     def setUp(self) -> None:
