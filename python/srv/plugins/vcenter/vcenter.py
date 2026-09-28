@@ -122,6 +122,52 @@ def _scsi_controller_class_for_type(type_name: Any) -> type:
     )
 
 
+def _distributed_portgroup_name(vm: Any, portgroup_key: str) -> str | None:
+    """Name of the distributed port group ``portgroup_key`` among the VM's own networks.
+
+    ``vm.network`` lists every network the VM is on, distributed port groups
+    included. A port group's key is normally its MoRef id, so that is compared
+    first and ``key`` (a property fetch) is read only when it differs.
+    """
+    try:
+        for network in getattr(vm, "network", None) or []:
+            if getattr(network, "_moId", None) == portgroup_key or getattr(network, "key", None) == portgroup_key:
+                name = getattr(network, "name", None)
+                if name:
+                    return str(name)
+    except Exception as exc:
+        # The name only labels the NIC for a later restore; never fail a
+        # backup or an inventory scan over it.
+        logger.warning("Could not resolve distributed port group %s: %s", portgroup_key, exc)
+    return None
+
+
+def _nic_network_name(vm: Any, device: Any) -> str | None:
+    """Name of the network a NIC is on, as a restore will look it up.
+
+    A standard port group names itself on the NIC's backing (``deviceName``).
+    A distributed port group does not: the backing carries only the port group
+    key and the switch UUID, and the NIC's ``deviceInfo.summary`` reads
+    "DVSwitch: <switch uuid>" -- the same text for every port group on that
+    switch. Recording the summary made NICs on different port groups of one
+    switch look like one network, which a restore can neither find by name nor
+    map apart. The summary is kept only as a last resort, for a port group the
+    VM's own network list does not show.
+    """
+    backing = getattr(device, "backing", None)
+    device_name = getattr(backing, "deviceName", None)
+    if device_name:
+        return str(device_name)
+    portgroup_key = getattr(getattr(backing, "port", None), "portgroupKey", None)
+    if not portgroup_key:
+        return None
+    resolved = _distributed_portgroup_name(vm, str(portgroup_key))
+    if resolved:
+        return resolved
+    summary = getattr(getattr(device, "deviceInfo", None), "summary", None)
+    return str(summary) if summary else None
+
+
 def _fault_message(error: Any) -> str:
     """Best-effort human-readable text for a vCenter task/SOAP fault.
 
@@ -834,14 +880,7 @@ class VCenterNode(Hypervisor):
         scsi_controller_bus_number: int | None = None
         for device in config.hardware.device:
             if isinstance(device, vim.vm.device.VirtualEthernetCard):
-                backing = getattr(device, "backing", None)
-                network_name = getattr(backing, "deviceName", None)
-                if network_name is None:
-                    port = getattr(backing, "port", None)
-                    if port is not None:
-                        portgroup_key = getattr(port, "portgroupKey", None)
-                        if portgroup_key:
-                            network_name = getattr(getattr(device, "deviceInfo", None), "summary", None)
+                network_name = _nic_network_name(vm, device)
                 adapters.append(
                     {
                         "label": getattr(device.deviceInfo, "label", "Network adapter"),
@@ -1064,12 +1103,25 @@ class VCenterNode(Hypervisor):
         scsi_spec.device = scsi_controller
 
         device_changes: list[Any] = [scsi_spec]
+        # What became of each adapter, so the restore can report it: an adapter
+        # whose network is missing on the host is left out of the VM, and
+        # before this list existed that only showed up as a server-log warning.
+        restored_adapters: list[dict[str, Any]] = []
         for adapter in config_metadata.get("network_adapters", []):
             if not isinstance(adapter, dict):
                 continue
             nic_spec = self._build_nic_spec(datacenter, host, adapter)
             if nic_spec is not None:
                 device_changes.append(nic_spec)
+            restored_adapters.append(
+                {
+                    "label": adapter.get("label"),
+                    "network": str(adapter.get("network") or "").strip() or None,
+                    "source_network": adapter.get("source_network"),
+                    "connected": bool(adapter.get("connected", True)),
+                    "attached": nic_spec is not None,
+                }
+            )
 
         created_disk_paths: list[str] = []
         disk_layout = disk_layout or []
@@ -1196,6 +1248,7 @@ class VCenterNode(Hypervisor):
             "restored_firmware": resulting_firmware,
             "requested_scsi_controller_type": requested_scsi_controller_type,
             "requested_secure_boot": bool(requested_secure_boot) if requested_secure_boot is not None else None,
+            "network_adapters": restored_adapters,
         }
 
     def remove_snapshot(self, vm_name: str, snapshot_name: str) -> None:
@@ -1712,7 +1765,7 @@ class VCenterNode(Hypervisor):
                         continue
 
                     backing = getattr(device, "backing", None)
-                    network_name = getattr(backing, "deviceName", None) or getattr(backing, "network", None)
+                    network_name = _nic_network_name(vm, device) or getattr(backing, "network", None)
                     nic_entries.append(
                         {
                             "vm_id": vm_uuid,

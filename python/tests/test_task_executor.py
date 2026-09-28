@@ -2541,6 +2541,123 @@ class TaskExecutorTests(unittest.TestCase):
         self._assert_abr_mode_file(command)
         self.assertIn("demo-vm-restored", command[command.index("--vmdk") + 1])
 
+    def test_vcenter_vm_restore_sends_each_adapter_to_its_own_target_network(self) -> None:
+        # Two adapters recorded on one source network name -- what a distributed
+        # switch's port groups used to be recorded as. network_map, keyed by
+        # that name, holds only the last target picked; the per-adapter map is
+        # what keeps them apart.
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {"num_cpu": 2, "memory_mb": 4096},
+            }
+        }
+
+        class ReportingNode(FakeVCenterNode):
+            # Like the real node: an adapter whose network the host lacks is left out.
+            def create_vm_shell(self, **kwargs):  # type: ignore[override]
+                payload = super().create_vm_shell(**kwargs)
+                payload["network_adapters"] = [
+                    {**adapter, "attached": adapter.get("network") != "Lab"}
+                    for adapter in kwargs["config_metadata"]["network_adapters"]
+                ]
+                return payload
+
+        fake_module = types.SimpleNamespace(VCenterNode=ReportingNode)
+        shared = "DVSwitch: 50 16 aa bb"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (pathlib.Path(temp_dir) / "01-demo-vm.vmdk").write_text("fake-vmdk", encoding="utf-8")
+            manifest_path = pathlib.Path(temp_dir) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "vm_name": "demo-vm",
+                        "vm_config": {
+                            "guest_id": "ubuntu64Guest",
+                            "firmware": "bios",
+                            "num_cpu": 2,
+                            "memory_mb": 4096,
+                            "network_adapters": [
+                                {"label": "Network adapter 1", "network": shared, "connected": True},
+                                {"label": "Network adapter 2", "network": shared, "connected": True},
+                                {"label": "Network adapter 3", "network": "Lab", "connected": True},
+                            ],
+                        },
+                        "disks": [
+                            {
+                                "index": 1,
+                                "disk_label": "Hard disk 1",
+                                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                                "destination_path": "",
+                                "abr_path": str(pathlib.Path(temp_dir)),
+                                "abr_backup_name": "01-demo-vm.vmdk",
+                                "storage_mode": "local",
+                                "store_mode": "full",
+                                "source_disk_type_code": 5,
+                                "source_disk_type_name": "vmfs_flat",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._register_backup_point("point-vm-nics", manifest_path)
+
+            task = {
+                "id": "task-vcenter-restore-nics",
+                "status": "queued",
+                "task_type": "restore",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "manifest_path": str(manifest_path),
+                    "point_id": "point-vm-nics",
+                    "target_vm_name": "demo-vm-restored",
+                    "target_host_name": "esx-dst.local",
+                    "target_datastore_name": "datastore2",
+                    "tool_path": EXISTING_TOOL_PATH,
+                    "network_map": {shared: "Backup"},
+                    "network_adapter_map": [
+                        {"index": 0, "source_network": shared, "target_network": "Prod"},
+                        {"index": 1, "source_network": shared, "target_network": "Backup"},
+                    ],
+                },
+            }
+            messages: list[str] = []
+
+            def capture(update: dict[str, object]) -> None:
+                messages.append(str(update.get("message") or ""))
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch(
+                    "python.srv.plugins.vcenter.vcenter_restore.run_capped",
+                    side_effect=lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok"),
+                ):
+                    result = run_task(task, progress_callback=capture)
+
+        self.assertEqual(result["status"], "completed")
+        adapters = ReportingNode.created_vms[0]["config_metadata"]["network_adapters"]
+        self.assertEqual([adapter["network"] for adapter in adapters], ["Prod", "Backup", "Lab"])
+        self.assertEqual([adapter.get("source_network") for adapter in adapters], [shared, shared, None])
+        self.assertIn(f"Network adapter 1 restored on network Prod (mapped from source network {shared})", messages)
+        self.assertIn(f"Network adapter 2 restored on network Backup (mapped from source network {shared})", messages)
+        self.assertIn("Network adapter 3 was not restored: network Lab was not found on host esx-dst.local", messages)
+        self.assertEqual(len(result["result"]["network_adapters"]), 3)
+
     @staticmethod
     def _disk_c_added_after_incremental_entry(
         index: int, task_root: "pathlib.Path", label: str, filename: str

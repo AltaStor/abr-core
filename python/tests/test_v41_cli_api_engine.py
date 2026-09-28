@@ -3092,6 +3092,63 @@ class AbrV41EngineTests(unittest.TestCase):
             {"VM Network": "VM Network", "DMZ": "BMC_Network"},
         )
 
+    def test_restore_start_keeps_two_adapters_on_one_source_network_apart(self) -> None:
+        """Each adapter reaches the target picked for it even when both were
+        recorded on the same source network; a map keyed by source network
+        name keeps only the last one, which put both NICs on one network."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._two_host_network_inventory("p-shared-source", tmpdir, source_host="esx-02.local")
+            manifest_path = f"{tmpdir}/manifest.json"
+            with open(manifest_path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            for adapter in manifest["vm_config"]["network_adapters"]:
+                adapter["network"] = "VM Network"
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            source_nics = abr_v41.get_restore_context("p-shared-source")["source_vm"]["nics"]
+
+            session = abr_v41.restore_start(
+                {
+                    "restore_point_id": "p-shared-source",
+                    "target": {
+                        "inventory_id": inventory["id"],
+                        "host_id": "esx-02.local",
+                        "datastore_id": f"{inventory['id']}::datastore::tstds",
+                        "vm_name": "restoredtstvm",
+                    },
+                    "network_mappings": [
+                        {"source_nic_id": source_nics[0]["id"], "target_network_id": f"{inventory['id']}::network::VM Network"},
+                        {"source_nic_id": source_nics[1]["id"], "target_network_id": f"{inventory['id']}::network::BMC_Network"},
+                    ],
+                }
+            )
+
+        adapter_map = TASKS[session["id"]]["parameters"]["network_adapter_map"]
+        self.assertEqual(
+            [(item["index"], item["source_network"], item["target_network"]) for item in adapter_map],
+            [(0, "VM Network", "VM Network"), (1, "VM Network", "BMC_Network")],
+        )
+
+    def test_restore_start_sends_no_adapter_map_for_a_legacy_name_map(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._two_host_network_inventory("p-legacy-map", tmpdir, source_host="esx-01.local")
+            session = abr_v41.restore_start(
+                {
+                    "restore_point_id": "p-legacy-map",
+                    "target": {
+                        "inventory_id": inventory["id"],
+                        "host_id": "esx-01.local",
+                        "datastore_id": f"{inventory['id']}::datastore::tstds",
+                        "vm_name": "restoredtstvm",
+                    },
+                    "network_map": ["VM Network:VM Network", "DMZ:DMZ"],
+                }
+            )
+
+        parameters = TASKS[session["id"]]["parameters"]
+        self.assertEqual(parameters["network_map"], {"VM Network": "VM Network", "DMZ": "DMZ"})
+        self.assertIsNone(parameters["network_adapter_map"])
+
     def test_restore_start_marks_imported_points_as_having_no_discoverable_source_resource(self) -> None:
         inventory = abr_v41.create_inventory_record(
             {

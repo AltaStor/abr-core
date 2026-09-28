@@ -972,6 +972,109 @@ class VCenterNodeGetInventoryTests(unittest.TestCase):
         self.assertEqual(inventory["network_adapters"], [])
 
 
+_DVS_SUMMARY = "DVSwitch: 50 16 aa bb"
+
+
+def _fake_dvs_nic(label: str, portgroup_key: str) -> object:
+    """A NIC on a distributed port group: its backing names only the port group
+    key and switch UUID, and vCenter's summary names only the switch."""
+    nic = vim.vm.device.VirtualVmxnet3()
+    nic.deviceInfo = vim.Description(label=label, summary=_DVS_SUMMARY)
+    nic.backing = vim.vm.device.VirtualEthernetCard.DistributedVirtualPortBackingInfo()
+    nic.backing.port = vim.dvs.PortConnection(portgroupKey=portgroup_key, switchUuid="50 16 aa bb")
+    nic.connectable = vim.vm.device.VirtualDevice.ConnectInfo(startConnected=True, connected=True)
+    return nic
+
+
+def _fake_vm_networks() -> list[object]:
+    return [
+        types.SimpleNamespace(_moId="network-7", name="VM Network"),
+        types.SimpleNamespace(_moId="dvportgroup-101", name="Prod"),
+        # A port group whose key is not its MoRef id.
+        types.SimpleNamespace(_moId="dvportgroup-5", key="dvportgroup-102", name="Backup"),
+    ]
+
+
+class VCenterNodeNetworkAdapterTests(unittest.TestCase):
+    def test_restore_metadata_names_each_distributed_port_group(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        fake_vm = _fake_restore_metadata_vm(
+            firmware="bios",
+            devices=[
+                _fake_dvs_nic("Network adapter 1", "dvportgroup-101"),
+                _fake_dvs_nic("Network adapter 2", "dvportgroup-102"),
+            ],
+        )
+        fake_vm.network = _fake_vm_networks()
+        node._get_vm = lambda vm_name: fake_vm if vm_name == "demo-vm" else None  # type: ignore[method-assign]
+
+        metadata = node.get_vm_restore_metadata("demo-vm")
+
+        # Not the switch summary both NICs share: that made them one network.
+        self.assertEqual([adapter["network"] for adapter in metadata["network_adapters"]], ["Prod", "Backup"])
+
+    def test_restore_metadata_falls_back_to_the_summary_for_an_unlisted_port_group(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        fake_vm = _fake_restore_metadata_vm(firmware="bios", devices=[_fake_dvs_nic("Network adapter 1", "dvportgroup-999")])
+        fake_vm.network = _fake_vm_networks()
+        node._get_vm = lambda vm_name: fake_vm if vm_name == "demo-vm" else None  # type: ignore[method-assign]
+
+        metadata = node.get_vm_restore_metadata("demo-vm")
+
+        self.assertEqual(metadata["network_adapters"][0]["network"], _DVS_SUMMARY)
+
+    def test_inventory_names_the_distributed_port_group_of_a_nic(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        fake_vm = _fake_healthy_vm(name="web-01", uuid="uuid-web-01")
+        fake_vm.config.hardware.device[1] = _fake_dvs_nic("Network adapter 1", "dvportgroup-101")
+        fake_vm.network = _fake_vm_networks()
+        node.si = _FakeServiceInstance([fake_vm])
+
+        inventory = node.get_inventory()
+
+        self.assertEqual(inventory["network_adapters"][0]["network"], "Prod")
+
+    def test_create_vm_shell_reports_which_adapters_it_attached(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        host, datacenter, vm_folder, created_vm = _fake_vm_create_context(resulting_firmware="bios")
+
+        node._get_host = lambda host_name: host if host_name == "esx-01.local" else None  # type: ignore[method-assign]
+        node._get_vm = lambda vm_name: None  # type: ignore[method-assign]
+        node._get_datacenter = lambda obj: datacenter  # type: ignore[method-assign]
+        node._wait_for_task = lambda task: created_vm  # type: ignore[method-assign]
+        node._find_network = lambda datacenter, host, name: vim.Network("network-7") if name == "Prod" else None  # type: ignore[method-assign]
+
+        with self.assertLogs("python.srv.plugins.vcenter.vcenter", level="WARNING"):
+            result = node.create_vm_shell(
+                vm_name="demo-vm-restored",
+                host_name="esx-01.local",
+                datastore_name="ds-01",
+                config_metadata={
+                    "guest_id": "ubuntu64Guest",
+                    "num_cpu": 2,
+                    "memory_mb": 4096,
+                    "firmware": "bios",
+                    "network_adapters": [
+                        {"label": "Network adapter 1", "network": "Prod", "source_network": _DVS_SUMMARY, "connected": True},
+                        {"label": "Network adapter 2", "network": "Missing", "connected": True},
+                    ],
+                },
+                disk_layout=[],
+            )
+
+        self.assertEqual(
+            [(adapter["network"], adapter["attached"]) for adapter in result["network_adapters"]],
+            [("Prod", True), ("Missing", False)],
+        )
+        self.assertEqual(result["network_adapters"][0]["source_network"], _DVS_SUMMARY)
+        nics = [
+            change.device
+            for change in vm_folder.calls[0]["config"].deviceChange
+            if isinstance(change.device, vim.vm.device.VirtualEthernetCard)
+        ]
+        self.assertEqual(len(nics), 1)
+
+
 class _FakeSessionManager:
     def __init__(self, *, login_error: Exception | None = None) -> None:
         self.logins: list[tuple[str, str]] = []

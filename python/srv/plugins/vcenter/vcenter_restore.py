@@ -567,6 +567,40 @@ def _disk_type_details(
     }
 
 
+def _report_network_adapters(
+    progress_callback: ProgressCallback,
+    adapters: Any,
+    host_name: str,
+) -> list[dict[str, Any]]:
+    """Say which network each adapter of the new VM ended up on.
+
+    Written to the server log and, through the progress feed, to the session
+    log. Before this nothing in a restore named a NIC's network, so a restored
+    VM whose adapters all came up on one network left no trace of why.
+    """
+    reported = [adapter for adapter in adapters if isinstance(adapter, dict)] if isinstance(adapters, list) else []
+    for position, adapter in enumerate(reported, start=1):
+        label = str(adapter.get("label") or f"Network adapter {position}")
+        network = str(adapter.get("network") or "").strip()
+        source_network = str(adapter.get("source_network") or "").strip()
+        if not adapter.get("attached", True):
+            message = (
+                f"{label} was not restored: network {network} was not found on host {host_name}"
+                if network
+                else f"{label} was not restored: the restore point recorded no network for it"
+            )
+            logger.warning("%s", message)
+        else:
+            message = f"{label} restored on network {network}"
+            if source_network and source_network != network:
+                message += f" (mapped from source network {source_network})"
+            if not adapter.get("connected", True):
+                message += ", disconnected"
+            logger.info("%s", message)
+        _emit_progress(progress_callback, "prepare", 5, message, worker_mode="vcenter-abr-vmdk-tool")
+    return reported
+
+
 def run_vcenter_restore(
     task: dict[str, Any],
     progress_callback: ProgressCallback = None,
@@ -673,16 +707,33 @@ def run_vcenter_restore(
             raise VCenterBackupError("Backup manifest does not contain any disks")
 
         network_map = parameters.get("network_map")
+        # The target of each adapter, by its position in the manifest's
+        # network_adapters. network_map is keyed by source network NAME, so it
+        # cannot send two adapters on one source network to different targets;
+        # a per-adapter entry wins over it, and network_map covers the rest.
+        adapter_targets: dict[int, str] = {}
+        adapter_map = parameters.get("network_adapter_map")
+        for entry in adapter_map if isinstance(adapter_map, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            position = entry.get("index")
+            target_network = str(entry.get("target_network") or "").strip()
+            if isinstance(position, int) and not isinstance(position, bool) and target_network:
+                adapter_targets[position] = target_network
         connect_nics = bool(parameters.get("connect_nics", True))
-        if isinstance(network_map, dict) or not connect_nics:
+        if isinstance(network_map, dict) or adapter_targets or not connect_nics:
             remapped_adapters: list[dict[str, Any]] = []
-            for adapter in vm_config.get("network_adapters", []) or []:
+            for position, adapter in enumerate(vm_config.get("network_adapters", []) or []):
                 if not isinstance(adapter, dict):
                     continue
                 adapter_copy = dict(adapter)
                 source_network = str(adapter_copy.get("network") or "")
-                if isinstance(network_map, dict) and source_network and source_network in network_map:
+                if position in adapter_targets:
+                    adapter_copy["network"] = adapter_targets[position]
+                elif isinstance(network_map, dict) and source_network and source_network in network_map:
                     adapter_copy["network"] = str(network_map[source_network])
+                if adapter_copy.get("network") != adapter.get("network"):
+                    adapter_copy["source_network"] = source_network or None
                 if not connect_nics:
                     adapter_copy["connected"] = False
                 remapped_adapters.append(adapter_copy)
@@ -789,6 +840,9 @@ def run_vcenter_restore(
                 created_vm.get("restored_firmware") or "unknown",
                 created_vm.get("requested_scsi_controller_type") or "unknown",
                 created_vm.get("requested_secure_boot"),
+            )
+            restored_network_adapters = _report_network_adapters(
+                progress_callback, created_vm.get("network_adapters"), target_host_name
             )
             original_destroyed = False
             original_identity: dict[str, str] = {}
@@ -1130,6 +1184,7 @@ def run_vcenter_restore(
             "disk_type": parameters.get("disk_type"),
             "disk_types": parameters.get("disk_types") if isinstance(parameters.get("disk_types"), dict) else None,
             "network_map": network_map if isinstance(network_map, dict) else None,
+            "network_adapters": restored_network_adapters,
             "transport_mode": transport_mode,
             "service_type": service_type,
             "power_on": bool(parameters.get("power_on")),

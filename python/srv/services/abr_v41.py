@@ -6967,11 +6967,21 @@ def _resolve_restore_network_selection(
     mappings: list[dict[str, Any]],
     legacy_network_map: Any,
     host: dict[str, Any] | None = None,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    """Resolve where the restored VM's network adapters go.
+
+    Returns the source-network-name map every path produces, plus -- for
+    per-adapter ``mappings`` -- one entry per mapped adapter, by its position in
+    the manifest's ``network_adapters``. The name map alone cannot tell two
+    adapters on the same source network apart (a distributed switch's port
+    groups used to be recorded under one name, too), so it sent them all to
+    whichever target was listed last; the engine applies the per-adapter
+    entries first.
+    """
     source_vm = _build_restore_source_vm(point, manifest)
     source_nics = [item for item in source_vm.get("nics", []) if isinstance(item, dict)]
     if not source_nics:
-        return _parse_restore_network_map(legacy_network_map)
+        return _parse_restore_network_map(legacy_network_map), []
 
     source_networks = [str(item.get("source_network") or "").strip() for item in source_nics if str(item.get("source_network") or "").strip()]
     # A port group on another host's virtual switch is not a valid destination
@@ -6986,14 +6996,18 @@ def _resolve_restore_network_selection(
 
     if mappings:
         resolved: dict[str, str] = {}
-        source_index = {str(item.get("id") or ""): item for item in source_nics}
+        adapter_targets: dict[int, dict[str, Any]] = {}
+        # _source_network_fallbacks builds one NIC per manifest adapter, in the
+        # manifest's order, so a NIC's position here is its adapter's position
+        # in vm_config.network_adapters -- which is what the engine indexes.
+        source_index = {str(item.get("id") or ""): (position, item) for position, item in enumerate(source_nics)}
         for entry in mappings:
             source_nic_id = str(entry.get("source_nic_id") or "").strip()
             target_network_id = str(entry.get("target_network_id") or "").strip()
             if not source_nic_id and not target_network_id:
                 continue
             _ensure(bool(source_nic_id and target_network_id), 422, "invalid_restore", "Each network mapping requires source_nic_id and target_network_id")
-            source_nic = source_index.get(source_nic_id)
+            position, source_nic = source_index.get(source_nic_id) or (None, None)
             _ensure(source_nic is not None, 404, "network_adapter_not_found", "Source network adapter not found", source_nic_id=source_nic_id)
             source_network = str(source_nic.get("source_network") or "").strip()
             _ensure(bool(source_network), 422, "invalid_restore", "Source network adapter is missing a source network", source_nic_id=source_nic_id)
@@ -7008,14 +7022,21 @@ def _resolve_restore_network_selection(
                 inventory_id=target_inventory_id,
             )
             _ensure(target_network is not None, 404, "network_not_found", "Target network not found in inventory", target_network_id=target_network_id, inventory_id=target_inventory_id)
-            resolved[source_network] = str(target_network.get("name") or "")
+            target_network_name = str(target_network.get("name") or "")
+            resolved[source_network] = target_network_name
+            adapter_targets[position] = {
+                "index": position,
+                "label": source_nic.get("label"),
+                "source_network": source_network,
+                "target_network": target_network_name,
+            }
         missing = [
             str(item.get("label") or item.get("id") or "network adapter")
             for item in source_nics
             if str(item.get("source_network") or "").strip() and str(item.get("source_network") or "").strip() not in resolved
         ]
         _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for all source adapters", adapters=missing)
-        return resolved
+        return resolved, [adapter_targets[position] for position in sorted(adapter_targets)]
 
     legacy = _parse_restore_network_map(legacy_network_map)
     if legacy:
@@ -7043,7 +7064,7 @@ def _resolve_restore_network_selection(
                 )
         missing = [source_network for source_network in source_networks if source_network not in legacy]
         _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for all source adapters", networks=missing)
-        return legacy
+        return legacy, []
 
     automatic = {
         source_network: source_network
@@ -7052,7 +7073,7 @@ def _resolve_restore_network_selection(
     }
     missing = [source_network for source_network in source_networks if source_network and source_network not in automatic]
     _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for the selected restore target", networks=missing)
-    return automatic
+    return automatic, []
 
 
 def _parse_restore_network_map(value: Any) -> dict[str, str]:
@@ -7612,7 +7633,7 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             vm_name=target_vm_name,
         )
 
-    network_map = _resolve_restore_network_selection(
+    network_map, network_adapter_map = _resolve_restore_network_selection(
         point=point,
         manifest=manifest,
         target_inventory_id=str(target_inventory["id"]),
@@ -7679,6 +7700,7 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             "manifest_path": manifest_path,
             "backup_root": (placement or {}).get("backup_root") if isinstance(placement, dict) else _restore_point_artifact(point).get("backup_root"),
             "network_map": network_map,
+            "network_adapter_map": network_adapter_map or None,
             "force": force,
             "power_on": power_on,
             "connect_nics": connect_nics,
