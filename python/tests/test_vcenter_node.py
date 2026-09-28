@@ -1275,3 +1275,148 @@ class NormalizeDiskUuidTests(unittest.TestCase):
         for value in (None, "", "   ", "N/A", "n/a", "None", "NULL", "Unknown"):
             with self.subTest(value=value):
                 self.assertIsNone(_normalize_disk_uuid(value))
+
+
+class _FakeDatastore(vim.Datastore):
+    @property
+    def name(self) -> str:
+        return self._name
+
+
+class RestoredDiskProvisioningTests(unittest.TestCase):
+    @staticmethod
+    def _source_disk(*, thin: bool, eagerly_scrub: bool | None) -> vim.vm.device.VirtualDisk:
+        disk = vim.vm.device.VirtualDisk()
+        disk.key = 2000
+        disk.unitNumber = 0
+        disk.controllerKey = 1000
+        disk.capacityInKB = 2 * 1024 * 1024
+        disk.deviceInfo = vim.Description(label="Hard disk 1", summary="")
+        backing = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
+        backing.fileName = "[data1] demo-vm/demo-vm.vmdk"
+        backing.thinProvisioned = thin
+        if eagerly_scrub is not None:
+            backing.eagerlyScrub = eagerly_scrub
+        disk.backing = backing
+        return disk
+
+    def _created_disks(self, disk_layout: list[dict[str, object]]) -> list[object]:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        host, datacenter, vm_folder, created_vm = _fake_vm_create_context(resulting_firmware="bios")
+        datastore = _FakeDatastore("datastore-1")
+        object.__setattr__(datastore, "_name", "ds-01")
+        host.datastore = [datastore]
+        node._get_host = lambda host_name: host if host_name == "esx-01.local" else None  # type: ignore[method-assign]
+        node._get_vm = lambda vm_name: None  # type: ignore[method-assign]
+        node._get_datacenter = lambda obj: datacenter  # type: ignore[method-assign]
+        node._wait_for_task = lambda task: created_vm  # type: ignore[method-assign]
+
+        node.create_vm_shell(
+            vm_name="demo-vm-restored",
+            host_name="esx-01.local",
+            datastore_name="ds-01",
+            config_metadata={
+                "guest_id": "ubuntu64Guest",
+                "num_cpu": 2,
+                "memory_mb": 4096,
+                "firmware": "bios",
+                "network_adapters": [],
+            },
+            disk_layout=disk_layout,
+        )
+        return [
+            change.device
+            for change in vm_folder.calls[0]["config"].deviceChange
+            if isinstance(change.device, vim.vm.device.VirtualDisk)
+        ]
+
+    def test_a_thick_source_disk_is_created_thick(self) -> None:
+        disks = self._created_disks(
+            [{"capacity_gb": 1, "file_name": "00-disk.vmdk", "thin_provisioned": False, "eager_zeroed": False}]
+        )
+
+        self.assertEqual(len(disks), 1)
+        self.assertFalse(disks[0].backing.thinProvisioned)
+        self.assertFalse(disks[0].backing.eagerlyScrub)
+
+    def test_an_eager_zeroed_source_disk_is_created_eager_zeroed(self) -> None:
+        disks = self._created_disks(
+            [{"capacity_gb": 1, "file_name": "00-disk.vmdk", "thin_provisioned": False, "eager_zeroed": True}]
+        )
+
+        self.assertFalse(disks[0].backing.thinProvisioned)
+        self.assertTrue(disks[0].backing.eagerlyScrub)
+
+    def test_a_thin_source_disk_stays_thin(self) -> None:
+        disks = self._created_disks(
+            [{"capacity_gb": 1, "file_name": "00-disk.vmdk", "thin_provisioned": True, "eager_zeroed": False}]
+        )
+
+        self.assertTrue(disks[0].backing.thinProvisioned)
+
+    def test_a_layout_without_a_provisioning_decision_still_creates_thin(self) -> None:
+        disks = self._created_disks([{"capacity_gb": 1, "file_name": "00-disk.vmdk"}])
+
+        self.assertTrue(disks[0].backing.thinProvisioned)
+
+    def _attach(self, **kwargs: object) -> vim.vm.device.VirtualDisk:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        controller = vim.vm.device.VirtualLsiLogicController()
+        controller.key = 1000
+        vm = types.SimpleNamespace(
+            config=types.SimpleNamespace(hardware=types.SimpleNamespace(device=[controller])),
+        )
+        specs: list[object] = []
+
+        def _reconfig(*, spec: object) -> object:
+            specs.append(spec)
+            return object()
+
+        vm.ReconfigVM_Task = _reconfig  # type: ignore[attr-defined]
+        node._get_vm = lambda vm_name: vm if vm_name == "demo-vm-restored" else None  # type: ignore[method-assign]
+        node._wait_for_task = lambda task: None  # type: ignore[method-assign]
+
+        node.attach_existing_disk("demo-vm-restored", "[ds-01] demo-vm-restored/00-disk.vmdk", **kwargs)  # type: ignore[arg-type]
+        return specs[0].deviceChange[0].device
+
+    def test_an_attached_thick_disk_is_declared_thick(self) -> None:
+        device = self._attach(thin_provisioned=False, eager_zeroed=False)
+
+        self.assertFalse(device.backing.thinProvisioned)
+        self.assertFalse(device.backing.eagerlyScrub)
+
+    def test_an_attached_eager_zeroed_disk_is_declared_eager_zeroed(self) -> None:
+        device = self._attach(thin_provisioned=False, eager_zeroed=True)
+
+        self.assertTrue(device.backing.eagerlyScrub)
+
+    def test_an_attached_disk_with_no_decision_is_declared_thin(self) -> None:
+        device = self._attach()
+
+        self.assertTrue(device.backing.thinProvisioned)
+
+
+class SourceDiskEagerZeroedTests(unittest.TestCase):
+    def _disks(self, *, thin: bool, eagerly_scrub: bool | None) -> list[dict[str, object]]:
+        node = VCenterNode("vc.local", "user", "secret")
+        disk = RestoredDiskProvisioningTests._source_disk(thin=thin, eagerly_scrub=eagerly_scrub)
+        vm = _fake_restore_metadata_vm(firmware="bios", devices=[disk])
+        return node._collect_disks(vm)
+
+    def test_a_lazy_zeroed_thick_disk_is_recorded_as_not_eager(self) -> None:
+        disks = self._disks(thin=False, eagerly_scrub=False)
+
+        self.assertEqual(disks[0]["source_disk_type_name"], "vmfs_flat")
+        self.assertIs(disks[0]["source_disk_eager_zeroed"], False)
+
+    def test_an_eager_zeroed_thick_disk_is_recorded_as_eager(self) -> None:
+        disks = self._disks(thin=False, eagerly_scrub=True)
+
+        self.assertEqual(disks[0]["source_disk_type_name"], "vmfs_flat")
+        self.assertIs(disks[0]["source_disk_eager_zeroed"], True)
+
+    def test_a_thin_disk_records_no_eager_zeroed_answer(self) -> None:
+        disks = self._disks(thin=True, eagerly_scrub=None)
+
+        self.assertEqual(disks[0]["source_disk_type_name"], "vmfs_thin")
+        self.assertIsNone(disks[0]["source_disk_eager_zeroed"])

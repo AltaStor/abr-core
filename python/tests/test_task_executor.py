@@ -247,12 +247,16 @@ class FakeVCenterNode:
         datastore_path: str,
         disk_label: str | None = None,
         disk_uuid: str | None = None,
+        thin_provisioned: bool | None = None,
+        eager_zeroed: bool = False,
     ) -> dict[str, object]:
         payload = {
             "vm_name": vm_name,
             "datastore_path": datastore_path,
             "disk_label": disk_label,
             "disk_uuid": disk_uuid,
+            "thin_provisioned": thin_provisioned,
+            "eager_zeroed": eager_zeroed,
             "controller_key": 1000,
             "unit_number": 1,
             "label": disk_label or "Restored disk",
@@ -296,12 +300,14 @@ class FakeVCenterNode:
         disk_path: str,
         capacity_gb: float,
         disk_type_code: int = VddkDiskType.VMFS_THIN,
+        eager_zeroed: bool = False,
     ) -> dict[str, object]:
         payload = {
             "datastore_name": datastore_name,
             "disk_path": disk_path,
             "capacity_gb": capacity_gb,
             "disk_type_code": disk_type_code,
+            "eager_zeroed": eager_zeroed,
         }
         self.created_managed_disks.append(payload)
         return payload
@@ -2425,6 +2431,123 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(len(disk_layout), 2)
         self.assertEqual(disk_layout[0]["disk_uuid"], "6000C292-d2c6-df32-2e38-2d46be8d7a29")
         self.assertEqual(disk_layout[1]["disk_uuid"], "N/A")
+
+    def test_vcenter_vm_restore_gives_each_new_disk_its_source_provisioning(self) -> None:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-prov-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-prov-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest_path = pathlib.Path(temp_dir) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "vm_name": "demo-vm",
+                        "vm_config": {"firmware": "bios", "guest_id": "windows2022srvNext_64Guest"},
+                        "disks": [
+                            {
+                                "index": 1,
+                                "disk_label": "Hard disk 1",
+                                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                                "uuid": "6000C292-0001",
+                                "capacity_gb": 40,
+                                "destination_path": "",
+                                "abr_path": str(pathlib.Path(temp_dir)),
+                                "abr_backup_name": "01-demo-vm.vmdk",
+                                "storage_mode": "local",
+                                "store_mode": "full",
+                                "source_disk_type_code": 7,
+                                "source_disk_type_name": "vmfs_thin",
+                            },
+                            {
+                                "index": 2,
+                                "disk_label": "Hard disk 2",
+                                "datastore_path": "[datastore1] demo-vm/demo-vm_1.vmdk",
+                                "uuid": "6000C292-0002",
+                                "capacity_gb": 2,
+                                "destination_path": "",
+                                "abr_path": str(pathlib.Path(temp_dir)),
+                                "abr_backup_name": "02-demo-vm_1.vmdk",
+                                "storage_mode": "local",
+                                "store_mode": "full",
+                                "source_disk_type_code": 5,
+                                "source_disk_type_name": "vmfs_flat",
+                                "source_disk_eager_zeroed": False,
+                            },
+                            {
+                                "index": 3,
+                                "disk_label": "Hard disk 3",
+                                "datastore_path": "[datastore1] demo-vm/demo-vm_2.vmdk",
+                                "uuid": "6000C292-0003",
+                                "capacity_gb": 2,
+                                "destination_path": "",
+                                "abr_path": str(pathlib.Path(temp_dir)),
+                                "abr_backup_name": "03-demo-vm_2.vmdk",
+                                "storage_mode": "local",
+                                "store_mode": "full",
+                                "source_disk_type_code": 5,
+                                "source_disk_type_name": "vmfs_flat",
+                                "source_disk_eager_zeroed": True,
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._register_backup_point("point-vm-prov", manifest_path)
+
+            task = {
+                "id": "task-vcenter-restore-provisioning",
+                "status": "queued",
+                "task_type": "restore",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-prov-1",
+                "parameters": {
+                    "manifest_path": str(manifest_path),
+                    "point_id": "point-vm-prov",
+                    "target_vm_name": "demo-vm-restored",
+                    "target_host_name": "esx-dst.local",
+                    "target_datastore_name": "datastore2",
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                return FakeCompletedProcess(returncode=0, stdout="ok")
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch("python.srv.plugins.vcenter.vcenter_restore.run_capped", side_effect=fake_run):
+                    result = run_task(task)
+
+        self.assertEqual(result["status"], "completed")
+        disk_layout = FakeVCenterNode.created_vms[0]["disk_layout"]
+        self.assertEqual([disk["thin_provisioned"] for disk in disk_layout], [True, False, False])
+        self.assertEqual([disk["eager_zeroed"] for disk in disk_layout], [False, False, True])
+        self.assertEqual(
+            [disk["resolved_disk_eager_zeroed"] for disk in result["result"]["disks"]],
+            [False, False, True],
+        )
+        self.assertEqual(
+            [disk["resolved_disk_type_name"] for disk in result["result"]["disks"]],
+            ["vmfs_thin", "vmfs_flat", "vmfs_flat"],
+        )
 
     def test_vcenter_vm_restore_task_creates_new_vm_and_attaches_restored_disks(self) -> None:
         HYPERVISORS["hv-vc"] = {
@@ -4604,6 +4727,95 @@ class TaskExecutorTests(unittest.TestCase):
         )
         self.assertEqual(recorded_commands[0][1], "restore")
         self.assertIn("[ds-01] demo-vm-restored/01-demo-vm.vmdk", recorded_commands[0])
+
+    def test_hostagent_vm_restore_recreates_an_eager_zeroed_source_disk(self) -> None:
+        FakeVCenterNode.service_type = "HostAgent"
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "esxi.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "root", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_path = pathlib.Path(temp_dir) / "01-demo-vm.vmdk"
+            backup_path.write_text("fake-vmdk", encoding="utf-8")
+            manifest_path = pathlib.Path(temp_dir) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "vm_name": "demo-vm",
+                        "vm_config": {
+                            "guest_id": "debian12_64Guest",
+                            "num_cpu": 2,
+                            "memory_mb": 2048,
+                            "network_adapters": [],
+                        },
+                        "disks": [
+                            {
+                                "index": 1,
+                                "disk_label": "Hard disk 1",
+                                "capacity_gb": 20,
+                                "datastore_path": "[ds-01] demo-vm/demo-vm.vmdk",
+                                "destination_path": "",
+                                "abr_path": str(pathlib.Path(temp_dir)),
+                                "abr_backup_name": "01-demo-vm.vmdk",
+                                "storage_mode": "local",
+                                "store_mode": "full",
+                                "source_disk_type_code": 5,
+                                "source_disk_type_name": "vmfs_flat",
+                                "source_disk_eager_zeroed": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._register_backup_point("point-hostagent-eager", manifest_path)
+
+            task = {
+                "id": "task-hostagent-restore-eager",
+                "status": "queued",
+                "task_type": "restore",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "manifest_path": str(manifest_path),
+                    "point_id": "point-hostagent-eager",
+                    "target_vm_name": "demo-vm-restored",
+                    "target_host_name": "esx-01.local",
+                    "target_datastore_name": "ds-01",
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                return FakeCompletedProcess(returncode=0, stdout="ok")
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch("python.srv.plugins.vcenter.vcenter_restore.run_capped", side_effect=fake_run):
+                    result = run_task(task)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(FakeVCenterNode.created_managed_disks[0]["disk_type_code"], 5)
+        self.assertTrue(FakeVCenterNode.created_managed_disks[0]["eager_zeroed"])
+        self.assertFalse(FakeVCenterNode.attachments[0]["thin_provisioned"])
+        self.assertTrue(FakeVCenterNode.attachments[0]["eager_zeroed"])
 
     def test_vm_restore_rejects_unsupported_disk_type_before_creating_vm(self) -> None:
         FakeVCenterNode.service_type = "HostAgent"

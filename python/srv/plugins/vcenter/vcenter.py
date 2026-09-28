@@ -16,7 +16,12 @@ from pyVim.connect import Disconnect, SmartConnect
 from pyVmomi import vim, vmodl
 from ...core.server_defaults import env_int
 from ..hypervisor import Hypervisor
-from .vcenter_disk_types import VddkDiskType, classify_vmware_disk_type, hostagent_disk_type_from_code
+from .vcenter_disk_types import (
+    VddkDiskType,
+    classify_vmware_disk_eager_zeroed,
+    classify_vmware_disk_type,
+    hostagent_disk_type_from_code,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -575,6 +580,9 @@ class VCenterNode(Hypervisor):
                     "uuid": getattr(device.backing, "uuid", None),
                     "source_disk_type_code": disk_type_code,
                     "source_disk_type_name": disk_type_name,
+                    "source_disk_eager_zeroed": classify_vmware_disk_eager_zeroed(
+                        source_backing, disk_type_code
+                    ),
                 }
             )
         return disks
@@ -1153,7 +1161,10 @@ class VCenterNode(Hypervisor):
             backing.fileName = disk_path
             backing.datastore = disk_datastore
             backing.diskMode = "persistent"
-            backing.thinProvisioned = True
+            requested_thin = disk.get("thin_provisioned")
+            backing.thinProvisioned = True if requested_thin is None else bool(requested_thin)
+            if not backing.thinProvisioned:
+                backing.eagerlyScrub = bool(disk.get("eager_zeroed"))
             source_disk_uuid = _normalize_disk_uuid(disk.get("disk_uuid"))
             if source_disk_uuid:
                 backing.uuid = source_disk_uuid
@@ -1277,6 +1288,8 @@ class VCenterNode(Hypervisor):
         datastore_path: str,
         disk_label: str | None = None,
         disk_uuid: str | None = None,
+        thin_provisioned: bool | None = None,
+        eager_zeroed: bool = False,
     ) -> dict[str, Any]:
         vm = self._get_vm(vm_name)
         if not vm:
@@ -1320,7 +1333,9 @@ class VCenterNode(Hypervisor):
         backing = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
         backing.fileName = datastore_path
         backing.diskMode = "persistent"
-        backing.thinProvisioned = True
+        backing.thinProvisioned = True if thin_provisioned is None else bool(thin_provisioned)
+        if not backing.thinProvisioned:
+            backing.eagerlyScrub = bool(eager_zeroed)
         source_disk_uuid = _normalize_disk_uuid(disk_uuid)
         if source_disk_uuid:
             backing.uuid = source_disk_uuid
@@ -1345,6 +1360,7 @@ class VCenterNode(Hypervisor):
         disk_path: str,
         capacity_gb: float,
         disk_type_code: int = VddkDiskType.VMFS_THIN,
+        eager_zeroed: bool = False,
     ) -> dict[str, Any]:
         if self.si is None:
             raise ValueError("Not connected")
@@ -1383,7 +1399,7 @@ class VCenterNode(Hypervisor):
 
         spec = vim.VirtualDiskManager.FileBackedVirtualDiskSpec()
         spec.adapterType = "lsiLogic"
-        spec.diskType = hostagent_disk_type_from_code(disk_type_code)
+        spec.diskType = hostagent_disk_type_from_code(disk_type_code, eager_zeroed=eager_zeroed)
         spec.capacityKb = int(max(capacity_gb, 1.0) * 1024 * 1024)
 
         task = self.si.RetrieveContent().virtualDiskManager.CreateVirtualDisk_Task(
@@ -1756,6 +1772,7 @@ class VCenterNode(Hypervisor):
                             "uuid": disk_uuid,
                             "source_disk_type_code": disk.get("source_disk_type_code"),
                             "source_disk_type_name": disk.get("source_disk_type_name"),
+                            "source_disk_eager_zeroed": disk.get("source_disk_eager_zeroed"),
                         }
                     )
 

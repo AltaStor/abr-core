@@ -151,3 +151,96 @@ class RestoreDiskLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RestoreDiskProvisioningTests(unittest.TestCase):
+    THIN = {"source_disk_type_code": 7, "source_disk_type_name": "vmfs_thin"}
+    THICK_LAZY = {
+        "source_disk_type_code": 5,
+        "source_disk_type_name": "vmfs_flat",
+        "source_disk_eager_zeroed": False,
+    }
+    THICK_EAGER = {
+        "source_disk_type_code": 5,
+        "source_disk_type_name": "vmfs_flat",
+        "source_disk_eager_zeroed": True,
+    }
+    THICK_UNRECORDED = {"source_disk_type_code": 5, "source_disk_type_name": "vmfs_flat"}
+
+    def test_original_keeps_a_thin_disk_thin(self) -> None:
+        decision = vcenter_restore._resolve_disk_provisioning(parameters={}, disk_entry=dict(self.THIN))
+
+        self.assertTrue(decision["thin_provisioned"])
+        self.assertFalse(decision["eager_zeroed"])
+
+    def test_original_keeps_a_lazy_zeroed_thick_disk_thick(self) -> None:
+        decision = vcenter_restore._resolve_disk_provisioning(parameters={}, disk_entry=dict(self.THICK_LAZY))
+
+        self.assertFalse(decision["thin_provisioned"])
+        self.assertFalse(decision["eager_zeroed"])
+
+    def test_original_keeps_an_eager_zeroed_thick_disk_eager_zeroed(self) -> None:
+        decision = vcenter_restore._resolve_disk_provisioning(parameters={}, disk_entry=dict(self.THICK_EAGER))
+
+        self.assertFalse(decision["thin_provisioned"])
+        self.assertTrue(decision["eager_zeroed"])
+
+    def test_a_point_taken_before_eager_zeroed_was_recorded_restores_lazy_zeroed_thick(self) -> None:
+        decision = vcenter_restore._resolve_disk_provisioning(parameters={}, disk_entry=dict(self.THICK_UNRECORDED))
+
+        self.assertFalse(decision["thin_provisioned"])
+        self.assertFalse(decision["eager_zeroed"])
+
+    def test_an_explicit_thin_request_overrides_a_thick_source(self) -> None:
+        decision = vcenter_restore._resolve_disk_provisioning(
+            parameters={"disk_type": "thin"}, disk_entry=dict(self.THICK_EAGER)
+        )
+
+        self.assertTrue(decision["thin_provisioned"])
+        self.assertFalse(decision["eager_zeroed"])
+
+    def test_an_explicit_thick_request_does_not_borrow_the_source_eager_flag(self) -> None:
+        decision = vcenter_restore._resolve_disk_provisioning(
+            parameters={"disk_type": "thick"}, disk_entry=dict(self.THICK_EAGER)
+        )
+
+        self.assertFalse(decision["thin_provisioned"])
+        self.assertFalse(decision["eager_zeroed"])
+
+    def test_a_per_disk_override_wins_over_the_global_choice(self) -> None:
+        decision = vcenter_restore._resolve_disk_provisioning(
+            parameters={"disk_type": "thin", "disk_types": {"2": "thick"}},
+            disk_entry=dict(self.THIN),
+            disk_index=2,
+        )
+
+        self.assertFalse(decision["thin_provisioned"])
+
+    def test_the_layout_carries_each_disk_its_own_decision(self) -> None:
+        entries = [
+            {"disk_label": "Hard disk 1", "datastore_path": "[ssd] vm-1/vm-1.vmdk", "capacity_gb": 40, **self.THIN},
+            {"disk_label": "Hard disk 2", "datastore_path": "[ssd] vm-1/vm-1_1.vmdk", "capacity_gb": 500, **self.THICK_EAGER},
+        ]
+        provisioning = [
+            vcenter_restore._resolve_disk_provisioning(parameters={}, disk_entry=entry, disk_index=index)
+            for index, entry in enumerate(entries, start=1)
+        ]
+
+        layout = vcenter_restore._build_disk_layout(entries, {}, "restore-target", provisioning=provisioning)
+
+        self.assertEqual([item["thin_provisioned"] for item in layout], [True, False])
+        self.assertEqual([item["eager_zeroed"] for item in layout], [False, True])
+
+    def test_a_layout_built_without_decisions_leaves_them_unset(self) -> None:
+        entries = [{"disk_label": "Hard disk 1", "datastore_path": "[ssd] vm-1/vm-1.vmdk", "capacity_gb": 40}]
+
+        layout = vcenter_restore._build_disk_layout(entries, {}, "restore-target")
+
+        self.assertIsNone(layout[0]["thin_provisioned"])
+        self.assertFalse(layout[0]["eager_zeroed"])
+
+    def test_the_session_result_reports_the_eager_zeroed_decision(self) -> None:
+        details = vcenter_restore._disk_type_details("original", 5, True)
+
+        self.assertEqual(details["resolved_disk_type_name"], "vmfs_flat")
+        self.assertTrue(details["resolved_disk_eager_zeroed"])

@@ -229,6 +229,7 @@ def build_vcenter_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
                     "uuid": disk["uuid"],
                     "source_disk_type_code": disk.get("source_disk_type_code"),
                     "source_disk_type_name": disk.get("source_disk_type_name"),
+                    "source_disk_eager_zeroed": disk.get("source_disk_eager_zeroed"),
                 },
             }
         )
