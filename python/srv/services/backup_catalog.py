@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -15,15 +16,22 @@ from python.srv.core.mongo_db_wrapper import (
     JOBS,
     REPOSITORIES,
     RESOURCES_BY_HV,
+    TASKS,
     catalog_entries,
     catalog_records,
     persist_backup,
     persist_job,
+    persist_task,
 )
 from python.srv.core.storage_tool import (
     extract_s3_config,
     hydrate_manifest_via_disk_tool,
     immutability_is_enabled,
+    is_s3_repository,
+    join_s3_prefix,
+    list_disk_tool_backups,
+    remove_disk_tool_backup,
+    safe_path_component,
 )
 from python.srv.core.utils import utc_now
 from python.srv.services.abr_v41 import (
@@ -568,3 +576,132 @@ def backfill_backup_detail_fields() -> int:
         except Exception:
             logger.exception("Skipping detail backfill for backup %s due to an unexpected error", record.get("id"))
     return updated
+
+
+def _interrupted_task_output_location(task: dict[str, Any]) -> tuple[dict[str, Any], str] | None:
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    repository = REPOSITORIES.get(str(parameters.get("repository_id") or ""))
+    if not isinstance(repository, dict):
+        return None
+    task_id = str(task.get("id") or "")
+    if not task_id:
+        return None
+    vm_name = str(parameters.get("vm_name") or "").strip()
+    if not vm_name:
+        vm_id = str(task.get("resource_external_id") or "")
+        for point in catalog_records(BACKUPS):
+            if str(point.get("vm_id") or "") == vm_id and point.get("vm_name"):
+                vm_name = str(point.get("vm_name"))
+                break
+    vm_component = safe_path_component(vm_name or task.get("resource_external_id"), fallback="vm")
+    if is_s3_repository(repository):
+        return repository, join_s3_prefix(extract_s3_config(repository).get("prefix"), vm_component, task_id)
+    root = str(repository.get("path") or "").strip()
+    if not root:
+        return None
+    return repository, str(Path(root) / vm_component / task_id)
+
+
+def _task_output_is_registered(task_id: str) -> bool:
+    for point in catalog_records(BACKUPS):
+        artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+        if task_id in str(artifact.get("manifest_path") or ""):
+            return True
+        for disk in artifact.get("disks") or []:
+            if isinstance(disk, dict) and task_id in str(disk.get("abr_path") or ""):
+                return True
+    return False
+
+
+def _discard_interrupted_task_output(task: dict[str, Any]) -> None:
+    task_id = str(task.get("id") or "")
+    if _task_output_is_registered(task_id):
+        logger.info(
+            "Task %s left output that a restore point already references, so it was kept.",
+            task_id,
+        )
+        return
+    location = _interrupted_task_output_location(task)
+    if location is None:
+        return
+    repository, abr_path = location
+    try:
+        names = list_disk_tool_backups(repository, abr_path)
+    except Exception:
+        logger.warning(
+            "Could not list what task %s left at %s; its partial output stays until it is removed by hand.",
+            task_id,
+            abr_path,
+        )
+        return
+    for name in sorted(names):
+        try:
+            remove_disk_tool_backup(repository, abr_path, name, timeout=120)
+            logger.info("Removed the partial backup %r that task %s left at %s.", name, task_id, abr_path)
+        except Exception:
+            logger.warning(
+                "Could not remove the partial backup %r that task %s left at %s.",
+                name,
+                task_id,
+                abr_path,
+            )
+    if not is_s3_repository(repository):
+        folder = Path(abr_path)
+        try:
+            if folder.is_dir() and not any(folder.iterdir()):
+                folder.rmdir()
+        except OSError:
+            pass
+
+
+def fail_interrupted_tasks() -> int:
+    interrupted = [
+        record
+        for record in catalog_records(TASKS)
+        if str(record.get("status") or "") == "running"
+    ]
+    for record in interrupted:
+        task_id = str(record.get("id") or "")
+        updated = dict(record)
+        updated["status"] = "failed"
+        result = dict(updated.get("result") if isinstance(updated.get("result"), dict) else {})
+        result["message"] = (
+            "The server stopped while this task was running, so it was abandoned; "
+            "any partial output it had written was discarded"
+        )
+        result["failure_kind"] = "interrupted"
+        result["finished_at"] = utc_now()
+        updated["result"] = result
+        updated["updated_at"] = utc_now()
+        try:
+            _append_task_log(
+                updated,
+                level="error",
+                message="The server stopped while this task was running; the task was abandoned",
+            )
+        except Exception:
+            logger.exception("Could not write the interruption log line for task %s", task_id)
+        persist_task(updated)
+        logger.warning("Task %s was still running when the server last stopped; marked as failed.", task_id)
+    if interrupted:
+        _start_interrupted_task_sweep([dict(record) for record in interrupted])
+    return len(interrupted)
+
+
+def _start_interrupted_task_sweep(tasks: list[dict[str, Any]]) -> None:
+    threading.Thread(
+        target=_sweep_interrupted_tasks,
+        args=(tasks,),
+        name="interrupted-task-sweep",
+        daemon=True,
+    ).start()
+
+
+def _sweep_interrupted_tasks(tasks: list[dict[str, Any]]) -> None:
+    for task in tasks:
+        try:
+            _discard_interrupted_task_output(task)
+        except Exception:
+            logger.exception(
+                "Could not discard what interrupted task %s left behind", task.get("id")
+            )

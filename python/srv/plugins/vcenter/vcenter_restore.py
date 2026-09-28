@@ -34,7 +34,11 @@ from .vcenter_backup import (
     _get_vm_resource,
     _sanitize_name,
 )
-from .vcenter_disk_types import disk_type_name_from_code, normalize_disk_type_selection
+from .vcenter_disk_types import (
+    VddkDiskType,
+    disk_type_name_from_code,
+    normalize_disk_type_selection,
+)
 
 
 _PLACEHOLDER_DISK_UUIDS = {"n/a", "none", "null", "unknown"}
@@ -179,6 +183,7 @@ def _build_disk_layout(
     disk_entries: list[dict[str, Any]],
     datastore_map: dict[str, Any] | None = None,
     default_datastore_name: str = "",
+    provisioning: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     layout: list[dict[str, Any]] = []
     for index, disk in enumerate(disk_entries, start=1):
@@ -189,6 +194,11 @@ def _build_disk_layout(
             capacity_gb = float(capacity_value) if capacity_value not in (None, "") else 1.0
         except (TypeError, ValueError):
             capacity_gb = 1.0
+        disk_provisioning = (
+            provisioning[index - 1]
+            if provisioning is not None and len(provisioning) >= index
+            else {}
+        )
         layout.append(
             {
                 "label": str(disk.get("disk_label") or f"Hard disk {index}"),
@@ -196,6 +206,8 @@ def _build_disk_layout(
                 "file_name": _build_disk_file_name(index, source_name),
                 "disk_uuid": disk.get("uuid"),
                 "datastore_name": _disk_target_datastore_name(disk, datastore_map, default_datastore_name),
+                "thin_provisioned": disk_provisioning.get("thin_provisioned"),
+                "eager_zeroed": bool(disk_provisioning.get("eager_zeroed")),
             }
         )
     return layout
@@ -556,14 +568,41 @@ def _resolve_requested_disk_type(
     return normalized, normalized
 
 
+def _resolve_disk_provisioning(
+    *,
+    parameters: dict[str, Any],
+    disk_entry: dict[str, Any],
+    disk_index: int | None = None,
+) -> dict[str, Any]:
+    requested, resolved_code = _resolve_requested_disk_type(
+        parameters=parameters,
+        disk_entry=disk_entry,
+        disk_index=disk_index,
+    )
+    thin = resolved_code == VddkDiskType.VMFS_THIN
+    eager_zeroed = (
+        not thin
+        and requested == "original"
+        and bool(disk_entry.get("source_disk_eager_zeroed"))
+    )
+    return {
+        "requested": requested,
+        "code": resolved_code,
+        "thin_provisioned": thin,
+        "eager_zeroed": eager_zeroed,
+    }
+
+
 def _disk_type_details(
     requested: str | int,
     resolved_code: int,
+    eager_zeroed: bool = False,
 ) -> dict[str, Any]:
     return {
         "requested_disk_type": requested,
         "resolved_disk_type_code": resolved_code,
         "resolved_disk_type_name": disk_type_name_from_code(resolved_code),
+        "resolved_disk_eager_zeroed": eager_zeroed,
     }
 
 
@@ -800,6 +839,7 @@ def run_vcenter_restore(
         with VCenterNode(host, username, password, port=port, verify_ssl=verify_ssl) as node, node.session_keepalive():
             service_type = node.get_service_type()
             is_virtual_center = service_type == "VirtualCenter"
+            disk_provisioning: list[dict[str, Any]] = []
             for index, disk in enumerate(disk_entries, start=1):
                 if not isinstance(disk, dict):
                     raise VCenterBackupError("Backup manifest contains an invalid disk entry")
@@ -813,14 +853,21 @@ def run_vcenter_restore(
                     disk_index=index,
                     repository=repository,
                 )
-                _resolve_requested_disk_type(
-                    parameters=parameters,
-                    disk_entry=disk,
-                    disk_index=index,
+                disk_provisioning.append(
+                    _resolve_disk_provisioning(
+                        parameters=parameters,
+                        disk_entry=disk,
+                        disk_index=index,
+                    )
                 )
 
             disk_layout = (
-                _build_disk_layout(disk_entries, datastore_map, target_datastore_name)
+                _build_disk_layout(
+                    disk_entries,
+                    datastore_map,
+                    target_datastore_name,
+                    provisioning=disk_provisioning,
+                )
                 if is_virtual_center
                 else None
             )
@@ -921,11 +968,9 @@ def run_vcenter_restore(
                         abr_layers[-1]["source"] if abr_layers else "(none)",
                         restore_target,
                     )
-                    requested_disk_type, resolved_disk_type_code = _resolve_requested_disk_type(
-                        parameters=parameters,
-                        disk_entry=disk,
-                        disk_index=index,
-                    )
+                    provisioning = disk_provisioning[index - 1]
+                    requested_disk_type = provisioning["requested"]
+                    resolved_disk_type_code = provisioning["code"]
 
                     attachment: dict[str, Any] | None = None
                     if not is_virtual_center:
@@ -934,12 +979,15 @@ def run_vcenter_restore(
                             disk_path=restore_target,
                             capacity_gb=disk_capacity_gb,
                             disk_type_code=resolved_disk_type_code,
+                            eager_zeroed=provisioning["eager_zeroed"],
                         )
                         attachment = node.attach_existing_disk(
                             create_vm_name,
                             restore_target,
                             disk_label=str(disk.get("disk_label") or f"Hard disk {index}"),
                             disk_uuid=disk.get("uuid"),
+                            thin_provisioned=provisioning["thin_provisioned"],
+                            eager_zeroed=provisioning["eager_zeroed"],
                         )
                     progress = min(20 + int((index - 1) * 55 / max(len(disk_entries), 1)), 80)
                     progress_span = max(1, min(20 + int(index * 55 / max(len(disk_entries), 1)), 80) - progress)
@@ -1056,8 +1104,13 @@ def run_vcenter_restore(
                             "backup_mode": manifest.get("backup_mode"),
                             "source_disk_type_code": disk.get("source_disk_type_code"),
                             "source_disk_type_name": disk.get("source_disk_type_name"),
+                            "source_disk_eager_zeroed": disk.get("source_disk_eager_zeroed"),
                             "attachment": attachment,
-                            **_disk_type_details(requested_disk_type, resolved_disk_type_code),
+                            **_disk_type_details(
+                                requested_disk_type,
+                                resolved_disk_type_code,
+                                provisioning["eager_zeroed"],
+                            ),
                         }
                     )
 
@@ -1240,14 +1293,17 @@ def run_vcenter_restore(
         )
 
     disk_type_source = manifest_disk_entry if manifest_disk_entry is not None else payload
-    requested_disk_type, resolved_disk_type_code = _resolve_requested_disk_type(
+    disk_provisioning = _resolve_disk_provisioning(
         parameters=parameters,
         disk_entry=disk_type_source,
     )
+    requested_disk_type = disk_provisioning["requested"]
+    resolved_disk_type_code = disk_provisioning["code"]
     logger.debug(
-        "Resolved disk restore types: requested=%s resolved=%s",
+        "Resolved disk restore types: requested=%s resolved=%s eager_zeroed=%s",
         requested_disk_type,
         resolved_disk_type_code,
+        disk_provisioning["eager_zeroed"],
     )
 
     attach_to_vm = bool(parameters.get("attach_to_vm", True))
@@ -1290,6 +1346,7 @@ def run_vcenter_restore(
             disk_path=restored_datastore_path,
             capacity_gb=capacity_gb,
             disk_type_code=resolved_disk_type_code,
+            eager_zeroed=disk_provisioning["eager_zeroed"],
         )
 
         try:
@@ -1302,6 +1359,8 @@ def run_vcenter_restore(
                     vm_name,
                     restored_datastore_path,
                     disk_uuid=(manifest_disk_entry or {}).get("uuid"),
+                    thin_provisioned=disk_provisioning["thin_provisioned"],
+                    eager_zeroed=disk_provisioning["eager_zeroed"],
                 )
 
             # Best-effort byte counters (see the full-VM restore path above for the
@@ -1467,7 +1526,11 @@ def run_vcenter_restore(
             "attachment": attachment,
             "source_disk_type_code": disk_type_source.get("source_disk_type_code"),
             "source_disk_type_name": disk_type_source.get("source_disk_type_name"),
-            **_disk_type_details(requested_disk_type, resolved_disk_type_code),
+            **_disk_type_details(
+                requested_disk_type,
+                resolved_disk_type_code,
+                disk_provisioning["eager_zeroed"],
+            ),
             "disk_type": requested_disk_type,
             "transport_mode": transport_mode,
             "service_type": service_type,

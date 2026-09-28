@@ -29,8 +29,13 @@ JOB_ID = "job-1"
 VM_ID = "vm-1"
 
 
-def _disk(task_id: str, name: str = "01-disk.vmdk", disk_key: str = "2000") -> dict[str, object]:
-    return {
+def _disk(
+    task_id: str,
+    name: str = "01-disk.vmdk",
+    disk_key: str = "2000",
+    change_id: str | None = None,
+) -> dict[str, object]:
+    entry: dict[str, object] = {
         "index": 0,
         "disk_key": disk_key,
         "disk_label": "Hard disk 1",
@@ -39,6 +44,9 @@ def _disk(task_id: str, name: str = "01-disk.vmdk", disk_key: str = "2000") -> d
         "source_disk_type_code": 5,
         "source_disk_type_name": "thin",
     }
+    if change_id is not None:
+        entry["change_id"] = change_id
+    return entry
 
 
 def _point(point_id: str, execution_type: str, created_at: str, disks: list[dict[str, object]]) -> dict[str, object]:
@@ -355,7 +363,7 @@ class SyntheticFullRunTests(unittest.TestCase):
 
     @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
-    def test_a_failure_part_way_through_discards_the_disks_already_merged(self, copy_mock, remove_mock) -> None:
+    def test_a_failure_part_way_through_discards_every_disk_it_had_started(self, copy_mock, remove_mock) -> None:
         for point_id in ("p1", "p2", "p3"):
             BACKUPS[point_id]["artifact"]["disks"] = [_disk("task-x", "01-disk.vmdk"), _disk("task-x", "02-disk.vmdk")]
         copy_mock.side_effect = [
@@ -367,7 +375,7 @@ class SyntheticFullRunTests(unittest.TestCase):
             synthetic_full.run_synthetic_full(self._task())
 
         removed = [call.args[2] for call in remove_mock.call_args_list]
-        self.assertEqual(removed, ["01-disk.vmdk"])
+        self.assertEqual(removed, ["01-disk.vmdk", "02-disk.vmdk"])
 
     @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
@@ -388,7 +396,7 @@ class SyntheticFullRunTests(unittest.TestCase):
 
     @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
-    def test_cancellation_discards_what_was_already_merged(self, copy_mock, remove_mock) -> None:
+    def test_cancellation_discards_the_disk_it_was_merging_too(self, copy_mock, remove_mock) -> None:
         for point_id in ("p1", "p2", "p3"):
             BACKUPS[point_id]["artifact"]["disks"] = [_disk("task-x", "01-disk.vmdk"), _disk("task-x", "02-disk.vmdk")]
         copy_mock.side_effect = [
@@ -399,7 +407,10 @@ class SyntheticFullRunTests(unittest.TestCase):
         with self.assertRaises(TaskStopRequested):
             synthetic_full.run_synthetic_full(self._task())
 
-        self.assertEqual([call.args[2] for call in remove_mock.call_args_list], ["01-disk.vmdk"])
+        self.assertEqual(
+            [call.args[2] for call in remove_mock.call_args_list],
+            ["01-disk.vmdk", "02-disk.vmdk"],
+        )
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_cancellation_is_surfaced_as_a_stop_request(self, copy_mock) -> None:
@@ -844,3 +855,87 @@ class FullBackupParentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyntheticFullChangeIdTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for store in (BACKUPS, JOBS, REPOSITORIES, TASKS):
+            store.clear()
+        self._root = tempfile.mkdtemp(prefix="abr-synthetic-cbt-")
+        self.addCleanup(shutil.rmtree, self._root, ignore_errors=True)
+        self._manifest_patch = patch(
+            "python.srv.services.synthetic_full._source_manifest",
+            return_value={"format_version": 1, "vm_config": {"firmware": "efi"}},
+        )
+        self._manifest_patch.start()
+        self.addCleanup(self._manifest_patch.stop)
+        self._tool_patch = patch("python.srv.services.synthetic_full.run_disk_tool")
+        self._tool_patch.start()
+        self.addCleanup(self._tool_patch.stop)
+        REPOSITORIES[REPO_ID] = {"id": REPO_ID, "name": "Local", "type": "local", "path": self._root}
+        JOBS[JOB_ID] = {"id": JOB_ID, "name": "Nightly", "job_type": "backup", "repo_id": REPO_ID, "retention_days": 14}
+
+    def tearDown(self) -> None:
+        for store in (BACKUPS, JOBS, REPOSITORIES, TASKS):
+            store.clear()
+
+    def _task(self) -> dict[str, object]:
+        return {
+            "id": "task-new",
+            "job_id": JOB_ID,
+            "task_type": "backup",
+            "resource_type": "virtual_machine",
+            "resource_external_id": VM_ID,
+            "status": "queued",
+            "parameters": {"repository_id": REPO_ID, "synthetic_full": True,
+                           "resolved_backup_type": "SyntheticFull"},
+        }
+
+    def _load(self, chain: list[dict[str, object]]) -> None:
+        for point in chain:
+            BACKUPS[str(point["id"])] = point
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_the_merge_carries_the_newest_change_id(self, copy_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1024, "stored_data_size": 512, "merged_from": 3}
+        self._load([
+            _point("p1", "ActiveFull", "2026-01-01T00:00:00Z", [_disk("task-a", change_id="cid/1")]),
+            _point("p2", "Incremental", "2026-01-02T00:00:00Z", [_disk("task-b", change_id="cid/2")]),
+            _point("p3", "Incremental", "2026-01-03T00:00:00Z", [_disk("task-c", change_id="cid/3")]),
+        ])
+
+        result = synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(result["disks"][0]["change_id"], "cid/3")
+        self.assertEqual(result["disks"][0]["previous_change_id"], "")
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_each_disk_carries_its_own_newest_change_id(self, copy_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1024, "stored_data_size": 512, "merged_from": 2}
+        self._load([
+            _point("p1", "ActiveFull", "2026-01-01T00:00:00Z", [
+                _disk("task-a", name="01-disk.vmdk", disk_key="2000", change_id="a/1"),
+                _disk("task-a", name="02-disk.vmdk", disk_key="2001", change_id="b/1"),
+            ]),
+            _point("p2", "Incremental", "2026-01-02T00:00:00Z", [
+                _disk("task-b", name="01-disk.vmdk", disk_key="2000", change_id="a/2"),
+                _disk("task-b", name="02-disk.vmdk", disk_key="2001", change_id="b/2"),
+            ]),
+        ])
+
+        result = synthetic_full.run_synthetic_full(self._task())
+
+        carried = {disk["abr_backup_name"]: disk["change_id"] for disk in result["disks"]}
+        self.assertEqual(carried, {"01-disk.vmdk": "a/2", "02-disk.vmdk": "b/2"})
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_chain_whose_newest_point_has_no_change_id_carries_none(self, copy_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1024, "stored_data_size": 512, "merged_from": 2}
+        self._load([
+            _point("p1", "ActiveFull", "2026-01-01T00:00:00Z", [_disk("task-a", change_id="cid/1")]),
+            _point("p2", "Incremental", "2026-01-02T00:00:00Z", [_disk("task-b")]),
+        ])
+
+        result = synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(result["disks"][0]["change_id"], "")

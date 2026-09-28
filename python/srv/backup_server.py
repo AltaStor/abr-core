@@ -255,6 +255,15 @@ async def lifespan(_: FastAPI):
             logger.exception("Encryption key id backfill failed; continuing startup without it.")
         TASKS.clear()
         TASKS.update(load_tasks())
+        try:
+            abandoned = backup_catalog.fail_interrupted_tasks()
+            if abandoned:
+                logger.warning(
+                    "Marked %d task(s) as failed: they were still running when the server last stopped.",
+                    abandoned,
+                )
+        except Exception:
+            logger.exception("Could not reconcile tasks left running by an earlier run; continuing startup.")
         RESOURCES_BY_HV.clear()
         RESOURCES_BY_HV.update(load_resources())
         USERS.clear()
