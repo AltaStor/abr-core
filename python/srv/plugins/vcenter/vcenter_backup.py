@@ -1305,6 +1305,7 @@ def run_vcenter_backup(
                             "capacity_gb": disk.get("capacity_gb"),
                             "source_disk_type_code": disk.get("source_disk_type_code"),
                             "source_disk_type_name": disk.get("source_disk_type_name"),
+                            "source_disk_eager_zeroed": disk.get("source_disk_eager_zeroed"),
                         },
                     }
                     for disk in live_disks
@@ -1322,6 +1323,7 @@ def run_vcenter_backup(
                             "capacity_gb": disk.get("capacity_gb"),
                             "source_disk_type_code": disk.get("source_disk_type_code"),
                             "source_disk_type_name": disk.get("source_disk_type_name"),
+                            "source_disk_eager_zeroed": disk.get("source_disk_eager_zeroed"),
                         },
                     }
                     for disk in live_disks
@@ -2022,6 +2024,11 @@ def run_vcenter_backup(
                                 payload.get("source_disk_type_name")
                                 or disk.get("source_disk_type_name")
                             ),
+                            "source_disk_eager_zeroed": (
+                                payload.get("source_disk_eager_zeroed")
+                                if payload.get("source_disk_eager_zeroed") is not None
+                                else disk.get("source_disk_eager_zeroed")
+                            ),
                             "change_id": change_id,
                             "previous_change_id": query_change_id,
                             "utility_change_id": utility_change_id,
@@ -2406,6 +2413,11 @@ def run_vcenter_backup(
                             "source_disk_type_name": (
                                 payload.get("source_disk_type_name")
                                 or disk.get("source_disk_type_name")
+                            ),
+                            "source_disk_eager_zeroed": (
+                                payload.get("source_disk_eager_zeroed")
+                                if payload.get("source_disk_eager_zeroed") is not None
+                                else disk.get("source_disk_eager_zeroed")
                             ),
                             "change_id": str(
                                 (

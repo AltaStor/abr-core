@@ -79,10 +79,10 @@ def normalize_disk_type_selection(value: Any) -> str | int:
     return normalize_disk_type_code(value)
 
 
-def hostagent_disk_type_from_code(code: int) -> str:
+def hostagent_disk_type_from_code(code: int, *, eager_zeroed: bool = False) -> str:
     if code == VddkDiskType.VMFS_THIN:
         return "thin"
-    return "preallocated"
+    return "eagerZeroedThick" if eager_zeroed else "preallocated"
 
 
 def classify_vmware_disk_type(backing: Any, datastore_path: str) -> tuple[int | None, str | None]:
@@ -100,3 +100,12 @@ def classify_vmware_disk_type(backing: Any, datastore_path: str) -> tuple[int | 
         return 5, VDDK_DISK_TYPE_NAMES[5]
 
     return None, None
+
+
+def classify_vmware_disk_eager_zeroed(backing: Any, code: int | None) -> bool | None:
+    if code != VddkDiskType.VMFS_FLAT:
+        return None
+    eagerly_scrub = getattr(backing, "eagerlyScrub", None)
+    if eagerly_scrub is None:
+        return None
+    return bool(eagerly_scrub)
