@@ -880,40 +880,13 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 }
             )
 
-    def test_create_job_generates_a_key_when_encryption_is_switched_on_without_one(self) -> None:
-        # Encryption is a switch for API callers that don't manage keys (the
-        # web UI has no passphrase field) -- the appliance mints one rather
-        # than refusing, so the job really does encrypt.
-        job = abr_v41.create_backup_job(
-            {
-                "name": "Default Encryption",
-                "vms": ["web-01"],
-                "inventory_id": self.inventory["id"],
-                "repo_id": "repo-1",
-                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
-                "task_parameters": {"encryption_enabled": True},
-            }
-        )
+    def test_create_job_refuses_encryption_without_a_key(self) -> None:
+        before = len(JOBS)
 
-        self.assertEqual(job["encryption"]["enabled"], True)
-        self.assertEqual(job["encryption"]["key_set"], True)
-        self.assertEqual(job["task_parameters"]["encryption_key"], SECRET_MASK)
-        generated = JOBS[job["id"]]["task_parameters"]["encryption_key"]
-        self.assertTrue(generated.strip())
-
-        # A later edit must not rotate it: the restore points already written
-        # under the generated key have to stay decryptable.
-        edited = abr_v41.edit_job_record(job["id"], {"task_parameters": {"compression_level": 5}})
-        self.assertEqual(edited["encryption"]["enabled"], True)
-        self.assertEqual(edited["encryption"]["key_set"], True)
-        self.assertEqual(JOBS[job["id"]]["task_parameters"]["encryption_key"], generated)
-
-    def test_generated_encryption_keys_differ_between_jobs(self) -> None:
-        keys = set()
-        for name in ("Gen A", "Gen B"):
-            job = abr_v41.create_backup_job(
+        with self.assertRaises(abr_v41.ApiError) as ctx:
+            abr_v41.create_backup_job(
                 {
-                    "name": name,
+                    "name": "Default Encryption",
                     "vms": ["web-01"],
                     "inventory_id": self.inventory["id"],
                     "repo_id": "repo-1",
@@ -921,8 +894,47 @@ class JobEngineLifecycleTests(unittest.TestCase):
                     "task_parameters": {"encryption_enabled": True},
                 }
             )
-            keys.add(JOBS[job["id"]]["task_parameters"]["encryption_key"])
-        self.assertEqual(len(keys), 2)
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(ctx.exception.code, "encryption_key_required")
+        self.assertEqual(len(JOBS), before)
+
+    def test_turning_encryption_on_by_edit_refuses_without_a_key(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Later Encryption",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+            }
+        )
+
+        with self.assertRaises(abr_v41.ApiError) as ctx:
+            abr_v41.edit_job_record(job["id"], {"task_parameters": {"encryption_enabled": True}})
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(ctx.exception.code, "encryption_key_required")
+        self.assertEqual(JOBS[job["id"]]["task_parameters"].get("encryption_enabled"), None)
+        self.assertNotIn("encryption_key", JOBS[job["id"]]["task_parameters"])
+
+    def test_reaffirming_encryption_without_a_key_keeps_the_stored_one(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Reaffirmed Encryption",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+                "task_parameters": {"encryption_enabled": True, "encryption_key": "s3cr3t-key"},
+            }
+        )
+
+        edited = abr_v41.edit_job_record(job["id"], {"task_parameters": {"encryption_enabled": True}})
+
+        self.assertEqual(edited["encryption"]["enabled"], True)
+        self.assertEqual(edited["encryption"]["key_set"], True)
+        self.assertEqual(JOBS[job["id"]]["task_parameters"]["encryption_key"], "s3cr3t-key")
 
     def test_turning_encryption_off_drops_the_stored_key(self) -> None:
         job = abr_v41.create_backup_job(
@@ -932,7 +944,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
                 "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
-                "task_parameters": {"encryption_enabled": True},
+                "task_parameters": {"encryption_enabled": True, "encryption_key": "s3cr3t-key"},
             }
         )
 

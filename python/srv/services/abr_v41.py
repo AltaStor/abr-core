@@ -12,7 +12,6 @@ import math
 import os
 import platform
 import re
-import secrets
 import shutil
 import socket
 import stat
@@ -284,9 +283,6 @@ SMB_PATTERN = re.compile(r"^(//|\\\\)[^/\\\\]+[/\\\\].+$")
 ZONEINFO_ROOT = Path("/usr/share/zoneinfo")
 
 CATALOG_SNAPSHOT_FORMAT_VERSION = 1
-# Entropy behind an auto-generated job encryption key. token_urlsafe renders it
-# as ~43 printable characters, which the data mover takes as a passphrase.
-_GENERATED_ENCRYPTION_KEY_BYTES = 32
 CONFIGURATION_EXPORT_ALLOWLIST: tuple[str, ...] = (
     "ALTASTOR_BACKUP_APP",
     "ALTASTOR_BACKUP_HOST",
@@ -3665,10 +3661,6 @@ def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] |
 
     if result.get("encryption_enabled"):
         key = result.get("encryption_key")
-        if isinstance(key, str) and key.strip():
-            result["encryption_key"] = key.strip()
-        else:
-            result["encryption_key"] = secrets.token_urlsafe(_GENERATED_ENCRYPTION_KEY_BYTES)
         known = _normalized_encryption_keys(
             result.get("encryption_keys")
             or (previous or {}).get("encryption_keys")
@@ -3677,6 +3669,16 @@ def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] |
             carried = str((previous or {}).get("encryption_key") or "").strip()
             if carried:
                 known = [{"key_id": 0, "key": carried}]
+        _ensure(
+            (isinstance(key, str) and bool(key.strip())) or bool(known),
+            422,
+            "encryption_key_required",
+            "Turning encryption on requires an encryption key: supply one with --encryption-key",
+        )
+        if isinstance(key, str) and key.strip():
+            result["encryption_key"] = key.strip()
+        else:
+            result["encryption_key"] = str(known[-1]["key"])
         known, current_id = _record_encryption_key(known, str(result["encryption_key"]))
         result["encryption_keys"] = known
         result["encryption_key_id"] = current_id
@@ -7665,8 +7667,8 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         bool(encryption_key) or not _point_is_encrypted(point),
         409,
         "encryption_key_unavailable",
-        "This restore point is encrypted and no decryption key is available for it: the job that held the key was deleted "
-        "or its key was replaced. Repeat the restore with an explicit encryption key.",
+        "This restore point is encrypted and no decryption key is stored for it. Repeat the restore with an "
+        "explicit encryption key.",
         point_id=point_id,
     )
     task = {

@@ -860,7 +860,7 @@ class AbrV41EngineTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 422)
         self.assertIn("at least 8 characters", ctx.exception.message)
 
-    def test_encryption_without_a_key_still_generates_a_strong_one(self) -> None:
+    def test_encryption_without_a_key_is_refused_rather_than_generated(self) -> None:
         inventory = abr_v41.create_inventory_record(
             {
                 "name": "Generated Key",
@@ -878,19 +878,21 @@ class AbrV41EngineTests(unittest.TestCase):
             "discovered_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        job = abr_v41.create_backup_job(
-            {
-                "name": "Generated Key",
-                "vms": "vm-1",
-                "inventory_id": inventory["id"],
-                "repo_id": "repo-1",
-                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
-                "task_parameters": {"encryption_enabled": True},
-            }
-        )
+        with self.assertRaises(ApiError) as ctx:
+            abr_v41.create_backup_job(
+                {
+                    "name": "Generated Key",
+                    "vms": "vm-1",
+                    "inventory_id": inventory["id"],
+                    "repo_id": "repo-1",
+                    "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+                    "task_parameters": {"encryption_enabled": True},
+                }
+            )
 
-        stored = JOBS[job["id"]]["task_parameters"]["encryption_key"]
-        self.assertGreaterEqual(len(stored), 8)
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(ctx.exception.code, "encryption_key_required")
+        self.assertIn("--encryption-key", ctx.exception.message)
 
     def test_an_edit_that_does_not_touch_the_key_leaves_an_older_short_key_alone(self) -> None:
         job = self._job_with_key("Legacy Short Key", "long-enough-key", "192.168.12.83")
