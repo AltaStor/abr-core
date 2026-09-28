@@ -160,9 +160,14 @@ def build_disk_merges(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "source_path": source_path,
                 "source_names": qualified,
                 "template": template[identity],
+                "newest": disks[-1],
             }
         )
     return merges
+
+
+def _merged_change_id(newest_disk: dict[str, Any]) -> str:
+    return str(newest_disk.get("change_id") or newest_disk.get("next_change_id") or "").strip()
 
 
 def _discard_partial_merge(
@@ -170,12 +175,18 @@ def _discard_partial_merge(
     destination_path: str | None,
     written: list[str],
     task_root: Path,
+    in_flight: str | None = None,
 ) -> None:
+    names = list(written)
+    if in_flight and in_flight not in names:
+        names.append(in_flight)
     stranded: list[str] = []
-    for backup_name in written:
+    for backup_name in names:
         try:
             remove_disk_tool_backup(repository, destination_path, backup_name, timeout=120)
         except StorageToolError:
+            if backup_name == in_flight and backup_name not in written:
+                continue
             stranded.append(backup_name)
     if stranded:
         logger.error(
@@ -370,10 +381,14 @@ def run_synthetic_full(
         except ProcessCancelled as exc:
             from python.srv.core.task_executor import TaskStopRequested
 
-            _discard_partial_merge(repository, destination_path, written_names, task_root)
+            _discard_partial_merge(
+                repository, destination_path, written_names, task_root, in_flight=backup_name
+            )
             raise TaskStopRequested("Synthetic full cancelled; the merged backup was discarded") from exc
         except StorageToolError as exc:
-            _discard_partial_merge(repository, destination_path, written_names, task_root)
+            _discard_partial_merge(
+                repository, destination_path, written_names, task_root, in_flight=backup_name
+            )
             raise SyntheticFullError(f"Merging disk {position + 1}/{total} failed: {exc}") from exc
 
         written_names.append(backup_name)
@@ -397,7 +412,7 @@ def run_synthetic_full(
                 "storage_mode": "s3" if is_s3_repository(repository) else "local",
                 "destination_path": "",
                 "parent_path": "",
-                "change_id": "",
+                "change_id": _merged_change_id(merge["newest"]),
                 "previous_change_id": "",
                 "utility_change_id": "",
             }

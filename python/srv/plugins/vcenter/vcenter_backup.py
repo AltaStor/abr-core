@@ -1564,7 +1564,7 @@ def run_vcenter_backup(
                         or parent_disk.get("next_change_id")
                         or ""
                     )
-                    query_change_id = parent_change_id or change_id
+                    query_change_id = parent_change_id
                     missing_cbt_change_id = not query_change_id or new_disk_detected
                     parent_capacity_gb = parent_disk.get("capacity_gb")
                     current_capacity_gb = payload.get("capacity_gb") or disk.get("capacity_gb")
@@ -1593,8 +1593,14 @@ def run_vcenter_backup(
                                 "backup; a full copy is required to re-baseline before changed areas "
                                 "can be queried"
                             )
+                        if not change_id:
+                            raise VCenterBackupError(
+                                f"Snapshot did not return a CBT change ID for disk {datastore_path or uuid or index}"
+                            )
                         raise VCenterBackupError(
-                            f"Snapshot did not return a CBT change ID for disk {datastore_path or uuid or index}"
+                            f"The parent backup records no CBT change ID for disk "
+                            f"{datastore_path or uuid or index}, so changed areas cannot be queried; a full "
+                            "copy is required to re-baseline"
                         )
                     parent_destination_path = str(parent_disk.get("destination_path") or "").strip()
                     parent_path = (
