@@ -2033,6 +2033,104 @@ class AbrV41EngineTests(unittest.TestCase):
         self.assertIsNotNone(enabled["next_run_at"])
         self.assertIsNotNone(enabled["active_full_next_run_at"])
 
+    def test_a_new_active_full_schedule_drops_the_weekday_list_it_replaces(self) -> None:
+        inventory = self._inventory_with_vm("Replace Weekdays", "192.168.12.61")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Replace Weekdays",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 22:00",
+                "active_full_days": ["tue"],
+            }
+        )
+
+        self.assertEqual(job["active_full_days"], ["Tue"])
+
+        moved = abr_v41.edit_job_record(
+            job["id"],
+            {"active_full_schedule": {"type": "monthly", "day_of_month": 9, "time": "06:00"}},
+        )
+
+        self.assertEqual(moved["active_full_days"], [])
+        self.assertEqual(moved["active_full_schedule"]["type"], "monthly")
+
+    def test_a_new_synthetic_full_schedule_drops_the_weekday_list_it_replaces(self) -> None:
+        inventory = self._inventory_with_vm("Replace Synthetic Weekdays", "192.168.12.62")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Replace Synthetic Weekdays",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 22:00",
+                "synthetic_full_days": ["fri"],
+            }
+        )
+
+        moved = abr_v41.edit_job_record(
+            job["id"],
+            {"synthetic_full_schedule": {"type": "periodic", "every": "12h"}},
+        )
+
+        self.assertEqual(moved["synthetic_full_days"], [])
+        self.assertEqual(moved["synthetic_full_schedule"]["type"], "periodic")
+
+    def test_a_new_weekly_schedule_carries_its_own_weekdays_into_the_list(self) -> None:
+        inventory = self._inventory_with_vm("Weekly Carries Days", "192.168.12.63")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Weekly Carries Days",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 22:00",
+                "active_full_days": ["tue"],
+            }
+        )
+
+        moved = abr_v41.edit_job_record(
+            job["id"],
+            {"active_full_schedule": {"type": "weekly", "days": ["monday"], "time": "05:00"}},
+        )
+
+        self.assertEqual(moved["active_full_days"], ["Mon"])
+
+    def test_an_edit_that_leaves_the_schedules_alone_keeps_the_weekday_list(self) -> None:
+        inventory = self._inventory_with_vm("Keep Weekdays", "192.168.12.64")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Keep Weekdays",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 22:00",
+                "active_full_days": ["tue"],
+            }
+        )
+
+        edited = abr_v41.edit_job_record(job["id"], {"retention_days": 45})
+
+        self.assertEqual(edited["active_full_days"], ["Tue"])
+        self.assertEqual(edited["retention_days"], 45)
+
+    def test_creating_with_a_monthly_schedule_stores_no_weekday_list(self) -> None:
+        inventory = self._inventory_with_vm("Monthly No Weekdays", "192.168.12.65")
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Monthly No Weekdays",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": "daily 22:00",
+                "active_full_days": ["tue"],
+                "active_full_schedule": {"type": "monthly", "day_of_month": 9, "time": "06:00"},
+            }
+        )
+
+        self.assertEqual(job["active_full_days"], [])
+
     def test_edit_job_record_recomputes_full_schedule_next_runs(self) -> None:
         inventory = self._inventory_with_vm("Full Next Run", "192.168.12.57")
         job = abr_v41.create_backup_job(

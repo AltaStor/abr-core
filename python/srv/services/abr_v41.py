@@ -3842,9 +3842,9 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     synthetic_full_days = _normalize_day_list(payload.get("synthetic_full_days") or _split_csv(payload.get("synthetic_full_days_csv")))
     active_full_schedule = normalize_schedule_payload(payload.get("active_full_schedule"))
     synthetic_full_schedule = normalize_schedule_payload(payload.get("synthetic_full_schedule"))
-    if "active_full_schedule" in payload and active_full_schedule is None:
+    if "active_full_schedule" in payload and not _schedule_weekdays(active_full_schedule):
         active_full_days = []
-    if "synthetic_full_schedule" in payload and synthetic_full_schedule is None:
+    if "synthetic_full_schedule" in payload and not _schedule_weekdays(synthetic_full_schedule):
         synthetic_full_days = []
     base_is_enabled = isinstance(schedule, dict) and bool(schedule.get("enabled", True))
     description = str(payload.get("description") or "").strip()
@@ -3987,6 +3987,12 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     return job_to_dto(_persist_canonical_job(job))
 
 
+def _schedule_weekdays(schedule: Any) -> list[str]:
+    if not isinstance(schedule, dict) or str(schedule.get("kind") or "") != "weekly":
+        return []
+    return _normalize_day_list(schedule.get("weekdays") or [])
+
+
 def _retune_weekly_schedule(schedule: Any, days: list[str]) -> dict[str, Any] | None:
     if not isinstance(schedule, dict) or str(schedule.get("kind") or "") != "weekly":
         return schedule
@@ -4057,8 +4063,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         schedule_value = normalize_schedule_payload(payload[schedule_key])
         updated[schedule_key] = schedule_value
         updated[next_run_key] = _execution_schedule_next_run(schedule_value)
-        if schedule_value is None:
-            updated[days_key] = []
+        updated[days_key] = _schedule_weekdays(schedule_value)
         changed = True
     for schedule_key, days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
         if days_key not in payload or payload[days_key] is None:
