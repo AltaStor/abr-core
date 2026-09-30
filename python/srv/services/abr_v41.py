@@ -3344,6 +3344,7 @@ def verify_repository(record_id: str) -> dict[str, Any]:
 
 def rescan_repository(record_id: str) -> dict[str, Any]:
     repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    reconciled = reconcile_repository_points(repository)
     updated = _json_clone(repository)
     metadata = dict(updated.get("metadata") if isinstance(updated.get("metadata"), dict) else {})
     metadata["last_scan_at"] = utc_now()
@@ -3358,6 +3359,7 @@ def rescan_repository(record_id: str) -> dict[str, Any]:
         "status": payload["status"],
         "last_scan_at": payload["last_scan_at"],
         "catalog": payload["catalog"],
+        "restore_points": reconciled,
     }
 
 
@@ -4446,14 +4448,22 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
             try:
                 remove_disk_tool_backup(repository, abr_path, abr_backup_name, timeout=120)
             except StorageToolError:
-                all_removed = False
-                LOGGER.warning(
-                    "Failed to delete remote backup artifact: point=%s path=%s name=%s",
-                    point.get("id"),
-                    abr_path,
-                    abr_backup_name,
-                    exc_info=True,
-                )
+                if _stored_backup_is_absent(repository, abr_path, abr_backup_name):
+                    LOGGER.info(
+                        "Backup artifact was already gone, counting it as deleted: point=%s path=%s name=%s",
+                        point.get("id"),
+                        abr_path,
+                        abr_backup_name,
+                    )
+                else:
+                    all_removed = False
+                    LOGGER.warning(
+                        "Failed to delete remote backup artifact: point=%s path=%s name=%s",
+                        point.get("id"),
+                        abr_path,
+                        abr_backup_name,
+                        exc_info=True,
+                    )
             continue
         destination_path = disk.get("destination_path")
         if isinstance(destination_path, str) and destination_path:
@@ -4495,6 +4505,79 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
                 exc_info=True,
             )
     return all_removed
+
+
+def _stored_backup_names(repository: dict[str, Any], abr_path: str) -> set[str] | None:
+    if not is_s3_repository(repository):
+        location = Path(abr_path)
+        if not location.exists():
+            return set()
+        if not os.access(location, os.R_OK | os.X_OK):
+            return None
+    try:
+        return list_disk_tool_backups(repository, abr_path, timeout=60)
+    except StorageToolError:
+        return None
+
+
+def _stored_backup_is_absent(repository: dict[str, Any], abr_path: str, backup_name: str) -> bool:
+    names = _stored_backup_names(repository, abr_path)
+    return names is not None and backup_name not in names
+
+
+def _point_artifact_locations(point: dict[str, Any]) -> list[tuple[str, str]]:
+    artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+    locations: list[tuple[str, str]] = []
+    for disk in artifact.get("disks", []):
+        if not isinstance(disk, dict):
+            continue
+        abr_path = str(disk.get("abr_path") or "").strip()
+        backup_name = str(disk.get("abr_backup_name") or "").strip()
+        if abr_path and backup_name:
+            locations.append((abr_path, backup_name))
+    return locations
+
+
+def reconcile_repository_points(repository: dict[str, Any]) -> dict[str, int]:
+    repository_id = str(repository.get("id") or "")
+    listings: dict[str, set[str] | None] = {}
+    summary = {"checked": 0, "marked_missing": 0, "restored": 0, "unreadable": 0}
+    for record in catalog_records(BACKUPS):
+        point = normalize_backup_point(record)
+        if str(point.get("repository_id") or "") != repository_id:
+            continue
+        locations = _point_artifact_locations(point)
+        if not locations:
+            continue
+        summary["checked"] += 1
+        absent = False
+        unreadable = False
+        for abr_path, backup_name in locations:
+            if abr_path not in listings:
+                listings[abr_path] = _stored_backup_names(repository, abr_path)
+            names = listings[abr_path]
+            if names is None:
+                unreadable = True
+            elif backup_name not in names:
+                absent = True
+        status = str(point.get("status") or "available")
+        if unreadable:
+            summary["unreadable"] += 1
+            continue
+        if absent and status != "missing":
+            point["status"] = "missing"
+            persist_backup(point)
+            summary["marked_missing"] += 1
+            LOGGER.warning(
+                "Restore point has no stored data left; marking it missing: point=%s repository=%s",
+                point.get("id"),
+                repository_id,
+            )
+        elif not absent and status == "missing":
+            point["status"] = "available"
+            persist_backup(point)
+            summary["restored"] += 1
+    return summary
 
 
 def _segment_points(points: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -4837,6 +4920,10 @@ def _chain_name(points: list[dict[str, Any]]) -> str:
 
 def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
     latest = points[-1]
+    unhealthy = next(
+        (point for point in points if _normalize_backup_health(point.get("status")) == "invalid"),
+        None,
+    )
     restore_points = [
         {
             "id": point["id"],
@@ -4874,7 +4961,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "name": latest.get("repository_name"),
             "type": latest.get("repository_type"),
         },
-        "status": latest.get("status"),
+        "status": (unhealthy or latest).get("status"),
         "restore_point_count": len(points),
         "created_at": points[0].get("created_at"),
         "last_restore_point_at": latest.get("created_at"),

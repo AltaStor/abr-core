@@ -7,7 +7,7 @@ import json
 import shutil
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -697,6 +697,11 @@ class FullBackupParentTests(unittest.TestCase):
         for store in (BACKUPS, JOBS, REPOSITORIES, TASKS):
             store.clear()
 
+    @staticmethod
+    def _stamp(task_id: str) -> str:
+        days_ago = 5 - int(task_id[-1])
+        return (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+
     def _register(self, execution_type: str, task_id: str) -> dict[str, object]:
         from python.srv.services.backup_catalog import register_backup_from_completed_task
 
@@ -710,13 +715,13 @@ class FullBackupParentTests(unittest.TestCase):
             "status": "completed",
             "resource_type": "virtual_machine",
             "resource_external_id": VM_ID,
-            "updated_at": f"2026-01-0{task_id[-1]}T00:00:00Z",
+            "updated_at": self._stamp(task_id),
             "parameters": {"repository_id": REPO_ID},
             "result": {
                 "resolved_backup_type": execution_type,
                 "repository_id": REPO_ID,
                 "repository_type": "local",
-                "finished_at": f"2026-01-0{task_id[-1]}T00:00:00Z",
+                "finished_at": self._stamp(task_id),
                 "disks": [{"index": 1, "abr_path": f"/srv/backups/web01/{task_id}",
                            "abr_backup_name": "01-disk.vmdk"}],
                 "manifest_path": f"/srv/backups/web01/{task_id}/manifest.json",

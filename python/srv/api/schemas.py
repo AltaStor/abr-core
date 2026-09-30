@@ -710,6 +710,7 @@ class RepositoryScanResult(_LenientModel):
     status: DocStr = None
     last_scan_at: DocStr = None
     catalog: DocObject = None
+    restore_points: DocObject = None
 
 
 class S3TestResult(_LenientModel):
