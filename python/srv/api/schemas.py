@@ -61,6 +61,7 @@ class JobDTO(_LenientModel):
     created_at: str | None = None
     updated_at: str | None = None
     next_run_at: str | None = None
+    next_incremental_run_at: str | None = None
     last_run_at: str | None = None
     last_session_id: str | None = None
     active_sessions: list[Any] = []
@@ -359,6 +360,7 @@ class CreateJobRequest(_LenientModel):
     repo: LaxStr | None = None
     repo_id: LaxStr | None = None
     schedule: dict[str, Any] | LaxStr | None = None
+    enabled: LaxBool | None = None
     retention_days: LaxInt = None
     gfs: dict[str, Any] | None = None
     active_full_days: list[Any] | LaxStr | None = None
@@ -391,6 +393,7 @@ class CreateCopyJobRequest(_LenientModel):
 class UpdateJobRequest(_LenientModel):
     name: LaxStr | None = None
     schedule: dict[str, Any] | LaxStr | None = None
+    enabled: LaxBool | None = None
     retention_days: LaxInt = None
     gfs_weekly: LaxInt = None
     gfs_monthly: LaxInt = None

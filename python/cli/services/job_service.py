@@ -483,12 +483,14 @@ class JobService:
             normalized = str(description).strip()
             payload["description"] = normalized or None
 
-        schedule = self.build_schedule_payload(
-            args,
-            current_schedule=job.get("schedule") if isinstance(job.get("schedule"), dict) else None,
-        )
-        if schedule is not None:
-            payload["schedule"] = schedule
+        enabled_override = self._schedule_enabled_override(args)
+        if enabled_override is not None:
+            payload["enabled"] = enabled_override
+        stored_schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else None
+        if enabled_override is None or self._schedule_detail_fields_present(args) or getattr(args, "schedule", None):
+            schedule = self.build_schedule_payload(args, current_schedule=stored_schedule)
+            if schedule is not None:
+                payload["schedule"] = schedule
 
         task_parameter_updates = self._build_task_parameter_updates(args)
         if task_parameter_updates:

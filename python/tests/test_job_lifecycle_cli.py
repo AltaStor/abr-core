@@ -556,7 +556,7 @@ class JobPayloadBuilderTests(unittest.TestCase):
 
         self.assertEqual(payload["retention_days"], 0)
 
-    def test_edit_payload_can_toggle_existing_schedule_disabled(self) -> None:
+    def test_edit_payload_switches_the_job_off_without_touching_its_schedule(self) -> None:
         job = {
             "id": "job-1",
             "schedule": {"type": "weekly", "days": ["monday"], "time": "22:00", "enabled": True, "timezone": "UTC"},
@@ -590,8 +590,8 @@ class JobPayloadBuilderTests(unittest.TestCase):
 
         payload = self.service.build_edit_payload(job, args)
 
-        self.assertEqual(payload["schedule"]["enabled"], False)
-        self.assertEqual(payload["schedule"]["type"], "weekly")
+        self.assertEqual(payload["enabled"], False)
+        self.assertNotIn("schedule", payload)
 
     @staticmethod
     def _base_edit_args(**overrides: Any) -> SimpleNamespace:
@@ -1136,9 +1136,9 @@ class JobEngineLifecycleTests(unittest.TestCase):
         # Regression: a job's schedule can already be due (or overdue) at the
         # moment someone clicks "Run now"/"Run full backup" — e.g. an hourly
         # job the operator ran early. start_job_record() must push
-        # next_run_at forward the same way the scheduler's own dispatch does,
+        # next_incremental_run_at forward the same way the scheduler's own dispatch does,
         # or the very next scheduler poll sees the stale, still-due
-        # next_run_at and fires the job again right behind the manual run.
+        # next_incremental_run_at and fires the job again right behind the manual run.
         job = abr_v41.create_backup_job(
             {
                 "name": "Overdue Periodic Job",
@@ -1151,14 +1151,14 @@ class JobEngineLifecycleTests(unittest.TestCase):
         )
         # Simulate the schedule already being due when the manual run happens.
         overdue_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-        JOBS[job["id"]]["next_run_at"] = overdue_at
+        JOBS[job["id"]]["next_incremental_run_at"] = overdue_at
 
         started = abr_v41.start_job_record(job["id"])
         self.assertEqual(len(started["items"]), 1)
 
-        # next_run_at must have moved into the future...
-        next_run_at = datetime.fromisoformat(JOBS[job["id"]]["next_run_at"])
-        self.assertGreater(next_run_at, datetime.now(timezone.utc))
+        # next_incremental_run_at must have moved into the future...
+        next_incremental_run_at = datetime.fromisoformat(JOBS[job["id"]]["next_incremental_run_at"])
+        self.assertGreater(next_incremental_run_at, datetime.now(timezone.utc))
 
         # ...so the scheduler's next poll must not enqueue a second run.
         scheduler = JobScheduler(poll_interval_seconds=0.1)

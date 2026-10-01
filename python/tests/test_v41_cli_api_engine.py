@@ -2243,7 +2243,7 @@ class AbrV41EngineTests(unittest.TestCase):
         self.assertIsNone(edited["synthetic_full_next_run_at"])
         self.assertEqual(edited["synthetic_full_days"], [])
 
-    def test_create_backup_job_without_schedule_is_planned(self) -> None:
+    def test_create_backup_job_without_a_base_schedule_is_switched_on(self) -> None:
         inventory = abr_v41.create_inventory_record(
             {
                 "name": "Prod Hyper-V",
@@ -2273,8 +2273,87 @@ class AbrV41EngineTests(unittest.TestCase):
 
         self.assertIsNone(job["schedule"])
         self.assertIsNone(job["schedule_summary"])
-        self.assertIsNone(job["next_run_at"])
-        self.assertEqual(job["status"], "planned")
+        self.assertIsNone(job["next_incremental_run_at"])
+        self.assertEqual(job["next_run_at"], job["active_full_next_run_at"])
+        self.assertTrue(job["enabled"])
+        self.assertEqual(job["status"], "active")
+
+    def test_next_run_at_reports_the_earliest_schedule_and_not_the_base_one(self) -> None:
+        inventory = abr_v41.create_inventory_record(
+            {
+                "name": "Prod Hyper-V",
+                "type": "hyper-v",
+                "address": "192.168.12.41",
+                "username": "administrator",
+                "password": "secret",
+            }
+        )
+        RESOURCES_BY_HV[inventory["id"]]["vm-1"] = {
+            "resource_type": "virtual_machine",
+            "external_id": "vm-1",
+            "name": "vm-1",
+            "payload": {},
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        far_weekday = days[(datetime.now(timezone.utc).weekday() + 3) % 7]
+
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Nightly",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": {"type": "weekly", "days": [far_weekday], "time": "22:00"},
+                "synthetic_full_schedule": {"type": "daily", "time": "03:30"},
+            }
+        )
+
+        self.assertLess(job["synthetic_full_next_run_at"], job["next_incremental_run_at"])
+        self.assertEqual(job["next_run_at"], job["synthetic_full_next_run_at"])
+
+    def test_a_switched_off_job_reports_no_next_run_on_any_slot(self) -> None:
+        inventory = abr_v41.create_inventory_record(
+            {
+                "name": "Prod Hyper-V",
+                "type": "hyper-v",
+                "address": "192.168.12.42",
+                "username": "administrator",
+                "password": "secret",
+            }
+        )
+        RESOURCES_BY_HV[inventory["id"]]["vm-1"] = {
+            "resource_type": "virtual_machine",
+            "external_id": "vm-1",
+            "name": "vm-1",
+            "payload": {},
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Nightly",
+                "vms": "vm-1",
+                "inventory_id": inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": {"type": "daily", "time": "22:00"},
+                "synthetic_full_schedule": {"type": "daily", "time": "03:30"},
+            }
+        )
+
+        switched_off = abr_v41.edit_job_record(job["id"], {"enabled": False})
+
+        self.assertIsNone(switched_off["next_incremental_run_at"])
+        self.assertIsNone(switched_off["synthetic_full_next_run_at"])
+        self.assertIsNone(switched_off["next_run_at"])
+
+        switched_on = abr_v41.edit_job_record(job["id"], {"enabled": True})
+
+        self.assertIsNotNone(switched_on["next_incremental_run_at"])
+        self.assertIsNotNone(switched_on["synthetic_full_next_run_at"])
+        self.assertEqual(
+            switched_on["next_run_at"],
+            min(switched_on["next_incremental_run_at"], switched_on["synthetic_full_next_run_at"]),
+        )
 
     def test_create_repository_record_accepts_remote_address_and_preserves_description(self) -> None:
         repository = abr_v41.create_repository_record(
@@ -2507,7 +2586,7 @@ class AbrV41EngineTests(unittest.TestCase):
         self.assertEqual(job["schedule_summary"], "Daily at 20:00 (America/New_York)")
         self.assertEqual(job["next_run_at"], "2026-05-25T00:00:00+00:00")
 
-    def test_create_copy_job_without_schedule_is_planned(self) -> None:
+    def test_create_copy_job_without_a_base_schedule_is_switched_on(self) -> None:
         inventory = abr_v41.create_inventory_record(
             {
                 "name": "Source Hyper-V",
@@ -2546,8 +2625,10 @@ class AbrV41EngineTests(unittest.TestCase):
 
         self.assertIsNone(job["schedule"])
         self.assertIsNone(job["schedule_summary"])
-        self.assertIsNone(job["next_run_at"])
-        self.assertEqual(job["status"], "planned")
+        self.assertIsNone(job["next_incremental_run_at"])
+        self.assertEqual(job["next_run_at"], job["active_full_next_run_at"])
+        self.assertTrue(job["enabled"])
+        self.assertEqual(job["status"], "active")
 
     @patch("python.srv.services.abr_v41._server_timezone_name", return_value="America/New_York")
     def test_legacy_schedule_timezone_abbreviation_uses_server_zone(self, _server_timezone_name: object) -> None:
