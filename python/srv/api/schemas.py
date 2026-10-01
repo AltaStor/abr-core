@@ -66,28 +66,65 @@ class TaskParametersDTO(_LenientModel):
     encryption_enabled: LaxBool | None = None
     encryption_key: LaxStr | None = None
     encryption_key_id: LaxStr | None = None
-    encryption_keys: SkipValidation[list[EncryptionKeyRefDTO]] | None = None
+    encryption_keys: list[EncryptionKeyRefDTO] | None = None
     tool_timeout_seconds: LaxInt = None
     app_aware: LaxBool | None = None
     dedup: LaxBool | None = None
 
 
+class ExecutionChoiceDTO(_LenientModel):
+    type: str | None = None
+    reason: str | None = None
+
+
 class ExecutionPolicyDTO(_LenientModel):
-    first_run: LaxStr | None = None
-    manual_force_full: LaxStr | None = None
+    first_run: ExecutionChoiceDTO | None = None
+    manual_force_full: ExecutionChoiceDTO | None = None
     active_full_days: DocStrArray = None
     synthetic_full_days: DocStrArray = None
-    active_full_schedule: SkipValidation[ScheduleDTO] | None = None
-    synthetic_full_schedule: SkipValidation[ScheduleDTO] | None = None
+    active_full_schedule: ScheduleDTO | None = None
+    synthetic_full_schedule: ScheduleDTO | None = None
     active_overrides_synthetic: LaxBool | None = None
     synthetic_requires_repository_support: LaxBool | None = None
-    default: LaxStr | None = None
+    default: ExecutionChoiceDTO | None = None
 
 
 class RepositoryImmutabilityDTO(_LenientModel):
     mode: LaxStr | None = None
     retention_days: LaxInt = None
     retention_scope: LaxStr | None = None
+
+
+class S3RepositoryDTO(_LenientModel):
+    bucket: str | None = None
+    prefix: str | None = None
+    region: str | None = None
+    endpoint_url: str | None = None
+    profile: str | None = None
+    path_style: bool | None = None
+    verify_tls: bool | None = None
+    description: str | None = None
+    access_key_masked: str | None = None
+    has_secret_key: bool | None = None
+    immutability: RepositoryImmutabilityDTO | None = None
+    location: str | None = None
+
+
+class ImmutabilityEffectDTO(_LenientModel):
+    previous: RepositoryImmutabilityDTO | None = None
+    current: RepositoryImmutabilityDTO | None = None
+    changed: bool | None = None
+    existing_restore_points: int | None = None
+    existing_data_protected: bool | None = None
+    effect: DocStrArray = None
+    limitations: DocStrArray = None
+    warnings: DocStrArray = None
+
+
+class ImmutabilityFailureDTO(_LenientModel):
+    restore_point_id: str | None = None
+    backup_name: str | None = None
+    message: str | None = None
 
 
 class RepositoryCapabilitiesDTO(_LenientModel):
@@ -152,7 +189,7 @@ class InventoryTreeNodeDTO(_LenientModel):
     cpu_model: LaxStr | None = None
     vm_count: LaxInt = None
     health: LaxStr | None = None
-    children: SkipValidation[list[InventoryTreeNodeDTO]] | None = None
+    children: list[InventoryTreeNodeDTO] | None = None
 
 
 class BackupTreeNodeDTO(_LenientModel):
@@ -178,8 +215,8 @@ class BackupTreeNodeDTO(_LenientModel):
     can_restore: LaxBool | None = None
     disabled_reason: LaxStr | None = None
     restore_payload: DocObject = None
-    latest_restore_point: SkipValidation[RestorePointDTO] | None = None
-    children: SkipValidation[list[BackupTreeNodeDTO]] | None = None
+    latest_restore_point: RestorePointDTO | None = None
+    children: list[BackupTreeNodeDTO] | None = None
 
 
 class JobRefDTO(_LenientModel):
@@ -204,23 +241,23 @@ class JobDTO(_LenientModel):
     vms: list[_Ref] = []
     repository: _Ref
     source_job: _Ref | None = None
-    schedule: SkipValidation[ScheduleDTO] | None = None
+    schedule: ScheduleDTO | None = None
     schedule_summary: str | None = None
     enabled: bool = False
     schedule_state: str | None = None
     retention_days: int | None = None
-    gfs: SkipValidation[GfsDTO] | None = None
+    gfs: GfsDTO | None = None
     active_full_days: list[Any] | None = None
     synthetic_full_days: list[Any] | None = None
-    active_full_schedule: SkipValidation[ScheduleDTO] | None = None
-    synthetic_full_schedule: SkipValidation[ScheduleDTO] | None = None
+    active_full_schedule: ScheduleDTO | None = None
+    synthetic_full_schedule: ScheduleDTO | None = None
     active_full_next_run_at: str | None = None
     synthetic_full_next_run_at: str | None = None
     compression_level: int | None = None
-    encryption: SkipValidation[JobEncryptionDTO] | None = None
-    task_parameters: SkipValidation[TaskParametersDTO] | None = {}
-    backup_options: SkipValidation[TaskParametersDTO] | None = {}
-    effective_execution_policy: SkipValidation[ExecutionPolicyDTO] | None = None
+    encryption: JobEncryptionDTO | None = None
+    task_parameters: TaskParametersDTO | None = {}
+    backup_options: TaskParametersDTO | None = {}
+    effective_execution_policy: ExecutionPolicyDTO | None = None
     status: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
@@ -334,7 +371,7 @@ class RepositoryStorageDTO(_LenientModel):
     free_bytes: int | None = None
     available: bool = False
     error: str | None = None
-    permissions: SkipValidation[StoragePermissionsDTO] | None = None
+    permissions: StoragePermissionsDTO | None = None
 
 
 class RepositoryDTO(_LenientModel):
@@ -346,7 +383,8 @@ class RepositoryDTO(_LenientModel):
     updated_at: str
     last_scan_at: str | None = None
     last_verify_at: str | None = None
-    last_verify: SkipValidation[LastVerifyDTO] | None = None
+    last_verify: LastVerifyDTO | None = None
+    s3: S3RepositoryDTO | None = None
     address: str | None = None
     metadata: DocObject = None
     bucket: str | None = None
@@ -355,7 +393,7 @@ class RepositoryDTO(_LenientModel):
     endpoint_url: str | None = None
     path_style: bool | None = None
     verify_tls: bool | None = None
-    immutability: SkipValidation[RepositoryImmutabilityDTO] | None = None
+    immutability: RepositoryImmutabilityDTO | None = None
     path: str | None = None
     location: str | None = None
     description: str | None = None
@@ -363,8 +401,8 @@ class RepositoryDTO(_LenientModel):
     capacity_bytes: int | None = None
     used_bytes: int | None = None
     free_bytes: int | None = None
-    capabilities: SkipValidation[RepositoryCapabilitiesDTO] | None = {}
-    catalog: SkipValidation[RepositoryCatalogDTO] | None = {}
+    capabilities: RepositoryCapabilitiesDTO | None = {}
+    catalog: RepositoryCatalogDTO | None = {}
     referenced_jobs: list[Any] = []
     jobs_count: int = 0
     backup_chain_count: int = 0
@@ -383,7 +421,7 @@ class RestorePointDTO(_LenientModel):
     created_at: str | None = None
     execution_type: str | None = None
     execution_reason: str | None = None
-    gfs_marks: SkipValidation[GfsMarksDTO] | None = None
+    gfs_marks: GfsMarksDTO | None = None
     gfs_protected: bool = False
     parent_point_id: str | None = None
     status: str | None = None
@@ -454,7 +492,7 @@ class CatalogManifestDTO(_LenientModel):
     product: str | None = None
     product_version: str | None = None
     exported_at: str | None = None
-    counts: SkipValidation[CatalogCountsDTO] | None = None
+    counts: CatalogCountsDTO | None = None
     configuration_keys: DocStrArray = None
 
 
@@ -468,10 +506,10 @@ class SessionDTO(_LenientModel):
     finished_at: str | None = None
     resolved_backup_type: str | None = None
     resolved_backup_reason: str | None = None
-    progress: SkipValidation[int] | None = None
+    progress: int | None = None
     processed_bytes: int | None = None
     transferred_bytes: int | None = None
-    errors: SkipValidation[list[SessionErrorDTO]] | None = None
+    errors: list[SessionErrorDTO] | None = None
     warnings: list[Any] = []
     message: str | None = None
     triggered_by: str | None = None
@@ -480,7 +518,7 @@ class SessionDTO(_LenientModel):
     backup_id: str | None = None
     restore_point_id: str | None = None
     failure_kind: str | None = None
-    verify: SkipValidation[SessionVerifyDTO] | None = None
+    verify: SessionVerifyDTO | None = None
     logs: list[Any] = []
 
 
@@ -866,15 +904,15 @@ class RestoreVmDTO(_LenientModel):
     vm_name: str | None = None
     inventory: _Ref | None = None
     restore_available: bool | None = None
-    latest_restore_point: SkipValidation[RestorePointDTO] | None = None
+    latest_restore_point: RestorePointDTO | None = None
 
 
 class RestoreVmList(_LenientModel):
-    items: SkipValidation[list[RestoreVmDTO]] | None = None
+    items: list[RestoreVmDTO] | None = None
 
 
 class RestorePointList(_LenientModel):
-    items: SkipValidation[list[RestorePointDTO]] | None = None
+    items: list[RestorePointDTO] | None = None
 
 
 
@@ -1003,8 +1041,8 @@ class TlsCertificateChangeDTO(TlsCertificateDTO):
 
 class SystemHealthDTO(_LenientModel):
     status: DocStr = None
-    components: SkipValidation[SystemComponentsDTO] | None = None
-    counts: SkipValidation[SystemCountsDTO] | None = None
+    components: SystemComponentsDTO | None = None
+    counts: SystemCountsDTO | None = None
 
 
 class DeletedResult(_LenientModel):
@@ -1019,8 +1057,8 @@ class RemovedResult(_LenientModel):
 
 
 class JobStartResult(_LenientModel):
-    job: SkipValidation[JobRefDTO] | None = None
-    items: SkipValidation[list[SessionDTO]] | None = None
+    job: JobRefDTO | None = None
+    items: list[SessionDTO] | None = None
 
 
 
@@ -1033,7 +1071,7 @@ class SessionLogEntryDTO(_LenientModel):
 
 class SessionLogDTO(_LenientModel):
     id: DocStr = None
-    logs: SkipValidation[list[SessionLogEntryDTO]] | None = None
+    logs: list[SessionLogEntryDTO] | None = None
 
 
 class StopSessionResult(_LenientModel):
@@ -1044,11 +1082,11 @@ class StopSessionResult(_LenientModel):
 
 
 class InventoryTreeResponse(_LenientModel):
-    nodes: SkipValidation[list[InventoryTreeNodeDTO]] | None = None
+    nodes: list[InventoryTreeNodeDTO] | None = None
 
 
 class BackupTreeResponse(_LenientModel):
-    nodes: SkipValidation[list[BackupTreeNodeDTO]] | None = None
+    nodes: list[BackupTreeNodeDTO] | None = None
 
 
 class RepositoryScanResult(_LenientModel):
@@ -1056,20 +1094,20 @@ class RepositoryScanResult(_LenientModel):
     name: DocStr = None
     status: DocStr = None
     last_scan_at: DocStr = None
-    catalog: SkipValidation[RepositoryCatalogSummaryDTO] | None = None
-    restore_points: SkipValidation[RestorePointReconcileDTO] | None = None
+    catalog: RepositoryCatalogSummaryDTO | None = None
+    restore_points: RestorePointReconcileDTO | None = None
 
 
 class S3TestResult(_LenientModel):
     status: DocStr = None
     message: DocStr = None
-    checks: DocObjectArray = None
+    checks: list[VerifyCheckDTO] | None = None
 
 
 class RepositoryVerifyResult(RepositoryDTO):
     message: DocStr = None
-    checks: SkipValidation[list[VerifyCheckDTO]] | None = None
-    immutability_effect: DocObject = None
+    checks: list[VerifyCheckDTO] | None = None
+    immutability_effect: ImmutabilityEffectDTO | None = None
     error: DocStr = None
 
 
@@ -1078,12 +1116,12 @@ class RepositoryImmutabilityApplyResult(_LenientModel):
     name: DocStr = None
     status: DocStr = None
     message: DocStr = None
-    immutability: SkipValidation[RepositoryImmutabilityDTO] | None = None
-    actual_retention_days: DocArray = None
+    immutability: RepositoryImmutabilityDTO | None = None
+    actual_retention_days: list[int] | None = None
     restore_point_count: DocInt = None
     updated_restore_points: DocInt = None
     failed_restore_points: DocInt = None
-    failures: DocObjectArray = None
+    failures: list[ImmutabilityFailureDTO] | None = None
 
 
 class InventoryScanResult(_LenientModel):
@@ -1091,7 +1129,7 @@ class InventoryScanResult(_LenientModel):
     name: DocStr = None
     status: DocStr = None
     last_scan_at: DocStr = None
-    discovery: SkipValidation[InventoryDiscoveryDTO] | None = None
+    discovery: InventoryDiscoveryDTO | None = None
 
 
 class InventoryTestResult(_LenientModel):
@@ -1127,7 +1165,7 @@ class BackupVerifyResult(_LenientModel):
 
 
 class SystemLogsDTO(_LenientModel):
-    entries: SkipValidation[list[SystemLogEntryDTO]] | None = None
+    entries: list[SystemLogEntryDTO] | None = None
     total: DocInt = None
     limit: DocInt = None
     level: DocStrOrNull = Field(
@@ -1151,19 +1189,19 @@ class CatalogRestoreRequest(_LenientModel):
 
 
 class CatalogSnapshotResult(_LenientModel):
-    manifest: SkipValidation[CatalogManifestDTO] | None = None
+    manifest: CatalogManifestDTO | None = None
     archive_base64: DocStr = None
 
 
 class CatalogRestoreResult(_LenientModel):
-    manifest: SkipValidation[CatalogManifestDTO] | None = None
+    manifest: CatalogManifestDTO | None = None
     restored: DocObject = None
     configuration: DocObject = None
 
 
 
 class SupportBundleResult(_LenientModel):
-    manifest: SkipValidation[CatalogManifestDTO] | None = None
+    manifest: CatalogManifestDTO | None = None
     archive_base64: DocStr = None
 
 
@@ -1174,7 +1212,7 @@ class HealthDTO(_LenientModel):
 class LoginResult(_LenientModel):
     token: DocStr = None
     expires_at: DocStr = None
-    user: SkipValidation[PublicUserDTO] | None = None
+    user: PublicUserDTO | None = None
 
 
 class LogoutResult(_LenientModel):
