@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .mongo_db_wrapper import HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, catalog_records, persist_job, persist_task
 from .server_defaults import env_int
 from .utils import utc_now
-from python.srv.services.abr_v41 import normalize_job_record, resolve_job_execution, schedule_next_run
+from python.srv.services.abr_v41 import normalize_job_record, resolve_job_execution, schedule_next_run, stored_slot_next_run
 
 logger = logging.getLogger(__name__)
 WEEKDAY_INDEX = {
@@ -122,7 +122,7 @@ class JobScheduler:
     EXECUTION_SLOTS = (
         ("active_full_schedule", "ActiveFull", "active_full_next_run_at"),
         ("synthetic_full_schedule", "SyntheticFull", "synthetic_full_next_run_at"),
-        ("schedule", "Incremental", "next_run_at"),
+        ("schedule", "Incremental", "next_incremental_run_at"),
     )
 
     def _due_slots(
@@ -142,7 +142,7 @@ class JobScheduler:
     def _slot_next_run_at(
         self, job: dict[str, Any], schedule: dict[str, Any], next_run_key: str
     ) -> datetime | None:
-        stored = _parse_timestamp(job.get(next_run_key))
+        stored = _parse_timestamp(stored_slot_next_run(job, next_run_key))
         if stored is not None:
             return stored
         base = _parse_timestamp(job.get("last_scheduled_at")) or _parse_timestamp(job.get("created_at"))
@@ -170,20 +170,28 @@ class JobScheduler:
             except ValueError:
                 job[next_run_key] = None
 
-    def _is_supported_backup_job(self, job: dict[str, Any]) -> bool:
-        normalized_job = normalize_job_record(job)
-        schedule = normalized_job.get("schedule")
+    SCHEDULE_KINDS = frozenset({"cron", "daily", "weekly", "monthly", "periodic"})
+
+    @classmethod
+    def _schedule_can_fire(cls, schedule: Any) -> bool:
         if not isinstance(schedule, dict):
             return False
         if not bool(schedule.get("enabled", True)):
             return False
-        if schedule.get("kind") not in {"cron", "daily", "weekly", "monthly", "periodic"}:
-            return False
+        return schedule.get("kind") in cls.SCHEDULE_KINDS
+
+    def _is_supported_backup_job(self, job: dict[str, Any]) -> bool:
+        normalized_job = normalize_job_record(job)
         if normalized_job.get("job_type") != "backup":
             return False
         if not normalized_job.get("inventory_id"):
             return False
-        return True
+        if not normalized_job.get("enabled"):
+            return False
+        return any(
+            self._schedule_can_fire(normalized_job.get(schedule_key))
+            for schedule_key, _execution_type, _next_run_key in self.EXECUTION_SLOTS
+        )
 
     def _get_interval_minutes(self, job: dict[str, Any]) -> int:
         schedule = job.get("schedule", {})

@@ -15,7 +15,7 @@ from .schemas import (
     InventoryScanResult,
     InventoryTestResult,
     RemovedResult,
-    TreeResponse,
+    InventoryTreeResponse,
     UpdateInventoryRequest,
     unset_excluded,
 )
@@ -31,7 +31,7 @@ def list_inventories() -> InventoryList:
     return {"items": abr_v41.list_inventory_records()}
 
 
-def list_inventory_vm_tree() -> TreeResponse:
+def list_inventory_vm_tree() -> InventoryTreeResponse:
     return {"nodes": abr_v41.list_inventory_vm_tree()}
 
 

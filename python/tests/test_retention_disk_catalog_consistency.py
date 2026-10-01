@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from python.srv.core.mongo_db_wrapper import BACKUPS, JOBS, REPOSITORIES
+from python.srv.core.storage_tool import StorageToolError
 from python.srv.services import abr_v41, backup_catalog
 from python.srv.services.api_errors import ApiError
 
@@ -186,6 +187,81 @@ class DeleteBackupArtifactsTracksRealFailuresTests(unittest.TestCase):
         self.assertTrue(backup_root.exists())
 
 
+class DeleteBackupArtifactsAcceptsAlreadyGoneDataTests(unittest.TestCase):
+    def setUp(self) -> None:
+        REPOSITORIES.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo_path = Path(self._tmp.name)
+        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Local", "type": "local", "path": str(self.repo_path)}
+
+    def tearDown(self) -> None:
+        REPOSITORIES.clear()
+
+    def _point(self, session: str) -> dict:
+        return abr_v41.normalize_backup_point(
+            {
+                "id": f"point-{session}",
+                "repository_id": "repo-1",
+                "vm_id": "vm-1",
+                "execution_type": "Incremental",
+                "created_at": "2020-01-01T00:00:00+00:00",
+                "artifact": {
+                    "disks": [
+                        {
+                            "index": 1,
+                            "abr_path": str(self.repo_path / "vm-1" / session),
+                            "abr_backup_name": "01-disk.vmdk",
+                        }
+                    ]
+                },
+            }
+        )
+
+    def test_a_backup_whose_directory_is_gone_counts_as_deleted(self) -> None:
+        point = self._point("session-gone")
+
+        with patch(
+            "python.srv.services.abr_v41.remove_disk_tool_backup",
+            side_effect=StorageToolError("failed to initialize 'file' backup storage"),
+        ):
+            all_removed = abr_v41._delete_backup_artifacts_from_point(point)
+
+        self.assertTrue(all_removed, "a retry with nothing left to delete must not fail forever")
+
+    def test_a_backup_that_is_still_stored_keeps_the_entry_for_retry(self) -> None:
+        location = self.repo_path / "vm-1" / "session-there"
+        location.mkdir(parents=True)
+        point = self._point("session-there")
+
+        with patch(
+            "python.srv.services.abr_v41.remove_disk_tool_backup",
+            side_effect=StorageToolError("permission denied"),
+        ), patch(
+            "python.srv.services.abr_v41.list_disk_tool_backups",
+            return_value={"01-disk.vmdk"},
+        ):
+            all_removed = abr_v41._delete_backup_artifacts_from_point(point)
+
+        self.assertFalse(all_removed, "data that is still there must be retried, not forgotten")
+
+    def test_storage_that_cannot_be_read_keeps_the_entry_for_retry(self) -> None:
+        location = self.repo_path / "vm-1" / "session-unreadable"
+        location.mkdir(parents=True)
+        point = self._point("session-unreadable")
+
+        with patch(
+            "python.srv.services.abr_v41.remove_disk_tool_backup",
+            side_effect=StorageToolError("permission denied"),
+        ), patch(
+            "python.srv.services.abr_v41.list_disk_tool_backups",
+            side_effect=StorageToolError("cannot list"),
+        ):
+            all_removed = abr_v41._delete_backup_artifacts_from_point(point)
+
+        self.assertFalse(all_removed, "storage we cannot read is not proof the data is gone")
+
+
 class RegisterBackupFromCompletedTaskRetentionFailureTests(unittest.TestCase):
     def setUp(self) -> None:
         BACKUPS.clear()
@@ -234,6 +310,116 @@ class RegisterBackupFromCompletedTaskRetentionFailureTests(unittest.TestCase):
         ):
             with self.assertRaises(TypeError):
                 backup_catalog.register_backup_from_completed_task(self._task())
+
+
+class RescanMarksRestorePointsWithoutDataTests(unittest.TestCase):
+    def setUp(self) -> None:
+        BACKUPS.clear()
+        REPOSITORIES.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo_path = Path(self._tmp.name)
+        self.repository = {"id": "repo-1", "name": "Local", "type": "local", "path": str(self.repo_path)}
+        REPOSITORIES["repo-1"] = self.repository
+
+    def tearDown(self) -> None:
+        BACKUPS.clear()
+        REPOSITORIES.clear()
+
+    def _store(self, point_id: str, session: str, *, status: str = "available") -> None:
+        BACKUPS[point_id] = {
+            "id": point_id,
+            "repository_id": "repo-1",
+            "vm_id": "vm-1",
+            "job_id": "job-1",
+            "execution_type": "Incremental",
+            "status": status,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "artifact": {
+                "disks": [
+                    {
+                        "index": 1,
+                        "abr_path": str(self.repo_path / "vm-1" / session),
+                        "abr_backup_name": "01-disk.vmdk",
+                    }
+                ]
+            },
+        }
+
+    def test_a_point_whose_data_is_gone_is_marked_missing(self) -> None:
+        self._store("point-gone", "session-gone")
+
+        summary = abr_v41.reconcile_repository_points(self.repository)
+
+        self.assertEqual(summary["marked_missing"], 1)
+        self.assertEqual(BACKUPS["point-gone"]["status"], "missing")
+
+    def test_a_point_whose_data_is_there_is_left_alone(self) -> None:
+        (self.repo_path / "vm-1" / "session-there").mkdir(parents=True)
+        self._store("point-there", "session-there")
+
+        with patch("python.srv.services.abr_v41.list_disk_tool_backups", return_value={"01-disk.vmdk"}):
+            summary = abr_v41.reconcile_repository_points(self.repository)
+
+        self.assertEqual(summary["marked_missing"], 0)
+        self.assertEqual(BACKUPS["point-there"]["status"], "available")
+
+    def test_storage_that_cannot_be_read_marks_nothing(self) -> None:
+        (self.repo_path / "vm-1" / "session-unreadable").mkdir(parents=True)
+        self._store("point-unreadable", "session-unreadable")
+
+        with patch("python.srv.services.abr_v41.list_disk_tool_backups", side_effect=StorageToolError("cannot list")):
+            summary = abr_v41.reconcile_repository_points(self.repository)
+
+        self.assertEqual(summary["unreadable"], 1)
+        self.assertEqual(summary["marked_missing"], 0)
+        self.assertEqual(BACKUPS["point-unreadable"]["status"], "available")
+
+    def test_a_stale_missing_mark_is_lifted_when_the_data_is_back(self) -> None:
+        (self.repo_path / "vm-1" / "session-back").mkdir(parents=True)
+        self._store("point-back", "session-back", status="missing")
+
+        with patch("python.srv.services.abr_v41.list_disk_tool_backups", return_value={"01-disk.vmdk"}):
+            summary = abr_v41.reconcile_repository_points(self.repository)
+
+        self.assertEqual(summary["restored"], 1)
+        self.assertEqual(BACKUPS["point-back"]["status"], "available")
+
+
+class BackupChainStatusFollowsItsWeakestPointTests(unittest.TestCase):
+    def test_a_chain_holding_a_point_without_data_is_not_reported_available(self) -> None:
+        points = [
+            abr_v41.normalize_backup_point(
+                {"id": "p1", "execution_type": "ActiveFull", "status": "available",
+                 "created_at": "2026-01-01T00:00:00+00:00", "chain_id": "chain-1"}
+            ),
+            abr_v41.normalize_backup_point(
+                {"id": "p2", "execution_type": "Incremental", "status": "missing",
+                 "created_at": "2026-01-02T00:00:00+00:00", "chain_id": "chain-1"}
+            ),
+            abr_v41.normalize_backup_point(
+                {"id": "p3", "execution_type": "Incremental", "status": "available",
+                 "created_at": "2026-01-03T00:00:00+00:00", "chain_id": "chain-1"}
+            ),
+        ]
+
+        chain = abr_v41.backup_chain_to_dto(points)
+
+        self.assertEqual(chain["status"], "missing")
+
+    def test_a_healthy_chain_still_reports_its_newest_point(self) -> None:
+        points = [
+            abr_v41.normalize_backup_point(
+                {"id": "p1", "execution_type": "ActiveFull", "status": "available",
+                 "created_at": "2026-01-01T00:00:00+00:00", "chain_id": "chain-1"}
+            ),
+            abr_v41.normalize_backup_point(
+                {"id": "p2", "execution_type": "Incremental", "status": "available",
+                 "created_at": "2026-01-02T00:00:00+00:00", "chain_id": "chain-1"}
+            ),
+        ]
+
+        self.assertEqual(abr_v41.backup_chain_to_dto(points)["status"], "available")
 
 
 class RetentionAcrossASyntheticFullTests(unittest.TestCase):

@@ -128,6 +128,59 @@ class JobService:
 
     EXECUTION_SCHEDULE_PREFIXES = ("active_full", "synthetic_full")
 
+    _SCHEDULE_DETAIL_FLAGS = (
+        ("time", "--time"),
+        ("days", "--days"),
+        ("day_of_month", "--day-of-month"),
+        ("every", "--every"),
+    )
+
+    _SCHEDULE_TYPE_DETAILS = {
+        "daily": ("time",),
+        "weekly": ("days", "time"),
+        "monthly": ("day_of_month", "time"),
+        "periodic": ("every",),
+    }
+
+    @classmethod
+    def _only_days_detail(cls, args: Any) -> bool:
+        if cls._is_empty_value(getattr(args, "days", None)):
+            return False
+        return all(cls._is_empty_value(getattr(args, name, None)) for name in ("time", "day_of_month", "every"))
+
+    @classmethod
+    def _merge_schedule_details(cls, stored: dict[str, Any], args: Any, *, enabled_override: bool | None) -> dict[str, Any]:
+        schedule_type = str(stored.get("type") or "").strip().lower()
+        accepted = cls._SCHEDULE_TYPE_DETAILS.get(schedule_type)
+        if accepted is None:
+            raise ValueError("Schedule details require --schedule")
+        label = schedule_type.capitalize()
+        for field_name, flag in cls._SCHEDULE_DETAIL_FLAGS:
+            if field_name in accepted or cls._is_empty_value(getattr(args, field_name, None)):
+                continue
+            raise ValueError(f"{label} schedules do not accept {flag}")
+
+        payload: dict[str, Any] = {
+            "type": schedule_type,
+            "enabled": bool(stored.get("enabled", True)) if enabled_override is None else enabled_override,
+        }
+        if "time" in accepted:
+            given = getattr(args, "time", None)
+            payload["time"] = parse_strict_hhmm(str(given)) if given not in {None, ""} else str(stored.get("time") or "")
+        if "days" in accepted:
+            given = getattr(args, "days", None)
+            if given:
+                payload["days"] = given if isinstance(given, list) else parse_weekday_csv(str(given))
+            else:
+                payload["days"] = list(stored.get("days") or [])
+        if "day_of_month" in accepted:
+            given = getattr(args, "day_of_month", None)
+            payload["day_of_month"] = int(given) if given is not None else int(stored.get("day_of_month") or 1)
+        if "every" in accepted:
+            given = getattr(args, "every", None)
+            payload["every"] = parse_duration(str(given)) if given not in {None, ""} else str(stored.get("every") or "")
+        return payload
+
     @classmethod
     def build_execution_schedule_payloads(cls, args: Any, current: dict[str, Any] | None = None) -> dict[str, Any]:
         payloads: dict[str, Any] = {}
@@ -136,16 +189,30 @@ class JobService:
             key = f"{prefix}_schedule"
             requested = getattr(args, key, None)
             state_only = bool(getattr(args, f"{prefix}_enabled", False) or getattr(args, f"{prefix}_disabled", False))
-            if cls._is_empty_value(requested) and not state_only:
+            prefixed = _ExecutionScheduleArgs(args, prefix)
+            has_details = cls._schedule_detail_fields_present(prefixed)
+            if cls._is_empty_value(requested) and not state_only and not has_details:
                 continue
             if not cls._is_empty_value(requested) and str(requested).strip().lower() in {"none", "off"}:
                 payloads[key] = None
                 continue
             stored = job.get(key) if isinstance(job.get(key), dict) else None
+            stored_type = str((stored or {}).get("type") or "").strip().lower()
+            keeps_stored_type = stored is not None and str(requested or "").strip().lower() in {"", stored_type}
+            if keeps_stored_type and has_details:
+                try:
+                    payloads[key] = cls._merge_schedule_details(
+                        stored, prefixed, enabled_override=cls._schedule_enabled_override(prefixed)
+                    )
+                except ValueError as error:
+                    raise cls._prefixed_schedule_error(error, prefix) from error
+                continue
+            if cls._is_empty_value(requested) and has_details:
+                if cls._only_days_detail(prefixed):
+                    continue
+                raise cls._prefixed_schedule_error(ValueError("Schedule details require --schedule"), prefix)
             try:
-                payloads[key] = cls.build_schedule_payload(
-                    _ExecutionScheduleArgs(args, prefix), current_schedule=stored
-                )
+                payloads[key] = cls.build_schedule_payload(prefixed, current_schedule=stored)
             except ValueError as error:
                 raise cls._prefixed_schedule_error(error, prefix) from error
         return payloads
@@ -416,12 +483,14 @@ class JobService:
             normalized = str(description).strip()
             payload["description"] = normalized or None
 
-        schedule = self.build_schedule_payload(
-            args,
-            current_schedule=job.get("schedule") if isinstance(job.get("schedule"), dict) else None,
-        )
-        if schedule is not None:
-            payload["schedule"] = schedule
+        enabled_override = self._schedule_enabled_override(args)
+        if enabled_override is not None:
+            payload["enabled"] = enabled_override
+        stored_schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else None
+        if enabled_override is None or self._schedule_detail_fields_present(args) or getattr(args, "schedule", None):
+            schedule = self.build_schedule_payload(args, current_schedule=stored_schedule)
+            if schedule is not None:
+                payload["schedule"] = schedule
 
         task_parameter_updates = self._build_task_parameter_updates(args)
         if task_parameter_updates:

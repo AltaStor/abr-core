@@ -3344,6 +3344,7 @@ def verify_repository(record_id: str) -> dict[str, Any]:
 
 def rescan_repository(record_id: str) -> dict[str, Any]:
     repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    reconciled = reconcile_repository_points(repository)
     updated = _json_clone(repository)
     metadata = dict(updated.get("metadata") if isinstance(updated.get("metadata"), dict) else {})
     metadata["last_scan_at"] = utc_now()
@@ -3358,6 +3359,7 @@ def rescan_repository(record_id: str) -> dict[str, Any]:
         "status": payload["status"],
         "last_scan_at": payload["last_scan_at"],
         "catalog": payload["catalog"],
+        "restore_points": reconciled,
     }
 
 
@@ -3546,9 +3548,9 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
         item["schedule"],
         item.get("created_at"),
     )
-    base_is_enabled = _base_schedule_is_enabled(item)
+    runs = _job_is_enabled(item)
     for schedule_key, _days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
-        if not base_is_enabled:
+        if not runs:
             item[next_run_key] = None
         elif not item.get(next_run_key):
             item[next_run_key] = _execution_schedule_next_run(item.get(schedule_key))
@@ -3557,18 +3559,20 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(task_parameters, dict):
         task_parameters = metadata.get("task_parameters") if isinstance(metadata.get("task_parameters"), dict) else {}
     item["task_parameters"] = dict(task_parameters)
-    item["enabled"] = bool(item["schedule"] and item["schedule"].get("enabled", True))
+    item["enabled"] = _job_is_enabled(item)
     item["schedule_state"] = "enabled" if item["schedule"] and item["enabled"] else "disabled" if item["schedule"] else "manual"
     item["vm_count"] = len(item["vm_ids"]) or len(item["vm_names"])
-    if item["schedule"] is None:
-        item["status"] = str(item.get("status") or "planned")
-    elif item["enabled"]:
+    if not item["enabled"]:
+        item["status"] = "disabled"
+    elif _job_has_a_schedule(item):
         item["status"] = "active"
     else:
-        item["status"] = "disabled"
+        item["status"] = str(item.get("status") or "planned")
     item["created_at"] = str(item.get("created_at") or utc_now())
     item["updated_at"] = str(item.get("updated_at") or item["created_at"])
-    item["next_run_at"] = item.get("next_run_at")
+    stored_incremental = item.get("next_incremental_run_at") if "next_incremental_run_at" in item else item.get("next_run_at")
+    item.pop("next_run_at", None)
+    item["next_incremental_run_at"] = stored_incremental if item["enabled"] else None
     item["last_run_at"] = item.get("last_run_at") or item.get("last_scheduled_at")
     item["last_session_id"] = item.get("last_session_id") or item.get("last_task_id")
     return item
@@ -3712,6 +3716,29 @@ def job_effective_policy(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def stored_slot_next_run(job: dict[str, Any], next_run_key: str) -> Any:
+    if next_run_key in job:
+        return job.get(next_run_key)
+    if next_run_key == "next_incremental_run_at":
+        return job.get("next_run_at")
+    return None
+
+
+def _earliest_next_run(job: dict[str, Any]) -> str | None:
+    earliest: tuple[datetime, str] | None = None
+    for key in ("next_incremental_run_at", "active_full_next_run_at", "synthetic_full_next_run_at"):
+        value = job.get(key)
+        if not value:
+            continue
+        try:
+            moment = _parse_dt(value)
+        except (TypeError, ValueError):
+            continue
+        if earliest is None or moment < earliest[0]:
+            earliest = (moment, str(value))
+    return earliest[1] if earliest else None
+
+
 def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_job_record(job)
     active_sessions = _active_sessions_for_job(str(normalized["id"]))
@@ -3778,7 +3805,8 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "status": normalized.get("status"),
         "created_at": normalized.get("created_at"),
         "updated_at": normalized.get("updated_at"),
-        "next_run_at": normalized.get("next_run_at"),
+        "next_run_at": _earliest_next_run(normalized),
+        "next_incremental_run_at": normalized.get("next_incremental_run_at"),
         "last_run_at": normalized.get("last_run_at"),
         "last_session_id": normalized.get("last_session_id"),
         "active_sessions": active_sessions,
@@ -3842,11 +3870,12 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     synthetic_full_days = _normalize_day_list(payload.get("synthetic_full_days") or _split_csv(payload.get("synthetic_full_days_csv")))
     active_full_schedule = normalize_schedule_payload(payload.get("active_full_schedule"))
     synthetic_full_schedule = normalize_schedule_payload(payload.get("synthetic_full_schedule"))
-    if "active_full_schedule" in payload and active_full_schedule is None:
+    if "active_full_schedule" in payload and not _schedule_weekdays(active_full_schedule):
         active_full_days = []
-    if "synthetic_full_schedule" in payload and synthetic_full_schedule is None:
+    if "synthetic_full_schedule" in payload and not _schedule_weekdays(synthetic_full_schedule):
         synthetic_full_days = []
     base_is_enabled = isinstance(schedule, dict) and bool(schedule.get("enabled", True))
+    job_enabled = bool(payload.get("enabled", True)) if not isinstance(schedule, dict) else base_is_enabled
     description = str(payload.get("description") or "").strip()
     task_parameters = payload.get("task_parameters") if isinstance(payload.get("task_parameters"), dict) else payload.get("backup_options")
     if task_parameters is None:
@@ -3911,10 +3940,11 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_next_run_at": _execution_schedule_next_run(synthetic_full_schedule) if base_is_enabled else None,
         "description": description,
         "task_parameters": dict(task_parameters),
-        "status": "active" if schedule and bool(schedule.get("enabled", True)) else "disabled" if schedule else "planned",
+        "enabled": job_enabled,
+        "status": "active" if job_enabled else "disabled",
         "created_at": now,
         "updated_at": now,
-        "next_run_at": schedule_next_run(schedule, after=_parse_dt(now)).isoformat() if schedule and bool(schedule.get("enabled", True)) else None,
+        "next_incremental_run_at": schedule_next_run(schedule, after=_parse_dt(now)).isoformat() if schedule and bool(schedule.get("enabled", True)) else None,
         "last_run_at": None,
         "last_session_id": None,
     }
@@ -3935,6 +3965,9 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     enabled_override = payload.get("enabled")
     if isinstance(schedule, dict) and enabled_override is not None:
         schedule["enabled"] = bool(enabled_override)
+    job_enabled = bool(enabled_override) if enabled_override is not None else (
+        bool(schedule.get("enabled", True)) if isinstance(schedule, dict) else True
+    )
     raw_retention_days = payload.get("retention_days")
     if raw_retention_days is None:
         raw_retention_days = source_job.get("retention_days")
@@ -3974,10 +4007,11 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_schedule": _json_clone(source_job.get("synthetic_full_schedule")),
         "description": description,
         "task_parameters": dict(source_task_parameters),
-        "status": "active" if schedule and bool(schedule.get("enabled", True)) else "disabled" if schedule else "planned",
+        "enabled": job_enabled,
+        "status": "active" if job_enabled else "disabled",
         "created_at": now,
         "updated_at": now,
-        "next_run_at": schedule_next_run(schedule, after=_parse_dt(now)).isoformat() if schedule and bool(schedule.get("enabled", True)) else None,
+        "next_incremental_run_at": schedule_next_run(schedule, after=_parse_dt(now)).isoformat() if schedule and bool(schedule.get("enabled", True)) else None,
         "last_run_at": None,
         "last_session_id": None,
     }
@@ -3985,6 +4019,12 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
         job.pop("source_job_id", None)
         job.pop("source_job_name", None)
     return job_to_dto(_persist_canonical_job(job))
+
+
+def _schedule_weekdays(schedule: Any) -> list[str]:
+    if not isinstance(schedule, dict) or str(schedule.get("kind") or "") != "weekly":
+        return []
+    return _normalize_day_list(schedule.get("weekdays") or [])
 
 
 def _retune_weekly_schedule(schedule: Any, days: list[str]) -> dict[str, Any] | None:
@@ -4011,11 +4051,33 @@ def _base_schedule_is_enabled(job: dict[str, Any]) -> bool:
     return isinstance(schedule, dict) and bool(schedule.get("enabled", True))
 
 
+def _job_has_a_schedule(job: dict[str, Any]) -> bool:
+    if isinstance(job.get("schedule"), dict):
+        return True
+    return any(
+        isinstance(job.get(schedule_key), dict)
+        for schedule_key, _days_key, _next_run_key in EXECUTION_SCHEDULE_FIELDS
+    )
+
+
+def _job_is_enabled(job: dict[str, Any]) -> bool:
+    stored = job.get("enabled")
+    if isinstance(stored, bool):
+        return stored
+    schedule = job.get("schedule")
+    if isinstance(schedule, dict):
+        return bool(schedule.get("enabled", True))
+    return True
+
+
 def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     current = resolve_job(record_id=job_id)
     updated = _json_clone(current)
-    was_enabled = _base_schedule_is_enabled(updated)
+    was_enabled = _job_is_enabled(updated)
     changed = False
+    if "enabled" in payload and payload["enabled"] is not None:
+        updated["enabled"] = bool(payload["enabled"])
+        changed = True
     if payload.get("name"):
         new_name = str(payload["name"])
         _ensure(bool(new_name.strip()), 422, "invalid_job", "Job name must not be empty")
@@ -4029,7 +4091,9 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         changed = True
     if "schedule" in payload and payload["schedule"] is not None:
         updated["schedule"] = normalize_schedule_payload(payload["schedule"])
-        updated["next_run_at"] = schedule_next_run(updated["schedule"], after=_now_utc()).isoformat() if bool(updated["schedule"].get("enabled", True)) else None
+        updated["next_incremental_run_at"] = schedule_next_run(updated["schedule"], after=_now_utc()).isoformat() if bool(updated["schedule"].get("enabled", True)) else None
+        if "enabled" not in payload:
+            updated["enabled"] = bool(updated["schedule"].get("enabled", True))
         changed = True
     if "retention_days" in payload and payload["retention_days"] is not None:
         retention_days = int(payload["retention_days"])
@@ -4057,8 +4121,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         schedule_value = normalize_schedule_payload(payload[schedule_key])
         updated[schedule_key] = schedule_value
         updated[next_run_key] = _execution_schedule_next_run(schedule_value)
-        if schedule_value is None:
-            updated[days_key] = []
+        updated[days_key] = _schedule_weekdays(schedule_value)
         changed = True
     for schedule_key, days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
         if days_key not in payload or payload[days_key] is None:
@@ -4118,19 +4181,26 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     updated["updated_at"] = utc_now()
     if updated.get("schedule"):
         updated["schedule_summary"] = _render_schedule_summary(updated["schedule"])
-        updated["status"] = "active" if bool(updated["schedule"].get("enabled", True)) else "disabled"
         if not bool(updated["schedule"].get("enabled", True)):
-            updated["next_run_at"] = None
+            updated["next_incremental_run_at"] = None
+    else:
+        updated["next_incremental_run_at"] = None
+    is_enabled = _job_is_enabled(updated)
+    if not is_enabled:
+        updated["next_incremental_run_at"] = None
+    if not is_enabled:
+        updated["status"] = "disabled"
+    elif _job_has_a_schedule(updated):
+        updated["status"] = "active"
     else:
         updated["status"] = "planned"
-        updated["next_run_at"] = None
-    is_enabled = _base_schedule_is_enabled(updated)
     if was_enabled and not is_enabled:
         for _schedule_key, _days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
             updated[next_run_key] = None
     elif is_enabled and not was_enabled:
         for schedule_key, _days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
             updated[next_run_key] = _execution_schedule_next_run(updated.get(schedule_key))
+        updated["next_incremental_run_at"] = _execution_schedule_next_run(updated.get("schedule"))
     return job_to_dto(_persist_canonical_job(updated))
 
 
@@ -4441,14 +4511,22 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
             try:
                 remove_disk_tool_backup(repository, abr_path, abr_backup_name, timeout=120)
             except StorageToolError:
-                all_removed = False
-                LOGGER.warning(
-                    "Failed to delete remote backup artifact: point=%s path=%s name=%s",
-                    point.get("id"),
-                    abr_path,
-                    abr_backup_name,
-                    exc_info=True,
-                )
+                if _stored_backup_is_absent(repository, abr_path, abr_backup_name):
+                    LOGGER.info(
+                        "Backup artifact was already gone, counting it as deleted: point=%s path=%s name=%s",
+                        point.get("id"),
+                        abr_path,
+                        abr_backup_name,
+                    )
+                else:
+                    all_removed = False
+                    LOGGER.warning(
+                        "Failed to delete remote backup artifact: point=%s path=%s name=%s",
+                        point.get("id"),
+                        abr_path,
+                        abr_backup_name,
+                        exc_info=True,
+                    )
             continue
         destination_path = disk.get("destination_path")
         if isinstance(destination_path, str) and destination_path:
@@ -4490,6 +4568,79 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
                 exc_info=True,
             )
     return all_removed
+
+
+def _stored_backup_names(repository: dict[str, Any], abr_path: str) -> set[str] | None:
+    if not is_s3_repository(repository):
+        location = Path(abr_path)
+        if not location.exists():
+            return set()
+        if not os.access(location, os.R_OK | os.X_OK):
+            return None
+    try:
+        return list_disk_tool_backups(repository, abr_path, timeout=60)
+    except StorageToolError:
+        return None
+
+
+def _stored_backup_is_absent(repository: dict[str, Any], abr_path: str, backup_name: str) -> bool:
+    names = _stored_backup_names(repository, abr_path)
+    return names is not None and backup_name not in names
+
+
+def _point_artifact_locations(point: dict[str, Any]) -> list[tuple[str, str]]:
+    artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+    locations: list[tuple[str, str]] = []
+    for disk in artifact.get("disks", []):
+        if not isinstance(disk, dict):
+            continue
+        abr_path = str(disk.get("abr_path") or "").strip()
+        backup_name = str(disk.get("abr_backup_name") or "").strip()
+        if abr_path and backup_name:
+            locations.append((abr_path, backup_name))
+    return locations
+
+
+def reconcile_repository_points(repository: dict[str, Any]) -> dict[str, int]:
+    repository_id = str(repository.get("id") or "")
+    listings: dict[str, set[str] | None] = {}
+    summary = {"checked": 0, "marked_missing": 0, "restored": 0, "unreadable": 0}
+    for record in catalog_records(BACKUPS):
+        point = normalize_backup_point(record)
+        if str(point.get("repository_id") or "") != repository_id:
+            continue
+        locations = _point_artifact_locations(point)
+        if not locations:
+            continue
+        summary["checked"] += 1
+        absent = False
+        unreadable = False
+        for abr_path, backup_name in locations:
+            if abr_path not in listings:
+                listings[abr_path] = _stored_backup_names(repository, abr_path)
+            names = listings[abr_path]
+            if names is None:
+                unreadable = True
+            elif backup_name not in names:
+                absent = True
+        status = str(point.get("status") or "available")
+        if unreadable:
+            summary["unreadable"] += 1
+            continue
+        if absent and status != "missing":
+            point["status"] = "missing"
+            persist_backup(point)
+            summary["marked_missing"] += 1
+            LOGGER.warning(
+                "Restore point has no stored data left; marking it missing: point=%s repository=%s",
+                point.get("id"),
+                repository_id,
+            )
+        elif not absent and status == "missing":
+            point["status"] = "available"
+            persist_backup(point)
+            summary["restored"] += 1
+    return summary
 
 
 def _segment_points(points: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -4832,6 +4983,10 @@ def _chain_name(points: list[dict[str, Any]]) -> str:
 
 def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
     latest = points[-1]
+    unhealthy = next(
+        (point for point in points if _normalize_backup_health(point.get("status")) == "invalid"),
+        None,
+    )
     restore_points = [
         {
             "id": point["id"],
@@ -4869,7 +5024,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "name": latest.get("repository_name"),
             "type": latest.get("repository_type"),
         },
-        "status": latest.get("status"),
+        "status": (unhealthy or latest).get("status"),
         "restore_point_count": len(points),
         "created_at": points[0].get("created_at"),
         "last_restore_point_at": latest.get("created_at"),
@@ -7357,24 +7512,24 @@ def start_job_record(
                 )
             )
     schedule = job.get("schedule")
-    # A manual "Run now"/"Run full backup" must push next_run_at forward the
+    # A manual "Run now"/"Run full backup" must push next_incremental_run_at forward the
     # same way the scheduler does after its own dispatch (_dispatch_due_jobs
     # in job_scheduler.py) — otherwise a job whose scheduled time has already
     # arrived (or was already due when triggered manually) keeps a stale,
-    # now-past next_run_at, and the scheduler's next poll (every 5s) sees it
+    # now-past next_incremental_run_at, and the scheduler's next poll (every 5s) sees it
     # as still due and fires it again right behind the manual run, which
     # looks like the job running twice.
-    next_run_at = (
+    next_incremental_run_at = (
         schedule_next_run(schedule, after=_now_utc()).isoformat()
         if isinstance(schedule, dict) and bool(schedule.get("enabled", True))
-        else job.get("next_run_at")
+        else job.get("next_incremental_run_at")
     )
     persisted = _persist_canonical_job(
         {
             **job,
             "last_run_at": utc_now(),
             "last_session_id": sessions[-1]["id"] if sessions else None,
-            "next_run_at": next_run_at,
+            "next_incremental_run_at": next_incremental_run_at,
             "updated_at": utc_now(),
         }
     )

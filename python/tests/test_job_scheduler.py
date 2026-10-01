@@ -104,7 +104,7 @@ class JobSchedulerTests(unittest.TestCase):
         self.assertEqual(job["last_session_id"], task["id"])
         self.assertEqual(job["status"], "active")
         self.assertEqual(job["last_run_at"], task["created_at"])
-        self.assertIsInstance(job["next_run_at"], str)
+        self.assertIsInstance(job["next_incremental_run_at"], str)
         self.assertIsInstance(job["last_scheduled_at"], str)
 
     def test_due_interval_backup_job_reads_task_parameters_from_metadata(self) -> None:
@@ -216,7 +216,7 @@ class JobSchedulerTests(unittest.TestCase):
 
         self.assertEqual(len(TASKS), 1)
         self.assertEqual(next(iter(TASKS.values()))["resource_external_id"], "vm-1")
-        self.assertGreater(datetime.fromisoformat(JOBS["job-1"]["next_run_at"]), datetime.now(timezone.utc))
+        self.assertGreater(datetime.fromisoformat(JOBS["job-1"]["next_incremental_run_at"]), datetime.now(timezone.utc))
 
     def test_due_weekly_backup_job_enqueues_vm_task(self) -> None:
         created_at = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
@@ -571,9 +571,22 @@ class SyntheticFullSchedulingTests(unittest.TestCase):
 
         self.assertEqual(self._types(self._dispatch()), ["Incremental"])
 
-    def test_a_job_without_a_base_schedule_never_runs_its_full_schedules(self) -> None:
+    def test_a_legacy_record_keeps_the_next_run_it_already_stored(self) -> None:
+        self._register_job(next_run_at=(datetime.now(timezone.utc) + timedelta(hours=4)).isoformat())
+        JOBS["job-1"].pop("next_incremental_run_at", None)
+
+        self.assertEqual(self._dispatch(), [])
+
+    def test_a_job_without_a_base_schedule_still_runs_its_full_schedules(self) -> None:
         self._register_job(active_full_schedule=self._due_daily())
         JOBS["job-1"]["schedule"] = None
+
+        self.assertEqual(self._types(self._dispatch()), ["ActiveFull"])
+
+    def test_a_switched_off_job_runs_nothing_even_without_a_base_schedule(self) -> None:
+        self._register_job(active_full_schedule=self._due_daily())
+        JOBS["job-1"]["schedule"] = None
+        JOBS["job-1"]["enabled"] = False
 
         self.assertEqual(self._types(self._dispatch()), [])
 
@@ -755,19 +768,25 @@ class LegacyFullDayMigrationTests(unittest.TestCase):
 
         self.assertEqual(job["synthetic_full_next_run_at"], "2026-12-31T00:00:00+00:00")
 
-    def test_a_job_that_never_runs_on_its_own_promises_no_next_run(self) -> None:
-        for label, schedule in (
-            ("no schedule", None),
-            ("disabled schedule", {"type": "daily", "time": "02:00", "timezone": "UTC", "enabled": False}),
-        ):
-            with self.subTest(schedule=label):
-                job = self._job(
-                    schedule,
-                    synthetic_full_days=["wednesday"],
-                    synthetic_full_next_run_at="2026-12-31T00:00:00+00:00",
-                )
-                self.assertTrue(job["synthetic_full_schedule"]["enabled"])
-                self.assertIsNone(job["synthetic_full_next_run_at"])
+    def test_a_switched_off_job_promises_no_next_run(self) -> None:
+        job = self._job(
+            {"type": "daily", "time": "02:00", "timezone": "UTC", "enabled": False},
+            synthetic_full_days=["wednesday"],
+            synthetic_full_next_run_at="2026-12-31T00:00:00+00:00",
+        )
+
+        self.assertTrue(job["synthetic_full_schedule"]["enabled"])
+        self.assertIsNone(job["synthetic_full_next_run_at"])
+
+    def test_a_job_without_a_base_schedule_still_promises_its_full_run(self) -> None:
+        job = self._job(
+            None,
+            synthetic_full_days=["wednesday"],
+            synthetic_full_next_run_at="2026-12-31T00:00:00+00:00",
+        )
+
+        self.assertTrue(job["synthetic_full_schedule"]["enabled"])
+        self.assertEqual(job["synthetic_full_next_run_at"], "2026-12-31T00:00:00+00:00")
 
     def test_a_job_with_no_day_lists_has_no_extra_schedules(self) -> None:
         job = self._job({"type": "daily", "time": "02:00", "timezone": "UTC"})

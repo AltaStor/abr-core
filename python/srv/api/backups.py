@@ -14,7 +14,7 @@ from .schemas import (
     BackupList,
     BackupVerifyResult,
     ImportBackupRequest,
-    TreeResponse,
+    BackupTreeResponse,
     VerifyBackupRequest,
     unset_excluded,
 )
@@ -26,7 +26,7 @@ def list_backups(repo: str | None = Query(default=None)) -> BackupList:
     return {"items": abr_v41.list_backup_chains(repo_name=repo)}
 
 
-def list_backup_tree() -> TreeResponse:
+def list_backup_tree() -> BackupTreeResponse:
     return {"nodes": abr_v41.list_backup_tree()}
 
 
