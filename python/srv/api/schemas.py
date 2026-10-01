@@ -29,204 +29,204 @@ DocStrOrNull = Annotated[Any, Field(json_schema_extra={"anyOf": [{"type": "strin
 
 
 class ScheduleDTO(_LenientModel):
-    type: LaxStr | None = None
-    time: LaxStr | None = None
+    type: DocStr = None
+    time: DocStr = None
     days: DocStrArray = None
-    day_of_month: LaxInt = None
-    expression: LaxStr | None = None
-    every: LaxStr | None = None
-    interval_minutes: LaxInt = None
-    enabled: LaxBool | None = None
-    timezone: LaxStr | None = None
+    day_of_month: DocInt = None
+    expression: DocStr = None
+    every: DocStr = None
+    interval_minutes: DocInt = None
+    enabled: DocBool = None
+    timezone: DocStr = None
 
 
 class GfsDTO(_LenientModel):
-    weekly: LaxInt = None
-    monthly: LaxInt = None
-    yearly: LaxInt = None
-    enabled: LaxBool | None = None
+    weekly: DocInt = None
+    monthly: DocInt = None
+    yearly: DocInt = None
+    enabled: DocBool = None
 
 
 class GfsMarksDTO(_LenientModel):
-    weekly: LaxBool | None = None
-    monthly: LaxBool | None = None
-    yearly: LaxBool | None = None
+    weekly: DocBool = None
+    monthly: DocBool = None
+    yearly: DocBool = None
 
 
 class JobEncryptionDTO(_LenientModel):
-    enabled: LaxBool | None = None
-    key_set: LaxBool | None = None
-    key_id: LaxStr | None = None
+    enabled: DocBool = None
+    key_set: DocBool = None
+    key_id: DocStr = None
     key_ids: DocStrArray = None
-    key_count: LaxInt = None
+    key_count: DocInt = None
 
 
 class TaskParametersDTO(_LenientModel):
-    compression_level: LaxInt = None
-    encryption_enabled: LaxBool | None = None
-    encryption_key: LaxStr | None = None
-    encryption_key_id: LaxStr | None = None
-    encryption_keys: list[EncryptionKeyRefDTO] | None = None
-    tool_timeout_seconds: LaxInt = None
-    app_aware: LaxBool | None = None
-    dedup: LaxBool | None = None
+    compression_level: DocInt = None
+    encryption_enabled: DocBool = None
+    encryption_key: DocStr = None
+    encryption_key_id: DocStr = None
+    encryption_keys: list[EncryptionKeyRefDTO] | DocArray = None
+    tool_timeout_seconds: DocInt = None
+    app_aware: DocBool = None
+    dedup: DocBool = None
 
 
 class ExecutionChoiceDTO(_LenientModel):
-    type: str | None = None
-    reason: str | None = None
+    type: DocStr = None
+    reason: DocStr = None
 
 
 class ExecutionPolicyDTO(_LenientModel):
-    first_run: ExecutionChoiceDTO | None = None
-    manual_force_full: ExecutionChoiceDTO | None = None
+    first_run: ExecutionChoiceDTO | DocObject = None
+    manual_force_full: ExecutionChoiceDTO | DocObject = None
     active_full_days: DocStrArray = None
     synthetic_full_days: DocStrArray = None
-    active_full_schedule: ScheduleDTO | None = None
-    synthetic_full_schedule: ScheduleDTO | None = None
-    active_overrides_synthetic: LaxBool | None = None
-    synthetic_requires_repository_support: LaxBool | None = None
-    default: ExecutionChoiceDTO | None = None
+    active_full_schedule: ScheduleDTO | DocObject = None
+    synthetic_full_schedule: ScheduleDTO | DocObject = None
+    active_overrides_synthetic: DocBool = None
+    synthetic_requires_repository_support: DocBool = None
+    default: ExecutionChoiceDTO | DocObject = None
 
 
 class RepositoryImmutabilityDTO(_LenientModel):
-    mode: LaxStr | None = None
-    retention_days: LaxInt = None
-    retention_scope: LaxStr | None = None
+    mode: DocStr = None
+    retention_days: DocInt = None
+    retention_scope: DocStr = None
 
 
 class S3RepositoryDTO(_LenientModel):
-    bucket: str | None = None
-    prefix: str | None = None
-    region: str | None = None
-    endpoint_url: str | None = None
-    profile: str | None = None
-    path_style: bool | None = None
-    verify_tls: bool | None = None
-    description: str | None = None
-    access_key_masked: str | None = None
-    has_secret_key: bool | None = None
-    immutability: RepositoryImmutabilityDTO | None = None
-    location: str | None = None
+    bucket: DocStr = None
+    prefix: DocStr = None
+    region: DocStr = None
+    endpoint_url: DocStr = None
+    profile: DocStr = None
+    path_style: DocBool = None
+    verify_tls: DocBool = None
+    description: DocStr = None
+    access_key_masked: DocStr = None
+    has_secret_key: DocBool = None
+    immutability: RepositoryImmutabilityDTO | DocObject = None
+    location: DocStr = None
 
 
 class ImmutabilityEffectDTO(_LenientModel):
-    previous: RepositoryImmutabilityDTO | None = None
-    current: RepositoryImmutabilityDTO | None = None
-    changed: bool | None = None
-    existing_restore_points: int | None = None
-    existing_data_protected: bool | None = None
+    previous: RepositoryImmutabilityDTO | DocObject = None
+    current: RepositoryImmutabilityDTO | DocObject = None
+    changed: DocBool = None
+    existing_restore_points: DocInt = None
+    existing_data_protected: DocBool = None
     effect: DocStrArray = None
     limitations: DocStrArray = None
     warnings: DocStrArray = None
 
 
 class ImmutabilityFailureDTO(_LenientModel):
-    restore_point_id: str | None = None
-    backup_name: str | None = None
-    message: str | None = None
+    restore_point_id: DocStr = None
+    backup_name: DocStr = None
+    message: DocStr = None
 
 
 class RepositoryCapabilitiesDTO(_LenientModel):
-    supports_synthetic_full: LaxBool | None = None
-    supports_immutability: LaxBool | None = None
+    supports_synthetic_full: DocBool = None
+    supports_immutability: DocBool = None
 
 
 class RepositoryCatalogDTO(_LenientModel):
-    backup_chains: LaxInt = None
-    restore_points: LaxInt = None
-    used_bytes: LaxInt = None
+    backup_chains: DocInt = None
+    restore_points: DocInt = None
+    used_bytes: DocInt = None
 
 
 class StoragePermissionsDTO(_LenientModel):
-    mode: LaxStr | None = None
-    owner: LaxStr | None = None
-    group: LaxStr | None = None
-    world_writable: LaxBool | None = None
-    sticky: LaxBool | None = None
-    parent_world_writable: LaxBool | None = None
-    readable: LaxBool | None = None
-    writable: LaxBool | None = None
+    mode: DocStr = None
+    owner: DocStr = None
+    group: DocStr = None
+    world_writable: DocBool = None
+    sticky: DocBool = None
+    parent_world_writable: DocBool = None
+    readable: DocBool = None
+    writable: DocBool = None
 
 
 class SystemComponentsDTO(_LenientModel):
-    api: LaxStr | None = None
-    database: LaxStr | None = None
-    repositories: LaxStr | None = None
-    inventories: LaxStr | None = None
-    scheduler: LaxStr | None = None
-    task_pool: LaxStr | None = None
+    api: DocStr = None
+    database: DocStr = None
+    repositories: DocStr = None
+    inventories: DocStr = None
+    scheduler: DocStr = None
+    task_pool: DocStr = None
 
 
 class SystemCountsDTO(_LenientModel):
-    repositories: LaxInt = None
-    inventories: LaxInt = None
-    jobs: LaxInt = None
-    sessions: LaxInt = None
-    restore_points: LaxInt = None
+    repositories: DocInt = None
+    inventories: DocInt = None
+    jobs: DocInt = None
+    sessions: DocInt = None
+    restore_points: DocInt = None
 
 
 class InventoryTreeNodeDTO(_LenientModel):
-    id: LaxStr | None = None
-    kind: LaxStr | None = None
-    label: LaxStr | None = None
-    inventory_id: LaxStr | None = None
-    inventory_name: LaxStr | None = None
-    datacenter_id: LaxStr | None = None
-    datacenter_name: LaxStr | None = None
-    disk_capacity_bytes: LaxInt = None
-    cluster_id: LaxStr | None = None
-    cluster_name: LaxStr | None = None
-    host_id: LaxStr | None = None
-    host_name: LaxStr | None = None
-    vm_id: LaxStr | None = None
-    guest_os: LaxStr | None = None
-    cpu_count: LaxInt = None
-    memory_mb: LaxInt = None
-    power_state: LaxStr | None = None
-    ip_address: LaxStr | None = None
-    host_status: LaxStr | None = None
-    cpu_model: LaxStr | None = None
-    vm_count: LaxInt = None
-    health: LaxStr | None = None
-    children: list[InventoryTreeNodeDTO] | None = None
+    id: DocStr = None
+    kind: DocStr = None
+    label: DocStr = None
+    inventory_id: DocStr = None
+    inventory_name: DocStr = None
+    datacenter_id: DocStr = None
+    datacenter_name: DocStr = None
+    disk_capacity_bytes: DocInt = None
+    cluster_id: DocStr = None
+    cluster_name: DocStr = None
+    host_id: DocStr = None
+    host_name: DocStr = None
+    vm_id: DocStr = None
+    guest_os: DocStr = None
+    cpu_count: DocInt = None
+    memory_mb: DocInt = None
+    power_state: DocStr = None
+    ip_address: DocStr = None
+    host_status: DocStr = None
+    cpu_model: DocStr = None
+    vm_count: DocInt = None
+    health: DocStr = None
+    children: list[InventoryTreeNodeDTO] | DocArray = None
 
 
 class BackupTreeNodeDTO(_LenientModel):
-    id: LaxStr | None = None
-    kind: LaxStr | None = None
-    label: LaxStr | None = None
-    repository_id: LaxStr | None = None
-    repository_name: LaxStr | None = None
-    inventory_id: LaxStr | None = None
-    inventory_name: LaxStr | None = None
-    job_id: LaxStr | None = None
-    job_name: LaxStr | None = None
-    protected_object_id: LaxStr | None = None
-    protected_object_name: LaxStr | None = None
-    backup_id: LaxStr | None = None
-    backup_name: LaxStr | None = None
-    restore_point_id: LaxStr | None = None
-    timestamp: LaxStr | None = None
-    last_restore_point_at: LaxStr | None = None
-    backup_type: LaxStr | None = None
-    health: LaxStr | None = None
-    restore_points_count: LaxInt = None
-    can_restore: LaxBool | None = None
-    disabled_reason: LaxStr | None = None
+    id: DocStr = None
+    kind: DocStr = None
+    label: DocStr = None
+    repository_id: DocStr = None
+    repository_name: DocStr = None
+    inventory_id: DocStr = None
+    inventory_name: DocStr = None
+    job_id: DocStr = None
+    job_name: DocStr = None
+    protected_object_id: DocStr = None
+    protected_object_name: DocStr = None
+    backup_id: DocStr = None
+    backup_name: DocStr = None
+    restore_point_id: DocStr = None
+    timestamp: DocStr = None
+    last_restore_point_at: DocStr = None
+    backup_type: DocStr = None
+    health: DocStr = None
+    restore_points_count: DocInt = None
+    can_restore: DocBool = None
+    disabled_reason: DocStr = None
     restore_payload: DocObject = None
-    latest_restore_point: RestorePointDTO | None = None
-    children: list[BackupTreeNodeDTO] | None = None
+    latest_restore_point: RestorePointDTO | DocObject = None
+    children: list[BackupTreeNodeDTO] | DocArray = None
 
 
 class JobRefDTO(_LenientModel):
-    id: LaxStr | None = None
-    name: LaxStr | None = None
-    job_type: LaxStr | None = None
+    id: DocStr = None
+    name: DocStr = None
+    job_type: DocStr = None
 
 
 class SessionErrorDTO(_LenientModel):
-    message: LaxStr | None = None
+    message: DocStr = None
 
 
 class JobDTO(_LenientModel):
@@ -238,26 +238,26 @@ class JobDTO(_LenientModel):
     vm_ids: list[str] = []
     vm_names: list[str] = []
     vm_count: int = 0
-    vms: list[_Ref] = []
+    vms: list[_Ref] | DocArray = []
     repository: _Ref
-    source_job: _Ref | None = None
-    schedule: ScheduleDTO | None = None
+    source_job: _Ref | DocObject = None
+    schedule: ScheduleDTO | DocObject = None
     schedule_summary: str | None = None
     enabled: bool = False
     schedule_state: str | None = None
     retention_days: int | None = None
-    gfs: GfsDTO | None = None
-    active_full_days: list[Any] | None = None
-    synthetic_full_days: list[Any] | None = None
-    active_full_schedule: ScheduleDTO | None = None
-    synthetic_full_schedule: ScheduleDTO | None = None
+    gfs: GfsDTO | DocObject = None
+    active_full_days: DocStrArray = None
+    synthetic_full_days: DocStrArray = None
+    active_full_schedule: ScheduleDTO | DocObject = None
+    synthetic_full_schedule: ScheduleDTO | DocObject = None
     active_full_next_run_at: str | None = None
     synthetic_full_next_run_at: str | None = None
     compression_level: int | None = None
-    encryption: JobEncryptionDTO | None = None
-    task_parameters: TaskParametersDTO | None = {}
-    backup_options: TaskParametersDTO | None = {}
-    effective_execution_policy: ExecutionPolicyDTO | None = None
+    encryption: JobEncryptionDTO | DocObject = None
+    task_parameters: TaskParametersDTO | DocObject = {}
+    backup_options: TaskParametersDTO | DocObject = {}
+    effective_execution_policy: ExecutionPolicyDTO | DocObject = None
     status: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
@@ -265,7 +265,7 @@ class JobDTO(_LenientModel):
     next_incremental_run_at: str | None = None
     last_run_at: str | None = None
     last_session_id: str | None = None
-    active_sessions: list[Any] = []
+    active_sessions: DocObjectArray = None
     active_session_count: int = 0
     can_delete: bool = True
     delete_disabled_reason: str | None = None
@@ -299,21 +299,21 @@ class InventoryDTO(_LenientModel):
     created_at: str
     updated_at: str
     last_scan_at: str | None = None
-    last_scan_error: str | None = None
-    kind: str | None = None
-    description: str | None = None
-    address: str | None = None
-    endpoint: str | None = None
-    username: str | None = None
-    vm_count: int | None = None
-    host_count: int | None = None
-    cluster_count: int | None = None
+    last_scan_error: DocStr = None
+    kind: DocStr = None
+    description: DocStr = None
+    address: DocStr = None
+    endpoint: DocStr = None
+    username: DocStr = None
+    vm_count: DocInt = None
+    host_count: DocInt = None
+    cluster_count: DocInt = None
     metadata: DocObject = None
     discovery: InventoryDiscoveryDTO
     connection: InventoryConnectionDTO
-    referenced_jobs: list[Any] = []
+    referenced_jobs: DocObjectArray = None
     jobs_count: int = 0
-    active_sessions: list[Any] = []
+    active_sessions: DocObjectArray = None
     active_session_count: int = 0
     can_delete: bool = True
     delete_disabled_reason: str | None = None
@@ -324,45 +324,45 @@ class InventoryList(_LenientModel):
 
 
 class EncryptionKeyRefDTO(_LenientModel):
-    key_id: str | None = None
-    key: str | None = None
+    key_id: DocStr = None
+    key: DocStr = None
 
 
 class RepositoryCatalogSummaryDTO(_LenientModel):
-    backup_chains: int | None = None
-    restore_points: int | None = None
-    used_bytes: int | None = None
+    backup_chains: DocInt = None
+    restore_points: DocInt = None
+    used_bytes: DocInt = None
 
 
 class RestorePointReconcileDTO(_LenientModel):
-    checked: int | None = None
-    marked_missing: int | None = None
-    restored: int | None = None
-    unreadable: int | None = None
+    checked: DocInt = None
+    marked_missing: DocInt = None
+    restored: DocInt = None
+    unreadable: DocInt = None
 
 
 class SystemLogEntryDTO(_LenientModel):
-    id: str | None = None
-    ts: str | None = None
-    level: str | None = None
-    source: str | None = None
-    logger: str | None = None
-    function: str | None = None
-    line: int | None = None
-    pid: int | None = None
-    message: str | None = None
+    id: DocStr = None
+    ts: DocStr = None
+    level: DocStr = None
+    source: DocStr = None
+    logger: DocStr = None
+    function: DocStr = None
+    line: DocInt = None
+    pid: DocInt = None
+    message: DocStr = None
 
 
 class VerifyCheckDTO(_LenientModel):
-    name: str | None = None
-    status: str | None = None
-    message: str | None = None
+    name: DocStr = None
+    status: DocStr = None
+    message: DocStr = None
 
 
 class LastVerifyDTO(_LenientModel):
-    checked_at: str | None = None
-    status: str | None = None
-    message: str | None = None
+    checked_at: DocStr = None
+    status: DocStr = None
+    message: DocStr = None
 
 
 class RepositoryStorageDTO(_LenientModel):
@@ -371,7 +371,7 @@ class RepositoryStorageDTO(_LenientModel):
     free_bytes: int | None = None
     available: bool = False
     error: str | None = None
-    permissions: StoragePermissionsDTO | None = None
+    permissions: StoragePermissionsDTO | DocObject = None
 
 
 class RepositoryDTO(_LenientModel):
@@ -382,10 +382,10 @@ class RepositoryDTO(_LenientModel):
     created_at: str
     updated_at: str
     last_scan_at: str | None = None
-    last_verify_at: str | None = None
-    last_verify: LastVerifyDTO | None = None
-    s3: S3RepositoryDTO | None = None
-    address: str | None = None
+    last_verify_at: DocStr = None
+    last_verify: LastVerifyDTO | DocObject = None
+    s3: S3RepositoryDTO | DocObject = None
+    address: DocStr = None
     metadata: DocObject = None
     bucket: str | None = None
     prefix: str | None = None
@@ -393,7 +393,7 @@ class RepositoryDTO(_LenientModel):
     endpoint_url: str | None = None
     path_style: bool | None = None
     verify_tls: bool | None = None
-    immutability: RepositoryImmutabilityDTO | None = None
+    immutability: RepositoryImmutabilityDTO | DocObject = None
     path: str | None = None
     location: str | None = None
     description: str | None = None
@@ -401,9 +401,9 @@ class RepositoryDTO(_LenientModel):
     capacity_bytes: int | None = None
     used_bytes: int | None = None
     free_bytes: int | None = None
-    capabilities: RepositoryCapabilitiesDTO | None = {}
-    catalog: RepositoryCatalogDTO | None = {}
-    referenced_jobs: list[Any] = []
+    capabilities: RepositoryCapabilitiesDTO | DocObject = {}
+    catalog: RepositoryCatalogDTO | DocObject = {}
+    referenced_jobs: DocObjectArray = None
     jobs_count: int = 0
     backup_chain_count: int = 0
     restore_point_count: int = 0
@@ -421,7 +421,7 @@ class RestorePointDTO(_LenientModel):
     created_at: str | None = None
     execution_type: str | None = None
     execution_reason: str | None = None
-    gfs_marks: GfsMarksDTO | None = None
+    gfs_marks: GfsMarksDTO | DocObject = None
     gfs_protected: bool = False
     parent_point_id: str | None = None
     status: str | None = None
@@ -435,17 +435,17 @@ class RestorePointDTO(_LenientModel):
     compression_ratio: float | None = None
     compression_level: int | None = None
     encryption_enabled: bool | None = None
-    restore_point_id: str | None = None
-    backup_id: str | None = None
-    point_type: str | None = None
-    available: bool | None = None
-    consistency_state: str | None = None
-    job_id: str | None = None
-    job_name: str | None = None
-    inventory_id: str | None = None
-    inventory_name: str | None = None
-    inventory: _Ref | None = None
-    repository: _Ref | None = None
+    restore_point_id: DocStr = None
+    backup_id: DocStr = None
+    point_type: DocStr = None
+    available: DocBool = None
+    consistency_state: DocStr = None
+    job_id: DocStr = None
+    job_name: DocStr = None
+    inventory_id: DocStr = None
+    inventory_name: DocStr = None
+    inventory: _Ref | DocObject = None
+    repository: _Ref | DocObject = None
 
 
 class BackupChainDTO(_LenientModel):
@@ -462,7 +462,7 @@ class BackupChainDTO(_LenientModel):
     latest_execution_type: str | None = None
     latest_execution_reason: str | None = None
     gfs_protected: bool = False
-    restore_points: list[RestorePointDTO] = []
+    restore_points: list[RestorePointDTO] | DocArray = []
 
 
 class BackupList(_LenientModel):
@@ -470,29 +470,29 @@ class BackupList(_LenientModel):
 
 
 class SessionVerifyDTO(_LenientModel):
-    id: str | None = None
-    result: str | None = None
-    warnings: list[Any] = []
+    id: DocStr = None
+    result: DocStr = None
+    warnings: DocObjectArray = None
     errors: list[Any] = []
-    checked_restore_points: int | None = None
-    checked_artifacts: int | None = None
+    checked_restore_points: DocInt = None
+    checked_artifacts: DocInt = None
 
 
 class CatalogCountsDTO(_LenientModel):
-    hypervisors: int | None = None
-    repositories: int | None = None
-    jobs: int | None = None
-    backups: int | None = None
-    tasks: int | None = None
-    users: int | None = None
+    hypervisors: DocInt = None
+    repositories: DocInt = None
+    jobs: DocInt = None
+    backups: DocInt = None
+    tasks: DocInt = None
+    users: DocInt = None
 
 
 class CatalogManifestDTO(_LenientModel):
-    format_version: int | None = None
-    product: str | None = None
-    product_version: str | None = None
-    exported_at: str | None = None
-    counts: CatalogCountsDTO | None = None
+    format_version: DocInt = None
+    product: DocStr = None
+    product_version: DocStr = None
+    exported_at: DocStr = None
+    counts: CatalogCountsDTO | DocObject = None
     configuration_keys: DocStrArray = None
 
 
@@ -500,7 +500,7 @@ class SessionDTO(_LenientModel):
     id: str
     state: str
     type: str | None = None
-    job: _Ref | None = None
+    job: _Ref | DocObject = None
     vm_id: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
@@ -509,17 +509,17 @@ class SessionDTO(_LenientModel):
     progress: int | None = None
     processed_bytes: int | None = None
     transferred_bytes: int | None = None
-    errors: list[SessionErrorDTO] | None = None
-    warnings: list[Any] = []
-    message: str | None = None
-    triggered_by: str | None = None
-    vm_name: str | None = None
-    source_vm_name: str | None = None
-    backup_id: str | None = None
-    restore_point_id: str | None = None
-    failure_kind: str | None = None
-    verify: SessionVerifyDTO | None = None
-    logs: list[Any] = []
+    errors: list[SessionErrorDTO] | DocArray = None
+    warnings: DocObjectArray = None
+    message: DocStr = None
+    triggered_by: DocStr = None
+    vm_name: DocStr = None
+    source_vm_name: DocStr = None
+    backup_id: DocStr = None
+    restore_point_id: DocStr = None
+    failure_kind: DocStr = None
+    verify: SessionVerifyDTO | DocObject = None
+    logs: DocObjectArray = None
 
 
 class SessionList(_LenientModel):
@@ -875,19 +875,14 @@ class StartRestoreRequest(_LenientModel):
     force: LaxBool | None = None
 
 
-class RestoreStartResult(_LenientModel):
-    id: DocStr = None
+class RestoreStartResult(SessionDTO):
     restore_session_id: DocStr = None
     session_state: DocStr = None
-    state: DocStr = None
     status: DocStr = None
     restore_mode: DocStr = None
-    restore_point_id: DocStr = None
-    backup_id: DocStr = None
     source_inventory_id: DocStr = None
     source_inventory_name: DocStr = None
     source_vm_id: DocStr = None
-    source_vm_name: DocStr = None
     target_inventory_id: DocStr = None
     target_inventory_name: DocStr = None
     target_host_id: DocStr = None
@@ -899,32 +894,104 @@ class RestoreStartResult(_LenientModel):
 
 
 
+
 class RestoreVmDTO(_LenientModel):
-    vm_id: str | None = None
-    vm_name: str | None = None
-    inventory: _Ref | None = None
-    restore_available: bool | None = None
-    latest_restore_point: RestorePointDTO | None = None
+    vm_id: DocStr = None
+    vm_name: DocStr = None
+    inventory: _Ref | DocObject = None
+    restore_available: DocBool = None
+    latest_restore_point: RestorePointDTO | DocObject = None
 
 
 class RestoreVmList(_LenientModel):
-    items: list[RestoreVmDTO] | None = None
+    items: list[RestoreVmDTO] | DocArray = None
 
 
 class RestorePointList(_LenientModel):
-    items: list[RestorePointDTO] | None = None
+    items: list[RestorePointDTO] | DocArray = None
 
 
 
 
+
+
+class RestoreContextPointDTO(_LenientModel):
+    id: DocStr = None
+    type: DocStr = None
+    status: DocStr = None
+    health: DocStr = None
+    available: DocBool = None
+    timestamp: DocStr = None
+    backup_id: DocStr = None
+    job_id: DocStr = None
+    job_name: DocStr = None
+    inventory_id: DocStr = None
+    inventory: _Ref | DocObject = None
+    repository_id: DocStr = None
+    repository_type: DocStr = None
+    repository: _Ref | DocObject = None
+
+
+class RestoreSourceVmDTO(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+    instance_uuid: DocStr = None
+    guest_id: DocStr = None
+    guest_os: DocStr = None
+    firmware: DocStr = None
+    cpu_count: DocInt = None
+    memory_mb: DocInt = None
+    disks: DocObjectArray = None
+    nics: DocObjectArray = None
+    folder: DocStr = None
+    original_host: DocStr = None
+    original_datastore: DocStr = None
+    resource_pool: DocStr = None
+
+
+class RestoreTargetsDTO(_LenientModel):
+    inventories: DocObjectArray = None
+    hosts: DocObjectArray = None
+    datastores: DocObjectArray = None
+    networks: DocObjectArray = None
+    folders: DocObjectArray = None
+    resource_pools: DocObjectArray = None
+    existing_vms: DocObjectArray = None
+
+
+class RestoreDefaultsDTO(_LenientModel):
+    restore_mode: DocStr = None
+    target_inventory_id: DocStr = None
+    target_host_id: DocStr = None
+    target_datastore_id: DocStr = None
+    target_vm_name: DocStr = None
+    disk_provisioning: DocStr = None
+    power_on_after_restore: DocBool = None
+    preserve_mac_addresses: DocBool = None
+    preserve_firmware: DocBool = None
+    connect_nics: DocBool = None
+    network_mappings: DocObjectArray = None
+    datastore_mappings: DocObjectArray = None
+
+
+class RestoreCapabilitiesDTO(_LenientModel):
+    supports_in_place_restore: DocBool = None
+    supports_network_mapping: DocBool = None
+    supports_datastore_mapping: DocBool = None
+    supports_disk_provisioning: DocBool = None
+    supports_folder_selection: DocBool = None
+    supports_resource_pool_selection: DocBool = None
+    supports_preserve_mac: DocBool = None
+    supports_power_on_after_restore: DocBool = None
+    supports_connect_nics: DocBool = None
 
 
 class RestoreContextDTO(_LenientModel):
-    restore_point: DocObject = None
-    source_vm: DocObject = None
-    targets: DocObject = None
-    defaults: DocObject = None
-    capabilities: DocObject = None
+    restore_point: RestoreContextPointDTO | DocObject = None
+    source_vm: RestoreSourceVmDTO | DocObject = None
+    targets: RestoreTargetsDTO | DocObject = None
+    defaults: RestoreDefaultsDTO | DocObject = None
+    capabilities: RestoreCapabilitiesDTO | DocObject = None
 
 
 class SystemVersionDTO(_LenientModel):
@@ -1041,8 +1108,8 @@ class TlsCertificateChangeDTO(TlsCertificateDTO):
 
 class SystemHealthDTO(_LenientModel):
     status: DocStr = None
-    components: SystemComponentsDTO | None = None
-    counts: SystemCountsDTO | None = None
+    components: SystemComponentsDTO | DocObject = None
+    counts: SystemCountsDTO | DocObject = None
 
 
 class DeletedResult(_LenientModel):
@@ -1057,21 +1124,21 @@ class RemovedResult(_LenientModel):
 
 
 class JobStartResult(_LenientModel):
-    job: JobRefDTO | None = None
-    items: list[SessionDTO] | None = None
+    job: JobRefDTO | DocObject = None
+    items: list[SessionDTO] | DocArray = None
 
 
 
 class SessionLogEntryDTO(_LenientModel):
-    timestamp: str | None = None
-    level: str | None = None
-    component: str | None = None
-    message: str | None = None
+    timestamp: DocStr = None
+    level: DocStr = None
+    component: DocStr = None
+    message: DocStr = None
 
 
 class SessionLogDTO(_LenientModel):
     id: DocStr = None
-    logs: list[SessionLogEntryDTO] | None = None
+    logs: list[SessionLogEntryDTO] | DocArray = None
 
 
 class StopSessionResult(_LenientModel):
@@ -1082,11 +1149,11 @@ class StopSessionResult(_LenientModel):
 
 
 class InventoryTreeResponse(_LenientModel):
-    nodes: list[InventoryTreeNodeDTO] | None = None
+    nodes: list[InventoryTreeNodeDTO] | DocArray = None
 
 
 class BackupTreeResponse(_LenientModel):
-    nodes: list[BackupTreeNodeDTO] | None = None
+    nodes: list[BackupTreeNodeDTO] | DocArray = None
 
 
 class RepositoryScanResult(_LenientModel):
@@ -1094,20 +1161,20 @@ class RepositoryScanResult(_LenientModel):
     name: DocStr = None
     status: DocStr = None
     last_scan_at: DocStr = None
-    catalog: RepositoryCatalogSummaryDTO | None = None
-    restore_points: RestorePointReconcileDTO | None = None
+    catalog: RepositoryCatalogSummaryDTO | DocObject = None
+    restore_points: RestorePointReconcileDTO | DocObject = None
 
 
 class S3TestResult(_LenientModel):
     status: DocStr = None
     message: DocStr = None
-    checks: list[VerifyCheckDTO] | None = None
+    checks: list[VerifyCheckDTO] | DocArray = None
 
 
 class RepositoryVerifyResult(RepositoryDTO):
     message: DocStr = None
-    checks: list[VerifyCheckDTO] | None = None
-    immutability_effect: ImmutabilityEffectDTO | None = None
+    checks: list[VerifyCheckDTO] | DocArray = None
+    immutability_effect: ImmutabilityEffectDTO | DocObject = None
     error: DocStr = None
 
 
@@ -1116,12 +1183,12 @@ class RepositoryImmutabilityApplyResult(_LenientModel):
     name: DocStr = None
     status: DocStr = None
     message: DocStr = None
-    immutability: RepositoryImmutabilityDTO | None = None
+    immutability: RepositoryImmutabilityDTO | DocObject = None
     actual_retention_days: list[int] | None = None
     restore_point_count: DocInt = None
     updated_restore_points: DocInt = None
     failed_restore_points: DocInt = None
-    failures: list[ImmutabilityFailureDTO] | None = None
+    failures: list[ImmutabilityFailureDTO] | DocArray = None
 
 
 class InventoryScanResult(_LenientModel):
@@ -1129,7 +1196,7 @@ class InventoryScanResult(_LenientModel):
     name: DocStr = None
     status: DocStr = None
     last_scan_at: DocStr = None
-    discovery: InventoryDiscoveryDTO | None = None
+    discovery: InventoryDiscoveryDTO | DocObject = None
 
 
 class InventoryTestResult(_LenientModel):
@@ -1165,7 +1232,7 @@ class BackupVerifyResult(_LenientModel):
 
 
 class SystemLogsDTO(_LenientModel):
-    entries: list[SystemLogEntryDTO] | None = None
+    entries: list[SystemLogEntryDTO] | DocArray = None
     total: DocInt = None
     limit: DocInt = None
     level: DocStrOrNull = Field(
@@ -1189,19 +1256,19 @@ class CatalogRestoreRequest(_LenientModel):
 
 
 class CatalogSnapshotResult(_LenientModel):
-    manifest: CatalogManifestDTO | None = None
+    manifest: CatalogManifestDTO | DocObject = None
     archive_base64: DocStr = None
 
 
 class CatalogRestoreResult(_LenientModel):
-    manifest: CatalogManifestDTO | None = None
+    manifest: CatalogManifestDTO | DocObject = None
     restored: DocObject = None
     configuration: DocObject = None
 
 
 
 class SupportBundleResult(_LenientModel):
-    manifest: CatalogManifestDTO | None = None
+    manifest: CatalogManifestDTO | DocObject = None
     archive_base64: DocStr = None
 
 
@@ -1212,7 +1279,7 @@ class HealthDTO(_LenientModel):
 class LoginResult(_LenientModel):
     token: DocStr = None
     expires_at: DocStr = None
-    user: PublicUserDTO | None = None
+    user: PublicUserDTO | DocObject = None
 
 
 class LogoutResult(_LenientModel):
