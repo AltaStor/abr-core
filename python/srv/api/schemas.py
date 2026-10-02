@@ -325,6 +325,8 @@ class InventoryDTO(_LenientModel):
     updated_at: str
     last_scan_at: str | None = None
     last_scan_error: DocStr = None
+    status_checked_at: DocStr = None
+    status_error: DocStr = None
     kind: DocStr = None
     description: DocStr = None
     address: DocStr = None

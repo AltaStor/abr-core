@@ -1434,7 +1434,11 @@ class AbrV41EngineTests(unittest.TestCase):
 
         self.assertEqual(HYPERVISORS[inventory["id"]]["status"], "unknown")
 
-        result = abr_v41.test_inventory(inventory["id"])
+        with patch(
+            "python.srv.services.inventory_management.HyperVInventoryProvider.test_connection",
+            return_value=None,
+        ):
+            result = abr_v41.test_inventory(inventory["id"])
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(HYPERVISORS[inventory["id"]]["status"], "available")

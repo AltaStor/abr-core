@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +55,11 @@ class UnicodeJobNameServiceLayerTests(unittest.TestCase):
     back through the public list API. In-memory store, like the rest of the suite."""
 
     def setUp(self) -> None:
+        registrable = patch(
+            "python.srv.services.abr_v41.assert_inventory_registrable", return_value=None
+        )
+        registrable.start()
+        self.addCleanup(registrable.stop)
         BACKUPS.clear()
         HYPERVISORS.clear()
         JOBS.clear()
@@ -156,6 +162,11 @@ class UnicodeTextFieldValidationTests(unittest.TestCase):
     """Covers non-name text fields on inventory and repository create paths."""
 
     def setUp(self) -> None:
+        registrable = patch(
+            "python.srv.services.abr_v41.assert_inventory_registrable", return_value=None
+        )
+        registrable.start()
+        self.addCleanup(registrable.stop)
         BACKUPS.clear()
         HYPERVISORS.clear()
         JOBS.clear()

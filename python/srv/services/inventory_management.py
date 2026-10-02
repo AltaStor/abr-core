@@ -13,7 +13,16 @@ from python.srv.core.credential_encryption import StoredCredentialUnreadable
 from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, TASKS, catalog_records, persist_hypervisor, replace_resources_for_hypervisor
 from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
-from python.srv.services.discovery import build_vcenter_resources, generate_inventory_discovery
+from python.srv.plugins.hyperv import (
+    HyperVAuthError,
+    HyperVPermissionError,
+    HyperVUnreachableError,
+)
+from python.srv.services.discovery import (
+    build_hyperv_resources,
+    build_vcenter_resources,
+    generate_inventory_discovery,
+)
 
 LIVE_INVENTORY_TYPES = ("vsphere", "hyper-v", "proxmox-ve", "xcp-ng")
 SUPPORTED_INVENTORY_TYPES = (*LIVE_INVENTORY_TYPES, "mock")
@@ -188,8 +197,32 @@ class _StubInventoryProvider(InventoryProvider):
         )
 
 
-class HyperVInventoryProvider(_StubInventoryProvider):
-    pass
+class HyperVInventoryProvider(InventoryProvider):
+    def test_connection(self, record: dict[str, Any]) -> None:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        credentials = _credentials_from_record(record)
+        host = metadata.get("host") or extract_host(str(record.get("address") or ""))
+        port = metadata.get("port")
+        port_explicit = bool(metadata.get("port_explicit"))
+        username = credentials.get("username")
+        password = credentials.get("password")
+        if not host or not username or not password:
+            raise ValueError("Saved Hyper-V inventory is missing host or credentials")
+
+        from python.srv.plugins.hyperv import HyperVNode
+
+        node = HyperVNode(
+            str(host),
+            str(username),
+            str(password),
+            port=int(port) if port and port_explicit else None,
+            verify_ssl=bool(metadata.get("verify_ssl", False)),
+        )
+        with node:
+            return node.identity()
+
+    def rescan(self, record: dict[str, Any]) -> list[dict[str, Any]]:
+        return build_hyperv_resources(record)
 
 
 class ProxmoxInventoryProvider(_StubInventoryProvider):
@@ -296,6 +329,7 @@ def apply_inventory_updates(record: dict[str, Any], updates: dict[str, Any]) -> 
         updated["endpoint"] = value
         metadata["host"] = extract_host(value)
         metadata["port"] = _extract_port(value, inventory_type_from_record(record))
+        metadata["port_explicit"] = "://" in value
         changed = True
     if "port" in updates:
         try:
@@ -307,6 +341,7 @@ def apply_inventory_updates(record: dict[str, Any], updates: dict[str, Any]) -> 
         # Applied after "address" so an explicit port always wins over one
         # implicitly re-derived from a simultaneously-edited address.
         metadata["port"] = port_value
+        metadata["port_explicit"] = True
         changed = True
     if "username" in updates:
         value = str(updates["username"] or "").strip()
@@ -360,6 +395,25 @@ class InventoryUnreachableError(RuntimeError):
         self.reason = reason
 
 
+class HyperVAlreadyRegisteredError(RuntimeError):
+    def __init__(self, *, scope: str, subject: str, existing_id: str, existing_name: str) -> None:
+        if scope == "cluster":
+            message = (
+                f"This host belongs to Hyper-V cluster {subject!r}, which is already registered "
+                f"as inventory {existing_name!r}. Edit that inventory instead of adding a second "
+                "one: two registrations of one cluster would protect the same VMs twice"
+            )
+        else:
+            message = (
+                f"Hyper-V host {subject!r} is already registered as inventory {existing_name!r}"
+            )
+        super().__init__(message)
+        self.scope = scope
+        self.subject = subject
+        self.existing_id = existing_id
+        self.existing_name = existing_name
+
+
 def _connection_failure(
     exc: BaseException, host: str, port: int, *, verify_ssl: bool = True
 ) -> InventoryUnreachableError:
@@ -393,18 +447,34 @@ def _connection_failure(
     )
 
 
-def assert_inventory_registrable(record: dict[str, Any]) -> None:
+def assert_inventory_registrable(record: dict[str, Any]) -> dict[str, Any]:
     """Refuse an inventory whose endpoint cannot be reached and authenticated.
 
     This is a connectivity check, not discovery: it authenticates and asks the
     endpoint what it is, which is sub-second against a live vCenter. Walking the
     inventory still happens in the background after registration succeeds.
     """
-    if inventory_type_from_record(record) != "vsphere":
-        return
+    inventory_type = inventory_type_from_record(record)
+    if inventory_type not in ("vsphere", "hyper-v"):
+        return {}
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     host = str(metadata.get("host") or "")
     port = int(metadata.get("port", 443) or 443)
+    if inventory_type == "hyper-v":
+        provider = InventoryProviderRegistry.resolve(record)
+        try:
+            identity = provider.test_connection(record)
+        except HyperVAuthError as exc:
+            raise InventoryUnreachableError(str(exc), reason="auth") from exc
+        except HyperVPermissionError as exc:
+            raise InventoryUnreachableError(str(exc), reason="permission") from exc
+        except HyperVUnreachableError as exc:
+            raise InventoryUnreachableError(str(exc), reason="unreachable") from exc
+        except Exception as exc:
+            raise _connection_failure(
+                exc, host, port, verify_ssl=bool(metadata.get("verify_ssl", True))
+            ) from exc
+        return {"identity": identity if isinstance(identity, dict) else {}}
     if not _endpoint_reachable(host, port, timeout=float(inventory_connect_timeout())):
         raise InventoryUnreachableError(
             f"{host}:{port} is not reachable from the backup server", reason="unreachable"
@@ -418,6 +488,48 @@ def assert_inventory_registrable(record: dict[str, Any]) -> None:
         raise _connection_failure(
             exc, host, port, verify_ssl=bool(metadata.get("verify_ssl", True))
         ) from exc
+    return {"identity": {}}
+
+
+def assert_hyperv_identity_is_new(record: dict[str, Any], identity: dict[str, Any]) -> None:
+    cluster = str(identity.get("cluster") or "").strip()
+    computer = str(identity.get("computer") or "").strip()
+    record_id = str(record.get("id") or "")
+    for existing in catalog_records(HYPERVISORS):
+        existing_id = str(existing.get("id") or "")
+        if existing_id == record_id or inventory_type_from_record(existing) != "hyper-v":
+            continue
+        existing_metadata = (
+            existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+        )
+        existing_cluster = str(existing_metadata.get("cluster_name") or "").strip()
+        existing_computer = str(existing_metadata.get("computer_name") or "").strip()
+        existing_name = str(existing.get("name") or "")
+        if cluster and existing_cluster and cluster.lower() == existing_cluster.lower():
+            raise HyperVAlreadyRegisteredError(
+                scope="cluster",
+                subject=cluster,
+                existing_id=existing_id,
+                existing_name=existing_name,
+            )
+        if cluster or existing_cluster:
+            continue
+        if computer and existing_computer and computer.lower() == existing_computer.lower():
+            raise HyperVAlreadyRegisteredError(
+                scope="host",
+                subject=computer,
+                existing_id=existing_id,
+                existing_name=existing_name,
+            )
+
+
+CONNECTION_FIELDS = ("address", "port", "username", "password", "token", "insecure")
+
+
+def connection_fields_changed(payload: dict[str, Any]) -> bool:
+    return any(
+        field in payload and payload[field] is not None for field in CONNECTION_FIELDS
+    )
 
 
 def test_inventory_connection(record: dict[str, Any]) -> dict[str, Any]:

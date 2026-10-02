@@ -889,6 +889,11 @@ class JobPayloadBuilderTests(unittest.TestCase):
 
 class JobEngineLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
+        registrable = patch(
+            "python.srv.services.abr_v41.assert_inventory_registrable", return_value=None
+        )
+        registrable.start()
+        self.addCleanup(registrable.stop)
         HYPERVISORS.clear()
         JOBS.clear()
         REPOSITORIES.clear()

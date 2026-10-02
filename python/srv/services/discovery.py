@@ -250,3 +250,132 @@ def build_vcenter_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
         )
 
     return resources
+
+
+def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
+    metadata = hv.get("metadata", {})
+    credentials = metadata.get("credentials", {})
+    host = metadata.get("host")
+    port = metadata.get("port")
+    port_explicit = bool(metadata.get("port_explicit"))
+    verify_ssl = bool(metadata.get("verify_ssl", False))
+    username = credentials.get("username")
+    password = credentials.get("password")
+
+    if not host or not username or not password:
+        raise ValueError("Saved Hyper-V registration is missing host or credentials")
+
+    from ..plugins.hyperv import HyperVNode
+
+    with HyperVNode(
+        str(host),
+        str(username),
+        str(password),
+        port=int(port) if port and port_explicit else None,
+        verify_ssl=verify_ssl,
+    ) as node:
+        inventory = node.get_inventory()
+        hosts = node.list_hosts()
+        cluster_name = node.cluster_name
+
+    resources: list[dict[str, Any]] = [
+        {
+            "resource_type": "hypervisor",
+            "external_id": hv["id"],
+            "name": hv["name"],
+            "payload": {
+                "inventory": "hyper-v",
+                "host": host,
+                "endpoint": hv.get("endpoint"),
+                "cluster_name": cluster_name,
+            },
+        }
+    ]
+
+    if cluster_name:
+        resources.append(
+            {
+                "resource_type": "cluster",
+                "external_id": cluster_name,
+                "name": cluster_name,
+                "payload": {"node_count": len(hosts)},
+            }
+        )
+
+    for host_item in hosts:
+        resources.append(
+            {
+                "resource_type": "host",
+                "external_id": str(host_item.get("name")),
+                "name": str(host_item.get("name")),
+                "payload": {
+                    "datacenter": host_item.get("datacenter"),
+                    "cluster_name": host_item.get("cluster"),
+                    "cluster_external_id": host_item.get("cluster"),
+                    "dns_name": host_item.get("dns_name"),
+                    "version": host_item.get("version"),
+                    "datastores": host_item.get("datastores", []),
+                    "datastore_capacity": host_item.get("datastore_capacity", {}),
+                    "networks": host_item.get("networks", []),
+                },
+            }
+        )
+
+    for vm in inventory["virtual_machines"]:
+        owner = str(vm.get("owner_node") or vm.get("host") or "")
+        resources.append(
+            {
+                "resource_type": "virtual_machine",
+                "external_id": vm["vm_id"],
+                "name": vm["name"],
+                "payload": {
+                    "power_state": vm["power_state"],
+                    "num_cpu": vm["num_cpu"],
+                    "memory_mb": vm["memory_mb"],
+                    "guest_os": vm["guest_os"],
+                    "firmware": vm.get("firmware"),
+                    "generation": vm.get("generation"),
+                    "host_name": owner,
+                    "cluster_name": cluster_name if vm.get("clustered") else None,
+                    "cluster_external_id": cluster_name if vm.get("clustered") else None,
+                    "clustered": bool(vm.get("clustered")),
+                },
+            }
+        )
+
+    for disk in inventory["disks"]:
+        resources.append(
+            {
+                "resource_type": "disk",
+                "external_id": disk["external_id"],
+                "name": disk["name"],
+                "payload": {
+                    "vm_id": disk["vm_id"],
+                    "capacity_gb": disk["capacity_gb"],
+                    "datastore_path": disk["datastore_path"],
+                    "uuid": disk["uuid"],
+                    "source_disk_type_code": disk.get("source_disk_type_code"),
+                    "source_disk_type_name": disk.get("source_disk_type_name"),
+                    "source_disk_eager_zeroed": disk.get("source_disk_eager_zeroed"),
+                    "controller": disk.get("controller"),
+                    "file_bytes": disk.get("file_bytes"),
+                },
+            }
+        )
+
+    for nic in inventory["network_adapters"]:
+        resources.append(
+            {
+                "resource_type": "network_adapter",
+                "external_id": nic["external_id"],
+                "name": nic["name"],
+                "payload": {
+                    "vm_id": nic["vm_id"],
+                    "mac": nic["mac"],
+                    "network": nic["network"],
+                    "connected": nic["connected"],
+                },
+            }
+        )
+
+    return resources

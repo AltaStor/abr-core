@@ -98,10 +98,13 @@ from python.srv.core.utils import utc_now
 from python.srv.services.inventory_management import (
     INVENTORY_KIND_BY_TYPE,
     EsxHostInClusterError,
+    HyperVAlreadyRegisteredError,
     InventoryProviderRegistry,
     apply_inventory_updates,
     InventoryUnreachableError,
+    assert_hyperv_identity_is_new,
     assert_inventory_registrable,
+    connection_fields_changed,
     creatable_inventory_types,
     default_port_for_type,
     extract_host,
@@ -1067,6 +1070,8 @@ def normalize_inventory_record(record: dict[str, Any]) -> dict[str, Any]:
     item["created_at"] = str(item.get("created_at") or utc_now())
     item["updated_at"] = str(item.get("updated_at") or item["created_at"])
     item["last_scan_at"] = item.get("last_scan_at")
+    item["status_checked_at"] = item.get("status_checked_at")
+    item["status_error"] = item.get("status_error")
     item["discovery"] = {
         "last_scan_at": item.get("last_scan_at"),
         "last_scan_error": item.get("last_scan_error"),
@@ -1522,12 +1527,15 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
         "created_at": created_at,
         "updated_at": created_at,
         "last_scan_at": None,
+        "status_checked_at": None,
+        "status_error": None,
         "vm_count": 0,
         "host_count": 0,
         "cluster_count": 0,
         "metadata": {
             "host": address.split("/", 1)[0].split(":", 1)[0],
             "port": effective_port,
+            "port_explicit": port is not None,
             "verify_ssl": not insecure,
             "credentials": {
                 "username": username or None,
@@ -1537,7 +1545,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
         },
     }
     try:
-        assert_inventory_registrable(record)
+        proof = _proof_of_connection(assert_inventory_registrable(record))
     except EsxHostInClusterError as exc:
         raise api_error(
             409,
@@ -1554,6 +1562,16 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             port=effective_port,
             reason=exc.reason,
         ) from exc
+    try:
+        record = _apply_inventory_identity(record, proof.get("identity") or {})
+    except HyperVAlreadyRegisteredError as exc:
+        raise _already_registered_error(exc) from exc
+    if proof:
+        checked_at = utc_now()
+        record["status"] = "available"
+        record["status_checked_at"] = checked_at
+        record["status_error"] = None
+        record["updated_at"] = checked_at
     persist_hypervisor(record)
     RESOURCES_BY_HV.setdefault(record["id"], {})
     if AUTO_DISCOVER_ON_INVENTORY_ADD:
@@ -1562,6 +1580,70 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
         # `job create` still covers the case where this has not finished.
         schedule_inventory_discovery(record["id"])
     return normalize_inventory_record(record)
+
+
+def _proof_of_connection(result: Any) -> dict[str, Any]:
+    return result if isinstance(result, dict) else {}
+
+
+def _already_registered_error(exc: HyperVAlreadyRegisteredError) -> ApiError:
+    return api_error(
+        409,
+        "inventory_already_registered",
+        str(exc),
+        scope=exc.scope,
+        subject=exc.subject,
+        existing_id=exc.existing_id,
+        existing_name=exc.existing_name,
+    )
+
+
+def _record_inventory_identity(record: dict[str, Any], identity: Any) -> dict[str, Any]:
+    if not isinstance(identity, dict) or not identity:
+        return record
+    updated = dict(record)
+    metadata = dict(updated.get("metadata") if isinstance(updated.get("metadata"), dict) else {})
+    metadata["cluster_name"] = str(identity.get("cluster") or "") or None
+    metadata["computer_name"] = str(identity.get("computer") or "") or None
+    updated["metadata"] = metadata
+    return updated
+
+
+def _apply_inventory_identity(record: dict[str, Any], identity: Any) -> dict[str, Any]:
+    if not isinstance(identity, dict) or not identity:
+        return record
+    assert_hyperv_identity_is_new(record, identity)
+    return _record_inventory_identity(record, identity)
+
+
+def _recheck_inventory_connection(record: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(record)
+    checked_at = utc_now()
+    try:
+        proof = _proof_of_connection(assert_inventory_registrable(updated))
+    except (EsxHostInClusterError, InventoryUnreachableError) as exc:
+        updated["status"] = "unavailable"
+        updated["status_error"] = str(exc)
+        updated["status_checked_at"] = checked_at
+        updated["updated_at"] = checked_at
+        return updated
+    except Exception as exc:
+        LOGGER.warning(
+            "Could not re-check inventory %s after an edit: %s", record.get("id"), exc
+        )
+        updated["status"] = "unavailable"
+        updated["status_error"] = str(exc)
+        updated["status_checked_at"] = checked_at
+        updated["updated_at"] = checked_at
+        return updated
+    if not proof:
+        return updated
+    updated = _apply_inventory_identity(updated, proof.get("identity") or {})
+    updated["status"] = "available"
+    updated["status_error"] = None
+    updated["status_checked_at"] = checked_at
+    updated["updated_at"] = checked_at
+    return updated
 
 
 def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1589,6 +1671,11 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
             _ensure_ascii_name(new_name, field="Inventory name", code="invalid_inventory")
         normalized = apply_inventory_updates(normalized, updates)
     _ensure(any(key in payload for key in ("name", "address", "port", "username", "password", "description", "token", "insecure")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
+    if connection_fields_changed(payload):
+        try:
+            normalized = _recheck_inventory_connection(normalized)
+        except HyperVAlreadyRegisteredError as exc:
+            raise _already_registered_error(exc) from exc
     persist_hypervisor(normalized)
     return normalize_inventory_record(normalized)
 
@@ -1596,10 +1683,19 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
 def test_inventory(record_id: str) -> dict[str, Any]:
     record = _inventory_record_for_update(record_id)
     provider = InventoryProviderRegistry.resolve(record)
+    checked_at = utc_now()
     try:
-        provider.test_connection(record)
+        identity = provider.test_connection(record)
     except EsxHostInClusterError as exc:
-        update_hypervisor_fields(record["id"], {"status": "unavailable", "updated_at": utc_now()})
+        update_hypervisor_fields(
+            record["id"],
+            {
+                "status": "unavailable",
+                "status_error": str(exc),
+                "status_checked_at": checked_at,
+                "updated_at": checked_at,
+            },
+        )
         return {
             "id": record["id"],
             "name": record.get("name"),
@@ -1611,7 +1707,15 @@ def test_inventory(record_id: str) -> dict[str, Any]:
             "error": str(exc),
         }
     except Exception as exc:
-        update_hypervisor_fields(record["id"], {"status": "unavailable", "updated_at": utc_now()})
+        update_hypervisor_fields(
+            record["id"],
+            {
+                "status": "unavailable",
+                "status_error": str(exc),
+                "status_checked_at": checked_at,
+                "updated_at": checked_at,
+            },
+        )
         return {
             "id": record["id"],
             "name": record.get("name"),
@@ -1620,7 +1724,17 @@ def test_inventory(record_id: str) -> dict[str, Any]:
             "message": "Unable to connect to virtualization environment",
             "error": str(exc),
         }
-    update_hypervisor_fields(record["id"], {"status": "available", "updated_at": utc_now()})
+    learned = _record_inventory_identity(record, identity)
+    update_hypervisor_fields(
+        record["id"],
+        {
+            "status": "available",
+            "status_error": None,
+            "status_checked_at": checked_at,
+            "updated_at": checked_at,
+            "metadata": learned.get("metadata", record.get("metadata")),
+        },
+    )
     return {
         "id": record["id"],
         "name": record.get("name"),
@@ -1679,8 +1793,16 @@ def rescan_inventory(record_id: str) -> dict[str, Any]:
         # response -- a later GET (page reload, background auto-discovery
         # retry) still shows *why* the environment is unavailable instead of
         # just that it is. Cleared below on the next successful rescan.
+        failed_at = utc_now()
         update_hypervisor_fields(
-            record_id, {"status": "unavailable", "last_scan_error": str(exc), "updated_at": utc_now()}
+            record_id,
+            {
+                "status": "unavailable",
+                "last_scan_error": str(exc),
+                "status_error": str(exc),
+                "status_checked_at": failed_at,
+                "updated_at": failed_at,
+            },
         )
         raise api_error(
             502,
@@ -1711,6 +1833,8 @@ def rescan_inventory(record_id: str) -> dict[str, Any]:
     updated["last_scan_at"] = discovered_at
     updated["updated_at"] = discovered_at
     updated["last_scan_error"] = None
+    updated["status_error"] = None
+    updated["status_checked_at"] = discovered_at
     update_hypervisor_fields(
         record_id,
         {
@@ -1719,6 +1843,8 @@ def rescan_inventory(record_id: str) -> dict[str, Any]:
             "last_scan_at": discovered_at,
             "updated_at": discovered_at,
             "last_scan_error": None,
+            "status_error": None,
+            "status_checked_at": discovered_at,
         },
     )
     return {
