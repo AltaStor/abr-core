@@ -37,6 +37,7 @@ from python.srv.core.utils import utc_now
 from python.srv.services.abr_v41 import (
     _append_task_log,
     apply_retention_to_chain,
+    chain_clock_anomalies,
     extend_segment_object_lock,
     normalize_backup_point,
     normalize_job_record,
@@ -253,6 +254,27 @@ def _record_session_warning(
     _append_task_log(task, level="warn", message=message, component=component)
 
 
+def _report_clock_anomalies(task: dict[str, Any], chain_id: str, retention_days: int) -> None:
+    for anomaly in chain_clock_anomalies(chain_id):
+        point_id = str(anomaly.get("point_id") or "")
+        if anomaly.get("kind") == "ahead_of_server_clock":
+            message = (
+                f"Restore point {point_id} is dated {anomaly.get('created_at')}, which is ahead of this "
+                f"server's time ({anomaly.get('server_time')}). Retention is measured from that date, so "
+                f"the point can outlive the job's retention of {retention_days} day(s) until the clock "
+                "catches up. Check the clock on this server."
+            )
+        else:
+            message = (
+                f"Restore point {point_id} is dated {anomaly.get('created_at')}, earlier than the restore "
+                f"point it chains onto ({anomaly.get('parent_point_id')}, dated "
+                f"{anomaly.get('parent_created_at')}). The chain no longer follows the dates, which "
+                "happens when the server clock was ahead while a backup was written."
+            )
+        logger.warning("%s", message)
+        _record_session_warning(task, message, component="catalog", **anomaly)
+
+
 def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] | None:
     if task.get("task_type") != "backup" or task.get("status") != "completed":
         return None
@@ -429,6 +451,17 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
     if normalized_job is not None:
         retention_vm_id = str(normalized_record.get("vm_id") or "")
         retention_repository_id = str(normalized_record.get("repository_id") or "") or None
+        try:
+            _report_clock_anomalies(
+                task,
+                str(normalized_record.get("chain_id") or ""),
+                int(normalized_job.get("retention_days") or 0),
+            )
+        except Exception:
+            logger.exception(
+                "Could not check the dates of chain %s against the server clock",
+                normalized_record.get("chain_id"),
+            )
         try:
             failures = apply_retention_to_chain(
                 normalized_job, vm_id=retention_vm_id, repository_id=retention_repository_id

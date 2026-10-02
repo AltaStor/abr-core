@@ -4643,6 +4643,118 @@ def reconcile_repository_points(repository: dict[str, Any]) -> dict[str, int]:
     return summary
 
 
+CLOCK_SKEW_TOLERANCE = timedelta(seconds=60)
+
+
+def _points_by_parent(points: list[dict[str, Any]]) -> dict[str, list[str]]:
+    children: dict[str, list[str]] = defaultdict(list)
+    for point in points:
+        parent_id = str(point.get("parent_point_id") or "")
+        point_id = str(point.get("id") or "")
+        if parent_id and point_id:
+            children[parent_id].append(point_id)
+    return children
+
+
+def _descendant_ids(points: list[dict[str, Any]]) -> dict[str, set[str]]:
+    children = _points_by_parent(points)
+    descendants: dict[str, set[str]] = {}
+
+    def collect(point_id: str) -> set[str]:
+        known = descendants.get(point_id)
+        if known is not None:
+            return known
+        descendants[point_id] = set()
+        gathered: set[str] = set()
+        for child_id in children.get(point_id, []):
+            gathered.add(child_id)
+            gathered |= collect(child_id)
+        descendants[point_id] = gathered
+        return gathered
+
+    for point in points:
+        collect(str(point.get("id") or ""))
+    return descendants
+
+
+def _retention_dates(points: list[dict[str, Any]]) -> dict[str, datetime]:
+    by_id = {str(point.get("id") or ""): point for point in points}
+    descendants = _descendant_ids(points)
+    dates: dict[str, datetime] = {}
+    for point_id, point in by_id.items():
+        candidates = [_parse_dt(point.get("created_at"))]
+        for child_id in descendants.get(point_id, set()):
+            child = by_id.get(child_id)
+            if child is not None:
+                candidates.append(_parse_dt(child.get("created_at")))
+        dates[point_id] = min(candidates)
+    return dates
+
+
+def _keep_points_others_still_need(
+    to_delete: list[dict[str, Any]],
+    points: list[dict[str, Any]],
+    *,
+    job_id: str,
+) -> list[dict[str, Any]]:
+    delete_ids = {str(point.get("id") or "") for point in to_delete}
+    if not delete_ids:
+        return to_delete
+    descendants = _descendant_ids(points)
+    needed = {
+        point_id
+        for point_id in delete_ids
+        if any(child_id not in delete_ids for child_id in descendants.get(point_id, set()))
+    }
+    if not needed:
+        return to_delete
+    for point_id in sorted(needed):
+        LOGGER.warning(
+            "Retention kept expired restore point %s of job %s: a restore point that chains onto it is "
+            "not expired. Its dates do not follow its chain, which happens when the server clock was "
+            "ahead while it was written.",
+            point_id,
+            job_id,
+        )
+    return [point for point in to_delete if str(point.get("id") or "") not in needed]
+
+
+def chain_clock_anomalies(chain_id: str) -> list[dict[str, Any]]:
+    points = list(grouped_backup_points().get(str(chain_id or ""), []))
+    if not points:
+        return []
+    now = _now_utc()
+    by_id = {str(point.get("id") or ""): point for point in points}
+    anomalies: list[dict[str, Any]] = []
+    for point in points:
+        point_id = str(point.get("id") or "")
+        created = _parse_dt(point.get("created_at"))
+        if created - now > CLOCK_SKEW_TOLERANCE:
+            anomalies.append(
+                {
+                    "kind": "ahead_of_server_clock",
+                    "point_id": point_id,
+                    "created_at": str(point.get("created_at") or ""),
+                    "server_time": now.isoformat(),
+                }
+            )
+        parent = by_id.get(str(point.get("parent_point_id") or ""))
+        if parent is None:
+            continue
+        parent_created = _parse_dt(parent.get("created_at"))
+        if parent_created - created > CLOCK_SKEW_TOLERANCE:
+            anomalies.append(
+                {
+                    "kind": "older_than_its_parent",
+                    "point_id": point_id,
+                    "created_at": str(point.get("created_at") or ""),
+                    "parent_point_id": str(parent.get("id") or ""),
+                    "parent_created_at": str(parent.get("created_at") or ""),
+                }
+            )
+    return anomalies
+
+
 def _segment_points(points: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     segments: list[list[dict[str, Any]]] = []
     current_segment: list[dict[str, Any]] = []
@@ -4663,18 +4775,24 @@ def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: 
         return failures
     _apply_gfs_marks(points, dict(job.get("gfs") or {}))
     cutoff = _now_utc() - timedelta(days=int(job.get("retention_days") or 0))
+    retention_dates = _retention_dates(points)
+
+    def expired(point: dict[str, Any]) -> bool:
+        return retention_dates[str(point.get("id") or "")] < cutoff
+
     to_delete: list[dict[str, Any]] = []
     for segment in _segment_points(points):
         full_point = segment[0]
         other_points = segment[1:]
-        expired_flags = [_parse_dt(point.get("created_at")) < cutoff for point in segment]
+        expired_flags = [expired(point) for point in segment]
         all_expired = all(expired_flags)
         if full_point.get("gfs_protected"):
-            if other_points and all(_parse_dt(point.get("created_at")) < cutoff and not point.get("gfs_protected") for point in other_points):
+            if other_points and all(expired(point) and not point.get("gfs_protected") for point in other_points):
                 to_delete.extend(other_points)
             continue
         if all_expired and not any(point.get("gfs_protected") for point in segment):
             to_delete.extend(segment)
+    to_delete = _keep_points_others_still_need(to_delete, points, job_id=str(job.get("id") or ""))
     if not to_delete:
         for point in points:
             persist_backup(point)
