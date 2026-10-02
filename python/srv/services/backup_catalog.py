@@ -613,6 +613,92 @@ def _task_output_is_registered(task_id: str) -> bool:
     return False
 
 
+def _task_backup_snapshot(task: dict[str, Any]) -> tuple[str, str] | None:
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    snapshot = result.get("backup_snapshot") if isinstance(result.get("backup_snapshot"), dict) else {}
+    vm_name = str(snapshot.get("vm_name") or "").strip()
+    snapshot_name = str(snapshot.get("name") or "").strip()
+    if not vm_name or not snapshot_name:
+        return None
+    return vm_name, snapshot_name
+
+
+def forget_task_backup_snapshot(task_id: str) -> None:
+    record = TASKS.get(task_id)
+    if not isinstance(record, dict):
+        return
+    result = record.get("result")
+    if not isinstance(result, dict) or "backup_snapshot" not in result:
+        return
+    trimmed = dict(result)
+    trimmed.pop("backup_snapshot", None)
+    updated = dict(record)
+    updated["result"] = trimmed
+    updated["updated_at"] = utc_now()
+    persist_task(updated)
+
+
+def stranded_backup_snapshots(
+    hypervisor_id: str,
+    vm_name: str,
+    exclude_task_id: str = "",
+) -> list[tuple[str, str]]:
+    pending: list[tuple[str, str]] = []
+    for record in catalog_records(TASKS):
+        task_id = str(record.get("id") or "")
+        if not task_id or task_id == exclude_task_id:
+            continue
+        if str(record.get("status") or "") == "running":
+            continue
+        if str(record.get("hypervisor_id") or "") != hypervisor_id:
+            continue
+        snapshot = _task_backup_snapshot(record)
+        if snapshot is None or snapshot[0] != vm_name:
+            continue
+        pending.append((task_id, snapshot[1]))
+    return pending
+
+
+def _remove_interrupted_task_snapshot(task: dict[str, Any]) -> None:
+    snapshot = _task_backup_snapshot(task)
+    if snapshot is None:
+        return
+    vm_name, snapshot_name = snapshot
+    task_id = str(task.get("id") or "")
+    hypervisor = HYPERVISORS.get(str(task.get("hypervisor_id") or ""))
+    if not isinstance(hypervisor, dict):
+        logger.warning(
+            "Interrupted task %s left the snapshot %r on VM %r, but its hypervisor is no longer "
+            "registered, so the snapshot has to be removed by hand.",
+            task_id,
+            snapshot_name,
+            vm_name,
+        )
+        return
+    from python.srv.plugins import build_hypervisor_plugin
+
+    try:
+        with build_hypervisor_plugin(hypervisor) as node:
+            node.remove_snapshot(vm_name, snapshot_name)
+    except Exception as exc:
+        logger.warning(
+            "Could not remove the snapshot %r that interrupted task %s left on VM %r (%s); "
+            "the next backup of that VM will try again.",
+            snapshot_name,
+            task_id,
+            vm_name,
+            exc,
+        )
+        return
+    forget_task_backup_snapshot(task_id)
+    logger.info(
+        "Removed the snapshot %r that interrupted task %s left on VM %r.",
+        snapshot_name,
+        task_id,
+        vm_name,
+    )
+
+
 def _discard_interrupted_task_output(task: dict[str, Any]) -> None:
     task_id = str(task.get("id") or "")
     if _task_output_is_registered(task_id):
@@ -699,6 +785,12 @@ def _start_interrupted_task_sweep(tasks: list[dict[str, Any]]) -> None:
 
 def _sweep_interrupted_tasks(tasks: list[dict[str, Any]]) -> None:
     for task in tasks:
+        try:
+            _remove_interrupted_task_snapshot(task)
+        except Exception:
+            logger.exception(
+                "Could not remove the snapshot interrupted task %s left behind", task.get("id")
+            )
         try:
             _discard_interrupted_task_output(task)
         except Exception:
