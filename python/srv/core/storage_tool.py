@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -237,6 +238,25 @@ def s3_endpoint_connect_error(endpoint_url: str) -> str | None:
 def safe_path_component(value: Any, *, fallback: str = "item") -> str:
     cleaned = _SAFE_PATH_CHARS.sub("-", str(value or "").strip()).strip(".-")
     return cleaned or fallback
+
+
+def filesystem_free_bytes(path: str | Path) -> int | None:
+    candidate = Path(str(path))
+    while not candidate.exists() and candidate.parent != candidate:
+        candidate = candidate.parent
+    try:
+        return int(shutil.disk_usage(str(candidate)).free)
+    except OSError:
+        return None
+
+
+def describe_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(size) < 1024 or unit == "GiB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{int(value)} B"
 
 
 def ensure_private_directory(path: Path) -> None:

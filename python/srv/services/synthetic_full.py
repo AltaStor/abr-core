@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import errno
 import json
 import logging
 import time
@@ -14,6 +15,8 @@ from typing import Any, Callable
 from python.srv.core.mongo_db_wrapper import REPOSITORIES
 from python.srv.core.storage_tool import (
     StorageToolError,
+    describe_bytes,
+    filesystem_free_bytes,
     remove_disk_tool_backup,
     apply_repository_immutability,
     copy_disk_tool_chain,
@@ -203,6 +206,71 @@ def _discard_partial_merge(
         pass
 
 
+def _repository_storage_root(repository: dict[str, Any]) -> str:
+    return str(repository.get("path") or "").strip()
+
+
+def _free_bytes_at_start(repository: dict[str, Any]) -> int | None:
+    from python.srv.core.storage_tool import is_s3_repository
+
+    if is_s3_repository(repository):
+        return None
+    root = _repository_storage_root(repository)
+    if not root:
+        return None
+    try:
+        return filesystem_free_bytes(root)
+    except Exception:
+        return None
+
+
+def _largest_point_bytes(points: list[dict[str, Any]]) -> int | None:
+    largest = 0
+    for point in points:
+        try:
+            largest = max(largest, int(point.get("size_bytes") or 0))
+        except (TypeError, ValueError):
+            continue
+    return largest or None
+
+
+def _no_room_detail(
+    repository: dict[str, Any],
+    points: list[dict[str, Any]],
+    free_at_start: int | None,
+) -> str | None:
+    if free_at_start is None:
+        return None
+    needed = _largest_point_bytes(points)
+    if needed is None or free_at_start >= needed:
+        return None
+    return _ran_out_of_room_message(repository, needed=needed, free_at_start=free_at_start)
+
+
+FREE_SPACE_HINT = "Free space in that filesystem, or merge into another repository"
+
+
+def _repository_label(repository: dict[str, Any]) -> str:
+    name = str(repository.get("name") or repository.get("id") or "the destination")
+    root = _repository_storage_root(repository)
+    return f"repository {name!r}" + (f" at {root}" if root else "")
+
+
+def _out_of_space_message(repository: dict[str, Any], free_bytes: int | None) -> str:
+    free = f" ({describe_bytes(free_bytes)} free)" if free_bytes is not None else ""
+    return f"The {_repository_label(repository)} ran out of space{free}. {FREE_SPACE_HINT}"
+
+
+def _ran_out_of_room_message(
+    repository: dict[str, Any], *, needed: int, free_at_start: int
+) -> str:
+    return (
+        f"The {_repository_label(repository)} ran out of space: this synthetic full needs about "
+        f"{describe_bytes(needed)} and {describe_bytes(free_at_start)} were free when the merge "
+        f"started. {FREE_SPACE_HINT}"
+    )
+
+
 def _source_manifest(point: dict[str, Any]) -> dict[str, Any]:
     from python.srv.services.backup_catalog import _load_backup_manifest_payload
 
@@ -217,9 +285,16 @@ def _write_synthetic_manifest(
     payload: dict[str, Any],
     retention_days: int | None = None,
 ) -> Path:
-    ensure_private_directory(task_root)
     manifest_path = task_root / "manifest.json"
-    manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    try:
+        ensure_private_directory(task_root)
+        manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError as exc:
+        if exc.errno != errno.ENOSPC:
+            raise
+        raise SyntheticFullError(
+            _out_of_space_message(repository, _free_bytes_at_start(repository))
+        ) from exc
     try:
         run_disk_tool(
             [
@@ -293,8 +368,16 @@ def run_synthetic_full(
     _destination_root, task_root, destination_path = _resolve_backup_storage_layout(
         task=task, vm_name=vm_name, parameters=parameters, repository=repository
     )
+    free_at_start = _free_bytes_at_start(repository)
     if not is_s3_repository(repository):
-        ensure_private_directory(task_root.parent)
+        try:
+            ensure_private_directory(task_root.parent)
+        except OSError as exc:
+            if exc.errno != errno.ENOSPC:
+                raise
+            raise SyntheticFullError(
+                _out_of_space_message(repository, _free_bytes_at_start(repository))
+            ) from exc
     source_paths = {merge["source_path"] for merge in merges}
     if repository_id == source_repository_id and destination_path is not None and destination_path in source_paths:
         raise SyntheticFullValidationError(
@@ -389,7 +472,20 @@ def run_synthetic_full(
             _discard_partial_merge(
                 repository, destination_path, written_names, task_root, in_flight=backup_name
             )
-            raise SyntheticFullError(f"Merging disk {position + 1}/{total} failed: {exc}") from exc
+            detail = _no_room_detail(repository, points, free_at_start)
+            raise SyntheticFullError(
+                f"Merging disk {position + 1}/{total} failed: {detail or exc}"
+            ) from exc
+        except OSError as exc:
+            if exc.errno != errno.ENOSPC:
+                raise
+            _discard_partial_merge(
+                repository, destination_path, written_names, task_root, in_flight=backup_name
+            )
+            raise SyntheticFullError(
+                f"Merging disk {position + 1}/{total} failed: "
+                + _out_of_space_message(repository, _free_bytes_at_start(repository))
+            ) from exc
 
         written_names.append(backup_name)
 
