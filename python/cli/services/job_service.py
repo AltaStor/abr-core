@@ -7,7 +7,13 @@ import copy
 from typing import Any
 
 from ..cli_context import CliContext
-from ..parsing.validators import parse_csv_values, parse_duration, parse_strict_hhmm, parse_weekday_csv
+from ..parsing.validators import (
+    STRICT_TIME_PATTERN,
+    parse_csv_values,
+    parse_duration,
+    parse_strict_hhmm,
+    parse_weekday_csv,
+)
 
 _NEW_SCHEDULE_TYPES = {"daily", "weekly", "monthly", "periodic"}
 
@@ -149,6 +155,24 @@ class JobService:
         return all(cls._is_empty_value(getattr(args, name, None)) for name in ("time", "day_of_month", "every"))
 
     @classmethod
+    def _reject_days_a_schedule_cannot_use(cls, stored: Any, prefix: str) -> None:
+        if not isinstance(stored, dict):
+            return
+        schedule_type = str(stored.get("type") or "").strip().lower()
+        if schedule_type in {"", "weekly"}:
+            return
+        flag = f"--{prefix.replace('_', '-')}"
+        raise ValueError(
+            f"{schedule_type.capitalize()} schedules do not accept {flag}-days. "
+            f"Pass {flag}-schedule none to turn this schedule off"
+        )
+
+    @staticmethod
+    def _stored_schedule_time(stored: dict[str, Any]) -> str:
+        stored_time = str(stored.get("time") or "").strip()
+        return stored_time if STRICT_TIME_PATTERN.fullmatch(stored_time) else ""
+
+    @classmethod
     def _merge_schedule_details(cls, stored: dict[str, Any], args: Any, *, enabled_override: bool | None) -> dict[str, Any]:
         schedule_type = str(stored.get("type") or "").strip().lower()
         accepted = cls._SCHEDULE_TYPE_DETAILS.get(schedule_type)
@@ -191,6 +215,8 @@ class JobService:
             state_only = bool(getattr(args, f"{prefix}_enabled", False) or getattr(args, f"{prefix}_disabled", False))
             prefixed = _ExecutionScheduleArgs(args, prefix)
             has_details = cls._schedule_detail_fields_present(prefixed)
+            if cls._is_empty_value(requested) and not has_details and getattr(prefixed, "days", None) is not None:
+                cls._reject_days_a_schedule_cannot_use(job.get(key), prefix)
             if cls._is_empty_value(requested) and not state_only and not has_details:
                 continue
             if not cls._is_empty_value(requested) and str(requested).strip().lower() in {"none", "off"}:
@@ -293,6 +319,14 @@ class JobService:
             payload["enabled"] = enabled_override
             return payload
 
+        stored = current_schedule if isinstance(current_schedule, dict) else {}
+        given_time = getattr(args, "time", None)
+        resolved_time = (
+            parse_strict_hhmm(str(given_time))
+            if given_time not in {None, ""}
+            else cls._stored_schedule_time(stored)
+        )
+
         schedule_text = str(schedule_value).strip()
         if not schedule_text:
             raise ValueError("Schedule must not be empty")
@@ -303,9 +337,12 @@ class JobService:
                 raise ValueError("Do not combine legacy schedule text with --time, --days, --day-of-month, or --every")
             return cls._legacy_schedule_payload(schedule_text, enabled=enabled_override)
 
-        enabled = True if enabled_override is None else enabled_override
+        if enabled_override is not None:
+            enabled = enabled_override
+        else:
+            enabled = bool(stored.get("enabled", True)) if stored else True
         if lowered == "daily":
-            if getattr(args, "time", None) in {None, ""}:
+            if not resolved_time:
                 raise ValueError("Daily schedules require --time")
             if getattr(args, "days", None):
                 raise ValueError("Daily schedules do not accept --days")
@@ -313,26 +350,26 @@ class JobService:
                 raise ValueError("Daily schedules do not accept --day-of-month")
             if getattr(args, "every", None):
                 raise ValueError("Daily schedules do not accept --every")
-            return {"type": "daily", "time": parse_strict_hhmm(str(args.time)), "enabled": enabled}
+            return {"type": "daily", "time": resolved_time, "enabled": enabled}
 
         if lowered == "weekly":
             days = getattr(args, "days", None)
             if not days:
                 raise ValueError("Weekly schedules require --days")
-            if getattr(args, "time", None) in {None, ""}:
+            if not resolved_time:
                 raise ValueError("Weekly schedules require --time")
             if getattr(args, "day_of_month", None) is not None:
                 raise ValueError("Weekly schedules do not accept --day-of-month")
             if getattr(args, "every", None):
                 raise ValueError("Weekly schedules do not accept --every")
             parsed_days = days if isinstance(days, list) else parse_weekday_csv(str(days))
-            return {"type": "weekly", "days": parsed_days, "time": parse_strict_hhmm(str(args.time)), "enabled": enabled}
+            return {"type": "weekly", "days": parsed_days, "time": resolved_time, "enabled": enabled}
 
         if lowered == "monthly":
             day_of_month = getattr(args, "day_of_month", None)
             if day_of_month is None:
                 raise ValueError("Monthly schedules require --day-of-month")
-            if getattr(args, "time", None) in {None, ""}:
+            if not resolved_time:
                 raise ValueError("Monthly schedules require --time")
             if getattr(args, "days", None):
                 raise ValueError("Monthly schedules do not accept --days")
@@ -340,7 +377,7 @@ class JobService:
                 raise ValueError("Monthly schedules do not accept --every")
             if int(day_of_month) < 1 or int(day_of_month) > 31:
                 raise ValueError("Monthly schedules require --day-of-month from 1 to 31")
-            return {"type": "monthly", "day_of_month": int(day_of_month), "time": parse_strict_hhmm(str(args.time)), "enabled": enabled}
+            return {"type": "monthly", "day_of_month": int(day_of_month), "time": resolved_time, "enabled": enabled}
 
         if getattr(args, "time", None) not in {None, ""}:
             raise ValueError("Periodic schedules do not accept --time")
