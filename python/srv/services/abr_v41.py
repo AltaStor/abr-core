@@ -9,6 +9,7 @@ import calendar
 import json
 import logging
 import math
+import functools
 import os
 import platform
 import re
@@ -53,6 +54,7 @@ from python.srv.core.mongo_db_wrapper import (
     update_hypervisor_fields,
 )
 from python.srv.core.server_defaults import env_int
+from python.srv.core.subprocess_util import run_capped
 from python.srv.core.secure_archive import (
     ArchiveError,
     WrongPasswordError,
@@ -178,7 +180,36 @@ def schedule_inventory_discovery(inventory_id: str, *, force: bool = False) -> t
     return thread
 
 PRODUCT_NAME = "AltaStor Backup & Replication"
-PRODUCT_VERSION = "26.09"
+PRODUCT_VERSION = "26.11"
+SERVER_PACKAGE_NAME = "altastor-backup-server"
+PACKAGE_QUERY_TIMEOUT_SECONDS = 10
+
+
+def installed_package_versions() -> dict[str, str]:
+    try:
+        result = run_capped(
+            ["dpkg-query", "-W", "-f=${Package} ${Version}\\n", "altastor-*"],
+            timeout=PACKAGE_QUERY_TIMEOUT_SECONDS,
+            nice=False,
+        )
+    except Exception:
+        LOGGER.debug("Could not read the installed package versions", exc_info=True)
+        return {}
+    output = result.stdout
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    versions: dict[str, str] = {}
+    for line in str(output or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].startswith("altastor"):
+            versions[parts[0]] = parts[1]
+    return versions
+
+
+@functools.lru_cache(maxsize=1)
+def product_version() -> str:
+    installed = str(installed_package_versions().get(SERVER_PACKAGE_NAME) or "").strip()
+    return installed or PRODUCT_VERSION
 
 REPO_TYPES = ("local", "nfs", "smb", "s3")
 
@@ -8020,7 +8051,7 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
 def system_version() -> dict[str, Any]:
     return {
         "product": PRODUCT_NAME,
-        "version": PRODUCT_VERSION,
+        "version": product_version(),
         "cli_binary": "abr",
     }
 
@@ -8083,7 +8114,7 @@ def system_info() -> dict[str, Any]:
     rather than a plausible-looking placeholder."""
     return {
         "product": PRODUCT_NAME,
-        "version": PRODUCT_VERSION,
+        "version": product_version(),
         "hostname": socket.gethostname() or None,
         "os": _linux_os_pretty_name(),
         "kernel": platform.release() or None,
@@ -8204,7 +8235,7 @@ def export_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     manifest = {
         "format_version": CATALOG_SNAPSHOT_FORMAT_VERSION,
         "product": PRODUCT_NAME,
-        "product_version": PRODUCT_VERSION,
+        "product_version": product_version(),
         "exported_at": utc_now(),
         "counts": {table: len(records) for table, records in catalog.items() if table != "resources"},
         "configuration_keys": sorted(configuration.keys()),
