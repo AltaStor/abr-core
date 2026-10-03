@@ -2,6 +2,8 @@
 # Copyright © 2026 Norvitex OÜ
 
 from typing import Any
+
+from ..core.mongo_db_wrapper import RESOURCES_BY_HV
 from .helpers import deterministic_seed
 
 
@@ -252,6 +254,14 @@ def build_vcenter_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
     return resources
 
 
+def _last_known_guest_os(hypervisor_id: str, vm_id: str) -> str:
+    known = RESOURCES_BY_HV.get(hypervisor_id, {}).get(("virtual_machine", vm_id))
+    if not isinstance(known, dict):
+        return ""
+    payload = known.get("payload") if isinstance(known.get("payload"), dict) else {}
+    return str(payload.get("guest_os") or "")
+
+
 def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
     metadata = hv.get("metadata", {})
     credentials = metadata.get("credentials", {})
@@ -323,6 +333,9 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
 
     for vm in inventory["virtual_machines"]:
         owner = str(vm.get("owner_node") or vm.get("host") or "")
+        guest_os = str(vm.get("guest_os") or "") or _last_known_guest_os(
+            str(hv["id"]), str(vm["vm_id"])
+        )
         resources.append(
             {
                 "resource_type": "virtual_machine",
@@ -332,9 +345,13 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
                     "power_state": vm["power_state"],
                     "num_cpu": vm["num_cpu"],
                     "memory_mb": vm["memory_mb"],
-                    "guest_os": vm["guest_os"],
+                    "guest_os": guest_os,
                     "firmware": vm.get("firmware"),
                     "generation": vm.get("generation"),
+                    "version": vm.get("version"),
+                    "checkpoints": vm.get("checkpoints"),
+                    "config_path": vm.get("config_path"),
+                    "checkpoint_path": vm.get("checkpoint_path"),
                     "host_name": owner,
                     "cluster_name": cluster_name if vm.get("clustered") else None,
                     "cluster_external_id": cluster_name if vm.get("clustered") else None,
@@ -359,6 +376,7 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
                     "source_disk_eager_zeroed": disk.get("source_disk_eager_zeroed"),
                     "controller": disk.get("controller"),
                     "file_bytes": disk.get("file_bytes"),
+                    "parent_path": disk.get("parent_path"),
                 },
             }
         )
@@ -374,6 +392,7 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
                     "mac": nic["mac"],
                     "network": nic["network"],
                     "connected": nic["connected"],
+                    "dynamic_mac": nic.get("dynamic_mac"),
                 },
             }
         )

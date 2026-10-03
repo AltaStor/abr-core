@@ -19,17 +19,24 @@ foreach ($vm in Get-VM) {
         $kvp = (Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_KvpExchangeComponent `
             -Filter "SystemName='$($vm.Id)'" -ErrorAction SilentlyContinue).GuestIntrinsicExchangeItems
         foreach ($item in $kvp) {
-            if ($item -match '<PROPERTY NAME="Name" TYPE="string"><VALUE>OSName</VALUE></PROPERTY>.*?<PROPERTY NAME="Data" TYPE="string"><VALUE>(.*?)</VALUE>') {
-                $os = $Matches[1]
-                break
-            }
+            try {
+                $props = @{}
+                foreach ($p in ([xml]$item).INSTANCE.PROPERTY) { $props[$p.NAME] = $p.VALUE }
+                if ($props['Name'] -eq 'OSName') { $os = [string]$props['Data']; break }
+            } catch { }
         }
     } catch { }
+
+    $checkpoints = 0
+    try { $checkpoints = @(Get-VMSnapshot -VM $vm -ErrorAction SilentlyContinue).Count } catch { }
 
     $vms += [pscustomobject]@{
         vm_id = $vm.Id.ToString(); name = $vm.Name; power_state = [string]$vm.State
         num_cpu = [int]$vm.ProcessorCount; memory_mb = [int]($vm.MemoryStartup / 1MB)
         generation = [int]$vm.Generation; guest_os = $os; version = [string]$vm.Version
+        checkpoints = [int]$checkpoints
+        config_path = [string]$vm.ConfigurationLocation
+        checkpoint_path = [string]$vm.SnapshotFileLocation
     }
 
     foreach ($d in Get-VMHardDiskDrive -VM $vm) {
@@ -44,6 +51,7 @@ foreach ($vm in Get-VM) {
             format = if ($info) { [string]$info.VhdFormat } else { '' }
             disk_type = if ($info) { [string]$info.VhdType } else { '' }
             identifier = if ($info) { [string]$info.DiskIdentifier } else { '' }
+            parent_path = if ($info) { [string]$info.ParentPath } else { '' }
         }
     }
 
@@ -51,6 +59,7 @@ foreach ($vm in Get-VM) {
         $nics += [pscustomobject]@{
             vm_id = $vm.Id.ToString(); id = $n.Id; name = $n.Name
             mac = $n.MacAddress; network = $n.SwitchName; connected = [bool]$n.SwitchName
+            dynamic_mac = [bool]$n.DynamicMacAddressEnabled
         }
     }
 }

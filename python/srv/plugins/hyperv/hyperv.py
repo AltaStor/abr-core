@@ -280,6 +280,10 @@ class HyperVNode(Hypervisor):
             "guest_os": str(raw.get("guest_os") or ""),
             "firmware": "efi" if generation >= 2 else "bios",
             "generation": generation,
+            "version": str(raw.get("version") or ""),
+            "checkpoints": int(raw.get("checkpoints") or 0),
+            "config_path": str(raw.get("config_path") or ""),
+            "checkpoint_path": str(raw.get("checkpoint_path") or ""),
             "host": node,
             "clustered": name in self._owners,
             "owner_node": self._owners.get(name) or node,
@@ -302,6 +306,7 @@ class HyperVNode(Hypervisor):
             "source_disk_eager_zeroed": str(raw.get("disk_type") or "").lower() == "fixed",
             "controller": str(raw.get("controller") or ""),
             "file_bytes": int(raw.get("file_bytes") or 0),
+            "parent_path": str(raw.get("parent_path") or ""),
         }
 
     def _nic_record(self, raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -314,6 +319,7 @@ class HyperVNode(Hypervisor):
             "mac": str(raw.get("mac") or ""),
             "network": str(raw.get("network") or ""),
             "connected": bool(raw.get("connected")),
+            "dynamic_mac": bool(raw.get("dynamic_mac")),
         }
 
     def _candidate_ports(self) -> List[int]:
