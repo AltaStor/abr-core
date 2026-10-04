@@ -166,7 +166,13 @@ def _disk_target_datastore_name(
     disk: dict[str, Any],
     datastore_map: dict[str, Any] | None,
     default_name: str,
+    disk_targets: dict[int, str] | None = None,
+    index: int | None = None,
 ) -> str:
+    if isinstance(disk_targets, dict) and index is not None:
+        override = str(disk_targets.get(index) or "").strip()
+        if override:
+            return override
     if not isinstance(datastore_map, dict) or not datastore_map:
         return default_name
     datastore_path = str(disk.get("datastore_path") or "").strip()
@@ -184,6 +190,7 @@ def _build_disk_layout(
     datastore_map: dict[str, Any] | None = None,
     default_datastore_name: str = "",
     provisioning: list[dict[str, Any]] | None = None,
+    disk_targets: dict[int, str] | None = None,
 ) -> list[dict[str, Any]]:
     layout: list[dict[str, Any]] = []
     for index, disk in enumerate(disk_entries, start=1):
@@ -205,7 +212,7 @@ def _build_disk_layout(
                 "capacity_gb": max(capacity_gb, 1.0),
                 "file_name": _build_disk_file_name(index, source_name),
                 "disk_uuid": disk.get("uuid"),
-                "datastore_name": _disk_target_datastore_name(disk, datastore_map, default_datastore_name),
+                "datastore_name": _disk_target_datastore_name(disk, datastore_map, default_datastore_name, disk_targets, index),
                 "thin_provisioned": disk_provisioning.get("thin_provisioned"),
                 "eager_zeroed": bool(disk_provisioning.get("eager_zeroed")),
             }
@@ -798,6 +805,14 @@ def run_vcenter_restore(
             parameters.get("target_datastore_name") or _derive_manifest_datastore_name(disk_entries)
         ).strip()
         datastore_map = parameters.get("datastore_map") if isinstance(parameters.get("datastore_map"), dict) else {}
+        disk_targets: dict[int, str] = {}
+        for entry in parameters.get("disk_datastore_map") if isinstance(parameters.get("disk_datastore_map"), list) else []:
+            if not isinstance(entry, dict):
+                continue
+            position = entry.get("index")
+            target_datastore = str(entry.get("target_datastore") or "").strip()
+            if isinstance(position, int) and not isinstance(position, bool) and target_datastore:
+                disk_targets[position] = target_datastore
         logger.info(
             "Preparing %s from %s to target VM %s on host %s datastore %s",
             recovery_label.lower(),
@@ -867,6 +882,7 @@ def run_vcenter_restore(
                     datastore_map,
                     target_datastore_name,
                     provisioning=disk_provisioning,
+                    disk_targets=disk_targets,
                 )
                 if is_virtual_center
                 else None
@@ -951,7 +967,7 @@ def run_vcenter_restore(
                             disk_read_bytes = int(disk_capacity_gb * 1024**3)
 
                     source_datastore_path = str(disk.get("datastore_path") or "")
-                    disk_datastore_name = _disk_target_datastore_name(disk, datastore_map, target_datastore_name)
+                    disk_datastore_name = _disk_target_datastore_name(disk, datastore_map, target_datastore_name, disk_targets, index)
                     restore_target = (
                         str(created_disk_paths[index - 1])
                         if is_virtual_center and len(created_disk_paths) >= index

@@ -7152,6 +7152,159 @@ def _source_disk_datastore(disk: dict[str, Any]) -> str:
     return str(datastore_name or "").strip()
 
 
+def _collect_restore_mapping(mappings: dict[str, str], source: str, target: str, *, flag: str) -> None:
+    for existing_source, existing_target in mappings.items():
+        if existing_source.lower() != source.lower():
+            continue
+        _ensure(
+            existing_target.lower() == target.lower(),
+            422,
+            "invalid_restore",
+            f"{flag} maps the same source twice, to different targets",
+            source=existing_source,
+            targets=[existing_target, target],
+        )
+        return
+    mappings[source] = target
+
+
+def _parse_restore_identifier_map(value: Any, *, flag: str, source_key: str, target_key: str) -> dict[str, str]:
+    form = f"Each {flag} value must use the form <source>=<target> or <source>:<target>"
+    if isinstance(value, dict):
+        pairs = list(value.items())
+    elif not value:
+        return {}
+    elif isinstance(value, list):
+        pairs = []
+        for raw in value:
+            if isinstance(raw, dict):
+                pairs.append((raw.get(source_key), raw.get(target_key)))
+                continue
+            text = str(raw or "")
+            left, separator, right = text.partition("=")
+            if separator != "=":
+                left, separator, right = text.partition(":")
+            _ensure(separator in {"=", ":"} and bool(left.strip()) and bool(right.strip()), 422, "invalid_restore", form, value=text)
+            pairs.append((left, right))
+    else:
+        raise api_error(422, "invalid_restore", form)
+    mappings: dict[str, str] = {}
+    for source, target in pairs:
+        source_text = str(source or "").strip()
+        target_text = str(target or "").strip()
+        _ensure(bool(source_text) and bool(target_text), 422, "invalid_restore", form)
+        _collect_restore_mapping(mappings, source_text, target_text, flag=flag)
+    return mappings
+
+
+def _restore_disk_identities(source_vm: dict[str, Any]) -> list[dict[str, Any]]:
+    return [disk for disk in (source_vm.get("disks") or []) if isinstance(disk, dict)]
+
+
+def _resolve_restore_disk_placement(
+    source_vm: dict[str, Any],
+    *,
+    inventory_id: str,
+    host: dict[str, Any],
+    requested: Any,
+    restore_mode: str,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    overrides = _parse_restore_identifier_map(
+        requested, flag="--disk-datastore", source_key="source_disk", target_key="target_datastore"
+    )
+    if not overrides:
+        return [], {}
+    _ensure(
+        restore_mode != "in_place",
+        422,
+        "invalid_restore",
+        "In-place restore keeps every disk on its own datastore and cannot take a disk placement",
+    )
+    disks = _restore_disk_identities(source_vm)
+    position_by_identifier: dict[str, int] = {}
+    for position, disk in enumerate(disks, start=1):
+        for identifier in (str(disk.get("id") or ""), str(disk.get("label") or "")):
+            if identifier:
+                position_by_identifier.setdefault(identifier.lower(), position)
+    targets: list[dict[str, Any]] = []
+    resolved: dict[str, dict[str, Any]] = {}
+    for requested_disk, target_identifier in overrides.items():
+        position = position_by_identifier.get(requested_disk.lower())
+        _ensure(
+            position is not None,
+            422,
+            "invalid_restore",
+            "Disk placement names a disk this restore point does not carry",
+            disk=requested_disk,
+            disks=[{"id": disk.get("id"), "label": disk.get("label")} for disk in disks],
+        )
+        datastore = _resolve_restore_target_datastore(inventory_id, target_identifier, host=host)
+        target_name = str(datastore.get("name") or "").strip()
+        disk = disks[position - 1]
+        targets.append(
+            {
+                "index": position,
+                "disk_id": disk.get("id"),
+                "label": disk.get("label"),
+                "target_datastore": target_name,
+            }
+        )
+        resolved[target_name] = datastore
+    return sorted(targets, key=lambda item: int(item["index"])), resolved
+
+
+def _restore_disk_target_name(
+    disk: dict[str, Any],
+    position: int,
+    disk_targets: dict[int, str],
+    placement: dict[str, str],
+    default_name: str,
+) -> str:
+    override = str(disk_targets.get(position) or "").strip()
+    if override:
+        return override
+    return str(placement.get(_source_disk_datastore(disk)) or default_name).strip() or default_name
+
+
+def _resolve_restore_nic_network_mappings(
+    source_vm: dict[str, Any],
+    *,
+    inventory_id: str,
+    host: dict[str, Any] | None,
+    requested: Any,
+) -> list[dict[str, Any]]:
+    overrides = _parse_restore_identifier_map(
+        requested, flag="--nic-network", source_key="source_nic", target_key="target_network"
+    )
+    if not overrides:
+        return []
+    nics = [nic for nic in (source_vm.get("nics") or []) if isinstance(nic, dict)]
+    nic_by_identifier: dict[str, dict[str, Any]] = {}
+    for nic in nics:
+        for identifier in (str(nic.get("id") or ""), str(nic.get("label") or "")):
+            if identifier:
+                nic_by_identifier.setdefault(identifier.lower(), nic)
+    source_networks = [
+        str(nic.get("source_network") or "").strip() for nic in nics if str(nic.get("source_network") or "").strip()
+    ]
+    mappings: list[dict[str, Any]] = []
+    for requested_nic, target_identifier in overrides.items():
+        nic = nic_by_identifier.get(requested_nic.lower())
+        _ensure(
+            nic is not None,
+            404,
+            "network_adapter_not_found",
+            "Adapter placement names an adapter this restore point does not carry",
+            adapter=requested_nic,
+            adapters=[{"id": item.get("id"), "label": item.get("label")} for item in nics],
+        )
+        network = _resolve_restore_target_network(
+            inventory_id, target_identifier, source_networks=source_networks, host=host
+        )
+        mappings.append({"source_nic_id": nic.get("id"), "target_network_id": str(network.get("id") or "")})
+    return mappings
+
+
 def _resolve_restore_datastore_placement(
     source_vm: dict[str, Any],
     *,
@@ -7297,6 +7450,8 @@ def _normalize_restore_request_payload(payload: dict[str, Any], point: dict[str,
         "network_mappings": [item for item in network_mappings if isinstance(item, dict)],
         "legacy_network_map": payload.get("network_map"),
         "datastore_map": payload.get("datastore_map") or payload.get("datastore_mappings"),
+        "disk_datastore_map": payload.get("disk_datastore_map") or payload.get("disk_datastore_mappings"),
+        "nic_network_map": payload.get("nic_network_map") or payload.get("nic_network_mappings"),
         "force": force,
     }
 
@@ -7374,12 +7529,14 @@ def _resolve_restore_network_selection(
         # manifest's order, so a NIC's position here is its adapter's position
         # in vm_config.network_adapters -- which is what the engine indexes.
         source_index = {str(item.get("id") or ""): (position, item) for position, item in enumerate(source_nics)}
+        requested_targets: dict[str, str] = {}
         for entry in mappings:
             source_nic_id = str(entry.get("source_nic_id") or "").strip()
             target_network_id = str(entry.get("target_network_id") or "").strip()
             if not source_nic_id and not target_network_id:
                 continue
             _ensure(bool(source_nic_id and target_network_id), 422, "invalid_restore", "Each network mapping requires source_nic_id and target_network_id")
+            _collect_restore_mapping(requested_targets, source_nic_id, target_network_id, flag="--nic-network")
             position, source_nic = source_index.get(source_nic_id) or (None, None)
             _ensure(source_nic is not None, 404, "network_adapter_not_found", "Source network adapter not found", source_nic_id=source_nic_id)
             source_network = str(source_nic.get("source_network") or "").strip()
@@ -7403,10 +7560,23 @@ def _resolve_restore_network_selection(
                 "source_network": source_network,
                 "target_network": target_network_name,
             }
+        for position, item in enumerate(source_nics):
+            if position in adapter_targets:
+                continue
+            source_network = str(item.get("source_network") or "").strip()
+            if not source_network or source_network not in target_network_names:
+                continue
+            adapter_targets[position] = {
+                "index": position,
+                "label": item.get("label"),
+                "source_network": source_network,
+                "target_network": source_network,
+            }
+            resolved.setdefault(source_network, source_network)
         missing = [
             str(item.get("label") or item.get("id") or "network adapter")
-            for item in source_nics
-            if str(item.get("source_network") or "").strip() and str(item.get("source_network") or "").strip() not in resolved
+            for position, item in enumerate(source_nics)
+            if str(item.get("source_network") or "").strip() and position not in adapter_targets
         ]
         _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for all source adapters", adapters=missing)
         return resolved, [adapter_targets[position] for position in sorted(adapter_targets)]
@@ -7435,6 +7605,14 @@ def _resolve_restore_network_selection(
                     host=(host or {}).get("name"),
                     network=target_network_name,
                 )
+        legacy = {
+            **{
+                source_network: source_network
+                for source_network in source_networks
+                if source_network not in legacy and source_network in target_network_names
+            },
+            **legacy,
+        }
         missing = [source_network for source_network in source_networks if source_network not in legacy]
         _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for all source adapters", networks=missing)
         return legacy, []
@@ -7481,7 +7659,7 @@ def _parse_restore_network_map(value: Any) -> dict[str, str]:
             "Each --network-map value must use the form <source>=<target> or <source>:<target>",
             value=text,
         )
-        mappings[source_name] = target_name
+        _collect_restore_mapping(mappings, source_name, target_name, flag="--network-map")
     return mappings
 
 
@@ -7525,7 +7703,7 @@ def _parse_restore_datastore_map(value: Any) -> dict[str, str]:
             "invalid_restore",
             "Each datastore mapping requires a source datastore and a target datastore",
         )
-        mappings[source_name] = target_name
+        _collect_restore_mapping(mappings, source_name, target_name, flag="--datastore-map")
     return mappings
 
 
@@ -7970,13 +8148,21 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         requested=request.get("datastore_map"),
         restore_mode=restore_mode,
     )
+    disk_targets, disk_target_datastores = _resolve_restore_disk_placement(
+        source_vm,
+        inventory_id=str(target_inventory["id"]),
+        host=host,
+        requested=request.get("disk_datastore_map"),
+        restore_mode=restore_mode,
+    )
+    disk_target_by_index = {int(item["index"]): str(item["target_datastore"]) for item in disk_targets}
     disk_provisioning = str(request.get("disk_provisioning") or "").strip() or None
-    for target_name, target_datastore in placement_datastores.items():
+    for target_name, target_datastore in {**placement_datastores, **disk_target_datastores}.items():
         landing = [
             disk
-            for disk in (source_vm.get("disks") or [])
+            for position, disk in enumerate(source_vm.get("disks") or [], start=1)
             if isinstance(disk, dict)
-            and datastore_placement.get(_source_disk_datastore(disk), target_datastore_name) == target_name
+            and _restore_disk_target_name(disk, position, disk_target_by_index, datastore_placement, target_datastore_name) == target_name
         ]
         if landing:
             _ensure_restore_target_capacity(landing, target_datastore, restore_mode, disk_provisioning)
@@ -8006,11 +8192,20 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             vm_name=target_vm_name,
         )
 
+    requested_network_mappings = [
+        *(request.get("network_mappings") if isinstance(request.get("network_mappings"), list) else []),
+        *_resolve_restore_nic_network_mappings(
+            source_vm,
+            inventory_id=str(target_inventory["id"]),
+            host=host,
+            requested=request.get("nic_network_map"),
+        ),
+    ]
     network_map, network_adapter_map = _resolve_restore_network_selection(
         point=point,
         manifest=manifest,
         target_inventory_id=str(target_inventory["id"]),
-        mappings=request.get("network_mappings") if isinstance(request.get("network_mappings"), list) else [],
+        mappings=requested_network_mappings,
         legacy_network_map=request.get("legacy_network_map"),
         host=host,
     )
@@ -8063,6 +8258,7 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             "target_datastore_id": resolved_target_datastore_id,
             "target_datastore_name": target_datastore_name,
             "datastore_map": datastore_placement or None,
+            "disk_datastore_map": disk_targets or None,
             "target_vm_name": target_vm_name,
             # The VM the restore point was taken from -- kept alongside the
             # target so a restore session can name both ends (see

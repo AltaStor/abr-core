@@ -52,8 +52,9 @@ class RestoreCommands:
             "context",
             help="Show what a restore point can be mapped to.",
             description=(
-                "List the source datastores and networks a restore point carries, with the target\n"
-                "each one falls back to. These are the names --datastore-map and --network-map take.\n\n"
+                "List the disks, adapters, source datastores and networks a restore point carries, with\n"
+                "the target each one falls back to. These are the names --disk-datastore, --nic-network,\n"
+                "--datastore-map and --network-map take.\n\n"
                 "Examples:\n"
                 "  abr restore context --restore-point <point-id>\n"
                 "  abr restore context --restore-point <point-id> --output json"
@@ -89,6 +90,26 @@ class RestoreCommands:
         start.add_argument("--target-datastore", help="Target datastore name (legacy alias)")
         start.add_argument("--network-map", action="append", default=[], help="Network mapping source=destination. Repeat as needed.")
         start.add_argument("--datastore-map", dest="datastore_map", action="append", default=[], help="Datastore mapping source=destination for disks that must not land on --datastore. Repeat as needed.")
+        start.add_argument(
+            "--disk-datastore",
+            dest="disk_datastore",
+            action="append",
+            default=[],
+            help=(
+                'Per-disk placement disk=destination, where disk is the disk ID or label that restore context lists '
+                '(for example "Hard disk 2=fast-ssd"). Wins over --datastore-map, which wins over --datastore. Repeat as needed.'
+            ),
+        )
+        start.add_argument(
+            "--nic-network",
+            dest="nic_network",
+            action="append",
+            default=[],
+            help=(
+                'Per-adapter placement adapter=destination, where adapter is the adapter ID or label that restore '
+                'context lists. Sends two adapters on one source network to different targets. Repeat as needed.'
+            ),
+        )
         start.add_argument("--repo", help="Repository name for backup-copy restore")
         start.add_argument("--repo-id", help="Repository ID for backup-copy restore")
         start.add_argument("--power-on", action="store_true", help="Power on after restore")
@@ -212,6 +233,23 @@ class RestoreCommands:
                     "target": datastore_names.get(str(mapping.get("target_datastore_id") or ""), ""),
                 }
             )
+        default_datastore = datastore_names.get(str(defaults.get("target_datastore_id") or ""), "")
+        datastore_targets = {
+            str(mapping.get("source_datastore") or ""): datastore_names.get(str(mapping.get("target_datastore_id") or ""), "")
+            for mapping in defaults.get("datastore_mappings", [])
+            if isinstance(mapping, dict)
+        }
+        for disk in source_vm.get("disks", []):
+            if not isinstance(disk, dict):
+                continue
+            source_datastore = str((disk.get("datastore_path") or "").partition("]")[0]).lstrip("[").strip()
+            rows.append(
+                {
+                    "kind": "disk",
+                    "source": str(disk.get("label") or disk.get("id") or ""),
+                    "target": datastore_targets.get(source_datastore) or default_datastore,
+                }
+            )
         nics = {str(nic.get("id") or ""): nic for nic in source_vm.get("nics", []) if isinstance(nic, dict)}
         for mapping in defaults.get("network_mappings", []):
             if not isinstance(mapping, dict):
@@ -221,6 +259,19 @@ class RestoreCommands:
                 {
                     "kind": "network",
                     "source": str(nic.get("source_network") or ""),
+                    "target": network_names.get(str(mapping.get("target_network_id") or ""), ""),
+                }
+            )
+        for mapping in defaults.get("network_mappings", []):
+            if not isinstance(mapping, dict):
+                continue
+            nic = nics.get(str(mapping.get("source_nic_id") or "")) or {}
+            if not nic:
+                continue
+            rows.append(
+                {
+                    "kind": "adapter",
+                    "source": str(nic.get("label") or nic.get("id") or ""),
                     "target": network_names.get(str(mapping.get("target_network_id") or ""), ""),
                 }
             )

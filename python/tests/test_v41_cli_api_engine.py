@@ -3078,7 +3078,7 @@ class AbrV41EngineTests(unittest.TestCase):
         task = TASKS[session["id"]]
         self.assertEqual(task["parameters"]["network_map"], {"VM Network": "Recovery Network"})
 
-    def test_restore_start_rejects_a_legacy_network_map_that_leaves_a_nic_unmapped(self) -> None:
+    def test_restore_start_keeps_the_same_name_match_for_a_nic_a_legacy_map_leaves_out(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             inventory = abr_v41.create_inventory_record(
                 {"name": "vc-legacy-partial", "type": "vsphere", "address": "192.168.12.39", "username": "root", "password": "secret"}
@@ -3124,21 +3124,23 @@ class AbrV41EngineTests(unittest.TestCase):
                 }
             )
 
-            with self.assertRaises(ApiError) as ctx:
-                abr_v41.restore_start(
-                    {
-                        "restore_point_id": "p-legacy-partial",
-                        "target": {
-                            "inventory_id": inventory["id"],
-                            "host_id": "esx-01.local",
-                            "datastore_id": f"{inventory['id']}::datastore::tstds",
-                            "vm_name": "restoredtstvm",
-                        },
-                        "network_map": ["VM Network:Recovery Network"],
-                    }
-                )
+            session = abr_v41.restore_start(
+                {
+                    "restore_point_id": "p-legacy-partial",
+                    "target": {
+                        "inventory_id": inventory["id"],
+                        "host_id": "esx-01.local",
+                        "datastore_id": f"{inventory['id']}::datastore::tstds",
+                        "vm_name": "restoredtstvm",
+                    },
+                    "network_map": ["VM Network:Recovery Network"],
+                }
+            )
 
-        self.assertEqual(ctx.exception.code, "invalid_restore")
+            self.assertEqual(
+                TASKS[session["id"]]["parameters"]["network_map"],
+                {"VM Network": "Recovery Network", "DMZ": "DMZ"},
+            )
 
     def _two_host_network_inventory(self, point_id: str, tmpdir: str, *, source_host: str) -> dict[str, object]:
         """Inventory with two hosts whose virtual switches differ, plus a restore
@@ -3309,6 +3311,153 @@ class AbrV41EngineTests(unittest.TestCase):
             [(item["index"], item["source_network"], item["target_network"]) for item in adapter_map],
             [(0, "VM Network", "VM Network"), (1, "VM Network", "BMC_Network")],
         )
+
+    def test_restore_start_takes_per_adapter_targets_from_adapter_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._two_host_network_inventory("p-nic-flag", tmpdir, source_host="esx-02.local")
+            manifest_path = f"{tmpdir}/manifest.json"
+            with open(manifest_path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            for adapter in manifest["vm_config"]["network_adapters"]:
+                adapter["network"] = "VM Network"
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+
+            session = abr_v41.restore_start(
+                {
+                    "restore_point_id": "p-nic-flag",
+                    "target": {
+                        "inventory_id": inventory["id"],
+                        "host_id": "esx-02.local",
+                        "datastore_id": f"{inventory['id']}::datastore::tstds",
+                        "vm_name": "restoredtstvm",
+                    },
+                    "nic_network_map": ["Network adapter 1=VM Network", "Network adapter 2=BMC_Network"],
+                }
+            )
+
+        adapter_map = TASKS[session["id"]]["parameters"]["network_adapter_map"]
+        self.assertEqual(
+            [(item["index"], item["source_network"], item["target_network"]) for item in adapter_map],
+            [(0, "VM Network", "VM Network"), (1, "VM Network", "BMC_Network")],
+        )
+
+    def _two_disk_one_datastore_point(self, point_id: str, tmpdir: str) -> dict[str, object]:
+        inventory = abr_v41.create_inventory_record(
+            {"name": f"vc-disks-{point_id}", "type": "vsphere", "address": "192.168.13.52", "username": "root", "password": "secret"}
+        )
+        RESOURCES_BY_HV[inventory["id"]][("host", "esx-01.local")] = {
+            "resource_type": "host",
+            "external_id": "esx-01.local",
+            "name": "esx-01.local",
+            "payload": {"datastores": ["tstds", "fastds"], "networks": ["VM Network"]},
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        manifest_path = f"{tmpdir}/manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "vm_name": "tstvm",
+                    "vm_external_id": "vm-1",
+                    "vm_config": {
+                        "name": "tstvm",
+                        "source_host": "esx-01.local",
+                        "network_adapters": [{"label": "Network adapter 1", "network": "VM Network", "connected": True}],
+                    },
+                    "disks": [
+                        {"disk_label": "Hard disk 1", "capacity_gb": 40, "datastore_path": "[tstds] tstvm/tstvm.vmdk"},
+                        {"disk_label": "Hard disk 2", "capacity_gb": 60, "datastore_path": "[tstds] tstvm/tstvm_1.vmdk"},
+                    ],
+                },
+                handle,
+            )
+        BACKUPS[point_id] = abr_v41.normalize_backup_point(
+            {
+                "id": point_id,
+                "chain_id": f"backup-{point_id}",
+                "vm_id": "vm-1",
+                "vm_name": "tstvm",
+                "inventory_id": inventory["id"],
+                "inventory_name": inventory["name"],
+                "repository_id": "repo-1",
+                "repository_name": "Repo",
+                "execution_type": "ActiveFull",
+                "status": "available",
+                "artifact": {"manifest_path": manifest_path, "backup_root": tmpdir},
+                "placements": [{"repository_id": "repo-1", "repository_name": "Repo", "manifest_path": manifest_path, "backup_root": tmpdir}],
+            }
+        )
+        return inventory
+
+    def test_restore_start_sends_one_disk_of_a_shared_datastore_elsewhere(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._two_disk_one_datastore_point("p-disk-split", tmpdir)
+
+            session = abr_v41.restore_start(
+                {
+                    "restore_point_id": "p-disk-split",
+                    "target": {
+                        "inventory_id": inventory["id"],
+                        "host_id": "esx-01.local",
+                        "datastore_id": f"{inventory['id']}::datastore::tstds",
+                        "vm_name": "restoredtstvm",
+                    },
+                    "disk_datastore_map": ["Hard disk 2=fastds"],
+                }
+            )
+
+        parameters = TASKS[session["id"]]["parameters"]
+        self.assertEqual(
+            [(item["index"], item["label"], item["target_datastore"]) for item in parameters["disk_datastore_map"]],
+            [(2, "Hard disk 2", "fastds")],
+        )
+        self.assertEqual(parameters["target_datastore_name"], "tstds")
+
+    def test_restore_start_lets_a_disk_override_beat_the_datastore_map(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._two_disk_one_datastore_point("p-disk-precedence", tmpdir)
+
+            session = abr_v41.restore_start(
+                {
+                    "restore_point_id": "p-disk-precedence",
+                    "target": {
+                        "inventory_id": inventory["id"],
+                        "host_id": "esx-01.local",
+                        "datastore_id": f"{inventory['id']}::datastore::tstds",
+                        "vm_name": "restoredtstvm",
+                    },
+                    "datastore_map": ["tstds=fastds"],
+                    "disk_datastore_map": ["Hard disk 1=tstds"],
+                }
+            )
+
+        parameters = TASKS[session["id"]]["parameters"]
+        self.assertEqual(parameters["datastore_map"], {"tstds": "fastds"})
+        self.assertEqual(
+            [(item["index"], item["target_datastore"]) for item in parameters["disk_datastore_map"]],
+            [(1, "tstds")],
+        )
+
+    def test_restore_start_refuses_a_disk_the_point_does_not_carry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._two_disk_one_datastore_point("p-disk-unknown", tmpdir)
+
+            with self.assertRaises(ApiError) as ctx:
+                abr_v41.restore_start(
+                    {
+                        "restore_point_id": "p-disk-unknown",
+                        "target": {
+                            "inventory_id": inventory["id"],
+                            "host_id": "esx-01.local",
+                            "datastore_id": f"{inventory['id']}::datastore::tstds",
+                            "vm_name": "restoredtstvm",
+                        },
+                        "disk_datastore_map": ["Hard disk 7=fastds"],
+                    }
+                )
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("does not carry", ctx.exception.message)
 
     def test_restore_start_sends_no_adapter_map_for_a_legacy_name_map(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

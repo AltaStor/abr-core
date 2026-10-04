@@ -127,6 +127,144 @@ class RestoreDatastoreCapacityTests(unittest.TestCase):
         self.assertIsNotNone(error.exception.details["required_bytes"])
 
 
+class RestoreMappingConflictTests(unittest.TestCase):
+    def test_a_datastore_mapped_twice_to_the_same_target_is_accepted(self) -> None:
+        self.assertEqual(abr_v41._parse_restore_datastore_map(["ssd=sata", "ssd=sata"]), {"ssd": "sata"})
+
+    def test_a_datastore_mapped_twice_to_different_targets_is_refused(self) -> None:
+        with self.assertRaises(ApiError) as error:
+            abr_v41._parse_restore_datastore_map(["ssd=sata", "ssd=nvme"])
+        self.assertIn("--datastore-map", error.exception.message)
+        self.assertIn("different targets", error.exception.message)
+
+    def test_a_network_mapped_twice_to_different_targets_is_refused(self) -> None:
+        with self.assertRaises(ApiError) as error:
+            abr_v41._parse_restore_network_map(["VM Network=DMZ", "VM Network=Storage"])
+        self.assertIn("--network-map", error.exception.message)
+
+    def test_the_same_source_in_different_letter_case_still_conflicts(self) -> None:
+        with self.assertRaises(ApiError):
+            abr_v41._parse_restore_datastore_map(["ssd=sata", "SSD=nvme"])
+
+
+class RestoreDiskPlacementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.source_vm = {
+            "name": "vm-1",
+            "disks": [
+                dict(_disk("disk-1", "ssd-fast"), label="Hard disk 1"),
+                dict(_disk("disk-2", "ssd-fast"), label="Hard disk 2"),
+            ],
+        }
+        self.host = {"name": "host-1", "external_id": "host-1"}
+
+    def _resolve(self, requested, restore_mode="new_vm"):
+        with patch.object(abr_v41, "_resolve_restore_target_datastore", side_effect=lambda _i, name, host: _datastore(name)):
+            return abr_v41._resolve_restore_disk_placement(
+                self.source_vm,
+                inventory_id="inv",
+                host=self.host,
+                requested=requested,
+                restore_mode=restore_mode,
+            )
+
+    def test_without_an_override_nothing_is_placed_per_disk(self) -> None:
+        self.assertEqual(self._resolve(None), ([], {}))
+
+    def test_a_disk_label_places_only_that_disk(self) -> None:
+        targets, resolved = self._resolve(["Hard disk 2=nvme"])
+        self.assertEqual(targets, [{"index": 2, "disk_id": "disk-2", "label": "Hard disk 2", "target_datastore": "nvme"}])
+        self.assertEqual(list(resolved), ["nvme"])
+
+    def test_a_disk_id_places_the_same_disk(self) -> None:
+        targets, _resolved = self._resolve(["disk-2=nvme"])
+        self.assertEqual([item["index"] for item in targets], [2])
+
+    def test_the_web_ui_object_form_is_accepted(self) -> None:
+        targets, _resolved = self._resolve([{"source_disk": "Hard disk 1", "target_datastore": "nvme"}])
+        self.assertEqual([item["index"] for item in targets], [1])
+
+    def test_a_disk_the_restore_point_does_not_carry_is_refused(self) -> None:
+        with self.assertRaises(ApiError) as error:
+            self._resolve(["Hard disk 9=nvme"])
+        self.assertEqual(error.exception.status_code, 422)
+        self.assertIn("does not carry", error.exception.message)
+
+    def test_in_place_refuses_a_disk_placement(self) -> None:
+        with self.assertRaises(ApiError) as error:
+            self._resolve(["Hard disk 2=nvme"], restore_mode="in_place")
+        self.assertEqual(error.exception.status_code, 422)
+
+    def test_a_disk_placed_twice_to_different_targets_is_refused(self) -> None:
+        with self.assertRaises(ApiError) as error:
+            self._resolve(["Hard disk 2=nvme", "Hard disk 2=sata"])
+        self.assertIn("--disk-datastore", error.exception.message)
+
+    def test_a_disk_override_wins_over_the_datastore_map(self) -> None:
+        disks = self.source_vm["disks"]
+        placement = {"ssd-fast": "sata-restore"}
+        self.assertEqual(
+            abr_v41._restore_disk_target_name(disks[0], 1, {2: "nvme"}, placement, "restore-target"),
+            "sata-restore",
+        )
+        self.assertEqual(
+            abr_v41._restore_disk_target_name(disks[1], 2, {2: "nvme"}, placement, "restore-target"),
+            "nvme",
+        )
+
+    def test_without_either_the_default_datastore_is_used(self) -> None:
+        self.assertEqual(
+            abr_v41._restore_disk_target_name(self.source_vm["disks"][0], 1, {}, {}, "restore-target"),
+            "restore-target",
+        )
+
+
+class RestoreNicNetworkPlacementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.source_vm = {
+            "nics": [
+                {"id": "nic-1", "label": "Network adapter 1", "source_network": "VM Network"},
+                {"id": "nic-2", "label": "Network adapter 2", "source_network": "VM Network"},
+            ]
+        }
+        self.host = {"name": "host-1", "external_id": "host-1"}
+
+    def _resolve(self, requested):
+        with patch.object(
+            abr_v41,
+            "_resolve_restore_target_network",
+            side_effect=lambda _i, name, source_networks, host: {"id": f"inv::network::{name}", "name": name},
+        ):
+            return abr_v41._resolve_restore_nic_network_mappings(
+                self.source_vm, inventory_id="inv", host=self.host, requested=requested
+            )
+
+    def test_without_an_override_nothing_is_mapped(self) -> None:
+        self.assertEqual(self._resolve(None), [])
+
+    def test_two_adapters_on_one_source_network_reach_different_targets(self) -> None:
+        self.assertEqual(
+            self._resolve(["Network adapter 1=DMZ", "Network adapter 2=Storage"]),
+            [
+                {"source_nic_id": "nic-1", "target_network_id": "inv::network::DMZ"},
+                {"source_nic_id": "nic-2", "target_network_id": "inv::network::Storage"},
+            ],
+        )
+
+    def test_an_adapter_id_names_the_same_adapter(self) -> None:
+        self.assertEqual(self._resolve(["nic-2=DMZ"]), [{"source_nic_id": "nic-2", "target_network_id": "inv::network::DMZ"}])
+
+    def test_an_adapter_the_restore_point_does_not_carry_is_refused(self) -> None:
+        with self.assertRaises(ApiError) as error:
+            self._resolve(["Network adapter 9=DMZ"])
+        self.assertEqual(error.exception.code, "network_adapter_not_found")
+
+    def test_an_adapter_placed_twice_to_different_targets_is_refused(self) -> None:
+        with self.assertRaises(ApiError) as error:
+            self._resolve(["nic-1=DMZ", "nic-1=Storage"])
+        self.assertIn("--nic-network", error.exception.message)
+
+
 class RestoreDiskLayoutTests(unittest.TestCase):
     def setUp(self) -> None:
         self.entries = [
@@ -141,6 +279,16 @@ class RestoreDiskLayoutTests(unittest.TestCase):
     def test_a_mapped_disk_carries_its_own_datastore(self) -> None:
         layout = vcenter_restore._build_disk_layout(self.entries, {"sata-bulk": "sata-restore"}, "restore-target")
         self.assertEqual([item["datastore_name"] for item in layout], ["restore-target", "sata-restore"])
+
+    def test_a_per_disk_target_wins_over_the_datastore_map(self) -> None:
+        layout = vcenter_restore._build_disk_layout(
+            self.entries, {"sata-bulk": "sata-restore"}, "restore-target", disk_targets={1: "nvme"}
+        )
+        self.assertEqual([item["datastore_name"] for item in layout], ["nvme", "sata-restore"])
+
+    def test_a_per_disk_target_applies_without_any_datastore_map(self) -> None:
+        layout = vcenter_restore._build_disk_layout(self.entries, {}, "restore-target", disk_targets={2: "nvme"})
+        self.assertEqual([item["datastore_name"] for item in layout], ["restore-target", "nvme"])
 
     def test_a_disk_without_a_readable_source_path_falls_back_to_the_default(self) -> None:
         name = vcenter_restore._disk_target_datastore_name(
