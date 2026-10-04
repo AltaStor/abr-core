@@ -3839,12 +3839,29 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "next_run_at": _earliest_next_run(normalized),
         "next_incremental_run_at": normalized.get("next_incremental_run_at"),
         "last_run_at": normalized.get("last_run_at"),
+        "clock_anomalies": job_clock_anomalies(normalized),
         "last_session_id": normalized.get("last_session_id"),
         "active_sessions": active_sessions,
         "active_session_count": len(active_sessions),
         "can_delete": not active_sessions,
         "delete_disabled_reason": "Job has queued or running sessions" if active_sessions else None,
     }
+
+
+def job_clock_anomalies(job: dict[str, Any]) -> list[dict[str, Any]]:
+    now = _now_utc()
+    anomalies: list[dict[str, Any]] = []
+    raw_last_run = str(job.get("last_run_at") or "")
+    last_run = _parse_dt(raw_last_run) if raw_last_run else None
+    if last_run is not None and last_run - now > CLOCK_SKEW_TOLERANCE:
+        anomalies.append(
+            {
+                "kind": "last_run_ahead_of_server_clock",
+                "last_run_at": raw_last_run,
+                "server_time": now.isoformat(),
+            }
+        )
+    return anomalies
 
 
 def list_jobs() -> list[dict[str, Any]]:
