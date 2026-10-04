@@ -937,7 +937,9 @@ def schedule_next_run(schedule: dict[str, Any], *, after: datetime) -> datetime:
             candidate_date = local_after.date() + timedelta(days=offset)
             if candidate_date.weekday() not in wanted:
                 continue
-            candidate = datetime.combine(candidate_date, time(hour=hour, minute=minute), tzinfo=local_after.tzinfo)
+            candidate = datetime.combine(
+                candidate_date, time(hour=hour, minute=minute, fold=local_after.fold), tzinfo=local_after.tzinfo
+            )
             if candidate > local_after:
                 return candidate.astimezone(timezone.utc)
         raise api_error(422, "invalid_schedule", "Unable to compute next weekly run")
@@ -953,7 +955,9 @@ def schedule_next_run(schedule: dict[str, Any], *, after: datetime) -> datetime:
         for _ in range(0, 14):
             last_day = calendar.monthrange(year, month)[1]
             candidate_day = min(day_of_month, last_day)
-            candidate = datetime(year, month, candidate_day, hour, minute, tzinfo=local_after.tzinfo)
+            candidate = datetime(
+                year, month, candidate_day, hour, minute, tzinfo=local_after.tzinfo, fold=local_after.fold
+            )
             if candidate > local_after:
                 return candidate.astimezone(timezone.utc)
             month += 1
@@ -979,7 +983,7 @@ def schedule_next_run(schedule: dict[str, Any], *, after: datetime) -> datetime:
             _cron_field_values(expression.split()[3], minimum=1, maximum=12),
             _cron_field_values(expression.split()[4], minimum=0, maximum=6, names=CRON_WEEKDAY_NAMES),
         )
-        probe = local_after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        probe = (local_after.replace(second=0, microsecond=0) + timedelta(minutes=1)).replace(fold=local_after.fold)
         limit = probe + timedelta(days=366)
         while probe <= limit:
             cron_weekday = (probe.weekday() + 1) % 7
@@ -991,7 +995,7 @@ def schedule_next_run(schedule: dict[str, Any], *, after: datetime) -> datetime:
                 and cron_weekday in weekday_values
             ):
                 return probe.astimezone(timezone.utc)
-            probe += timedelta(minutes=1)
+            probe = (probe + timedelta(minutes=1)).replace(fold=local_after.fold)
         raise api_error(422, "invalid_schedule", "Unable to compute next cron run", schedule=expression)
     raise api_error(422, "invalid_schedule", "Unsupported schedule kind", kind=kind)
 
