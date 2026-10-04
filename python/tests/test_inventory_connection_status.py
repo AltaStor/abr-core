@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -15,18 +16,18 @@ from python.srv.services.inventory_management import (
 )
 
 
-HYPERV_HOST = "192.0.2.10"
-HYPERV_CLUSTER_HOST = "192.0.2.11"
-HYPERV_USERNAME = "EXAMPLE\\Administrator"
-HYPERV_PASSWORD = "test-password"
-HYPERV_NODE_A = "node-a"
-HYPERV_NODE_B = "node-b"
-HYPERV_CLUSTER_NAME = "node-cluster"
-HYPERV_DNS_SUFFIX = "example.test"
-HYPERV_SECOND_HOST = "192.0.2.12"
-VCENTER_HOST = "192.0.2.20"
-VCENTER_USERNAME = "administrator@vsphere.local"
-VCENTER_PASSWORD = "test-password"
+HYPERV_HOST = os.getenv("ABR_TEST_HYPERV_HOST", "192.0.2.10")
+HYPERV_CLUSTER_HOST = os.getenv("ABR_TEST_HYPERV_CLUSTER_HOST", "192.0.2.11")
+HYPERV_USERNAME = os.getenv("ABR_TEST_HYPERV_USERNAME", "EXAMPLE\\Administrator")
+HYPERV_PASSWORD = os.getenv("ABR_TEST_HYPERV_PASSWORD", "test-password")
+HYPERV_NODE_A = os.getenv("ABR_TEST_HYPERV_NODE_A", "node-a")
+HYPERV_NODE_B = os.getenv("ABR_TEST_HYPERV_NODE_B", "node-b")
+HYPERV_CLUSTER_NAME = os.getenv("ABR_TEST_HYPERV_CLUSTER_NAME", "node-cluster")
+HYPERV_DNS_SUFFIX = os.getenv("ABR_TEST_HYPERV_DNS_SUFFIX", "example.test")
+HYPERV_SECOND_HOST = os.getenv("ABR_TEST_HYPERV_SECOND_HOST", "192.0.2.12")
+VCENTER_HOST = os.getenv("ABR_TEST_VCENTER_HOST", "192.0.2.20")
+VCENTER_USERNAME = os.getenv("ABR_TEST_VCENTER_USERNAME", "administrator@vsphere.local")
+VCENTER_PASSWORD = os.getenv("ABR_TEST_VCENTER_PASSWORD", "test-password")
 
 CLUSTER_IDENTITY = {
     "computer": HYPERV_NODE_A.upper(),

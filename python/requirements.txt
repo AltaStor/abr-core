@@ -2,6 +2,7 @@ fastapi
 httpx
 pydantic
 pymongo
+pypsrp
 pyvmomi
 requests
 uvicorn

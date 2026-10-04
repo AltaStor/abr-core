@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -11,14 +12,14 @@ from python.srv.plugins.hyperv import HyperVNode
 from python.srv.services.discovery import build_hyperv_resources
 
 
-HYPERV_HOST = "192.0.2.10"
-HYPERV_CLUSTER_HOST = "192.0.2.11"
-HYPERV_USERNAME = "EXAMPLE\\Administrator"
-HYPERV_PASSWORD = "test-password"
-HYPERV_NODE_A = "node-a"
-HYPERV_NODE_B = "node-b"
-HYPERV_CLUSTER_NAME = "node-cluster"
-HYPERV_DNS_SUFFIX = "example.test"
+HYPERV_HOST = os.getenv("ABR_TEST_HYPERV_HOST", "192.0.2.10")
+HYPERV_CLUSTER_HOST = os.getenv("ABR_TEST_HYPERV_CLUSTER_HOST", "192.0.2.11")
+HYPERV_USERNAME = os.getenv("ABR_TEST_HYPERV_USERNAME", "EXAMPLE\\Administrator")
+HYPERV_PASSWORD = os.getenv("ABR_TEST_HYPERV_PASSWORD", "test-password")
+HYPERV_NODE_A = os.getenv("ABR_TEST_HYPERV_NODE_A", "node-a")
+HYPERV_NODE_B = os.getenv("ABR_TEST_HYPERV_NODE_B", "node-b")
+HYPERV_CLUSTER_NAME = os.getenv("ABR_TEST_HYPERV_CLUSTER_NAME", "node-cluster")
+HYPERV_DNS_SUFFIX = os.getenv("ABR_TEST_HYPERV_DNS_SUFFIX", "example.test")
 
 INVENTORY_RECORD = {
     "id": "inv-1",
