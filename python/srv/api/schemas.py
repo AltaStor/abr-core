@@ -732,6 +732,8 @@ class CreateJobRequest(_LenientModel):
     synthetic_full_days_csv: LaxStr | None = None
     active_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
     synthetic_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
+    active_full_enabled: LaxBool | None = None
+    synthetic_full_enabled: LaxBool | None = None
     description: LaxStr | None = None
     task_parameters: SkipValidation[TaskParametersRequest] | None = None
     backup_options: SkipValidation[TaskParametersRequest] | None = None
@@ -766,6 +768,8 @@ class UpdateJobRequest(_LenientModel):
     synthetic_full_days: list[Any] | LaxStr | None = None
     active_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
     synthetic_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
+    active_full_enabled: LaxBool | None = None
+    synthetic_full_enabled: LaxBool | None = None
     description: LaxStr | None = None
     task_parameters: SkipValidation[TaskParametersRequest] | None = None
     repo: LaxStr | None = None

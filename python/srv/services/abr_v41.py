@@ -3863,6 +3863,30 @@ def _execution_schedule_next_run(schedule: dict[str, Any] | None) -> str | None:
     return schedule_next_run(schedule, after=_now_utc()).isoformat()
 
 
+def _execution_schedule_state_key(schedule_key: str) -> str:
+    return schedule_key.removesuffix("_schedule") + "_enabled"
+
+
+def _requested_execution_schedule_state(payload: dict[str, Any], schedule_key: str) -> bool | None:
+    value = payload.get(_execution_schedule_state_key(schedule_key))
+    return None if value is None else bool(value)
+
+
+def _execution_schedule_with_state(
+    schedule: Any,
+    state: bool | None,
+    legacy_days: Any,
+    base_schedule: Any,
+    created_at: Any,
+) -> Any:
+    if state is None:
+        return schedule
+    if isinstance(schedule, dict):
+        return dict(schedule, enabled=state)
+    derived = _schedule_from_legacy_days(_normalize_day_list(legacy_days), base_schedule, created_at)
+    return dict(derived, enabled=state) if isinstance(derived, dict) else schedule
+
+
 def _has_full_backup_schedule(schedule: Any, legacy_days: Any) -> bool:
     if isinstance(schedule, dict):
         return bool(schedule.get("enabled", True))
@@ -3905,6 +3929,21 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         active_full_days = []
     if "synthetic_full_schedule" in payload and not _schedule_weekdays(synthetic_full_schedule):
         synthetic_full_days = []
+    now = utc_now()
+    active_full_schedule = _execution_schedule_with_state(
+        active_full_schedule,
+        _requested_execution_schedule_state(payload, "active_full_schedule"),
+        active_full_days,
+        schedule,
+        now,
+    )
+    synthetic_full_schedule = _execution_schedule_with_state(
+        synthetic_full_schedule,
+        _requested_execution_schedule_state(payload, "synthetic_full_schedule"),
+        synthetic_full_days,
+        schedule,
+        now,
+    )
     base_is_enabled = isinstance(schedule, dict) and bool(schedule.get("enabled", True))
     job_enabled = bool(payload.get("enabled", True)) if not isinstance(schedule, dict) else base_is_enabled
     description = str(payload.get("description") or "").strip()
@@ -3949,7 +3988,6 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         )
         inventory = candidate_inventories[0]
     vm_ids, vm_names = _resolve_vm_selection(str(inventory["id"]), tokens, auto_discover=True)
-    now = utc_now()
     job = {
         "id": str(uuid4()),
         "name": name,
@@ -4074,6 +4112,8 @@ def _touches_full_backup_policy(payload: dict[str, Any]) -> bool:
             return True
         if payload.get(days_key) is not None:
             return True
+        if payload.get(_execution_schedule_state_key(schedule_key)) is not None:
+            return True
     return False
 
 
@@ -4163,6 +4203,22 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if retuned != updated.get(schedule_key):
             updated[schedule_key] = retuned
             updated[next_run_key] = _execution_schedule_next_run(retuned)
+        changed = True
+    for schedule_key, days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
+        state = _requested_execution_schedule_state(payload, schedule_key)
+        if state is None:
+            continue
+        schedule_value = _execution_schedule_with_state(
+            updated.get(schedule_key),
+            state,
+            updated.get(days_key),
+            updated.get("schedule"),
+            updated.get("created_at"),
+        )
+        if schedule_value == updated.get(schedule_key):
+            continue
+        updated[schedule_key] = schedule_value
+        updated[next_run_key] = _execution_schedule_next_run(schedule_value)
         changed = True
     if "description" in payload:
         description = str(payload.get("description") or "").strip()
