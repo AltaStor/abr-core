@@ -871,30 +871,31 @@ def run_vcenter_restore(
                 if is_virtual_center
                 else None
             )
-            created_vm = node.create_vm_shell(
-                vm_name=create_vm_name,
-                host_name=target_host_name,
-                datastore_name=target_datastore_name,
-                config_metadata=vm_config,
-                disk_layout=disk_layout,
-            )
-            logger.info(
-                "Created VM shell %s on host %s datastore %s with resulting firmware %s, "
-                "SCSI controller type %s, Secure Boot requested=%s",
-                create_vm_name,
-                target_host_name,
-                target_datastore_name,
-                created_vm.get("restored_firmware") or "unknown",
-                created_vm.get("requested_scsi_controller_type") or "unknown",
-                created_vm.get("requested_secure_boot"),
-            )
-            restored_network_adapters = _report_network_adapters(
-                progress_callback, created_vm.get("network_adapters"), target_host_name
-            )
+            created_vm: dict[str, Any] = {}
             original_destroyed = False
             original_identity: dict[str, str] = {}
             identity_preserved = False
             try:
+                created_vm = node.create_vm_shell(
+                    vm_name=create_vm_name,
+                    host_name=target_host_name,
+                    datastore_name=target_datastore_name,
+                    config_metadata=vm_config,
+                    disk_layout=disk_layout,
+                )
+                logger.info(
+                    "Created VM shell %s on host %s datastore %s with resulting firmware %s, "
+                    "SCSI controller type %s, Secure Boot requested=%s",
+                    create_vm_name,
+                    target_host_name,
+                    target_datastore_name,
+                    created_vm.get("restored_firmware") or "unknown",
+                    created_vm.get("requested_scsi_controller_type") or "unknown",
+                    created_vm.get("requested_secure_boot"),
+                )
+                restored_network_adapters = _report_network_adapters(
+                    progress_callback, created_vm.get("network_adapters"), target_host_name
+                )
                 thumbprint = node.get_thumbprint()
                 created_disk_paths = created_vm.get("disk_paths", [])
                 if not isinstance(created_disk_paths, list):

@@ -378,6 +378,124 @@ class JobPayloadBuilderTests(unittest.TestCase):
             {"type": "monthly", "day_of_month": 1, "time": "03:30", "enabled": False},
         )
 
+    def test_turning_a_periodic_schedule_off_by_its_weekdays_is_refused_with_the_way_to_do_it(self) -> None:
+        stored = {"synthetic_full_schedule": {"type": "periodic", "every": "12h", "enabled": True}}
+
+        with self.assertRaises(ValueError) as ctx:
+            JobService.build_execution_schedule_payloads(
+                self._schedule_args(synthetic_full_days=[]), stored
+            )
+
+        self.assertEqual(
+            str(ctx.exception),
+            "Periodic schedules do not accept --synthetic-full-days. "
+            "Pass --synthetic-full-schedule none to turn this schedule off",
+        )
+
+    def test_the_same_refusal_covers_a_daily_and_a_monthly_schedule(self) -> None:
+        for schedule_type, stored_schedule in (
+            ("Daily", {"type": "daily", "time": "02:00", "enabled": True}),
+            ("Monthly", {"type": "monthly", "day_of_month": 1, "time": "02:00", "enabled": True}),
+        ):
+            with self.subTest(schedule_type=schedule_type):
+                with self.assertRaises(ValueError) as ctx:
+                    JobService.build_execution_schedule_payloads(
+                        self._schedule_args(active_full_days=[]),
+                        {"active_full_schedule": stored_schedule},
+                    )
+
+                self.assertEqual(
+                    str(ctx.exception),
+                    f"{schedule_type} schedules do not accept --active-full-days. "
+                    "Pass --active-full-schedule none to turn this schedule off",
+                )
+
+    def test_clearing_the_weekdays_of_a_weekly_schedule_is_still_how_it_is_turned_off(self) -> None:
+        stored = {"synthetic_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:00", "enabled": True}}
+
+        payloads = JobService.build_execution_schedule_payloads(
+            self._schedule_args(synthetic_full_days=[]), stored
+        )
+
+        self.assertEqual(payloads, {})
+
+    def test_weekdays_nobody_can_use_are_ignored_when_that_slot_has_no_schedule(self) -> None:
+        payloads = JobService.build_execution_schedule_payloads(
+            self._schedule_args(active_full_days=[]), {"active_full_schedule": None}
+        )
+
+        self.assertEqual(payloads, {})
+
+    def test_switching_to_monthly_keeps_the_time_the_job_already_has(self) -> None:
+        stored = {"active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:30", "enabled": True}}
+
+        payloads = JobService.build_execution_schedule_payloads(
+            self._schedule_args(active_full_schedule="monthly", active_full_day_of_month=5), stored
+        )
+
+        self.assertEqual(
+            payloads["active_full_schedule"],
+            {"type": "monthly", "day_of_month": 5, "time": "03:30", "enabled": True},
+        )
+
+    def test_switching_to_daily_keeps_the_time_too(self) -> None:
+        stored = {"synthetic_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "04:45", "enabled": True}}
+
+        payloads = JobService.build_execution_schedule_payloads(
+            self._schedule_args(synthetic_full_schedule="daily"), stored
+        )
+
+        self.assertEqual(
+            payloads["synthetic_full_schedule"],
+            {"type": "daily", "time": "04:45", "enabled": True},
+        )
+
+    def test_a_time_given_with_the_switch_wins_over_the_stored_one(self) -> None:
+        stored = {"active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "03:30", "enabled": True}}
+
+        payloads = JobService.build_execution_schedule_payloads(
+            self._schedule_args(
+                active_full_schedule="monthly", active_full_day_of_month=5, active_full_time="23:15"
+            ),
+            stored,
+        )
+
+        self.assertEqual(payloads["active_full_schedule"]["time"], "23:15")
+
+    def test_a_switch_with_no_time_to_inherit_still_asks_for_one(self) -> None:
+        stored = {"synthetic_full_schedule": {"type": "periodic", "every": "12h", "enabled": True}}
+
+        with self.assertRaises(ValueError) as ctx:
+            JobService.build_execution_schedule_payloads(
+                self._schedule_args(synthetic_full_schedule="weekly", synthetic_full_days=["Sun"]), stored
+            )
+
+        self.assertEqual(str(ctx.exception), "Weekly schedules require --synthetic-full-time")
+
+    def test_a_schedule_that_was_paused_stays_paused_when_its_type_changes(self) -> None:
+        stored = {"active_full_schedule": {"type": "daily", "time": "04:45", "enabled": False}}
+
+        payloads = JobService.build_execution_schedule_payloads(
+            self._schedule_args(active_full_schedule="weekly", active_full_days=["Sun"]), stored
+        )
+
+        self.assertEqual(
+            payloads["active_full_schedule"],
+            {"type": "weekly", "days": ["Sun"], "time": "04:45", "enabled": False},
+        )
+
+    def test_a_paused_schedule_still_starts_when_the_edit_asks_for_it(self) -> None:
+        stored = {"active_full_schedule": {"type": "daily", "time": "04:45", "enabled": False}}
+
+        payloads = JobService.build_execution_schedule_payloads(
+            self._schedule_args(
+                active_full_schedule="weekly", active_full_days=["Sun"], active_full_enabled=True
+            ),
+            stored,
+        )
+
+        self.assertTrue(payloads["active_full_schedule"]["enabled"])
+
     def test_create_backup_job_payload_supports_multiple_vms_and_daily_schedule(self) -> None:
         args = SimpleNamespace(
             name="Production VMs",

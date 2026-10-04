@@ -16,7 +16,7 @@ from python.srv.backup_server import SERVER_API_MAJOR, SERVER_API_MINOR, app
 from python.srv.core.mongo_db_wrapper import SESSIONS, USERS
 from python.srv.core.tls_bootstrap import ensure_self_signed_cert
 from python.srv.services import auth_service, tls_certificate_service
-from python.srv.services.abr_v41 import PRODUCT_NAME, PRODUCT_VERSION
+from python.srv.services.abr_v41 import PRODUCT_NAME, product_version
 
 from .test_tls_certificate_service import BOOTSTRAP_ENV, _key_pem, _Pki
 
@@ -229,10 +229,10 @@ class OpenApiContractTests(unittest.TestCase):
 
     def test_info_names_the_product_and_the_build(self) -> None:
         info = self.spec["info"]
-        self.assertEqual(info["version"], PRODUCT_VERSION)
+        self.assertEqual(info["version"], product_version())
         self.assertEqual(info["title"], PRODUCT_NAME)
         self.assertIn(PRODUCT_NAME, info["description"])
-        self.assertIn(PRODUCT_VERSION, info["description"])
+        self.assertIn(product_version(), info["description"])
         self.assertIn(f"/api/v{SERVER_API_MAJOR}", info["description"])
         self.assertIn(f"v{SERVER_API_MAJOR}.{SERVER_API_MINOR}", info["description"])
         self.assertNotIn("Mock", info["description"])

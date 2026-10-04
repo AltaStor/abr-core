@@ -921,6 +921,154 @@ class TaskExecutorTests(unittest.TestCase):
             f"expected a 'Removing snapshot' log entry, got: {messages}",
         )
 
+    def _register_vcenter_hypervisor(self) -> None:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+
+    def _run_backup(self, task_id: str, progress_callback) -> dict[str, object]:
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": task_id,
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "destination_dir": temp_dir,
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                return FakeCompletedProcess(returncode=0, stdout="ok")
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
+                    return run_task(task, progress_callback=progress_callback)
+
+    def test_a_backup_puts_its_snapshot_name_on_the_task_and_takes_it_off_again(self) -> None:
+        self._register_vcenter_hypervisor()
+        updates: list[dict[str, object]] = []
+
+        result = self._run_backup("task-snapshot-record", updates.append)
+
+        self.assertEqual(result["status"], "completed")
+        recorded = [update for update in updates if "backup_snapshot" in update]
+        self.assertEqual(
+            [update["backup_snapshot"] for update in recorded],
+            [{"vm_name": "demo-vm", "name": "demo-vm-snapshot"}, None],
+        )
+        self.assertTrue(all(update.get("log_entry") is False for update in recorded))
+        created_at = updates.index(recorded[0])
+        removed_at = updates.index(recorded[1])
+        self.assertLess(created_at, removed_at)
+        self.assertEqual(FakeVCenterNode.snapshots_removed, ["demo-vm-snapshot"])
+
+    def test_a_backup_removes_the_snapshot_an_interrupted_backup_left_on_the_same_vm(self) -> None:
+        self._register_vcenter_hypervisor()
+        self.addCleanup(TASKS.clear)
+        TASKS["task-abandoned"] = {
+            "id": "task-abandoned",
+            "task_type": "backup",
+            "status": "failed",
+            "hypervisor_id": "hv-vc",
+            "resource_type": "virtual_machine",
+            "resource_external_id": "vm-uuid-1",
+            "parameters": {"vm_name": "demo-vm"},
+            "result": {
+                "failure_kind": "interrupted",
+                "backup_snapshot": {"vm_name": "demo-vm", "name": "FullBackup_1790942477"},
+            },
+        }
+        updates: list[dict[str, object]] = []
+
+        result = self._run_backup("task-next-backup", updates.append)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            FakeVCenterNode.snapshots_removed,
+            ["FullBackup_1790942477", "demo-vm-snapshot"],
+        )
+        self.assertNotIn("backup_snapshot", TASKS["task-abandoned"]["result"])
+        self.assertTrue(
+            any(
+                "left behind by an interrupted backup" in str(update.get("message") or "")
+                for update in updates
+            ),
+            f"expected the session to report the leftover snapshot, got: {updates}",
+        )
+
+    def test_a_leftover_snapshot_that_cannot_be_removed_does_not_fail_the_backup(self) -> None:
+        self._register_vcenter_hypervisor()
+        self.addCleanup(TASKS.clear)
+        TASKS["task-abandoned"] = {
+            "id": "task-abandoned",
+            "task_type": "backup",
+            "status": "failed",
+            "hypervisor_id": "hv-vc",
+            "resource_type": "virtual_machine",
+            "resource_external_id": "vm-uuid-1",
+            "parameters": {"vm_name": "demo-vm"},
+            "result": {"backup_snapshot": {"vm_name": "demo-vm", "name": "FullBackup_locked"}},
+        }
+        real_remove = FakeVCenterNode.remove_snapshot
+
+        def refuse_the_leftover(node, vm_name: str, snapshot_name: str) -> None:
+            if snapshot_name == "FullBackup_locked":
+                raise RuntimeError("another operation is already in progress")
+            real_remove(node, vm_name, snapshot_name)
+
+        with patch.object(FakeVCenterNode, "remove_snapshot", refuse_the_leftover):
+            result = self._run_backup("task-next-backup", lambda update: None)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(FakeVCenterNode.snapshots_removed, ["demo-vm-snapshot"])
+        self.assertEqual(
+            TASKS["task-abandoned"]["result"]["backup_snapshot"],
+            {"vm_name": "demo-vm", "name": "FullBackup_locked"},
+        )
+
+    def test_a_running_backup_of_the_same_vm_keeps_its_own_snapshot(self) -> None:
+        self._register_vcenter_hypervisor()
+        self.addCleanup(TASKS.clear)
+        TASKS["task-live"] = {
+            "id": "task-live",
+            "task_type": "backup",
+            "status": "running",
+            "hypervisor_id": "hv-vc",
+            "resource_type": "virtual_machine",
+            "resource_external_id": "vm-uuid-1",
+            "parameters": {"vm_name": "demo-vm"},
+            "result": {"backup_snapshot": {"vm_name": "demo-vm", "name": "FullBackup_live"}},
+        }
+
+        result = self._run_backup("task-next-backup", lambda update: None)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(FakeVCenterNode.snapshots_removed, ["demo-vm-snapshot"])
+        self.assertEqual(
+            TASKS["task-live"]["result"]["backup_snapshot"],
+            {"vm_name": "demo-vm", "name": "FullBackup_live"},
+        )
+
     def test_vcenter_backup_task_honors_custom_compression_level(self) -> None:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",
@@ -2663,6 +2811,106 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(command[command.index("--name") + 1], "01-demo-vm.vmdk")
         self._assert_abr_mode_file(command)
         self.assertIn("demo-vm-restored", command[command.index("--vmdk") + 1])
+
+    def test_a_restore_stopped_while_the_vm_is_being_made_still_destroys_it(self) -> None:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {"num_cpu": 2, "memory_mb": 4096, "guest_os": "Ubuntu Linux (64-bit)"},
+            }
+        }
+
+        class ReportingNode(FakeVCenterNode):
+            def create_vm_shell(self, **kwargs):  # type: ignore[override]
+                payload = super().create_vm_shell(**kwargs)
+                payload["network_adapters"] = list(kwargs["config_metadata"]["network_adapters"])
+                return payload
+
+        fake_module = types.SimpleNamespace(VCenterNode=ReportingNode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_path = pathlib.Path(temp_dir) / "01-demo-vm.vmdk"
+            backup_path.write_text("fake-vmdk", encoding="utf-8")
+            manifest_path = pathlib.Path(temp_dir) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "vm_name": "demo-vm",
+                        "vm_config": {
+                            "guest_id": "ubuntu64Guest",
+                            "firmware": "efi",
+                            "guest_os": "Ubuntu Linux (64-bit)",
+                            "num_cpu": 2,
+                            "memory_mb": 4096,
+                            "network_adapters": [
+                                {"label": "Network adapter 1", "network": "VM Network", "connected": True}
+                            ],
+                        },
+                        "disks": [
+                            {
+                                "index": 1,
+                                "disk_label": "Hard disk 1",
+                                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                                "destination_path": "",
+                                "abr_path": str(pathlib.Path(temp_dir)),
+                                "abr_backup_name": "01-demo-vm.vmdk",
+                                "storage_mode": "local",
+                                "store_mode": "full",
+                                "source_disk_type_code": 5,
+                                "source_disk_type_name": "vmfs_flat",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._register_backup_point("point-vm-1", manifest_path)
+
+            task = {
+                "id": "task-restore-stopped-early",
+                "status": "queued",
+                "task_type": "restore",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "manifest_path": str(manifest_path),
+                    "point_id": "point-vm-1",
+                    "target_vm_name": "demo-vm-restored",
+                    "target_host_name": "esx-dst.local",
+                    "target_datastore_name": "datastore2",
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+
+            # The window the stop used to slip through: the VM exists, and the
+            # first progress update after it is reported raises the stop.
+            def stop_once_the_vm_exists(payload: dict) -> None:
+                if "Network adapter" in str(payload.get("message") or ""):
+                    raise TaskStopRequested("Session stop requested")
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch(
+                    "python.srv.plugins.vcenter.vcenter_restore.run_capped",
+                    side_effect=lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok"),
+                ):
+                    result = run_task(task, progress_callback=stop_once_the_vm_exists)
+
+        self.assertEqual(result["status"], "stopped")
+        self.assertIn("demo-vm-restored", FakeVCenterNode.created_vms[0]["vm_name"])
+        self.assertIn("demo-vm-restored", FakeVCenterNode.destroyed_vms)
 
     def test_vcenter_vm_restore_sends_each_adapter_to_its_own_target_network(self) -> None:
         # Two adapters recorded on one source network name -- what a distributed

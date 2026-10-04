@@ -71,7 +71,7 @@ from .core.mongo_db_wrapper import (
     load_users,
 )
 from .services import auth_service, backup_catalog, tls_certificate_service
-from .services.abr_v41 import PRODUCT_NAME, PRODUCT_VERSION
+from .services.abr_v41 import PRODUCT_NAME, product_version
 from .core.server_defaults import env_int
 from .core.task_pool import TaskProcessPool
 from .services.api_errors import (
@@ -378,9 +378,9 @@ def security_headers_for(scheme: str) -> dict[str, str]:
 
 app = FastAPI(
     title=PRODUCT_NAME,
-    version=PRODUCT_VERSION,
+    version=product_version(),
     description=(
-        f"{PRODUCT_NAME} {PRODUCT_VERSION}. Backup, replication and restore of virtual "
+        f"{PRODUCT_NAME} {product_version()}. Backup, replication and restore of virtual "
         f"machines. API v{SERVER_API_MAJOR}.{SERVER_API_MINOR}, served under "
         f"/api/v{SERVER_API_MAJOR} and answered with the {API_VERSION_HEADER} header."
     ),

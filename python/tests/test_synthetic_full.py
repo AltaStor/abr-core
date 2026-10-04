@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import shutil
 import tempfile
 import unittest
@@ -432,6 +433,108 @@ class SyntheticFullRunTests(unittest.TestCase):
 
         self.assertNotIsInstance(error.exception, SyntheticFullValidationError)
         self.assertIn("disk full", str(error.exception))
+
+    TOOL_WRITE_FAILURE = (
+        "Write error, expected 4194410 bytes, written 4265606425 bytes!\n"
+        "Error: failed to save data range at offset 29360128"
+    )
+
+    def _size_the_chain(self, largest: int) -> None:
+        for point in BACKUPS.values():
+            point["size_bytes"] = largest if str(point.get("execution_type")) == "ActiveFull" else 0
+
+    @patch("python.srv.services.synthetic_full._free_bytes_at_start", return_value=31_457_280)
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_merge_too_big_for_the_free_space_says_the_repository_ran_out(
+        self, copy_mock, free_mock
+    ) -> None:
+        from python.srv.core.storage_tool import StorageToolError
+
+        self._size_the_chain(2_071_211_352)
+        copy_mock.side_effect = StorageToolError(self.TOOL_WRITE_FAILURE)
+
+        with self.assertRaises(SyntheticFullError) as error:
+            synthetic_full.run_synthetic_full(self._task())
+
+        message = str(error.exception)
+        self.assertIn("ran out of space", message)
+        self.assertIn("'Local'", message)
+        self.assertIn(self._root, message)
+        self.assertIn("needs about 1.9 GiB", message)
+        self.assertIn("30.0 MiB were free", message)
+        self.assertNotIn("4265606425", message)
+
+    @patch("python.srv.services.synthetic_full._free_bytes_at_start", return_value=4_294_967_296)
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_merge_that_had_room_keeps_the_error_the_tool_reported(
+        self, copy_mock, free_mock
+    ) -> None:
+        from python.srv.core.storage_tool import StorageToolError
+
+        self._size_the_chain(2_071_211_352)
+        copy_mock.side_effect = StorageToolError(self.TOOL_WRITE_FAILURE)
+
+        with self.assertRaises(SyntheticFullError) as error:
+            synthetic_full.run_synthetic_full(self._task())
+
+        self.assertIn("4265606425", str(error.exception))
+        self.assertNotIn("ran out of space", str(error.exception))
+
+    @patch("python.srv.services.synthetic_full._free_bytes_at_start", return_value=31_457_280)
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_chain_of_unknown_size_keeps_the_error_the_tool_reported(
+        self, copy_mock, free_mock
+    ) -> None:
+        from python.srv.core.storage_tool import StorageToolError
+
+        self._size_the_chain(0)
+        copy_mock.side_effect = StorageToolError("the mover crashed")
+
+        with self.assertRaises(SyntheticFullError) as error:
+            synthetic_full.run_synthetic_full(self._task())
+
+        self.assertIn("the mover crashed", str(error.exception))
+        self.assertNotIn("ran out of space", str(error.exception))
+
+    @patch("python.srv.services.synthetic_full._free_bytes_at_start", return_value=None)
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_free_space_that_cannot_be_read_leaves_the_error_alone(
+        self, copy_mock, free_mock
+    ) -> None:
+        from python.srv.core.storage_tool import StorageToolError
+
+        copy_mock.side_effect = StorageToolError("disk full")
+
+        with self.assertRaises(SyntheticFullError) as error:
+            synthetic_full.run_synthetic_full(self._task())
+
+        self.assertIn("disk full", str(error.exception))
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_filesystem_that_fills_during_the_merge_is_named_with_its_free_space(
+        self, copy_mock
+    ) -> None:
+        copy_mock.side_effect = OSError(errno.ENOSPC, "No space left on device")
+
+        with self.assertRaises(SyntheticFullError) as error:
+            synthetic_full.run_synthetic_full(self._task())
+
+        message = str(error.exception)
+        self.assertIn("ran out of space", message)
+        self.assertIn("'Local'", message)
+        self.assertIn(self._root, message)
+        self.assertIn("free", message)
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_another_oserror_during_the_merge_is_not_called_a_space_problem(
+        self, copy_mock
+    ) -> None:
+        copy_mock.side_effect = OSError(errno.EACCES, "Permission denied")
+
+        with self.assertRaises(OSError) as error:
+            synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(error.exception.errno, errno.EACCES)
 
     @patch("python.srv.services.synthetic_full.apply_repository_immutability")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")

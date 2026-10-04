@@ -307,6 +307,71 @@ def _emit_progress(
     progress_callback(payload)
 
 
+def _record_backup_snapshot(
+    progress_callback: ProgressCallback,
+    vm_name: str,
+    snapshot_name: str | None,
+) -> None:
+    if progress_callback is None:
+        return
+    payload: dict[str, object] = {
+        "updated_at": utc_now(),
+        "log_entry": False,
+        "backup_snapshot": (
+            {"vm_name": vm_name, "name": snapshot_name} if snapshot_name else None
+        ),
+    }
+    try:
+        progress_callback(payload)
+    except TaskStopRequested:
+        pass
+
+
+def _remove_stranded_backup_snapshots(
+    node: Any,
+    task: dict[str, Any],
+    vm_name: str,
+    progress_callback: ProgressCallback,
+) -> None:
+    from ...services.backup_catalog import forget_task_backup_snapshot, stranded_backup_snapshots
+
+    try:
+        pending = stranded_backup_snapshots(
+            str(task.get("hypervisor_id") or ""),
+            vm_name,
+            exclude_task_id=str(task.get("id") or ""),
+        )
+    except Exception:
+        logger.exception("Could not look up snapshots left by interrupted backups of VM %s", vm_name)
+        return
+    for task_id, snapshot_name in pending:
+        _emit_progress(
+            progress_callback,
+            "snapshot",
+            12,
+            f"Removing snapshot {snapshot_name} left behind by an interrupted backup",
+            worker_mode="vcenter-abr-vmdk-tool",
+        )
+        try:
+            node.remove_snapshot(vm_name, snapshot_name)
+        except Exception as exc:
+            logger.warning(
+                "Could not remove the snapshot %s that interrupted task %s left on VM %s: %s",
+                snapshot_name,
+                task_id,
+                vm_name,
+                exc,
+            )
+            continue
+        forget_task_backup_snapshot(task_id)
+        logger.info(
+            "Removed the snapshot %s that interrupted task %s left on VM %s.",
+            snapshot_name,
+            task_id,
+            vm_name,
+        )
+
+
 def _disk_tool_progress_reporter(
     progress_callback: ProgressCallback,
     *,
@@ -1258,6 +1323,7 @@ def run_vcenter_backup(
             # "Nonmatching change UUID" (vim.fault.FileFault). Ensuring CBT on the
             # full anchors the chain on a valid CBT baseline so incrementals chain
             # correctly.
+            _remove_stranded_backup_snapshots(node, task, vm_name, progress_callback)
             _emit_progress(
                 progress_callback,
                 "cbt",
@@ -1274,6 +1340,7 @@ def run_vcenter_backup(
                 worker_mode="vcenter-abr-vmdk-tool",
             )
             snapshot_name = node.create_backup_snapshot(vm_name)
+            _record_backup_snapshot(progress_callback, vm_name, snapshot_name)
             backup_params = node.get_backup_parameters(vm_name, snapshot_name)
             vm_moref = str(backup_params.get("vm_moref") or "")
             snapshot_moref = str(backup_params.get("snapshot_moref") or "")
@@ -2590,6 +2657,7 @@ def run_vcenter_backup(
                 vm_name,
             )
             snapshot_name = None
+            _record_backup_snapshot(progress_callback, vm_name, None)
 
         if not stop_requested_after_completion and cancel_requested(task_id):
             stop_requested_after_completion = True
@@ -2694,6 +2762,7 @@ def run_vcenter_backup(
                     snapshot_name,
                     vm_name,
                 )
+                _record_backup_snapshot(progress_callback, vm_name, None)
             except Exception as exc:
                 logger.warning("Snapshot cleanup warning for VM %s: %s", vm_name, exc)
                 try:

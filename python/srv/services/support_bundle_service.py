@@ -441,7 +441,7 @@ def generate_support_bundle() -> dict[str, Any]:
 
     manifest = {
         "product": abr_v41.PRODUCT_NAME,
-        "product_version": abr_v41.PRODUCT_VERSION,
+        "product_version": abr_v41.product_version(),
         "generated_at": utc_now(),
         "hostname": socket.gethostname() or None,
         "files": included_files,
