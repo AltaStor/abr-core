@@ -4117,6 +4117,12 @@ def _touches_full_backup_policy(payload: dict[str, Any]) -> bool:
     return False
 
 
+def _schedule_runs(schedule: Any) -> bool | None:
+    if not isinstance(schedule, dict):
+        return None
+    return bool(schedule.get("enabled", True))
+
+
 def _base_schedule_is_enabled(job: dict[str, Any]) -> bool:
     schedule = job.get("schedule")
     return isinstance(schedule, dict) and bool(schedule.get("enabled", True))
@@ -4147,8 +4153,12 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     was_enabled = _job_is_enabled(updated)
     changed = False
     if "enabled" in payload and payload["enabled"] is not None:
-        updated["enabled"] = bool(payload["enabled"])
+        runs = bool(payload["enabled"])
+        updated["enabled"] = runs
         changed = True
+        if payload.get("schedule") is None and _schedule_runs(updated.get("schedule")) not in (None, runs):
+            updated["schedule"] = dict(updated["schedule"], enabled=runs)
+            updated["next_incremental_run_at"] = _execution_schedule_next_run(updated["schedule"])
     if payload.get("name"):
         new_name = str(payload["name"])
         _ensure(bool(new_name.strip()), 422, "invalid_job", "Job name must not be empty")
@@ -4161,9 +4171,10 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         updated["name"] = new_name
         changed = True
     if "schedule" in payload and payload["schedule"] is not None:
+        previously_ran = _schedule_runs(updated.get("schedule"))
         updated["schedule"] = normalize_schedule_payload(payload["schedule"])
         updated["next_incremental_run_at"] = schedule_next_run(updated["schedule"], after=_now_utc()).isoformat() if bool(updated["schedule"].get("enabled", True)) else None
-        if "enabled" not in payload:
+        if "enabled" not in payload and _schedule_runs(updated["schedule"]) != previously_ran:
             updated["enabled"] = bool(updated["schedule"].get("enabled", True))
         changed = True
     if "retention_days" in payload and payload["retention_days"] is not None:

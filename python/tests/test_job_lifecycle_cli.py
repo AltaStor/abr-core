@@ -967,6 +967,109 @@ class JobEngineLifecycleTests(unittest.TestCase):
         self.assertEqual(monthly["schedule"]["day_of_month"], 1)
         self.assertEqual(periodic["schedule"]["every"], "6h")
 
+    def _job_created_switched_off(self, name: str) -> dict[str, Any]:
+        return abr_v41.create_backup_job(
+            {
+                "name": name,
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": {"type": "daily", "time": "06:00", "enabled": False},
+                "active_full_days": ["sunday"],
+            }
+        )
+
+    def test_switching_a_job_on_turns_its_schedule_back_on(self) -> None:
+        job = self._job_created_switched_off("Created Switched Off")
+
+        self.assertFalse(job["enabled"])
+        self.assertFalse(job["schedule"]["enabled"])
+
+        resumed = abr_v41.edit_job_record(job["id"], {"enabled": True})
+
+        self.assertTrue(resumed["enabled"])
+        self.assertTrue(resumed["schedule"]["enabled"])
+        self.assertEqual(resumed["schedule"]["time"], "06:00")
+        self.assertIsNotNone(resumed["next_incremental_run_at"])
+
+    def test_switching_a_job_off_also_stops_its_schedule(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Created Running",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": {"type": "daily", "time": "06:00", "enabled": True},
+                "active_full_days": ["sunday"],
+            }
+        )
+
+        stopped = abr_v41.edit_job_record(job["id"], {"enabled": False})
+
+        self.assertFalse(stopped["enabled"])
+        self.assertFalse(stopped["schedule"]["enabled"])
+        self.assertIsNone(stopped["next_incremental_run_at"])
+
+        resumed = abr_v41.edit_job_record(job["id"], {"enabled": True})
+
+        self.assertTrue(resumed["schedule"]["enabled"])
+        self.assertIsNotNone(resumed["next_incremental_run_at"])
+
+    def test_switching_a_job_on_leaves_a_job_without_a_schedule_alone(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Manual Only",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_days": ["sunday"],
+                "enabled": False,
+            }
+        )
+
+        resumed = abr_v41.edit_job_record(job["id"], {"enabled": True})
+
+        self.assertTrue(resumed["enabled"])
+        self.assertIsNone(resumed["schedule"])
+
+    def test_restating_a_schedule_does_not_switch_the_job_off(self) -> None:
+        job = self._job_created_switched_off("Restated Schedule")
+        mismatched = abr_v41.edit_job_record(
+            job["id"], {"enabled": True, "schedule": {"type": "daily", "time": "06:00", "enabled": False}}
+        )
+
+        self.assertTrue(mismatched["enabled"])
+
+        restated = abr_v41.edit_job_record(
+            job["id"], {"schedule": {"type": "daily", "time": "06:00", "enabled": False}}
+        )
+
+        self.assertTrue(restated["enabled"])
+
+    def test_a_schedule_that_changes_state_still_drives_the_job_switch(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Schedule Driven",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": {"type": "daily", "time": "06:00", "enabled": True},
+                "active_full_days": ["sunday"],
+            }
+        )
+
+        stopped = abr_v41.edit_job_record(
+            job["id"], {"schedule": {"type": "daily", "time": "06:00", "enabled": False}}
+        )
+
+        self.assertFalse(stopped["enabled"])
+
+        resumed = abr_v41.edit_job_record(
+            job["id"], {"schedule": {"type": "daily", "time": "06:00", "enabled": True}}
+        )
+
+        self.assertTrue(resumed["enabled"])
+
     def test_create_refuses_days_whose_schedule_is_asked_to_stay_off(self) -> None:
         before = len(JOBS)
 
