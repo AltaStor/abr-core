@@ -887,18 +887,17 @@ def run_vcenter_restore(
                 if is_virtual_center
                 else None
             )
-            created_vm: dict[str, Any] = {}
             original_destroyed = False
             original_identity: dict[str, str] = {}
             identity_preserved = False
+            created_vm: dict[str, Any] = node.create_vm_shell(
+                vm_name=create_vm_name,
+                host_name=target_host_name,
+                datastore_name=target_datastore_name,
+                config_metadata=vm_config,
+                disk_layout=disk_layout,
+            )
             try:
-                created_vm = node.create_vm_shell(
-                    vm_name=create_vm_name,
-                    host_name=target_host_name,
-                    datastore_name=target_datastore_name,
-                    config_metadata=vm_config,
-                    disk_layout=disk_layout,
-                )
                 logger.info(
                     "Created VM shell %s on host %s datastore %s with resulting firmware %s, "
                     "SCSI controller type %s, Secure Boot requested=%s",
@@ -1210,13 +1209,24 @@ def run_vcenter_restore(
                         target_vm_name,
                     )
                     raise
+                outcome = "stopped" if isinstance(exc, TaskStopRequested) else "failed"
+                created_moref = str(created_vm.get("vm_moref") or "")
+                if not created_moref:
+                    logger.error(
+                        "Restore %s for VM shell %s, but the restore holds no moRef for the VM it created; "
+                        "nothing is destroyed, because a VM found by that name need not be this restore's.",
+                        outcome,
+                        create_vm_name,
+                    )
+                    raise
                 logger.warning(
-                    "Restore %s for VM shell %s; destroying created VM and cleaning up.",
-                    "stopped" if isinstance(exc, TaskStopRequested) else "failed",
+                    "Restore %s for VM shell %s; destroying the VM it created (moRef=%s) and cleaning up.",
+                    outcome,
                     create_vm_name,
+                    created_moref,
                 )
                 try:
-                    node.destroy_vm(create_vm_name, vm_moref=str(created_vm.get("vm_moref") or ""))
+                    node.destroy_vm(create_vm_name, vm_moref=created_moref)
                 except Exception:
                     logger.exception("Failed to destroy VM %s during restore cleanup.", create_vm_name)
                 raise

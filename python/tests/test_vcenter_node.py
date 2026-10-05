@@ -118,11 +118,13 @@ class _FakeVm:
             connectionState=connection_state,
         )
         self.unregister_calls = 0
+        self.destroy_calls = 0
         self.power_off_calls = 0
         self.power_on_calls = 0
         self.rename_calls: list[str] = []
 
     def Destroy_Task(self) -> object:
+        self.destroy_calls += 1
         return object()
 
     def Unregister(self) -> None:
@@ -344,6 +346,36 @@ class VCenterNodeDestroyVmTests(unittest.TestCase):
         node._get_vm = lambda vm_name: None  # type: ignore[method-assign]
 
         node.destroy_vm("missing-vm", vm_moref="vm-404")
+
+
+class VCenterNodeDestroyByMorefTests(unittest.TestCase):
+    def test_a_moref_that_is_gone_never_falls_back_to_a_vm_of_the_same_name(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        stranger = _FakeVm(name="existing-vm", moid="vm-999")
+        lookups: list[str] = []
+
+        node.get_service_type = lambda: "VirtualCenter"  # type: ignore[method-assign]
+        node._get_vm_by_moref = lambda vm_moref: None  # type: ignore[method-assign]
+        node._get_vm = lambda vm_name: lookups.append(vm_name) or stranger  # type: ignore[method-assign]
+        node._wait_for_task = lambda task: None  # type: ignore[method-assign]
+
+        node.destroy_vm("existing-vm", vm_moref="vm-restore-001")
+
+        self.assertEqual(lookups, [])
+        self.assertEqual(stranger.destroy_calls, 0)
+
+    def test_without_a_moref_the_vm_is_still_found_by_name(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        original = _FakeVm(name="demo-vm", moid="vm-101")
+
+        node.get_service_type = lambda: "VirtualCenter"  # type: ignore[method-assign]
+        node._get_vm_by_moref = lambda vm_moref: None  # type: ignore[method-assign]
+        node._get_vm = lambda vm_name: original if vm_name == "demo-vm" else None  # type: ignore[method-assign]
+        node._wait_for_task = lambda task: None  # type: ignore[method-assign]
+
+        node.destroy_vm("demo-vm")
+
+        self.assertEqual(original.destroy_calls, 1)
 
 
 class VCenterNodePowerOffVmTests(unittest.TestCase):
@@ -682,11 +714,15 @@ class VCenterNodeFirmwareTests(unittest.TestCase):
     def test_create_vm_shell_fails_when_resulting_firmware_does_not_match(self) -> None:
         node = VCenterNode("vc.local", "administrator", "secret")
         host, datacenter, vm_folder, created_vm = _fake_vm_create_context(resulting_firmware="bios")
+        removed: list[dict[str, object]] = []
 
         node._get_host = lambda host_name: host if host_name == "esx-01.local" else None  # type: ignore[method-assign]
         node._get_vm = lambda vm_name: None  # type: ignore[method-assign]
         node._get_datacenter = lambda obj: datacenter  # type: ignore[method-assign]
         node._wait_for_task = lambda task: created_vm  # type: ignore[method-assign]
+        node.destroy_vm = lambda vm_name, vm_moref=None: removed.append(  # type: ignore[method-assign]
+            {"vm_name": vm_name, "vm_moref": vm_moref}
+        )
 
         with self.assertRaisesRegex(RuntimeError, "requested efi, got bios"):
             node.create_vm_shell(
@@ -702,6 +738,8 @@ class VCenterNodeFirmwareTests(unittest.TestCase):
                 },
                 disk_layout=[],
             )
+
+        self.assertEqual(removed, [{"vm_name": "demo-vm-restored", "vm_moref": "vm-restore-001"}])
 
         self.assertEqual(vm_folder.calls[0]["config"].firmware, "efi")
 
