@@ -8507,6 +8507,22 @@ def snapshot_configuration() -> dict[str, str]:
     return configuration
 
 
+SECRET_CONFIGURATION_KEY_PARTS = ("PASSWORD", "SECRET", "TOKEN", "PASSPHRASE")
+_URI_CREDENTIALS_PATTERN = re.compile(r"^([a-z][a-z0-9+.-]*://)[^/]*@", re.IGNORECASE)
+
+
+def configuration_without_secrets(configuration: dict[str, Any]) -> dict[str, Any]:
+    shown: dict[str, Any] = {}
+    for key, value in configuration.items():
+        if any(part in str(key).upper() for part in SECRET_CONFIGURATION_KEY_PARTS):
+            shown[key] = SECRET_MASK if value not in (None, "") else value
+        elif isinstance(value, str):
+            shown[key] = _URI_CREDENTIALS_PATTERN.sub(rf"\g<1>{SECRET_MASK}@", value)
+        else:
+            shown[key] = value
+    return shown
+
+
 def export_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     password = payload.get("password") if isinstance(payload, dict) else None
     if not isinstance(password, str) or not password:
@@ -8583,7 +8599,7 @@ def import_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         configuration = {}
 
     counts = restore_catalog(catalog)
-    return {"manifest": manifest, "restored": counts, "configuration": configuration}
+    return {"manifest": manifest, "restored": counts, "configuration": configuration_without_secrets(configuration)}
 
 
 def _verify_disk_artifact(

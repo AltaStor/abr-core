@@ -222,6 +222,31 @@ class SystemCatalogSnapshotApiTests(unittest.TestCase):
         self.assertEqual(payload["configuration"]["BACKUP_WORKER_COUNT"], "4")
         self.assertNotIn("SOME_UNRELATED_VAR", payload["configuration"])
 
+    def test_a_restore_answer_masks_secrets_the_archive_still_carries(self) -> None:
+        self._seed_catalog()
+        with patch.dict(
+            "os.environ",
+            {
+                "ABR_BOOTSTRAP_ADMIN_PASSWORD": "Bootstrap-Secret-77",
+                "MONGODB_URI": "mongodb://catalog:Db-Secret-88@db.local:27017/backup_db",
+                "BACKUP_WORKER_COUNT": "4",
+            },
+        ):
+            body, payload = self._decrypted_export()
+
+        restored = self._restore(body["archive_base64"]).json()
+        configuration = restored["configuration"]
+
+        self.assertEqual(configuration["ABR_BOOTSTRAP_ADMIN_PASSWORD"], "********")
+        self.assertEqual(configuration["MONGODB_URI"], "mongodb://********@db.local:27017/backup_db")
+        self.assertEqual(configuration["BACKUP_WORKER_COUNT"], "4")
+        self.assertNotIn("Bootstrap-Secret-77", str(restored))
+        self.assertNotIn("Db-Secret-88", str(restored))
+        self.assertEqual(payload["configuration"]["ABR_BOOTSTRAP_ADMIN_PASSWORD"], "Bootstrap-Secret-77")
+        self.assertEqual(
+            payload["configuration"]["MONGODB_URI"], "mongodb://catalog:Db-Secret-88@db.local:27017/backup_db"
+        )
+
     def test_export_snapshot_includes_server_process_configuration(self) -> None:
         self._seed_catalog()
         with patch.dict(
