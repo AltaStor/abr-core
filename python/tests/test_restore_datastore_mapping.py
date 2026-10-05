@@ -142,6 +142,16 @@ class RestoreMappingConflictTests(unittest.TestCase):
             abr_v41._parse_restore_network_map(["VM Network=DMZ", "VM Network=Storage"])
         self.assertIn("--network-map", error.exception.message)
 
+    def test_networks_that_differ_only_in_letter_case_are_two_sources(self) -> None:
+        self.assertEqual(
+            abr_v41._parse_restore_network_map(["DMZ=Recovery", "dmz=Isolated"]),
+            {"DMZ": "Recovery", "dmz": "Isolated"},
+        )
+
+    def test_a_network_mapped_twice_with_the_same_spelling_still_conflicts(self) -> None:
+        with self.assertRaises(ApiError):
+            abr_v41._parse_restore_network_map(["DMZ=Recovery", "DMZ=Isolated"])
+
     def test_the_same_source_in_different_letter_case_still_conflicts(self) -> None:
         with self.assertRaises(ApiError):
             abr_v41._parse_restore_datastore_map(["ssd=sata", "SSD=nvme"])

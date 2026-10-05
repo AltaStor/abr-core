@@ -7173,12 +7173,17 @@ def _source_disk_datastore(disk: dict[str, Any]) -> str:
     return str(datastore_name or "").strip()
 
 
-def _collect_restore_mapping(mappings: dict[str, str], source: str, target: str, *, flag: str) -> None:
+def _collect_restore_mapping(
+    mappings: dict[str, str], source: str, target: str, *, flag: str, case_sensitive: bool = False
+) -> None:
+    def same(left: str, right: str) -> bool:
+        return left == right if case_sensitive else left.lower() == right.lower()
+
     for existing_source, existing_target in mappings.items():
-        if existing_source.lower() != source.lower():
+        if not same(existing_source, source):
             continue
         _ensure(
-            existing_target.lower() == target.lower(),
+            same(existing_target, target),
             422,
             "invalid_restore",
             f"{flag} maps the same source twice, to different targets",
@@ -7680,7 +7685,7 @@ def _parse_restore_network_map(value: Any) -> dict[str, str]:
             "Each --network-map value must use the form <source>=<target> or <source>:<target>",
             value=text,
         )
-        _collect_restore_mapping(mappings, source_name, target_name, flag="--network-map")
+        _collect_restore_mapping(mappings, source_name, target_name, flag="--network-map", case_sensitive=True)
     return mappings
 
 
