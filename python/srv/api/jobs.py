@@ -15,6 +15,8 @@ from .schemas import (
     JobDTO,
     JobList,
     JobStartResult,
+    RetentionRunResult,
+    RunRetentionRequest,
     StartJobRequest,
     UpdateJobRequest,
     unset_excluded,
@@ -57,6 +59,11 @@ def start_job(job_id: str, payload: StartJobRequest = Body(default_factory=Start
     )
 
 
+def run_retention(job_id: str, payload: RunRetentionRequest = Body(default_factory=RunRetentionRequest)) -> RetentionRunResult:
+    body = unset_excluded(payload)
+    return abr_v41.run_job_retention(job_id, dry_run=bool(body.get("dry_run", False)))
+
+
 register(router, [
     ("", create_job, ["POST"]),
     ("/copy", create_copy_job, ["POST"]),
@@ -65,4 +72,5 @@ register(router, [
     ("/{job_id}", patch_job, ["PATCH"]),
     ("/{job_id}", delete_job, ["DELETE"]),
     ("/{job_id}/start", start_job, ["POST"]),
+    ("/{job_id}/retention", run_retention, ["POST"]),
 ])

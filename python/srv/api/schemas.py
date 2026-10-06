@@ -816,6 +816,10 @@ class StartJobRequest(_LenientModel):
     target_repository_id: LaxStr | None = None
 
 
+class RunRetentionRequest(_LenientModel):
+    dry_run: LaxBool | None = None
+
+
 class StopSessionRequest(_LenientModel):
     force: LaxBool | None = None
 
@@ -1161,6 +1165,46 @@ class RemovedResult(_LenientModel):
 class JobStartResult(_LenientModel):
     job: JobRefDTO | DocObject = None
     items: list[SessionDTO] | DocArray = None
+
+
+class RetentionHoldDTO(_LenientModel):
+    point_id: DocStr = None
+    until: DocStr = None
+
+
+class RetentionChainDTO(_LenientModel):
+    job_id: DocStr = None
+    vm_id: DocStr = None
+    vm_name: DocStrOrNull = None
+    repository_id: DocStrOrNull = None
+    repository_name: DocStrOrNull = None
+    points: DocInt = None
+    kept: DocInt = None
+    removed: DocStrArray = None
+    held: list[RetentionHoldDTO] | DocObjectArray = None
+    failed: DocStrArray = None
+    kept_for_chain: DocStrArray = None
+    skipped_reason: DocStrOrNull = None
+
+
+class RetentionSummaryDTO(_LenientModel):
+    chains: DocInt = None
+    points: DocInt = None
+    removed: DocInt = None
+    held: DocInt = None
+    failed: DocInt = None
+    skipped: DocInt = None
+
+
+class RetentionRunResult(_LenientModel):
+    job_id: DocStr = None
+    job_name: DocStr = None
+    dry_run: DocBool = None
+    retention_days: DocInt = None
+    gfs: GfsDTO | DocObject = None
+    summary: RetentionSummaryDTO | DocObject = None
+    chains: list[RetentionChainDTO] | DocArray = None
+    ran_at: DocStr = None
 
 
 

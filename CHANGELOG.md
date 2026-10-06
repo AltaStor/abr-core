@@ -43,9 +43,16 @@ All notable changes to this project are documented in this file.
   `--immutability-days` counted from each backup.
 - A job reports how its last run went across all of its VMs, and its soonest
   next run across all of its schedules.
+- `abr job retention [--dry-run]` and `POST /api/v1/jobs/{id}/retention`
+  apply (or preview) a job's retention across all of its chains and report,
+  per chain, what was removed, what Object Lock still holds and what could not
+  be removed.
 
 ### Enhanced
 
+- Retention no longer tries to delete a restore point still under S3 Object
+  Lock: it is reported as held, with the older points it depends on, instead of
+  as a failure.
 - Improved backup and restore reliability with corrected backup and restore
   logic and better handling of storage backends.
 - Expanded CLI and web console capabilities, including support for S3-based

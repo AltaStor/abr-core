@@ -5336,10 +5336,15 @@ def _segment_points(points: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
 _RETENTION_LOCK_REPORTED: set[str] = set()
 
 
-def _point_object_lock(point: dict[str, Any]) -> str:
+def _point_object_lock(point: dict[str, Any], now: datetime) -> tuple[str, str] | None:
     repository = REPOSITORIES.get(str(point.get("repository_id") or ""))
     if not isinstance(repository, dict) or not is_s3_repository(repository):
-        return ""
+        return None
+    stored_expiry = str(point.get("immutability_expires_at") or "").strip()
+    try:
+        stored_until = _parse_dt(stored_expiry) if stored_expiry else None
+    except (TypeError, ValueError):
+        stored_until = None
     artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
     disk = next(
         (
@@ -5357,28 +5362,66 @@ def _point_object_lock(point: dict[str, Any]) -> str:
         else:
             days_left = int(info.get("retention_days") or 0) if isinstance(info, dict) else 0
             if isinstance(info, dict) and str(info.get("immutability") or "none") != "none" and days_left > 0:
-                return f"for {days_left} more day(s)"
-            return ""
-    stored_expiry = str(point.get("immutability_expires_at") or "").strip()
-    try:
-        if stored_expiry and _parse_dt(stored_expiry) > _now_utc():
-            return f"until {stored_expiry}"
-    except ValueError:
-        pass
-    return ""
+                until = stored_expiry if stored_until is not None and stored_until > now else (now + timedelta(days=days_left)).isoformat()
+                return until, f"for {days_left} more day(s)"
+            return None
+    if stored_until is not None and stored_until > now:
+        return stored_expiry, f"until {stored_expiry}"
+    return None
 
 
-def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: str | None) -> list[dict[str, Any]]:
+def _new_retention_report(job: dict[str, Any], vm_id: str, repository_id: str | None) -> dict[str, Any]:
+    return {
+        "job_id": str(job.get("id") or ""),
+        "vm_id": vm_id,
+        "vm_name": None,
+        "repository_id": repository_id,
+        "points": 0,
+        "removed": [],
+        "held": [],
+        "failed": [],
+        "kept_for_chain": [],
+        "skipped_reason": None,
+    }
+
+
+def apply_retention_to_chain(
+    job: dict[str, Any],
+    *,
+    vm_id: str,
+    repository_id: str | None,
+    report: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> list[dict[str, Any]]:
+    """Remove the restore points of one chain that the job's retention lets go.
+
+    A segment (a full and the incrementals on it) only goes once every point in
+    it has expired and none is kept by GFS, newest point first, so what is left
+    always restores. A point whose data is still under Object Lock is not even
+    tried: it is reported as held, and so are the older points it depends on.
+
+    ``report``, when given, is filled with what happened (or, with
+    ``dry_run``, what would happen) point by point.
+    """
     failures: list[dict[str, Any]] = []
+    if report is None:
+        report = _new_retention_report(job, vm_id, repository_id)
     points = _points_for_job_vm_repo(str(job["id"]), vm_id, repository_id)
+    report["points"] = len(points)
     if not points:
         return failures
+    report["vm_name"] = points[-1].get("vm_name")
     _apply_gfs_marks(points, dict(job.get("gfs") or {}))
-    cutoff = _now_utc() - timedelta(days=int(job.get("retention_days") or 0))
+    now = _now_utc()
+    cutoff = now - timedelta(days=int(job.get("retention_days") or 0))
     retention_dates = _retention_dates(points)
 
     def expired(point: dict[str, Any]) -> bool:
         return retention_dates[str(point.get("id") or "")] < cutoff
+
+    def keep(point: dict[str, Any]) -> None:
+        if not dry_run:
+            persist_backup(point)
 
     to_delete: list[dict[str, Any]] = []
     for segment in _segment_points(points):
@@ -5395,24 +5438,26 @@ def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: 
     to_delete = _keep_points_others_still_need(to_delete, points, job_id=str(job.get("id") or ""))
     if not to_delete:
         for point in points:
-            persist_backup(point)
+            keep(point)
         return failures
     delete_ids = {point["id"] for point in to_delete}
     for segment in _segment_points(points):
         segment_to_delete = [point for point in segment if point["id"] in delete_ids]
         if not segment_to_delete:
             for point in segment:
-                persist_backup(point)
+                keep(point)
             continue
 
         blocked = False
         for point in reversed(segment_to_delete):
+            point_id = str(point.get("id") or "")
             if blocked:
-                persist_backup(point)
+                report["kept_for_chain"].append(point_id)
+                keep(point)
                 continue
-            held = _point_object_lock(point)
+            held = _point_object_lock(point, now)
             if held:
-                point_id = str(point.get("id") or "")
+                until, remaining = held
                 if point_id not in _RETENTION_LOCK_REPORTED:
                     _RETENTION_LOCK_REPORTED.add(point_id)
                     LOGGER.info(
@@ -5420,14 +5465,19 @@ def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: 
                         "it is removed on the first pass after the lock expires",
                         point_id,
                         job.get("id"),
-                        held,
+                        remaining,
                     )
-                persist_backup(point)
+                report["held"].append({"point_id": point_id, "until": until})
+                keep(point)
                 blocked = True
+                continue
+            if dry_run:
+                report["removed"].append(point_id)
                 continue
             if _delete_backup_artifacts_from_point(point):
                 delete_backup(point["id"])
-                _RETENTION_LOCK_REPORTED.discard(str(point.get("id") or ""))
+                _RETENTION_LOCK_REPORTED.discard(point_id)
+                report["removed"].append(point_id)
             else:
                 LOGGER.error(
                     "Retention failed to delete backup artifacts; keeping catalog entry for retry: "
@@ -5439,18 +5489,91 @@ def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: 
                 )
                 failures.append(
                     {
-                        "point_id": str(point.get("id") or ""),
+                        "point_id": point_id,
                         "job_id": str(job.get("id") or ""),
                         "vm_id": vm_id,
                         "repository_id": repository_id,
                     }
                 )
-                persist_backup(point)
+                report["failed"].append(point_id)
+                keep(point)
                 blocked = True
         for point in segment:
             if point["id"] not in delete_ids:
-                persist_backup(point)
+                keep(point)
+    LOGGER.info(
+        "Retention%s for job %s, %s VM %s (%s) in repository %s: %d restore point(s), %s %d, "
+        "held by Object Lock %d, kept for their chain %d, failed %d",
+        " preview" if dry_run else "",
+        job.get("id"),
+        str(points[-1].get("hypervisor_kind") or "unknown") if points else "unknown",
+        report.get("vm_name") or vm_id,
+        vm_id,
+        repository_id,
+        len(points),
+        "would remove" if dry_run else "removed",
+        len(report["removed"]),
+        len(report["held"]),
+        len(report["kept_for_chain"]),
+        len(report["failed"]),
+    )
     return failures
+
+
+def _job_chains(job_id: str) -> list[tuple[str, str | None]]:
+    chains: dict[tuple[str, str | None], None] = {}
+    for point in normalized_backup_points():
+        if str(point.get("job_id") or "") != job_id:
+            continue
+        chains[(str(point.get("vm_id") or ""), point.get("repository_id") or None)] = None
+    return list(chains)
+
+
+def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
+    """Apply (or preview) a backup job's retention to every chain it wrote.
+
+    Retention also runs after each backup, for that backup's own chain; this
+    covers all of them at once, including VMs that have since left the job.
+    A chain with a backup of the same VM in flight is skipped, so that the
+    point the running backup chains onto cannot go from under it.
+    """
+    job = resolve_job(record_id=job_id)
+    _ensure(job.get("job_type") == "backup", 422, "invalid_job", "Retention applies to backup jobs")
+    busy_vms = {
+        str(task.get("resource_external_id") or "")
+        for task in catalog_records(TASKS)
+        if str(task.get("job_id") or "") == str(job["id"])
+        and _session_state(task) in {"queued", "running", "stopping"}
+    }
+    chains = []
+    for vm_id, repository_id in _job_chains(str(job["id"])):
+        report = _new_retention_report(job, vm_id, repository_id)
+        if vm_id in busy_vms:
+            report["skipped_reason"] = "a backup of this VM is running"
+            report["points"] = len(_points_for_job_vm_repo(str(job["id"]), vm_id, repository_id))
+        else:
+            apply_retention_to_chain(job, vm_id=vm_id, repository_id=repository_id, report=report, dry_run=dry_run)
+        report["repository_name"] = _repository_name_for(str(repository_id or "")) if repository_id else None
+        report["kept"] = report["points"] - len(report["removed"])
+        chains.append(report)
+    summary = {
+        "chains": len(chains),
+        "points": sum(item["points"] for item in chains),
+        "removed": sum(len(item["removed"]) for item in chains),
+        "held": sum(len(item["held"]) for item in chains),
+        "failed": sum(len(item["failed"]) for item in chains),
+        "skipped": sum(1 for item in chains if item["skipped_reason"]),
+    }
+    return {
+        "job_id": str(job["id"]),
+        "job_name": str(job.get("name") or ""),
+        "dry_run": bool(dry_run),
+        "retention_days": int(job.get("retention_days") or 0),
+        "gfs": dict(job.get("gfs") or {}),
+        "summary": summary,
+        "chains": chains,
+        "ran_at": utc_now(),
+    }
 
 
 def _append_task_log(task: dict[str, Any], *, level: str, message: str, component: str = "engine", **extra: Any) -> None:
