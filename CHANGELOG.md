@@ -72,6 +72,11 @@ All notable changes to this project are documented in this file.
   Lock validation and application, Hyper-V connection, authentication and
   discovery outcomes, per-chain retention results, and a summary of every
   queued backup and restore session.
+- A Hyper-V backup checks from the host that it can reach the repository
+  before it takes a checkpoint, so an unreachable S3 endpoint, refused keys or
+  a share the host cannot open fail the run without touching the VM. A failed
+  abr-vhdx-tool run on the host reports the tool's own reason, not only its
+  last line.
 - Improved backup and restore reliability with corrected backup and restore
   logic and better handling of storage backends.
 - Expanded CLI and web console capabilities, including support for S3-based

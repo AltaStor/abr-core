@@ -189,7 +189,10 @@ def parse_result(lines: Iterable[str]) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def failure_message(result: dict[str, Any] | None, lines: Iterable[str], exit_code: int | None) -> str:
+FAILURE_DETAIL_LINES = 5
+
+
+def _tool_error(result: dict[str, Any] | None, lines: list[str], exit_code: int | None) -> str:
     if result and result.get("error"):
         return str(result["error"])
     errors = [line.strip() for line in lines if line.strip().startswith("Error:")]
@@ -198,5 +201,20 @@ def failure_message(result: dict[str, Any] | None, lines: Iterable[str], exit_co
     return f"exit code {exit_code}"
 
 
-def change_tracking_lost(message: str) -> bool:
-    return bool(_CHANGE_TRACKING_LOST.search(message or ""))
+def failure_message(result: dict[str, Any] | None, lines: Iterable[str], exit_code: int | None) -> str:
+    lines = list(lines)
+    error = _tool_error(result, lines, exit_code)
+    details: list[str] = []
+    for line in lines:
+        text = line.strip()
+        if text.startswith("{"):
+            break
+        if text.startswith("Error:"):
+            text = text[len("Error:"):].strip()
+        if text and text not in error and text not in details:
+            details.append(text)
+    return "; ".join([*details[-FAILURE_DETAIL_LINES:], error])
+
+
+def change_tracking_lost(result: dict[str, Any] | None, lines: Iterable[str], exit_code: int | None) -> bool:
+    return bool(_CHANGE_TRACKING_LOST.search(_tool_error(result, list(lines), exit_code)))

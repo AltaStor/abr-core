@@ -75,15 +75,20 @@ It mirrors the VMware backup step for step:
 
 1. Any recovery checkpoint an interrupted backup of the same VM left behind is
    removed first. The same cleanup runs when the server starts.
-2. The checkpoint freezes the VM's disks: from then on the VM writes to new
+2. abr-vhdx-tool on the node that owns the VM checks that it can reach the
+   repository (`info` on the run's folder, with the same storage options and
+   credentials the backup uses). A node that cannot reach it fails the run
+   with the tool's reason before the VM is touched: no checkpoint is taken and
+   the previous backup's reference point stays.
+3. The checkpoint freezes the VM's disks: from then on the VM writes to new
    differencing disks, and the files the backup reads no longer change. Taking
    it also turns RCT on for the VM's disks.
-3. Each disk is backed up by abr-vhdx-tool on the node that owns the VM:
+4. Each disk is backed up by abr-vhdx-tool on the node that owns the VM:
    `backup --vhdx <checkpoint disk>` for a full backup, with
    `--type incremental --change-id <RCT id>` for an incremental, against the
    RCT id the previous backup recorded for that disk. The tool reports the
    disk's new RCT id, which the manifest keeps for the next incremental.
-4. The checkpoint is turned into a **reference point**: Hyper-V merges it back
+5. The checkpoint is turned into a **reference point**: Hyper-V merges it back
    into the VM's disks and keeps the change tracking position it marked. The
    reference point of the job's previous backup is then removed.
 
@@ -172,6 +177,7 @@ Lock validation. Credentials and encryption keys are never written to either.
 | Session says | Look at |
 | --- | --- |
 | `reaches S3 repositories, and local repositories only through an SMB share` | Point the job at an S3 repository, or give the local repository its share (`abr repo edit --server --share`) |
+| `cannot reach repository` | The reason that follows it: the S3 endpoint, keys and bucket the repository names, or its share, as seen from that node |
 | `cannot open the repository share` | The share's account (the repository's `--username`, else the inventory's), and that every node reaches the share on TCP 445 |
 | `abr-vhdx-tool is not installed on ...` | Set `ALTASTOR_VHDX_TOOL_PATH` on the appliance, or install the tool on the host at `ALTASTOR_HYPERV_TOOL_PATH` |
 | `needs an elevated (administrator) process` | The registered account is not a local administrator of that node |

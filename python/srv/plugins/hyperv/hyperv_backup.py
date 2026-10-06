@@ -78,6 +78,7 @@ HYPERVISOR_KIND = "hyper-v"
 ProgressCallback = Callable[[dict[str, object]], None] | None
 
 CONSISTENCY_CHOICES = ("application", "crash")
+REPOSITORY_CHECK_TIMEOUT_SECONDS = 120
 
 
 class HyperVBackupError(RuntimeError):
@@ -399,6 +400,9 @@ def run_hyperv_backup(
             _remove_stranded_checkpoints(node, task, vm_id, progress_callback)
             tool_path = node.ensure_disk_tool(source_node)
             _emit(progress_callback, "prepare", 10, f"abr-vhdx-tool is ready on {source_node} at {tool_path}")
+            _check_repository_access(
+                node, source_node, storage_args, storage_env, repository_label, task_id, progress_callback
+            )
 
             # A checkpoint can only be application consistent when there is
             # a running guest to quiesce.
@@ -713,6 +717,29 @@ def run_hyperv_backup(
             _cleanup_checkpoint(connection, vm_id, vm_name, checkpoint_id, progress_callback)
 
 
+def _check_repository_access(
+    node: HyperVNode,
+    source_node: str,
+    storage_args: list[str],
+    storage_env: dict[str, str],
+    repository_label: str,
+    task_id: str,
+    progress_callback: ProgressCallback,
+) -> None:
+    run = node.run_disk_tool(
+        source_node,
+        ["info", "--json", *storage_args],
+        env=storage_env,
+        should_cancel=lambda: cancel_requested(task_id),
+        timeout=REPOSITORY_CHECK_TIMEOUT_SECONDS,
+    )
+    result = run.get("result") or {}
+    if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
+        detail = vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
+        raise HyperVBackupError(f"{source_node} cannot reach repository {repository_label}: {detail}")
+    _emit(progress_callback, "prepare", 12, f"Repository {repository_label} is reachable from {source_node}")
+
+
 def _back_up_disks(
     node: HyperVNode,
     source_node: str,
@@ -791,8 +818,9 @@ def _back_up_disks(
         )
         result = run.get("result") or {}
         if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
-            detail = vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
-            if change_id and vhdx_tool.change_tracking_lost(detail):
+            lines = run.get("lines") or []
+            detail = vhdx_tool.failure_message(result, lines, run.get("exit_code"))
+            if change_id and vhdx_tool.change_tracking_lost(result, lines, run.get("exit_code")):
                 raise _ChangeTrackingLost(detail)
             raise HyperVBackupError(f"Backing up disk {slot} of {vm_name} failed: {detail}")
         logical = int(result.get("raw_data_size") or 0)
