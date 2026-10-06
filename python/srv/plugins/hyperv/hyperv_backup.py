@@ -646,6 +646,14 @@ def run_hyperv_backup(
                 immutability_generation.get("lock_days"),
                 immutability_generation.get("expires_at"),
             )
+            lock_mode = str((extract_s3_config(repository).get("immutability") or {}).get("mode") or "")
+            _emit(
+                progress_callback,
+                "finalize",
+                97,
+                f"Object Lock ({lock_mode}) holds this backup for {immutability_generation.get('lock_days')} "
+                f"day(s), until {immutability_generation.get('expires_at')}; it cannot be deleted before then",
+            )
         summary = (
             f"Hyper-V backup of {vm_name} completed: {backup_mode} backup of {len(disk_outputs)} disk(s), "
             f"read {_gib(total_read_bytes)}, stored {_gib(total_transferred_bytes)}"

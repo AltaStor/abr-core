@@ -494,6 +494,7 @@ class RestorePointDTO(_LenientModel):
     compression_ratio: float | None = None
     compression_level: int | None = None
     encryption_enabled: bool | None = None
+    immutability_expires_at: str | None = None
     restore_point_id: DocStr = None
     backup_id: DocStr = None
     point_type: DocStr = None

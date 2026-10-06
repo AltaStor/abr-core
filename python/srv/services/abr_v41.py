@@ -5195,6 +5195,7 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
     paths = []
     manifest_abr_paths: set[str] = set()
     all_removed = True
+    storage_refused = False
 
     for key in ("backup_root", "manifest_path"):
         value = artifact.get(key)
@@ -5233,6 +5234,7 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
                     )
                 else:
                     all_removed = False
+                    storage_refused = True
                     LOGGER.warning(
                         "Failed to delete remote backup artifact: point=%s path=%s name=%s",
                         point.get("id"),
@@ -5245,6 +5247,9 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
         if isinstance(destination_path, str) and destination_path:
             paths.append(Path(destination_path))
 
+    if storage_refused and is_s3_repository(repository):
+        return False
+
     for abr_path in manifest_abr_paths:
         try:
             remove_disk_tool_backup(repository, abr_path, "manifest", timeout=120)
@@ -5256,6 +5261,25 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
                 exc_info=True,
             )
 
+    return _delete_local_point_paths(point, paths, storage_roots) and all_removed
+
+
+def _delete_local_point_cache(point: dict[str, Any]) -> bool:
+    artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+    repository = REPOSITORIES.get(str(point.get("repository_id") or ""))
+    paths = [
+        Path(value)
+        for value in (artifact.get("backup_root"), artifact.get("manifest_path"))
+        if isinstance(value, str) and value
+    ]
+    return _delete_local_point_paths(
+        point, paths, _repository_storage_roots(repository if isinstance(repository, dict) else None)
+    )
+
+
+def _delete_local_point_paths(point: dict[str, Any], paths: list[Path], storage_roots: Any) -> bool:
+    point_repository_id = str(point.get("repository_id") or "")
+    all_removed = True
     for candidate in sorted({path.resolve() for path in paths if path.exists()}, key=lambda item: len(str(item)), reverse=True):
         if not _path_is_within_repository(candidate, storage_roots, point_repository_id):
             all_removed = False
@@ -6049,6 +6073,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "execution_reason": point.get("execution_reason"),
             "gfs_marks": point.get("gfs_marks"),
             "gfs_protected": point.get("gfs_protected"),
+            "immutability_expires_at": point.get("immutability_expires_at"),
             "parent_point_id": point.get("parent_point_id"),
             "status": point.get("status"),
             "vm_id": point.get("vm_id"),
@@ -6918,33 +6943,51 @@ def delete_backup_chain(
         if progress_callback is not None:
             progress_callback({"progress": progress, "message": message})
 
+    kept_for_chain: list[str] = []
     total_points = len(points)
     _emit(0, f"Deleting {total_points} restore point(s)")
-    for position, point in enumerate(points, start=1):
-        _emit(
-            int((position - 1) * 100 / total_points) if total_points else 100,
-            f"Deleting restore point {position}/{total_points}",
-        )
-        if _delete_backup_artifacts_from_point(point):
-            delete_backup(point["id"])
-            continue
-        artifacts_removed = False
-        if _point_repository_holds_immutable_backups(point):
-            LOGGER.error(
-                "Object Lock refused the deletion of backup artifacts; keeping catalog entry for retry: "
-                "point=%s repository=%s",
-                point.get("id"),
-                point.get("repository_id"),
+    position = 0
+    for segment in _segment_points(points):
+        held_point_id: str | None = None
+        for point in reversed(segment):
+            position += 1
+            _emit(
+                int((position - 1) * 100 / total_points) if total_points else 100,
+                f"Deleting restore point {position}/{total_points}",
             )
-            retained_points.append(str(point.get("id") or ""))
-            continue
-        delete_backup(point["id"])
+            point_id = str(point.get("id") or "")
+            if held_point_id is not None:
+                LOGGER.info(
+                    "Keeping restore point %s: restore point %s, which needs it to restore, is still held "
+                    "under Object Lock",
+                    point_id,
+                    held_point_id,
+                )
+                kept_for_chain.append(point_id)
+                continue
+            if _delete_backup_artifacts_from_point(point):
+                delete_backup(point["id"])
+                continue
+            artifacts_removed = False
+            if _point_repository_holds_immutable_backups(point):
+                LOGGER.error(
+                    "Object Lock refused the deletion of backup artifacts; keeping catalog entry for retry: "
+                    "point=%s repository=%s",
+                    point.get("id"),
+                    point.get("repository_id"),
+                )
+                retained_points.append(point_id)
+                held_point_id = point_id
+                continue
+            _delete_local_point_cache(point)
+            delete_backup(point["id"])
 
-    _emit(100, f"Deleted {total_points - len(retained_points)} of {total_points} restore point(s)")
+    kept_points = len(retained_points) + len(kept_for_chain)
+    _emit(100, f"Deleted {total_points - kept_points} of {total_points} restore point(s)")
     immutable_points = len(retained_points)
     result = {
         "id": backup_id,
-        "deleted": not retained_points,
+        "deleted": not kept_points,
         "restore_point_count": len(points),
         "artifacts_removed": artifacts_removed,
     }
@@ -6956,11 +6999,18 @@ def delete_backup_chain(
         if immutable_points:
             result["immutable_restore_points"] = immutable_points
             result["retained_restore_point_ids"] = retained_points
+        if kept_for_chain:
+            result["kept_for_chain_restore_point_ids"] = kept_for_chain
         result["message"] = (
             (
                 f"{immutable_points} restore point(s) are still held under S3 Object Lock and the storage refused "
                 "to delete their data. They are kept in the catalog and retried once the lock expires, so nothing "
                 "is left untracked in the bucket."
+                + (
+                    f" {len(kept_for_chain)} older restore point(s) they need to restore are kept with them."
+                    if kept_for_chain
+                    else ""
+                )
             )
             if immutable_points
             else (
@@ -7254,6 +7304,7 @@ def restore_point_to_dto(point: dict[str, Any]) -> dict[str, Any]:
         "available": _restore_point_is_available(point),
         "gfs_marks": point.get("gfs_marks"),
         "skipped_disks": _restore_point_artifact(point).get("skipped_disks") or [],
+        "immutability_expires_at": point.get("immutability_expires_at"),
     }
 
 
