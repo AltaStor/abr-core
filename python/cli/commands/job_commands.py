@@ -305,6 +305,15 @@ class JobCommands:
                 env_var=ENCRYPTION_KEY_ENV_VAR,
                 help_text="Encryption key/passphrase, used together with --set-encryption",
             )
+            parser.add_argument(
+                "--guest-consistency",
+                choices=("application", "crash"),
+                help=(
+                    "Hyper-V only: recovery checkpoint consistency. application quiesces a running guest "
+                    "through VSS and falls back to crash-consistent when it cannot (default); crash never "
+                    "involves the guest"
+                ),
+            )
         if include_policy_flags:
             parser.add_argument("--gfs-weekly", type=int, default=gfs_default, help="Weekly GFS count")
             parser.add_argument("--gfs-monthly", type=int, default=gfs_default, help="Monthly GFS count")

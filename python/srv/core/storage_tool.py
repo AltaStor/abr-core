@@ -919,6 +919,39 @@ def probe_repository_immutability(
     }
 
 
+# Subcommands that change what a repository holds; the rest only read it.
+_MUTATING_SUBCOMMANDS = frozenset({"backup", "copy", "remove", "retention", "meta_save"})
+
+
+_ABSENT_BACKUP_MARKERS = ("failed to open backup", "directory does not exist", "nosuchkey")
+
+
+def _reports_absent_backup(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _ABSENT_BACKUP_MARKERS)
+
+
+def _storage_operation_label(args: list[str]) -> str:
+    """'remove 01-disk.vmdk on s3 bucket b, path p' -- the operation and where
+    it went, from the arguments, with nothing secret in it."""
+
+    def option(name: str) -> str:
+        try:
+            return str(args[args.index(name) + 1])
+        except (ValueError, IndexError):
+            return ""
+
+    subcommand = args[0] if args else "?"
+    target = option("--name") or option("--source-names")
+    mode = option("--mode") or "file"
+    folder = option("--folder")
+    path = option("--path")
+    where = f"s3 bucket {folder}, path {path}" if mode == "s3" else f"folder {folder}"
+    immutable = option("--immutable")
+    lock = f", Object Lock {immutable} {option('--retention')} day(s)" if immutable and immutable != "none" else ""
+    return f"{subcommand}{f' {target}' if target else ''} on {where}{lock}"
+
+
 def run_disk_tool(
     args: list[str],
     *,
@@ -932,6 +965,9 @@ def run_disk_tool(
     resolved_tool_path = (tool_path or default_disk_tool_path()).expanduser()
     if not resolved_tool_path.is_file():
         raise StorageToolError(f"Backup tool not found: {resolved_tool_path}")
+    operation = _storage_operation_label(args)
+    mutating = bool(args) and args[0] in _MUTATING_SUBCOMMANDS
+    started = time.monotonic()
 
     try:
         progress_options: dict[str, Any] = {}
@@ -952,10 +988,23 @@ def run_disk_tool(
     except subprocess.TimeoutExpired as exc:
         stderr = (exc.stderr or exc.output or "").strip() if isinstance(exc.stderr, str) else ""
         detail = f": {stderr}" if stderr else ""
+        logger.warning("Storage operation %s timed out after %ss", operation, timeout)
         raise StorageToolError(f"backup tool timed out after {timeout}s{detail}") from exc
 
+    elapsed = time.monotonic() - started
     if completed.returncode != 0:
         stderr = (completed.stderr or completed.stdout or "").strip()
+        # Removing what was never written (cleanup after a failed run) is
+        # not a storage problem worth a warning.
+        absent = args[:1] == ["remove"] and _reports_absent_backup(stderr)
+        logger.log(
+            logging.WARNING if mutating and not absent else logging.DEBUG,
+            "Storage operation %s failed after %.1fs: %s",
+            operation,
+            elapsed,
+            condense_disk_tool_message(stderr) or f"exit code {completed.returncode}",
+        )
         raise StorageToolError(stderr or f"backup tool failed with exit code {completed.returncode}")
 
+    logger.log(logging.INFO if mutating else logging.DEBUG, "Storage operation %s done in %.1fs", operation, elapsed)
     return completed

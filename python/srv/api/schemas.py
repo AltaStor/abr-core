@@ -70,6 +70,7 @@ class TaskParametersDTO(_LenientModel):
     tool_timeout_seconds: DocInt = None
     app_aware: DocBool = None
     dedup: DocBool = None
+    hyperv_consistency: DocStr = None
 
 
 class ExecutionChoiceDTO(_LenientModel):
@@ -166,6 +167,36 @@ class SystemCountsDTO(_LenientModel):
     restore_points: DocInt = None
 
 
+class HyperVDiskDTO(_LenientModel):
+    name: DocStr = None
+    controller: DocStr = None
+    path: DocStr = None
+    format: DocStr = None
+    type: DocStr = None
+    capacity_bytes: DocInt = None
+    file_bytes: DocInt = None
+    has_parent: bool | None = None
+
+
+class HyperVNetworkAdapterDTO(_LenientModel):
+    name: DocStr = None
+    switch: DocStr = None
+    mac: DocStr = None
+    connected: bool | None = None
+
+
+class HyperVVmDetailsDTO(_LenientModel):
+    generation: DocInt = None
+    configuration_version: DocStr = None
+    firmware: DocStr = None
+    checkpoint_count: DocInt = None
+    clustered: bool | None = None
+    owner_node: DocStr = None
+    config_path: DocStr = None
+    disks: list[HyperVDiskDTO] | DocArray = None
+    network_adapters: list[HyperVNetworkAdapterDTO] | DocArray = None
+
+
 class InventoryTreeNodeDTO(_LenientModel):
     id: DocStr = None
     kind: DocStr = None
@@ -189,6 +220,7 @@ class InventoryTreeNodeDTO(_LenientModel):
     cpu_model: DocStr = None
     vm_count: DocInt = None
     health: DocStr = None
+    hyperv: HyperVVmDetailsDTO | DocObject = None
     children: list[InventoryTreeNodeDTO] | DocArray = None
 
 

@@ -402,6 +402,12 @@ A backup job cannot be created without at least one enabled full backup schedule
 The full schedules ride along with the job: a job whose base schedule is disabled, or which has no base schedule at all, runs nothing until it is enabled again. 
 Jobs that already use --active-full-days or --synthetic-full-days keep working: those day lists are read as weekly full schedules at the job's own schedule time. 
 
+Hyper-V jobs follow the same schedule rules: a full backup, then incrementals from Hyper-V's resilient change tracking, with active and synthetic fulls on their own schedules (see doc/HyperVBackup.md). Their disks are written by abr-vhdx-tool on the Hyper-V host, so their repository must be S3; a run against any other repository fails with the reason. One option is Hyper-V only: 
+• --guest-consistency <application|crash> sets the recovery checkpoint's consistency. application (the default) quiesces a running guest through VSS and, when the guest cannot be quiesced, takes a crash-consistent checkpoint and says so in the session. crash never involves the guest. A VM that is off, saved or paused always gets a crash-consistent checkpoint, which is consistent since nothing runs inside it. 
+
+Example: 
+abr job create --name "HV nightly" --inventory "hv-cluster" --vms "sql-01,web-01" --repository "repo-01" --schedule daily --time "22:00" --retention-days 14 --guest-consistency application 
+
 abr job create-copy 
 
 Description: Clone an existing job configuration. The copied job receives a new ID and name while preserving inventory, selected VMs, repository, schedule configuration, schedule enabled/disabled state, and existing backup options. Optional repository, schedule, and retention overrides are still accepted for compatibility. 

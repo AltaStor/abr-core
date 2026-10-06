@@ -232,6 +232,9 @@ EXECUTION_REASONS = (
     "ActiveOverridesSynthetic",
     "RepositorySyntheticUnsupportedEscalatedToActive",
     "StandardIncremental",
+    "EncryptionKeyChanged",
+    "IncrementalFallbackToFull",
+    "VmConfigurationChanged",
 )
 JOB_TYPES = ("backup", "backup-copy")
 TASK_TYPES = ("backup", "restore")
@@ -1274,6 +1277,70 @@ def _resource_label(resource: dict[str, Any] | None, fallback: str | None = None
     return _nullable_str(resource.get("name") or resource.get("external_id")) or fallback
 
 
+def _inventory_is_hyperv(inventory_id: Any) -> bool:
+    record = HYPERVISORS.get(str(inventory_id or ""))
+    return isinstance(record, dict) and inventory_type_from_record(record) == "hyper-v"
+
+
+def _hyperv_vm_parts(
+    resources: list[dict[str, Any]],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    """A Hyper-V inventory's discovered disks and network adapters, by VM id."""
+    disks: dict[str, list[dict[str, Any]]] = {}
+    nics: dict[str, list[dict[str, Any]]] = {}
+    for resource in resources:
+        kind = str(resource.get("resource_type") or "")
+        if kind not in {"disk", "network_adapter"}:
+            continue
+        payload = _resource_payload(resource)
+        target = disks if kind == "disk" else nics
+        target.setdefault(str(payload.get("vm_id") or ""), []).append(
+            {"name": str(resource.get("name") or ""), **payload}
+        )
+    return disks, nics
+
+
+def _hyperv_vm_details(
+    payload: dict[str, Any], disks: list[dict[str, Any]], nics: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """What the console shows of a Hyper-V VM beyond the common fields: its
+    configuration, and each disk and adapter as backup and recovery see them."""
+    return {
+        "generation": _nullable_number(payload.get("generation")),
+        "configuration_version": _nullable_str(payload.get("version")),
+        "firmware": _nullable_str(payload.get("firmware")),
+        "checkpoint_count": int(payload.get("checkpoints") or 0),
+        "clustered": bool(payload.get("clustered")),
+        "owner_node": _nullable_str(payload.get("host_name")),
+        "config_path": _nullable_str(payload.get("config_path")),
+        "disks": sorted(
+            (
+                {
+                    "name": disk["name"],
+                    "controller": _nullable_str(disk.get("controller")),
+                    "path": _nullable_str(disk.get("datastore_path")),
+                    "format": _nullable_str(disk.get("source_disk_type_code")),
+                    "type": _nullable_str(disk.get("source_disk_type_name")),
+                    "capacity_bytes": _capacity_bytes_from_disk_entry(disk),
+                    "file_bytes": _nullable_number(disk.get("file_bytes")),
+                    "has_parent": bool(disk.get("parent_path")),
+                }
+                for disk in disks
+            ),
+            key=lambda disk: str(disk["controller"] or disk["name"]),
+        ),
+        "network_adapters": [
+            {
+                "name": nic["name"],
+                "switch": _nullable_str(nic.get("network")),
+                "mac": _nullable_str(nic.get("mac")),
+                "connected": bool(nic.get("connected")),
+            }
+            for nic in nics
+        ],
+    }
+
+
 def list_inventory_vm_tree() -> list[dict[str, Any]]:
     root = {"children": [], "_child_index": {}}
     inventories = list_inventory_records()
@@ -1316,6 +1383,7 @@ def list_inventory_vm_tree() -> list[dict[str, Any]]:
             if capacity is None:
                 continue
             disk_capacity_by_vm[disk_vm_id] = disk_capacity_by_vm.get(disk_vm_id, 0) + capacity
+        hyperv_parts = _hyperv_vm_parts(resources) if _inventory_is_hyperv(inventory_id) else None
 
         inventory_node = _ensure_inventory_vm_tree_child(
             root,
@@ -1445,6 +1513,8 @@ def list_inventory_vm_tree() -> list[dict[str, Any]]:
                 health=power_state,
                 disk_capacity_bytes=disk_capacity_by_vm.get(vm_id),
             )
+            if hyperv_parts is not None:
+                vm_node["hyperv"] = _hyperv_vm_details(payload, *(part.get(vm_id, []) for part in hyperv_parts))
             parent.setdefault("children", []).append(vm_node)
 
     nodes = [_finalize_inventory_vm_tree_node(node) for node in root["children"]]
@@ -3073,6 +3143,24 @@ def _immutability_summary(immutability: dict[str, Any]) -> str:
 
 
 def validate_s3_immutability_config(config: dict[str, Any], *, write_probe: bool = True) -> dict[str, Any]:
+    """Check a bucket can hold backups under the configured Object Lock, and
+    log the outcome: every repository add, edit and verify comes through here."""
+    result = _validate_s3_immutability_config(config, write_probe=write_probe)
+    immutability = normalize_immutability_config(config.get("immutability"))
+    LOGGER.log(
+        logging.INFO if result.get("status") == "success" else logging.WARNING,
+        "Object Lock validation of S3 bucket %s (endpoint %s, %s, write probe %s): %s - %s",
+        config.get("bucket"),
+        config.get("endpoint_url") or "AWS",
+        _immutability_summary(immutability) if immutability_is_enabled(immutability) else "immutability off",
+        "on" if write_probe else "off",
+        result.get("status"),
+        result.get("message"),
+    )
+    return result
+
+
+def _validate_s3_immutability_config(config: dict[str, Any], *, write_probe: bool = True) -> dict[str, Any]:
     checks, error = _s3_format_checks(config)
     if error is not None:
         return {"status": "error", "checks": checks, "message": error}
@@ -3297,7 +3385,7 @@ def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:
     return f"for {span} (its full-backup cycle plus the longer of the job retention and the {configured} configured)"
 
 
-def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
+def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
     repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
     _assert_repository_supports_immutability(repository)
     config = normalize_immutability_config(extract_s3_config(repository).get("immutability"))
@@ -3371,6 +3459,21 @@ def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
     result["status"] = "success"
     result["message"] = (
         f"{len(updated)} restore point(s) are now held in {config['mode']} mode {period}, counted from now"
+    )
+    return result
+
+
+def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
+    result = _apply_immutability_to_existing_backups(record_id)
+    LOGGER.log(
+        logging.INFO if result.get("status") == "success" else logging.WARNING,
+        "Object Lock applied to existing backups of repository %s: %s of %s restore point(s) updated, "
+        "%s refused - %s",
+        result.get("name") or record_id,
+        result.get("updated_restore_points"),
+        result.get("restore_point_count"),
+        result.get("failed_restore_points"),
+        result.get("message"),
     )
     return result
 
@@ -3896,8 +3999,24 @@ def _record_encryption_key(keys: list[dict[str, Any]], key: str) -> tuple[list[d
     return [*keys, {"key_id": next_id, "key": key}], next_id
 
 
+TASK_PARAMETER_CHOICES = {
+    "hyperv_consistency": ("application", "crash"),
+}
+
+
 def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] | None = None) -> dict[str, Any]:
     result = dict(params)
+    for key, allowed in TASK_PARAMETER_CHOICES.items():
+        if result.get(key) is None:
+            continue
+        value = str(result[key]).strip().lower()
+        _ensure(
+            value in allowed,
+            422,
+            "invalid_job",
+            f"task_parameters.{key} must be one of: {', '.join(allowed)}",
+        )
+        result[key] = value
     if "compression_level" in result and result["compression_level"] is not None:
         level = _whole_number(result["compression_level"])
         _ensure(
@@ -7170,9 +7289,66 @@ def _capacity_bytes_from_disk_entry(disk: dict[str, Any]) -> int | None:
     return None
 
 
+_PLATFORM_LABELS = {"vsphere": "VMware", "hyper-v": "Hyper-V", "proxmox-ve": "Proxmox", "xcp-ng": "XCP-ng"}
+_POINT_KIND_TO_INVENTORY_TYPE = {"vcenter": "vsphere", "hyper-v": "hyper-v"}
+
+
+def _point_inventory_type(point: dict[str, Any]) -> str | None:
+    kind = str(point.get("hypervisor_kind") or "").strip().lower()
+    return _POINT_KIND_TO_INVENTORY_TYPE.get(kind)
+
+
+def _point_platform_label(point: dict[str, Any]) -> str:
+    return _PLATFORM_LABELS.get(_point_inventory_type(point) or "", "source platform")
+
+
+def _inventory_platform_label(inventory: dict[str, Any]) -> str:
+    return _PLATFORM_LABELS.get(inventory_type_from_record(inventory), str(inventory.get("type") or "another platform"))
+
+
+def _restore_target_kind_matches(point: dict[str, Any], inventory: dict[str, Any]) -> bool:
+    """A restore point goes back to the platform it came from: nothing here
+    converts a VM between hypervisors. Points of unknown origin (imported,
+    mock) keep the old behaviour and may go anywhere except Hyper-V, whose
+    restore needs a Hyper-V manifest."""
+    expected = _point_inventory_type(point)
+    actual = inventory_type_from_record(inventory)
+    if expected:
+        return actual == expected
+    return actual != "hyper-v"
+
+
+_CSV_PATH = re.compile(r"^([A-Za-z]:\\ClusterStorage\\[^\\]+)(?:\\(.*))?$", re.IGNORECASE)
+_DRIVE_PATH = re.compile(r"^([A-Za-z]:)(?:\\(.*))?$")
+_UNC_PATH = re.compile(r"^(\\\\[^\\]+\\[^\\]+)(?:\\(.*))?$")
+
+
+def _parse_windows_storage_path(raw: str) -> tuple[str | None, str | None, str | None]:
+    """A Hyper-V disk path as (datastore, folder, file name): the datastore is
+    the Cluster Shared Volume, drive or share the file lives on, which is
+    what Hyper-V hosts report as their storage."""
+    value = raw.replace("/", "\\")
+    for pattern in (_CSV_PATH, _UNC_PATH, _DRIVE_PATH):
+        match = pattern.match(value)
+        if not match:
+            continue
+        datastore = match.group(1)
+        if pattern is not _UNC_PATH:
+            datastore = datastore[0].upper() + datastore[1:]
+        rest = (match.group(2) or "").strip("\\")
+        if not rest:
+            return datastore, None, None
+        parts = rest.split("\\")
+        folder = "\\".join(parts[:-1]) or None
+        return datastore, folder, parts[-1] or None
+    return None, None, None
+
+
 def _parse_datastore_path_parts(datastore_path: str | None) -> tuple[str | None, str | None, str | None]:
     raw = str(datastore_path or "").strip()
-    if not raw.startswith("[") or "]" not in raw:
+    if not raw.startswith("["):
+        return _parse_windows_storage_path(raw) if raw else (None, None, None)
+    if "]" not in raw:
         return None, None, None
     datastore, relative_path = raw.split("]", 1)
     datastore_name = datastore[1:].strip() or None
@@ -7285,7 +7461,10 @@ def _source_network_fallbacks(manifest_vm_config: dict[str, Any], discovered_nic
                 "id": _source_nic_id(manifest_vm_config.get("instance_uuid") or manifest_vm_config.get("name"), index + 1, manifest_adapter, discovered),
                 "label": str(manifest_adapter.get("label") or (discovered or {}).get("name") or f"Network adapter {index + 1}"),
                 "source_network": str(manifest_adapter.get("network") or payload.get("network") or "").strip() or None,
-                "mac_address": str(manifest_adapter.get("mac_address") or payload.get("mac") or "").strip() or None,
+                "mac_address": str(
+                    manifest_adapter.get("mac_address") or manifest_adapter.get("mac") or payload.get("mac") or ""
+                ).strip()
+                or None,
                 "connected": bool(manifest_adapter.get("connected", payload.get("connected", True))),
             }
         )
@@ -7565,7 +7744,7 @@ def get_restore_context(restore_point_id: str) -> dict[str, Any]:
     point = _resolve_restore_source_point({"point_id": restore_point_id})
     manifest = _load_restore_manifest_record(point)
     source_vm = _build_restore_source_vm(point, manifest)
-    inventories = list_inventory_records()
+    inventories = [item for item in list_inventory_records() if _restore_target_kind_matches(point, item)]
     target_inventories = [
         {
             "id": str(item.get("id") or ""),
@@ -7751,9 +7930,11 @@ def _resolve_restore_target_datastore(inventory_id: str, datastore_identifier: s
     )
 
 
-_THIN_PROVISIONING_REQUESTS = {"thin", "thin-provisioned", "thin_provisioned", "vmfs_thin"}
+# Hyper-V's "dynamic" VHDX (and a differencing chain, restored as one dynamic
+# disk) grows with its data the way a thin VMDK does.
+_THIN_PROVISIONING_REQUESTS = {"thin", "thin-provisioned", "thin_provisioned", "vmfs_thin", "dynamic"}
 
-_THIN_SOURCE_DISK_TYPES = {"vmfs_thin", "vmfs_sparse", "monolithic_sparse", "split_sparse"}
+_THIN_SOURCE_DISK_TYPES = {"vmfs_thin", "vmfs_sparse", "monolithic_sparse", "split_sparse", "dynamic", "differencing"}
 
 _WHOLE_DISK_BACKUP_MODES = {"full", "incremental-full-fallback"}
 
@@ -8552,6 +8733,26 @@ def _create_backup_session(
         "logs": [],
     }
     _append_task_log(task, level="info", message=f"Queued backup session for {vm_name}", component="session")
+    _append_task_log(
+        task,
+        level="info",
+        message=(
+            f"Job {job.get('name')}: {execution_type} ({execution_reason}) of {vm_name} from inventory "
+            f"{job.get('inventory_name')} to repository {parameters.get('repository_name')}"
+        ),
+        component="session",
+    )
+    LOGGER.info(
+        "Backup session %s queued: job %s, VM %s (%s) of inventory %s, %s (%s), repository %s",
+        task["id"],
+        job.get("name"),
+        vm_name,
+        vm_id,
+        job.get("inventory_name"),
+        execution_type,
+        execution_reason,
+        parameters.get("repository_name"),
+    )
     persist_task(task)
     return session_to_dto(task)
 
@@ -8847,6 +9048,14 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         id_option="--target-inventory-id",
     )
     _ensure(
+        _restore_target_kind_matches(point, target_inventory),
+        422,
+        "restore_option_unsupported",
+        f"A {_point_platform_label(point)} restore point can only be restored to a {_point_platform_label(point)} "
+        f"inventory; '{target_inventory.get('name')}' is {_inventory_platform_label(target_inventory)}",
+        inventory_id=target_inventory.get("id"),
+    )
+    _ensure(
         str(target_inventory.get("status") or "unknown").strip().lower() != "unavailable",
         409,
         "target_inventory_unavailable",
@@ -9054,6 +9263,19 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         "logs": [],
     }
     _append_task_log(task, level="info", message=f"Queued restore session for restore point {point_id}", component="session")
+    mode_label = "In-place" if restore_mode == "in_place" else "Out-of-place"
+    placement_text = ", ".join(f"{source} -> {target}" for source, target in sorted((datastore_placement or {}).items()))
+    network_text = ", ".join(f"{source} -> {target}" for source, target in sorted((network_map or {}).items()))
+    restore_summary = (
+        f"{mode_label} recovery of {point.get('vm_name') or point.get('vm_id')} from restore point {point_id} "
+        f"({point.get('created_at')}, {_restore_point_type(point)}) to {target_vm_name} on "
+        f"{target_inventory['name']}/{resolved_target_host_name}, storage {target_datastore_name}"
+        + (f", datastore mapping {placement_text}" if placement_text and restore_mode != "in_place" else "")
+        + (f", network mapping {network_text}" if network_text and restore_mode != "in_place" else "")
+        + (", power on afterwards" if power_on else "")
+    )
+    _append_task_log(task, level="info", message=restore_summary, component="session")
+    LOGGER.info("Restore session %s queued: %s", task["id"], restore_summary)
     persist_task(task)
     session = session_to_dto(task)
     return {

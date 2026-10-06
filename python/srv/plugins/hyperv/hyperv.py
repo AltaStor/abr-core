@@ -5,13 +5,16 @@ import functools
 import ipaddress
 import json
 import logging
+import re
 import socket
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List
 
 from ..hypervisor import Hypervisor, ProgressCallback
+from . import vhdx_tool
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,18 @@ class HyperVAuthError(HyperVError):
         self.detail = detail
 
 
+class HyperVVmNotFoundError(HyperVError):
+    pass
+
+
+class HyperVVmStateError(HyperVError):
+    pass
+
+
+class HyperVCheckpointError(HyperVError):
+    pass
+
+
 class HyperVPermissionError(HyperVError):
     def __init__(self, host: str, username: str, detail: str = "") -> None:
         message = f"{username} may sign in to {host} but lacks the rights this needs"
@@ -59,6 +74,39 @@ class HyperVPermissionError(HyperVError):
         self.host = host
         self.username = username
         self.detail = detail
+
+
+_GUID_PATTERN = re.compile(r"^\{?[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\}?$")
+
+# VM states a checkpoint can be taken in. A running VM gets an
+# application-consistent one when its guest allows; the others have nothing
+# running inside to quiesce, so their disks are consistent as they stand.
+BACKUP_READY_STATES = frozenset({"Running", "Off", "Saved", "Paused", "FastSaved"})
+QUIESCABLE_STATES = frozenset({"Running"})
+# Work Hyper-V is in the middle of that a checkpoint must not race with.
+BUSY_OPERATIONS = frozenset(
+    {
+        "ApplyingSnapshot",
+        "CreatingSnapshot",
+        "DeletingSnapshot",
+        "MergingDisks",
+        "ExportingVirtualMachine",
+        "MigratingVirtualMachine",
+        "BackingUpVirtualMachine",
+        "StorageMigrationPhaseOne",
+        "StorageMigrationPhaseTwo",
+        "MigratingPlannedVm",
+    }
+)
+CONSISTENCY_LEVELS = {"application": 1, "crash": 2}
+
+
+def is_guid(value: str) -> bool:
+    return bool(_GUID_PATTERN.match(str(value or "").strip()))
+
+
+def _ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 @functools.lru_cache(maxsize=None)
@@ -112,6 +160,10 @@ class HyperVNode(Hypervisor):
         self._owners: Dict[str, str] = {}
         self._snapshots: Dict[str, Dict[str, Any]] = {}
         self._shared_stores: List[Dict[str, Any]] = []
+        self._node_resolved: Dict[str, str] = {}
+        self._vm_nodes: Dict[str, str] = {}
+        self._vm_states: Dict[str, Dict[str, Any]] = {}
+        self._tool_paths: Dict[str, str] = {}
         self._lock = threading.Lock()
 
     def connect(self) -> None:
@@ -128,6 +180,8 @@ class HyperVNode(Hypervisor):
     def disconnect(self) -> None:
         self._clients.clear()
         self._snapshots.clear()
+        self._vm_nodes.clear()
+        self._vm_states.clear()
         self._nodes = []
         self._client = None
 
@@ -349,6 +403,11 @@ class HyperVNode(Hypervisor):
         ports = self._candidate_ports()
         reachable = [port for port in ports if _port_is_open(host, port)]
         if not reachable:
+            logger.warning(
+                "Hyper-V host %s does not answer WinRM on port(s) %s",
+                host,
+                ", ".join(str(port) for port in ports),
+            )
             raise HyperVUnreachableError(host, ports)
 
         last_error: BaseException | None = None
@@ -357,17 +416,38 @@ class HyperVNode(Hypervisor):
             try:
                 client.execute_ps("$env:COMPUTERNAME")
             except Exception as exc:
+                first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
                 if _is_auth_failure(exc):
-                    raise HyperVAuthError(host, self.user, str(exc).splitlines()[0]) from exc
+                    logger.warning(
+                        "Hyper-V host %s rejected the credentials of %s on WinRM port %d: %s",
+                        host,
+                        self.user,
+                        port,
+                        first_line,
+                    )
+                    raise HyperVAuthError(host, self.user, first_line) from exc
                 if _is_permission_failure(exc):
-                    raise HyperVPermissionError(host, self.user, str(exc).splitlines()[0]) from exc
+                    logger.warning(
+                        "Hyper-V host %s authenticated %s on WinRM port %d but refused the access it needs: %s",
+                        host,
+                        self.user,
+                        port,
+                        first_line,
+                    )
+                    raise HyperVPermissionError(host, self.user, first_line) from exc
 
                 logger.warning("Hyper-V host %s did not accept WinRM on port %d: %s", host, port, exc)
                 last_error = exc
                 continue
 
             self._resolved_port = port
-            logger.info("Connected to Hyper-V host %s over WinRM port %d", host, port)
+            logger.info(
+                "Connected to Hyper-V host %s over WinRM port %d (%s) as %s",
+                host,
+                port,
+                "HTTPS" if port == HTTPS_PORT else "HTTP",
+                self.user,
+            )
             return client
 
         raise HyperVUnreachableError(host, reachable, str(last_error or "")[:200])
@@ -392,6 +472,7 @@ class HyperVNode(Hypervisor):
 
             with self._lock:
                 self._clients[key] = client
+                self._node_resolved[key] = address
             return client
 
         raise last or HyperVUnreachableError(node, self._candidate_ports())
@@ -410,8 +491,8 @@ class HyperVNode(Hypervisor):
 
         return out
 
-    def _run_json(self, script: str, node: str | None = None) -> List[Dict[str, Any]]:
-        text = self._run(f"@({script}) | ConvertTo-Json -Depth 6 -Compress", node).strip()
+    def _run_json(self, script: str, node: str | None = None, depth: int = 6) -> List[Dict[str, Any]]:
+        text = self._run(f"@({script}) | ConvertTo-Json -Depth {depth} -Compress", node).strip()
         if not text:
             return []
 
@@ -496,32 +577,451 @@ class HyperVNode(Hypervisor):
 
         return same_network + rest
 
-    def get_backup_parameters(self, vm_name: str, snapshot_name: str) -> Dict[str, str]:
-        raise NotImplementedError("Hyper-V backup parameters are not implemented yet")
+    # ------------------------------------------------------------------
+    # Backup and restore. These follow the Hypervisor interface the vCenter
+    # plugin implements, in Hyper-V terms: a "snapshot" is a recovery
+    # checkpoint, a disk key or label is the drive's controller slot
+    # ("SCSI0:1"), a "datastore" is a volume, Cluster Shared Volume or share.
+    # Every VM argument takes the VM's id (a GUID) or, when it is unique, its
+    # name: Hyper-V does not keep names unique, so the engines always pass ids.
+    # The disks themselves are read and written by abr-vhdx-tool on the host
+    # (run_disk_tool), which also asks resilient change tracking (RCT) what
+    # changed; a backup's checkpoint ends as a reference point that keeps the
+    # tracking position the next incremental starts from.
+    # ------------------------------------------------------------------
 
-    def create_backup_snapshot(self, vm_name: str) -> str:
-        raise NotImplementedError("Hyper-V checkpoints are not implemented yet")
+    def _run_script(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        node: str | None = None,
+        *,
+        depth: int = 6,
+    ) -> List[Dict[str, Any]]:
+        payload = json.dumps(args, ensure_ascii=True)
+        body = load_script("common.ps1") + "\n" + load_script(name)
+        script = f"$AbrArgs = {_ps_quote(payload)} | ConvertFrom-Json\n& {{\n{body}\n}}"
+        return self._run_json(script, node, depth=depth)
+
+    def node_address(self, node: str) -> str:
+        """The address this server reaches a node at over WinRM."""
+        key = str(node or "").lower()
+        if not key or key == self.host.lower():
+            return self.host
+        resolved = self._node_resolved.get(key)
+        if resolved:
+            return resolved
+        candidates = self._node_addresses.get(key) or []
+        if len(self._nodes) == 1 and key == self._nodes[0].lower():
+            return self.host
+        return candidates[0] if candidates else node
+
+    def resolve_node(self, name: str) -> str:
+        """The cluster node (or the standalone host) a host name refers to."""
+        wanted = str(name or "").strip().lower()
+        for node in self.nodes:
+            if node.lower() == wanted or node.lower().split(".")[0] == wanted.split(".")[0]:
+                return node
+        if len(self.nodes) == 1 and wanted in (self.host.lower(), ""):
+            return self.nodes[0]
+        raise HyperVError(f"{name} is not a node of the Hyper-V inventory at {self.host} ({', '.join(self.nodes)})")
+
+    def _vm_id(self, vm: str) -> str:
+        value = str(vm or "").strip()
+        if is_guid(value):
+            return value.strip("{}").lower()
+        matches: Dict[str, Dict[str, Any]] = {}
+        for node in self.nodes:
+            for row in self._run_script("vm_by_name.ps1", {"name": value}, node):
+                matches[str(row.get("vm_id") or "").lower()] = row
+        if not matches:
+            raise HyperVVmNotFoundError(f"No virtual machine named {value!r} on {self.host}")
+        if len(matches) > 1:
+            raise HyperVVmNotFoundError(
+                f"{len(matches)} virtual machines on {self.host} are named {value!r}; use the VM id"
+            )
+        vm_id, row = next(iter(matches.items()))
+        self._vm_nodes[vm_id] = str(row.get("computer") or "")
+        return vm_id
+
+    def locate_vm(self, vm: str, *, hint: str | None = None) -> Dict[str, Any]:
+        """Find the node running a VM and report its state.
+
+        A clustered VM moves between nodes, so the node it was discovered on
+        is only the first place to look.
+        """
+        vm_id = self._vm_id(vm)
+        tried: set[str] = set()
+        candidates = [self._vm_nodes.get(vm_id), hint, *self.nodes]
+        for node in candidates:
+            if not node or node.lower() in tried:
+                continue
+            tried.add(node.lower())
+            try:
+                rows = self._run_script("vm_state.ps1", {"vm_id": vm_id}, node)
+            except HyperVUnreachableError:
+                logger.warning("Hyper-V node %s is unreachable while looking for VM %s", node, vm_id)
+                continue
+            if rows:
+                state = rows[0]
+                self._vm_nodes[vm_id] = str(state.get("computer") or node)
+                self._vm_states[vm_id] = state
+                return state
+        raise HyperVVmNotFoundError(
+            f"Virtual machine {vm} is not on any node of {self.host} ({', '.join(sorted(tried)) or 'none reachable'})"
+        )
+
+    def _vm_node(self, vm_id: str) -> str:
+        node = self._vm_nodes.get(vm_id)
+        if node:
+            return node
+        return str(self.locate_vm(vm_id).get("computer") or "")
+
+    def _run_vm_script(self, vm: str, name: str, args: Dict[str, Any], **kwargs: Any) -> List[Dict[str, Any]]:
+        """Run a script on the node that has the VM, following it if it moved."""
+        vm_id = self._vm_id(vm)
+        payload = {"vm_id": vm_id, **args}
+        node = self._vm_node(vm_id)
+        try:
+            return self._run_script(name, payload, node, **kwargs)
+        except HyperVError as exc:
+            if "ABR_VM_NOT_FOUND" not in str(exc):
+                raise
+        self._vm_nodes.pop(vm_id, None)
+        node = self._vm_node(vm_id)
+        return self._run_script(name, payload, node, **kwargs)
+
+    def ensure_vm_host_connected(self, vm_name: str, *, hint: str | None = None) -> Dict[str, Any]:
+        """Refuse up front when the VM cannot be checkpointed right now.
+
+        Mirrors the vCenter check for a disconnected ESXi host: a VM that is
+        mid-transition, in a critical state, or busy with another storage
+        operation fails the checkpoint with an opaque WMI error, so the reason
+        is spelled out before anything is changed on the host.
+        """
+        state = self.locate_vm(vm_name, hint=hint)
+        name = str(state.get("name") or vm_name)
+        current = str(state.get("state") or "")
+        if current.endswith("Critical"):
+            raise HyperVVmStateError(
+                f"VM {name} is in the {current} state: Hyper-V has lost access to its storage or "
+                "configuration. Fix the VM on the host before backing it up"
+            )
+        if current not in BACKUP_READY_STATES:
+            raise HyperVVmStateError(
+                f"VM {name} is {current or 'in an unknown state'}; a backup can start once it is "
+                "running, off, saved or paused. Retry when the transition has finished"
+            )
+        busy = sorted(BUSY_OPERATIONS.intersection(state.get("operational_status") or []))
+        if busy:
+            raise HyperVVmStateError(
+                f"VM {name} is busy ({', '.join(busy)}); a checkpoint cannot be taken until Hyper-V "
+                "has finished. Retry later"
+            )
+        return state
 
     def ensure_cbt_enabled(self, vm_name: str) -> bool:
-        raise NotImplementedError("Hyper-V reference points are not implemented yet")
+        """Nothing to enable: taking a recovery checkpoint turns resilient
+        change tracking on for the VM's disks. Returns False ("nothing had to
+        be enabled"), as the vCenter plugin does when CBT is on."""
+        return False
+
+    def create_recovery_checkpoint(self, vm_name: str, consistency: str = "application") -> Dict[str, Any]:
+        level = CONSISTENCY_LEVELS.get(consistency)
+        if level is None:
+            raise HyperVCheckpointError(f"Unknown checkpoint consistency {consistency!r}")
+        rows = self._run_vm_script(vm_name, "create_checkpoint.ps1", {"consistency_level": level})
+        if not rows or not rows[0].get("checkpoint_id"):
+            raise HyperVCheckpointError(f"Hyper-V created no recovery checkpoint for VM {vm_name}")
+        result = dict(rows[0])
+        result["consistency"] = consistency
+        logger.info(
+            "Created %s-consistent recovery checkpoint %s for VM %s on %s",
+            consistency,
+            result["checkpoint_id"],
+            vm_name,
+            result.get("computer"),
+        )
+        return result
+
+    def create_backup_snapshot(self, vm_name: str) -> str:
+        """An application-consistent recovery checkpoint when the guest can
+        quiesce, a crash-consistent one otherwise; returns its id."""
+        state = self.locate_vm(vm_name)
+        if str(state.get("state") or "") not in QUIESCABLE_STATES:
+            return str(self.create_recovery_checkpoint(vm_name, "crash")["checkpoint_id"])
+        try:
+            return str(self.create_recovery_checkpoint(vm_name, "application")["checkpoint_id"])
+        except HyperVError as exc:
+            logger.warning(
+                "Application-consistent checkpoint of VM %s failed (%s); taking a crash-consistent one",
+                vm_name,
+                exc,
+            )
+            return str(self.create_recovery_checkpoint(vm_name, "crash")["checkpoint_id"])
+
+    def get_backup_parameters(self, vm_name: str, snapshot_name: str) -> Dict[str, str]:
+        vm_id = self._vm_id(vm_name)
+        node = self._vm_node(vm_id)
+        return {
+            "vm_id": vm_id,
+            "checkpoint_id": str(snapshot_name),
+            "node": node,
+            "node_address": self.node_address(node),
+        }
+
+    def checkpoint_disks(self, vm_name: str, snapshot_name: str) -> List[Dict[str, Any]]:
+        """Every hard disk of the checkpoint, frozen file first, with its
+        chain; disks a backup cannot read say why."""
+        rows = self._run_vm_script(vm_name, "checkpoint_disks.ps1", {"checkpoint_id": str(snapshot_name)})
+        disks = [self._disk_entry(row) for row in rows]
+        disks.sort(key=lambda item: _slot_sort_key(item["slot"]))
+        return disks
 
     def get_snapshot_change_ids(self, vm_name: str, snapshot_name: str) -> List[Dict[str, Any]]:
-        raise NotImplementedError("Hyper-V reference points are not implemented yet")
+        """The checkpoint's disks. Their RCT ids come from abr-vhdx-tool, which
+        reports each disk's id (``rct_id``) as it backs the disk up."""
+        return [
+            {
+                "disk_label": disk["slot"],
+                "datastore_path": disk["datastore_path"],
+                "checkpoint_path": disk["checkpoint_path"],
+                "change_id": "",
+                "uuid": disk["uuid"],
+                "key": disk["slot"],
+                "capacity_bytes": disk["capacity_bytes"],
+            }
+            for disk in self.checkpoint_disks(vm_name, snapshot_name)
+            if disk["supported"]
+        ]
 
     def query_changed_disk_areas(
         self,
         vm_name: str,
         snapshot_name: str,
-        disk_key: int,
+        disk_key: Any,
         change_id: str,
     ) -> List[Dict[str, int]]:
-        raise NotImplementedError("Hyper-V changed block tracking is not implemented yet")
+        raise NotImplementedError(
+            "abr-vhdx-tool asks resilient change tracking for the changed areas itself (--change-id)"
+        )
 
     def get_vm_disks(self, vm_name: str) -> List[Dict[str, Any]]:
-        raise NotImplementedError("Hyper-V disk enumeration is not implemented yet")
+        disks = [self._disk_entry(row) for row in self._run_vm_script(vm_name, "live_disks.ps1", {})]
+        disks.sort(key=lambda item: _slot_sort_key(item["slot"]))
+        for disk in disks:
+            disk["current_datastore_path"] = disk.pop("checkpoint_path")
+        return disks
 
     def get_vm_restore_metadata(self, vm_name: str) -> Dict[str, Any]:
-        raise NotImplementedError("Hyper-V restore metadata is not implemented yet")
+        rows = self._run_vm_script(vm_name, "vm_config.ps1", {})
+        if not rows:
+            raise HyperVError(f"Hyper-V returned no configuration for VM {vm_name}")
+        config = dict(rows[0])
+        config.setdefault("guest_id", None)
+        config.setdefault("scsi_controller_type", None)
+        return config
+
+    def remove_snapshot(self, vm_name: str, snapshot_name: str) -> None:
+        """Remove a recovery checkpoint; a checkpoint already gone is not an error."""
+        rows = self._run_vm_script(vm_name, "remove_checkpoint.ps1", {"checkpoint_id": str(snapshot_name)})
+        outcome = rows[0] if rows else {}
+        if outcome.get("removed"):
+            logger.info("Removed recovery checkpoint %s of VM %s", snapshot_name, vm_name)
+        else:
+            logger.info(
+                "Recovery checkpoint %s of VM %s was already gone (%s)",
+                snapshot_name,
+                vm_name,
+                outcome.get("reason") or "unknown",
+            )
+
+    def convert_to_reference_point(self, vm_name: str, snapshot_name: str) -> Dict[str, Any]:
+        """Merge a backup's recovery checkpoint back into the VM, keeping the
+        change tracking position it marked as a reference point."""
+        rows = self._run_vm_script(vm_name, "reference_point.ps1", {"checkpoint_id": str(snapshot_name)})
+        point = dict(rows[0]) if rows else {}
+        logger.info(
+            "Recovery checkpoint %s of VM %s is now reference point %s",
+            snapshot_name,
+            vm_name,
+            point.get("reference_point_id") or "(not reported)",
+        )
+        return point
+
+    def remove_reference_point(self, vm_name: str, reference_point_id: str) -> bool:
+        """Remove a reference point an earlier backup left; one already gone is
+        not an error. Returns whether one was removed."""
+        rows = self._run_vm_script(
+            vm_name, "remove_reference_point.ps1", {"reference_point_id": str(reference_point_id)}
+        )
+        removed = bool((rows[0] if rows else {}).get("removed"))
+        logger.info(
+            "Reference point %s of VM %s %s",
+            reference_point_id,
+            vm_name,
+            "removed" if removed else "was already gone",
+        )
+        return removed
+
+    # -- abr-vhdx-tool ------------------------------------------------------
+
+    def ensure_disk_tool(self, node: str) -> str:
+        """The path of abr-vhdx-tool.exe on a node, copied there first when it
+        is missing or differs from the appliance's copy."""
+        key = str(node or self.host).lower()
+        with self._lock:
+            known = self._tool_paths.get(key)
+        if known:
+            return known
+        remote = vhdx_tool.remote_tool_path()
+        local = vhdx_tool.local_tool_path()
+        info = (self._run_script("tool_info.ps1", {"path": remote}, node) or [{}])[0]
+        if local is not None:
+            wanted = vhdx_tool.file_sha256(local)
+            if not info.get("exists") or str(info.get("sha256") or "").upper() != wanted:
+                logger.info(
+                    "Copying abr-vhdx-tool from %s to %s on Hyper-V node %s (%s there)",
+                    local,
+                    remote,
+                    node,
+                    "a different build is" if info.get("exists") else "it is not",
+                )
+                self._copy_file(node, local, remote)
+                info = (self._run_script("tool_info.ps1", {"path": remote}, node) or [{}])[0]
+                if str(info.get("sha256") or "").upper() != wanted:
+                    raise HyperVError(f"abr-vhdx-tool could not be copied to {remote} on {node}")
+        if not info.get("exists"):
+            raise HyperVError(
+                f"abr-vhdx-tool is not installed on {node} at {remote}. Install it there, or set "
+                "ALTASTOR_VHDX_TOOL_PATH on this appliance to the .exe so it is copied to every host"
+            )
+        logger.info("abr-vhdx-tool %s is ready on Hyper-V node %s at %s", info.get("version") or "", node, remote)
+        with self._lock:
+            self._tool_paths[key] = remote
+        return remote
+
+    def _copy_file(self, node: str, local: Path, remote: str) -> None:
+        folder = remote.rsplit("\\", 1)[0]
+        self.prepare_folders(node, [folder], [])
+        client = self._client_for(node) if node else self._client
+        client.copy(str(local), remote)
+
+    def run_disk_tool(
+        self,
+        node: str,
+        args: List[str],
+        *,
+        env: Dict[str, str] | None = None,
+        on_progress: Any = None,
+        should_cancel: Any = None,
+        timeout: float | None = None,
+    ) -> Dict[str, Any]:
+        """Run abr-vhdx-tool on a node and wait for it, relaying its
+        ``NN%`` lines to ``on_progress``.
+
+        Returns ``exit_code``, the ``--json`` ``result`` and the other
+        ``lines`` it printed. A stop request or a timeout stops the run,
+        which ends the tool; it discards what it had written itself, and no
+        virtual disk stays attached once it is gone.
+        """
+        from pypsrp.complex_objects import PSInvocationState
+        from pypsrp.powershell import PowerShell, RunspacePool
+
+        from ...core.storage_tool import redact_disk_tool_command
+        from ...core.subprocess_util import ProcessCancelled
+
+        tool = self.ensure_disk_tool(node)
+        client = self._client_for(node) if node else self._client
+        if client is None:
+            raise HyperVError("Hyper-V connection is not open")
+        logger.info("Running abr-vhdx-tool on %s: %s", node, " ".join(redact_disk_tool_command([tool, *args])))
+        started = time.monotonic()
+        output = _ToolOutput(on_progress)
+        with RunspacePool(client.wsman) as pool:
+            shell = PowerShell(pool)
+            shell.add_script(load_script("run_tool.ps1"))
+            shell.add_parameters({"Tool": tool, "ToolArgs": list(args), "ToolEnv": dict(env or {})})
+            shell.begin_invoke()
+            seen = 0
+            while shell.state == PSInvocationState.RUNNING:
+                if should_cancel is not None and should_cancel():
+                    shell.stop()
+                    raise ProcessCancelled("cancellation requested")
+                if timeout and time.monotonic() - started > timeout:
+                    shell.stop()
+                    raise HyperVError(f"abr-vhdx-tool on {node} did not finish within {int(timeout)}s")
+                shell.poll_invoke(timeout=2)
+                for item in shell.output[seen:]:
+                    output.feed(str(item))
+                seen = len(shell.output)
+            for item in shell.output[seen:]:
+                output.feed(str(item))
+            if shell.had_errors and output.exit_code is None:
+                messages = "; ".join(str(record).strip() for record in shell.streams.error)[:400]
+                raise HyperVError(f"abr-vhdx-tool could not be started on {node}: {messages}")
+        result = vhdx_tool.parse_result(output.lines)
+        logger.info(
+            "abr-vhdx-tool %s on %s exited %s after %.1fs",
+            args[0] if args else "",
+            node,
+            output.exit_code,
+            time.monotonic() - started,
+        )
+        return {"exit_code": output.exit_code, "result": result, "lines": output.lines}
+
+    def _disk_entry(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        chain = [item for item in (row.get("chain") or []) if isinstance(item, dict)]
+        top = chain[0] if chain else {}
+        base = chain[-1] if chain else {}
+        capacity = int(top.get("size") or 0)
+        base_type = str(base.get("type") or "")
+        return {
+            "slot": str(row.get("slot") or ""),
+            "disk_label": str(row.get("slot") or ""),
+            "controller_type": str(row.get("controller_type") or ""),
+            "controller_number": int(row.get("controller_number") or 0),
+            "controller_location": int(row.get("controller_location") or 0),
+            "supported": bool(row.get("supported")),
+            "unsupported_reason": str(row.get("unsupported_reason") or ""),
+            "checkpoint_path": str(row.get("path") or ""),
+            "datastore_path": str(base.get("path") or row.get("path") or ""),
+            "chain_paths": [str(item.get("path") or "") for item in chain],
+            "uuid": str(base.get("disk_identifier") or ""),
+            "capacity_bytes": capacity,
+            "capacity_gb": round(capacity / (1024 ** 3), 2),
+            "logical_sector_size": int(top.get("logical_sector_size") or 512),
+            "physical_sector_size": int(top.get("physical_sector_size") or 4096),
+            "block_size": int(base.get("block_size") or 0),
+            "vhd_format": str(base.get("format") or ""),
+            "vhd_type": base_type,
+            "source_disk_type_code": str(base.get("format") or ""),
+            "source_disk_type_name": base_type,
+            "source_disk_eager_zeroed": base_type.lower() == "fixed",
+        }
+
+    # -- restore side -------------------------------------------------------
+
+    def host_resources(self, node: str) -> Dict[str, Any]:
+        """What a restore can use on one node: volumes and Cluster Shared
+        Volumes with their free space, virtual switches, the names of the VMs
+        already there, and the host's default paths."""
+        rows = self._run_script("host_resources.ps1", {}, node)
+        raw = rows[0] if rows else {}
+        return {
+            "computer": str(raw.get("computer") or node),
+            "vm_path": str(raw.get("vm_path") or ""),
+            "vhd_path": str(raw.get("vhd_path") or ""),
+            "volumes": [item for item in raw.get("volumes") or [] if isinstance(item, dict)],
+            "switches": [item for item in raw.get("switches") or [] if isinstance(item, dict)],
+            "vm_names": [str(item) for item in raw.get("vm_names") or []],
+            "versions": [str(item) for item in raw.get("versions") or []],
+        }
+
+    def prepare_folders(self, node: str, folders: List[str], files: List[str]) -> List[str]:
+        """Create ``folders`` on a node; return those of ``files`` that already exist."""
+        rows = self._run_script("prepare_folders.ps1", {"folders": folders, "files": files}, node)
+        return [str(item) for item in ((rows[0] if rows else {}).get("existing") or [])]
 
     def create_vm_shell(
         self,
@@ -532,10 +1032,53 @@ class HyperVNode(Hypervisor):
         config_metadata: Dict[str, Any],
         disk_layout: List[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
-        raise NotImplementedError("Hyper-V VM creation is not implemented yet")
+        """Create the VM a restore attaches its disks to.
 
-    def remove_snapshot(self, vm_name: str, snapshot_name: str) -> None:
-        raise NotImplementedError("Hyper-V checkpoints are not implemented yet")
+        ``datastore_name`` is the folder the VM's configuration goes under,
+        ``config_metadata`` the backup's ``vm_config`` with each network
+        adapter's ``target_switch`` filled in (empty leaves it unconnected).
+        ``disk_layout`` only decides how many SCSI controllers to add; the
+        disks are attached afterwards with attach_existing_disk.
+        """
+        node = self.resolve_node(host_name)
+        scsi_needed = 0
+        for disk in disk_layout or []:
+            if str(disk.get("controller_type") or "").upper() == "SCSI":
+                scsi_needed = max(scsi_needed, int(disk.get("controller_number") or 0) + 1)
+        config = config_metadata
+        args = {
+            "name": vm_name,
+            "path": datastore_name,
+            "generation": int(config.get("generation") or (2 if config.get("firmware") == "efi" else 1)),
+            "num_cpu": int(config.get("num_cpu") or 1),
+            "memory_mb": int(config.get("memory_mb") or 1024),
+            "dynamic_memory": bool(config.get("dynamic_memory")),
+            "memory_minimum_mb": int(config.get("memory_minimum_mb") or 0),
+            "memory_maximum_mb": int(config.get("memory_maximum_mb") or 0),
+            "memory_buffer": int(config.get("memory_buffer") or 0),
+            "secure_boot_enabled": config.get("secure_boot_enabled"),
+            "secure_boot_template": str(config.get("secure_boot_template") or ""),
+            "tpm_enabled": bool(config.get("tpm_enabled")),
+            "notes": str(config.get("notes") or ""),
+            "scsi_controllers": max(scsi_needed, len(config.get("scsi_controllers") or [])),
+            "network_adapters": [
+                {
+                    "name": str(adapter.get("label") or "Network Adapter"),
+                    "switch": str(adapter.get("target_switch") or ""),
+                    "vlan_id": int(adapter.get("vlan_id") or 0) if str(adapter.get("vlan_mode") or "") == "Access" else 0,
+                }
+                for adapter in config.get("network_adapters") or []
+                if isinstance(adapter, dict) and not adapter.get("legacy")
+            ],
+        }
+        rows = self._run_script("create_vm.ps1", args, node)
+        created = dict(rows[0]) if rows else {}
+        vm_id = str(created.get("vm_id") or "").lower()
+        if not vm_id:
+            raise HyperVError(f"Hyper-V did not report the VM {vm_name} it was asked to create on {node}")
+        self._vm_nodes[vm_id] = node
+        logger.info("Created VM %s (%s) on %s under %s", vm_name, vm_id, node, datastore_name)
+        return {"vm_id": vm_id, "name": vm_name, "node": node, "path": str(created.get("path") or "")}
 
     def attach_existing_disk(
         self,
@@ -543,18 +1086,121 @@ class HyperVNode(Hypervisor):
         datastore_path: str,
         disk_label: str | None = None,
     ) -> Dict[str, Any]:
-        raise NotImplementedError("Hyper-V disk attach is not implemented yet")
+        """Attach a VHDX to a VM at a controller slot (``disk_label``, like
+        "SCSI0:1"); a drive already in that slot is pointed at the file."""
+        match = re.match(r"^([A-Za-z]+)(\d+):(\d+)$", str(disk_label or "SCSI0:0"))
+        if not match:
+            raise HyperVError(f"{disk_label!r} is not a controller slot such as SCSI0:1")
+        rows = self._run_vm_script(
+            vm_name,
+            "attach_disk.ps1",
+            {
+                "path": datastore_path,
+                "controller_type": match.group(1).upper(),
+                "controller_number": int(match.group(2)),
+                "controller_location": int(match.group(3)),
+            },
+        )
+        attached = dict(rows[0]) if rows else {}
+        logger.info("Attached %s to VM %s at %s", datastore_path, vm_name, disk_label)
+        return attached
+
+    def set_boot_disk(self, vm_name: str, slot: str, boot_order: List[Dict[str, Any]] | None = None) -> None:
+        self._run_vm_script(vm_name, "set_boot.ps1", {"slot": slot, "boot_order": boot_order or []})
+
+    def set_vm_hardware(self, vm_name: str, config: Dict[str, Any]) -> None:
+        self._run_vm_script(
+            vm_name,
+            "set_hardware.ps1",
+            {
+                "num_cpu": int(config.get("num_cpu") or 0),
+                "memory_mb": int(config.get("memory_mb") or 0),
+                "dynamic_memory": bool(config.get("dynamic_memory")),
+                "memory_minimum_mb": int(config.get("memory_minimum_mb") or 0),
+                "memory_maximum_mb": int(config.get("memory_maximum_mb") or 0),
+            },
+        )
+
+    def replace_vm_disks(self, vm_name: str, disks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Point a VM's drives at other files, slot by slot; returns each
+        slot's previous file so the swap can be undone."""
+        rows = self._run_vm_script(vm_name, "replace_disks.ps1", {"disks": disks})
+        return [dict(item) for item in rows]
+
+    def power_on_vm(self, vm_name: str, vm_moref: str | None = None) -> Dict[str, Any]:
+        rows = self._run_vm_script(vm_moref or vm_name, "vm_power.ps1", {"action": "start"})
+        return dict(rows[0]) if rows else {}
+
+    def power_off_vm(self, vm_name: str, vm_moref: str | None = None) -> Dict[str, Any]:
+        rows = self._run_vm_script(vm_moref or vm_name, "vm_power.ps1", {"action": "turnoff"})
+        return dict(rows[0]) if rows else {}
+
+    def destroy_vm(self, vm_name: str, vm_moref: str | None = None) -> None:
+        self._run_vm_script(vm_moref or vm_name, "remove_vm.ps1", {})
+        logger.info("Removed VM %s", vm_moref or vm_name)
+
+    def convert_disk(self, node: str, source: str, destination: str, disk_type: str) -> None:
+        self._run_script(
+            "convert_disk.ps1", {"source": source, "destination": destination, "type": disk_type}, node
+        )
+
+    def remove_files(self, node: str, paths: List[str]) -> List[str]:
+        """Delete files on a node; returns the ones that could not be removed."""
+        if not paths:
+            return []
+        rows = self._run_script("remove_files.ps1", {"paths": paths}, node)
+        return [str(item) for item in ((rows[0] if rows else {}).get("failed") or [])]
 
     def backup(
         self,
         task: dict[str, Any],
         progress_callback: ProgressCallback = None,
     ) -> dict[str, Any]:
-        raise NotImplementedError("Hyper-V backup is not implemented yet")
+        from .hyperv_backup import run_hyperv_backup
+
+        return run_hyperv_backup(task, progress_callback=progress_callback)
 
     def restore(
         self,
         task: dict[str, Any],
         progress_callback: ProgressCallback = None,
     ) -> dict[str, Any]:
-        raise NotImplementedError("Hyper-V restore is not implemented yet")
+        from .hyperv_restore import run_hyperv_restore
+
+        return run_hyperv_restore(task, progress_callback=progress_callback)
+
+class _ToolOutput:
+    """Sorts what abr-vhdx-tool prints: ``NN%`` progress lines, the exit code
+    the runner script appends, and everything else."""
+
+    def __init__(self, on_progress: Any = None) -> None:
+        self.on_progress = on_progress
+        self.lines: List[str] = []
+        self.exit_code: int | None = None
+
+    def feed(self, text: str) -> None:
+        for line in text.splitlines() or [""]:
+            if line.startswith("ABR_TOOL_EXIT="):
+                try:
+                    self.exit_code = int(line.split("=", 1)[1].strip())
+                except ValueError:
+                    self.exit_code = -1
+                continue
+            percent = vhdx_tool.progress_percent(line)
+            if percent is not None:
+                if self.on_progress is not None:
+                    self.on_progress(percent)
+                continue
+            self.lines.append(line)
+
+
+_CONTROLLER_ORDER = {"ide": 0, "scsi": 1}
+
+
+def _slot_sort_key(slot: str) -> tuple[int, int, int, str]:
+    """IDE before SCSI, then controller number and location: the order a
+    VM's disks keep from one backup to the next."""
+    match = re.match(r"^([A-Za-z]+)(\d+):(\d+)$", str(slot or ""))
+    if not match:
+        return (9, 0, 0, str(slot))
+    return (_CONTROLLER_ORDER.get(match.group(1).lower(), 5), int(match.group(2)), int(match.group(3)), "")

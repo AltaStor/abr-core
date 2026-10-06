@@ -226,6 +226,7 @@ class TaskProcessPool:
             update = dict(update)
             log_entry = update.pop("log_entry", True)
             warning = update.pop("warning", None)
+            log_level = str(update.pop("log_level", "") or ("warn" if warning else "info"))
             if "access_lock" in update:
                 task["access_lock"] = update.pop("access_lock") or None
             current_result = task.get("result")
@@ -238,11 +239,15 @@ class TaskProcessPool:
                 logs.append(
                     {
                         "timestamp": utc_now(),
-                        "level": "warn" if warning else "info",
+                        "level": log_level,
                         "component": "engine",
                         "message": str(update.get("message")),
                     }
                 )
+                if log_level == "warn" and not isinstance(warning, dict):
+                    warnings = task.get("warnings") if isinstance(task.get("warnings"), list) else []
+                    warnings.append({"message": str(update.get("message"))})
+                    task["warnings"] = warnings
             task["logs"] = logs
             if isinstance(warning, dict):
                 warnings = task.get("warnings") if isinstance(task.get("warnings"), list) else []

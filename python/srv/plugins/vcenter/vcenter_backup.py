@@ -478,6 +478,7 @@ def _disk_tool_progress_reporter(
     measure_transferred: Callable[[], int] | None = None,
     base_sent_bytes: int = 0,
     disk_sent_bytes: int = 0,
+    worker_mode: str = "vcenter-abr-vmdk-tool",
 ) -> Callable[[int, int], None]:
     """Relay the mover's own per-disk progress, with live byte counters.
 
@@ -518,7 +519,7 @@ def _disk_tool_progress_reporter(
             "transfer",
             mapped,
             f"{message_prefix}: {percent}%",
-            worker_mode="vcenter-abr-vmdk-tool",
+            worker_mode=worker_mode,
             tool_block_index=block_index,
             log_entry=False,
             **counters,

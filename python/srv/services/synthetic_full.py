@@ -317,6 +317,18 @@ def _write_synthetic_manifest(
     return manifest_path
 
 
+def _hypervisor_kind(task: dict[str, Any], manifest: dict[str, Any]) -> str:
+    from python.srv.core.mongo_db_wrapper import HYPERVISORS
+
+    hypervisor = HYPERVISORS.get(str(task.get("hypervisor_id") or "")) or {}
+    return str(
+        task.get("hypervisor_kind")
+        or manifest.get("hypervisor_kind")
+        or hypervisor.get("kind")
+        or "vcenter"
+    )
+
+
 def run_synthetic_full(
     task: dict[str, Any],
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -594,7 +606,7 @@ def run_synthetic_full(
     return {
         "operation": "backup",
         "worker_mode": "synthetic-full",
-        "hypervisor_kind": str(task.get("hypervisor_kind") or "vcenter"),
+        "hypervisor_kind": _hypervisor_kind(task, manifest_payload),
         "vm_name": vm_name,
         "vm_external_id": vm_id,
         "backup_mode": "full",

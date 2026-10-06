@@ -70,10 +70,18 @@ class RestoreCommands:
             help="Start restore.",
             description=(
                 "Start a full VM restore from a restore point.\n\n"
+                "A restore point goes back to the platform it came from. For Hyper-V, --datastore and\n"
+                "--datastore-map name a volume or Cluster Shared Volume of the target host (D:,\n"
+                "C:\\ClusterStorage\\Volume1) and --network-map maps the source adapters' virtual switches\n"
+                "to switches on the target host; the VM's files go under <volume>\\Hyper-V\\<new name>.\n"
+                "An in-place Hyper-V restore keeps the VM and replaces its disks; it is refused while the\n"
+                "VM has checkpoints.\n\n"
                 "Examples:\n"
                 '  abr restore start --restore-point <point-id> --new-name "sql-01-restored"\n'
                 '  abr restore start --backup <backup-id> --vm "sql-01" --target-inventory "vCenter-Prod" '
                 '--datastore "datastore1" --power-on\n'
+                '  abr restore start --restore-point <point-id> --new-name "web-01-copy" --target-inventory "hv-cluster" '
+                '--target-host "HV-NODE-2" --datastore "D:" --network-map "External=Isolated" --wait\n'
                 "  abr restore start --restore-point <point-id> --in-place --force"
             ),
             formatter_class=CompactHelpFormatter,

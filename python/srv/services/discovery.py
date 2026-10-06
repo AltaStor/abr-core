@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright © 2026 Norvitex OÜ
 
+import logging
+import time
 from typing import Any
 
 from ..core.mongo_db_wrapper import RESOURCES_BY_HV
 from .helpers import deterministic_seed
+
+discovery_logger = logging.getLogger(__name__)
 
 
 def generate_discovery(hypervisor_id: str, hypervisor_name: str) -> list[dict[str, Any]]:
@@ -277,16 +281,40 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
 
     from ..plugins.hyperv import HyperVNode
 
-    with HyperVNode(
-        str(host),
-        str(username),
-        str(password),
-        port=int(port) if port and port_explicit else None,
-        verify_ssl=verify_ssl,
-    ) as node:
-        inventory = node.get_inventory()
-        hosts = node.list_hosts()
-        cluster_name = node.cluster_name
+    started = time.monotonic()
+    discovery_logger.info("Hyper-V discovery of inventory %s (%s) started", hv.get("name"), host)
+    try:
+        with HyperVNode(
+            str(host),
+            str(username),
+            str(password),
+            port=int(port) if port and port_explicit else None,
+            verify_ssl=verify_ssl,
+        ) as node:
+            inventory = node.get_inventory()
+            hosts = node.list_hosts()
+            cluster_name = node.cluster_name
+    except Exception as exc:
+        discovery_logger.warning(
+            "Hyper-V discovery of inventory %s (%s) failed after %.1fs: %s",
+            hv.get("name"),
+            host,
+            time.monotonic() - started,
+            exc,
+        )
+        raise
+    discovery_logger.info(
+        "Hyper-V discovery of inventory %s (%s) found %s: %d host(s), %d VM(s), %d disk(s), "
+        "%d network adapter(s) in %.1fs",
+        hv.get("name"),
+        host,
+        f"cluster {cluster_name}" if cluster_name else "a standalone host",
+        len(hosts),
+        len(inventory["virtual_machines"]),
+        len(inventory["disks"]),
+        len(inventory["network_adapters"]),
+        time.monotonic() - started,
+    )
 
     resources: list[dict[str, Any]] = [
         {
