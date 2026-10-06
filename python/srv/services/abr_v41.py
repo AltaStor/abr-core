@@ -2378,6 +2378,24 @@ def resolve_repository(name: str | None = None, record_id: str | None = None) ->
     return normalize_repository_record(resolve_selector(catalog_records(REPOSITORIES), name=name, record_id=record_id, label="Repository"))
 
 
+def _ensure_local_repository_share(server: Any, share: Any, username: Any, password: Any) -> None:
+    """A local repository's server and share name the SMB share Hyper-V hosts
+    reach its folder by (abr-vhdx-tool writes there from the host); its
+    username and password are the account that opens it."""
+    _ensure(
+        bool(str(server or "").strip()) == bool(str(share or "").strip()),
+        422,
+        "invalid_repository",
+        "A local repository's SMB share for Hyper-V hosts needs both --server and --share",
+    )
+    _ensure(
+        not str(username or "").strip() or bool(str(password or "")),
+        422,
+        "invalid_repository",
+        "A local repository's SMB share account needs --password with --username",
+    )
+
+
 def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or "")
     repo_type = str(payload.get("type") or "").strip().lower()
@@ -2404,6 +2422,7 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
         _ensure(exists, 422, "invalid_repository", f"Path does not exist: {local_path}", path=path)
         _ensure(is_dir, 422, "invalid_repository", f"Path is not a directory: {local_path}", path=path)
         _reject_insecure_local_repository_path(local_path)
+        _ensure_local_repository_share(server, share, username, password)
     elif repo_type == "s3":
         s3_config = _normalize_s3_configuration(payload)
         if description and not s3_config.get("description"):
@@ -2549,6 +2568,16 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         _ensure(bool(str(updated.get("path") or "").strip()), 422, "invalid_repository", "local repositories require --path")
         if local_path is not None and local_path != original_path:
             _reject_insecure_local_repository_path(Path(local_path))
+        for field_name in ("server", "share"):
+            if field_name in payload and payload[field_name] is not None:
+                metadata[field_name] = str(payload[field_name]).strip() or None
+                changed = True
+        _ensure_local_repository_share(
+            metadata.get("server"),
+            metadata.get("share"),
+            payload.get("username", metadata.get("username")),
+            payload.get("password", metadata.get("password")),
+        )
     elif repo_type == "s3":
         current_s3 = extract_s3_config(updated)
         next_s3 = _normalize_s3_configuration(payload, existing=current_s3)

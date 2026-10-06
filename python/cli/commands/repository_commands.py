@@ -232,6 +232,8 @@ class RepositoryCommands:
                 "and --secret-key VALUE, which show them to every local user.\n\n"
                 "Examples:\n"
                 '  abr repo add --name "Local-Repo-1" --type local --path /mnt/backups/repo1\n'
+                '  abr repo add --name "HV-Local" --type local --path /mnt/backups/hv --server backup01 '
+                '--share hv --username "CORP\\backupsvc" --password "********"\n'
                 '  abr repo add --name "SMB-Repo" --type smb --address //fileserver/backups '
                 "--username backupsvc\n"
                 '  abr repo add --name "S3-Repo" --type s3 --bucket altastor-backups --region us-east-1 '
@@ -245,9 +247,15 @@ class RepositoryCommands:
         add.add_argument("--type", required=True, choices=("local", "nfs", "smb", "s3"), help="Repository type")
         add.add_argument("--path", help="Local repository path")
         add.add_argument("--address", help="NFS host:/export or SMB //host/share")
-        add.add_argument("--server", help="Remote repository server")
-        add.add_argument("--share", help="Remote repository share/export")
-        add.add_argument("--username", help="Repository username")
+        add.add_argument(
+            "--server",
+            help="Remote repository server; for a local repository, the SMB server Hyper-V hosts reach its folder on",
+        )
+        add.add_argument(
+            "--share",
+            help="Remote repository share/export; for a local repository, the SMB share (and folder) of --path",
+        )
+        add.add_argument("--username", help="Repository username (for a local repository, the SMB share's account)")
         add_secret_argument(add, "--password", env_var=REPO_PASSWORD_ENV_VAR, help_text="Repository password")
         add.add_argument("--description", help="Repository description")
         add.add_argument("--bucket", help="S3 bucket name")
@@ -332,6 +340,8 @@ class RepositoryCommands:
                 "Edit repository settings.\n\n"
                 "Examples:\n"
                 '  abr repo edit --name "Local-Repo-1" --description "Primary on-prem repository"\n'
+                '  abr repo edit --name "Local-Repo-1" --server backup01 --share repo1 --username "CORP\\backupsvc" '
+                '--password "********"\n'
                 '  abr repo edit --id <repo-id> --new-name "Local-Repo-1-Renamed"\n'
                 '  abr repo edit --name "S3-WORM" --immutable governance --immutability-days 30\n'
                 '  abr repo edit --name "S3-WORM" --immutable none'
@@ -342,8 +352,12 @@ class RepositoryCommands:
         edit.add_argument("--new-name", help="Updated repository name")
         edit.add_argument("--path", help="Updated local repository path")
         edit.add_argument("--address", help="Updated remote repository address")
-        edit.add_argument("--server", help="Updated remote repository server")
-        edit.add_argument("--share", help="Updated remote repository share/export")
+        edit.add_argument(
+            "--server", help="Updated remote repository server, or a local repository's SMB server (\"\" removes it)"
+        )
+        edit.add_argument(
+            "--share", help="Updated remote repository share/export, or a local repository's SMB share (\"\" removes it)"
+        )
         edit.add_argument("--username", help="Updated repository username")
         add_secret_argument(edit, "--password", env_var=REPO_PASSWORD_ENV_VAR, help_text="Updated repository password")
         edit.add_argument("--description", help="Updated repository description")

@@ -41,6 +41,7 @@ from ...core.storage_tool import (
     disk_tool_storage_args,
     ensure_private_directory,
     extract_s3_config,
+    is_s3_repository,
     run_disk_tool,
 )
 from ...core.subprocess_util import ProcessCancelled
@@ -243,8 +244,14 @@ def _backup_name(index: int, disk: dict[str, Any]) -> str:
     return f"{index:02d}-{_sanitize_name(stem or f'disk-{index}')}.vhdx"
 
 
+def _storage_mode(repository: dict[str, Any]) -> str:
+    return "s3" if is_s3_repository(repository) else "local"
+
+
 def _repository_label(repository: dict[str, Any], abr_path: str) -> str:
     name = str(repository.get("name") or repository.get("id") or "repository")
+    if not is_s3_repository(repository):
+        return f"{name} (folder {abr_path}, shared to the hosts as {vhdx_tool.windows_share(repository)})"
     bucket = str(extract_s3_config(repository).get("bucket") or "")
     return f"{name} (S3 bucket {bucket}, path {abr_path})"
 
@@ -584,8 +591,8 @@ def run_hyperv_backup(
                 **hyperv_details,
                 "disks": disk_outputs,
                 "repository_id": str(repository.get("id") or ""),
-                "repository_type": "s3",
-                "storage_mode": "s3",
+                "repository_type": _storage_mode(repository),
+                "storage_mode": _storage_mode(repository),
                 "repository_storage_path": abr_path,
                 "backup_root": str(task_root),
                 "processed_bytes": total_read_bytes,
@@ -661,8 +668,8 @@ def run_hyperv_backup(
             "backup_root": str(task_root),
             "manifest_path": str(manifest_path),
             "repository_id": str(repository.get("id") or ""),
-            "repository_type": "s3",
-            "storage_mode": "s3",
+            "repository_type": _storage_mode(repository),
+            "storage_mode": _storage_mode(repository),
             "repository_storage_path": abr_path,
             "immutability_generation": immutability_generation,
             "vm_config": vm_config,
@@ -823,8 +830,8 @@ def _back_up_disks(
                 "compression_ratio": _compression_ratio(logical, stored),
                 "destination_path": "",
                 "parent_path": "",
-                "storage_mode": "s3",
-                "repository_type": "s3",
+                "storage_mode": _storage_mode(repository),
+                "repository_type": _storage_mode(repository),
                 "repository_id": str(repository.get("id") or ""),
                 "abr_path": abr_path,
                 "abr_backup_name": backup_name,

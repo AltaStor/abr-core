@@ -55,7 +55,8 @@ All notable changes to this project are documented in this file.
   host, storage and virtual switch mapping. Disks are moved by abr-vhdx-tool
   (the `abr-vhdx-tools` repository) on the Hyper-V host, which the appliance
   deploys there (`ALTASTOR_VHDX_TOOL_PATH`, `ALTASTOR_HYPERV_TOOL_PATH`);
-  Hyper-V jobs need an S3 repository. See `doc/HyperVBackup.md`.
+  Hyper-V jobs need an S3 repository, or a local one shared to the hosts over
+  SMB (`abr repo edit --server --share`). See `doc/HyperVBackup.md`.
 - Hyper-V job option `--guest-consistency`.
 
 ### Enhanced

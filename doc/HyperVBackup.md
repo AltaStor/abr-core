@@ -28,8 +28,30 @@ each host must have the tool installed at that path already.
 | --- | --- | --- |
 | Every Hyper-V host (every node of a cluster) | WinRM, TCP 5986 (HTTPS) or 5985 | Inventory, checkpoints, VM configuration, running abr-vhdx-tool, building and changing VMs on restore |
 | The registered account | Local administrator on every node | Hyper-V WMI, and the elevated token abr-vhdx-tool needs to attach virtual disks |
-| The repository | **S3** (or S3-compatible), reachable from every host and from the backup server | The host writes and reads the disks; the server keeps the manifests, merges chains, applies retention and verifies. A folder on the appliance is not visible from Windows, so a local repository is refused for Hyper-V |
+| The repository | **S3** (or S3-compatible), reachable from every host and from the backup server; or a **local** repository whose folder is shared over SMB to every host (see below) | The host writes and reads the disks; the server keeps the manifests, merges chains, applies retention and verifies. Both have to reach the same storage |
 | The VM | Configuration version 8.0 or later for incremental backups | Resilient change tracking (RCT) starts with version 8.0; older VMs get a full backup every time |
+
+### A local repository
+
+A local repository is a folder of the appliance, which Windows cannot see. To
+use one for Hyper-V, share that folder over SMB (Samba on the appliance, or a
+NAS the appliance mounts at the repository's path) and give the repository the
+share every Hyper-V host reaches it by:
+
+```bash
+abr repo edit --name "HV-Local" --server backup01 --share hv --username 'CORP\backupsvc' --password '...'
+```
+
+`--server` and `--share` name `\\backup01\hv`, which must be the repository's
+own folder (`--share` may go on into a folder of the share, `hv\altastor`).
+abr-vhdx-tool then writes each backup to the same folder through the share,
+and the appliance reads it locally. A WinRM session has no network credentials
+of its own, so the host opens the share for each run with the repository's
+`--username` and `--password`, or the inventory's account when it has none.
+
+The appliance creates every backup folder itself, owned by the user its server
+runs as and writable by nobody else (mode 0750), so the share must write as
+that user (Samba's `force user`), and every node needs TCP 445 to it.
 
 The S3 keys reach the tool as the AWS SDK's environment variables of its
 WinRM session, never on its command line; encryption keys and S3 secrets are
@@ -149,7 +171,8 @@ Lock validation. Credentials and encryption keys are never written to either.
 
 | Session says | Look at |
 | --- | --- |
-| `can reach S3 repositories only` | Point the job at an S3 repository |
+| `reaches S3 repositories, and local repositories only through an SMB share` | Point the job at an S3 repository, or give the local repository its share (`abr repo edit --server --share`) |
+| `cannot open the repository share` | The share's account (the repository's `--username`, else the inventory's), and that every node reaches the share on TCP 445 |
 | `abr-vhdx-tool is not installed on ...` | Set `ALTASTOR_VHDX_TOOL_PATH` on the appliance, or install the tool on the host at `ALTASTOR_HYPERV_TOOL_PATH` |
 | `needs an elevated (administrator) process` | The registered account is not a local administrator of that node |
 | `is in the OffCritical state` | The host lost the VM's storage or configuration |

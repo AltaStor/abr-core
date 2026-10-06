@@ -936,12 +936,17 @@ class HyperVNode(Hypervisor):
         if client is None:
             raise HyperVError("Hyper-V connection is not open")
         logger.info("Running abr-vhdx-tool on %s: %s", node, " ".join(redact_disk_tool_command([tool, *args])))
+        env = dict(env or {})
+        if env.get("ABR_SMB_SHARE") and not env.get("ABR_SMB_USER"):
+            # A repository share with no account of its own is opened with
+            # the one this inventory signs in to the hosts with.
+            env["ABR_SMB_USER"], env["ABR_SMB_PASSWORD"] = self.user, self.password
         started = time.monotonic()
         output = _ToolOutput(on_progress)
         with RunspacePool(client.wsman) as pool:
             shell = PowerShell(pool)
             shell.add_script(load_script("run_tool.ps1"))
-            shell.add_parameters({"Tool": tool, "ToolArgs": list(args), "ToolEnv": dict(env or {})})
+            shell.add_parameters({"Tool": tool, "ToolArgs": list(args), "ToolEnv": env})
             shell.begin_invoke()
             seen = 0
             while shell.state == PSInvocationState.RUNNING:

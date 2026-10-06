@@ -12,8 +12,9 @@ or out of date.
 
 Both sides have to reach the repository: the tool on the host writes and reads
 the disks, and the backup server keeps the manifests, merges chains, applies
-retention and verifies with abr-vmdk-tool. An S3 repository is the one both
-can reach; a folder on this appliance is not visible from Windows.
+retention and verifies with abr-vmdk-tool. Both reach an S3 repository. A local
+repository is a folder of the appliance, which the hosts reach only when it is
+shared over SMB: its server and share name the UNC path they use for it.
 """
 
 from __future__ import annotations
@@ -31,9 +32,14 @@ TOOL_NAME = "abr-vhdx-tool.exe"
 DEFAULT_REMOTE_TOOL_PATH = r"C:\Program Files\AltaStor\abr-vhdx-tool.exe"
 
 HYPERV_REPOSITORY_MESSAGE = (
-    "Hyper-V disks are written and read by abr-vhdx-tool on the Hyper-V host, which can reach S3 "
-    "repositories only: a folder on this appliance is not visible from Windows. Use an S3 repository"
+    "Hyper-V disks are written and read by abr-vhdx-tool on the Hyper-V host, which reaches S3 "
+    "repositories, and local repositories only through an SMB share of their folder. Use an S3 "
+    "repository, or give this one the share the hosts reach it by (abr repo edit --server --share)"
 )
+
+# What run_tool.ps1 takes out of the tool's environment to open a repository's
+# share for the run, rather than handing it to the tool.
+SHARE_ENV = ("ABR_SMB_SHARE", "ABR_SMB_USER", "ABR_SMB_PASSWORD")
 
 _PROGRESS_LINE = re.compile(r"^\s*(\d{1,3})%\s*$")
 # What the tool says when it cannot take an incremental against the given RCT
@@ -83,9 +89,59 @@ def file_sha256(path: Path) -> str:
     return _hashes[key]
 
 
+def _is_local_repository(repository: dict[str, Any] | None) -> bool:
+    return isinstance(repository, dict) and str(repository.get("type") or "").strip().lower() == "local"
+
+
+def _repository_field(repository: dict[str, Any], name: str) -> str:
+    metadata = repository.get("metadata") if isinstance(repository.get("metadata"), dict) else {}
+    return str(repository.get(name) or metadata.get(name) or "")
+
+
+def windows_share(repository: dict[str, Any] | None) -> str | None:
+    r"""The UNC path Hyper-V hosts reach a local repository's folder by,
+    \\server\share[\folder], from its server and share; None without them."""
+    if not _is_local_repository(repository):
+        return None
+    server = _repository_field(repository, "server").strip().strip("\\/")
+    share = _repository_field(repository, "share").strip().replace("/", "\\").strip("\\")
+    if not server or not share:
+        return None
+    return f"\\\\{server}\\{share}"
+
+
 def ensure_hyperv_repository(repository: dict[str, Any] | None) -> None:
-    if not is_s3_repository(repository):
+    if not is_s3_repository(repository) and windows_share(repository) is None:
         raise VhdxToolError(HYPERV_REPOSITORY_MESSAGE)
+
+
+def _share_invocation(
+    repository: dict[str, Any], *, abr_path: str | None, create_folder: bool
+) -> tuple[list[str], dict[str, str]]:
+    """A local repository's folder as the hosts see it: the same place under
+    its share, which run_tool.ps1 opens with the repository's account (a
+    WinRM session has no network credentials of its own)."""
+    share = windows_share(repository) or ""
+    root = Path(str(repository.get("path") or "")).expanduser().resolve()
+    target = Path(abr_path).expanduser().resolve() if abr_path else root
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        raise VhdxToolError(
+            f"{target} is outside the folder of repository {repository.get('name')} ({root}), "
+            f"which is all the hosts reach through {share}"
+        ) from None
+    folder = "\\".join([share, *relative.parts])
+    args = ["--mode", "file", "--folder", folder]
+    if create_folder:
+        args.append("--create-folder")
+    server, share_name = share.lstrip("\\").split("\\")[:2]
+    env = {"ABR_SMB_SHARE": f"\\\\{server}\\{share_name}"}
+    username = _repository_field(repository, "username").strip()
+    if username:
+        env["ABR_SMB_USER"] = username
+        env["ABR_SMB_PASSWORD"] = _repository_field(repository, "password")
+    return args, env
 
 
 def storage_invocation(
@@ -94,6 +150,8 @@ def storage_invocation(
     """The tool's storage options for a repository, and the environment that
     carries its credentials."""
     ensure_hyperv_repository(repository)
+    if not is_s3_repository(repository):
+        return _share_invocation(repository, abr_path=abr_path, create_folder=create_folder)
     args = disk_tool_storage_args(repository, abr_path=abr_path, create_folder=create_folder)
     options: list[str] = []
     env: dict[str, str] = {}
