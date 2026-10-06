@@ -1362,7 +1362,7 @@ def list_inventory_vm_tree() -> list[dict[str, Any]]:
             if str(resource.get("resource_type") or "") == "host"
         }
         hosts_by_name = {
-            str(resource.get("name") or ""): resource
+            str(resource.get("name") or "").lower(): resource
             for resource in hosts.values()
             if str(resource.get("name") or "")
         }
@@ -1412,7 +1412,7 @@ def list_inventory_vm_tree() -> list[dict[str, Any]]:
 
             host_id = _nullable_str(payload.get("host_external_id") or payload.get("host_id"))
             host_name = _nullable_str(payload.get("host_name") or payload.get("host"))
-            host_resource = (hosts.get(host_id or "") if host_id else None) or (hosts_by_name.get(host_name or "") if host_name else None)
+            host_resource = (hosts.get(host_id or "") if host_id else None) or (hosts_by_name.get(host_name.lower()) if host_name else None)
             if host_resource is None and host_id is None and host_name is None:
                 host_resource = single_host
             host_payload = _resource_payload(host_resource)
