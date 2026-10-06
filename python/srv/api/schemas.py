@@ -264,6 +264,7 @@ class JobDTO(_LenientModel):
     next_run_at: str | None = None
     next_incremental_run_at: str | None = None
     last_run_at: str | None = None
+    clock_anomalies: DocObjectArray = None
     last_session_id: str | None = None
     active_sessions: DocObjectArray = None
     active_session_count: int = 0
@@ -732,6 +733,8 @@ class CreateJobRequest(_LenientModel):
     synthetic_full_days_csv: LaxStr | None = None
     active_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
     synthetic_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
+    active_full_enabled: LaxBool | None = None
+    synthetic_full_enabled: LaxBool | None = None
     description: LaxStr | None = None
     task_parameters: SkipValidation[TaskParametersRequest] | None = None
     backup_options: SkipValidation[TaskParametersRequest] | None = None
@@ -766,6 +769,8 @@ class UpdateJobRequest(_LenientModel):
     synthetic_full_days: list[Any] | LaxStr | None = None
     active_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
     synthetic_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
+    active_full_enabled: LaxBool | None = None
+    synthetic_full_enabled: LaxBool | None = None
     description: LaxStr | None = None
     task_parameters: SkipValidation[TaskParametersRequest] | None = None
     repo: LaxStr | None = None
@@ -855,6 +860,8 @@ class StartRestoreRequest(_LenientModel):
     network_mappings: SkipValidation[list[StartRestoreNetworkMapping]] | None = None
     network_map: DocStrArray = None
     datastore_map: DocStrArray = None
+    disk_datastore_map: DocStrArray = None
+    nic_network_map: DocStrArray = None
     datastore_mappings: SkipValidation[list[RestoreDatastoreMapping]] | None = None
     target_inventory: LaxStr | None = None
     target_inventory_id: LaxStr | None = None

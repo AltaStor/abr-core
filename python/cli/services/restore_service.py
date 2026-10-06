@@ -48,6 +48,8 @@ class RestoreService:
         repo_id = self._coalesce_string(getattr(args, "repo_id", None))
         network_map = getattr(args, "network_map", None) or []
         datastore_map = getattr(args, "datastore_map", None) or []
+        disk_datastore_map = getattr(args, "disk_datastore", None) or []
+        nic_network_map = getattr(args, "nic_network", None) or []
 
         if (new_name_raw is not None or legacy_name_raw is not None) and new_name is None:
             raise ValueError("restore start requires a non-empty --new-name")
@@ -126,6 +128,8 @@ class RestoreService:
             "target_datastore": target_datastore,
             "network_map": list(network_map),
             "datastore_map": list(datastore_map),
+            "disk_datastore_map": list(disk_datastore_map),
+            "nic_network_map": list(nic_network_map),
             "repo": repo_name,
             "repo_id": repo_id,
             "power_on": bool(getattr(args, "power_on", False)),

@@ -252,6 +252,54 @@ class JobPayloadBuilderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             JobService.build_execution_schedule_payloads(args, {})
 
+    def test_a_days_only_schedule_still_carries_its_state_flag(self) -> None:
+        args = SimpleNamespace(
+            active_full_schedule=None,
+            active_full_time=None,
+            active_full_day_of_month=None,
+            active_full_every=None,
+            active_full_days=["wednesday"],
+            active_full_enabled=False,
+            active_full_disabled=True,
+            synthetic_full_schedule=None,
+        )
+
+        payloads = JobService.build_execution_schedule_payloads(args)
+
+        self.assertEqual(payloads, {"active_full_enabled": False})
+
+    def test_a_days_only_schedule_carries_an_enabling_state_flag(self) -> None:
+        args = SimpleNamespace(
+            synthetic_full_schedule=None,
+            synthetic_full_time=None,
+            synthetic_full_day_of_month=None,
+            synthetic_full_every=None,
+            synthetic_full_days=["monday"],
+            synthetic_full_enabled=True,
+            synthetic_full_disabled=False,
+            active_full_schedule=None,
+        )
+
+        payloads = JobService.build_execution_schedule_payloads(args)
+
+        self.assertEqual(payloads, {"synthetic_full_enabled": True})
+
+    def test_days_without_a_state_flag_leave_the_schedule_to_the_days_field(self) -> None:
+        args = SimpleNamespace(
+            active_full_schedule=None,
+            active_full_time=None,
+            active_full_day_of_month=None,
+            active_full_every=None,
+            active_full_days=["wednesday"],
+            active_full_enabled=False,
+            active_full_disabled=False,
+            synthetic_full_schedule=None,
+        )
+
+        payloads = JobService.build_execution_schedule_payloads(args)
+
+        self.assertEqual(payloads, {})
+
     def test_execution_schedule_errors_name_the_prefixed_flag(self) -> None:
         args = SimpleNamespace(
             active_full_schedule="weekly",
@@ -918,6 +966,191 @@ class JobEngineLifecycleTests(unittest.TestCase):
         self.assertEqual(weekly["schedule"]["type"], "weekly")
         self.assertEqual(monthly["schedule"]["day_of_month"], 1)
         self.assertEqual(periodic["schedule"]["every"], "6h")
+
+    def _job_created_switched_off(self, name: str) -> dict[str, Any]:
+        return abr_v41.create_backup_job(
+            {
+                "name": name,
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": {"type": "daily", "time": "06:00", "enabled": False},
+                "active_full_days": ["sunday"],
+            }
+        )
+
+    def test_switching_a_job_on_turns_its_schedule_back_on(self) -> None:
+        job = self._job_created_switched_off("Created Switched Off")
+
+        self.assertFalse(job["enabled"])
+        self.assertFalse(job["schedule"]["enabled"])
+
+        resumed = abr_v41.edit_job_record(job["id"], {"enabled": True})
+
+        self.assertTrue(resumed["enabled"])
+        self.assertTrue(resumed["schedule"]["enabled"])
+        self.assertEqual(resumed["schedule"]["time"], "06:00")
+        self.assertIsNotNone(resumed["next_incremental_run_at"])
+
+    def test_switching_a_job_off_also_stops_its_schedule(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Created Running",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": {"type": "daily", "time": "06:00", "enabled": True},
+                "active_full_days": ["sunday"],
+            }
+        )
+
+        stopped = abr_v41.edit_job_record(job["id"], {"enabled": False})
+
+        self.assertFalse(stopped["enabled"])
+        self.assertFalse(stopped["schedule"]["enabled"])
+        self.assertIsNone(stopped["next_incremental_run_at"])
+
+        resumed = abr_v41.edit_job_record(job["id"], {"enabled": True})
+
+        self.assertTrue(resumed["schedule"]["enabled"])
+        self.assertIsNotNone(resumed["next_incremental_run_at"])
+
+    def test_switching_a_job_on_leaves_a_job_without_a_schedule_alone(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Manual Only",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_days": ["sunday"],
+                "enabled": False,
+            }
+        )
+
+        resumed = abr_v41.edit_job_record(job["id"], {"enabled": True})
+
+        self.assertTrue(resumed["enabled"])
+        self.assertIsNone(resumed["schedule"])
+
+    def test_restating_a_schedule_does_not_switch_the_job_off(self) -> None:
+        job = self._job_created_switched_off("Restated Schedule")
+        mismatched = abr_v41.edit_job_record(
+            job["id"], {"enabled": True, "schedule": {"type": "daily", "time": "06:00", "enabled": False}}
+        )
+
+        self.assertTrue(mismatched["enabled"])
+
+        restated = abr_v41.edit_job_record(
+            job["id"], {"schedule": {"type": "daily", "time": "06:00", "enabled": False}}
+        )
+
+        self.assertTrue(restated["enabled"])
+
+    def test_a_schedule_that_changes_state_still_drives_the_job_switch(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Schedule Driven",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "schedule": {"type": "daily", "time": "06:00", "enabled": True},
+                "active_full_days": ["sunday"],
+            }
+        )
+
+        stopped = abr_v41.edit_job_record(
+            job["id"], {"schedule": {"type": "daily", "time": "06:00", "enabled": False}}
+        )
+
+        self.assertFalse(stopped["enabled"])
+
+        resumed = abr_v41.edit_job_record(
+            job["id"], {"schedule": {"type": "daily", "time": "06:00", "enabled": True}}
+        )
+
+        self.assertTrue(resumed["enabled"])
+
+    def test_create_refuses_days_whose_schedule_is_asked_to_stay_off(self) -> None:
+        before = len(JOBS)
+
+        with self.assertRaises(abr_v41.ApiError) as ctx:
+            abr_v41.create_backup_job(
+                {
+                    "name": "Suspended Active Full",
+                    "vms": ["web-01"],
+                    "inventory_id": self.inventory["id"],
+                    "repo_id": "repo-1",
+                    "active_full_days": ["wednesday"],
+                    "active_full_enabled": False,
+                }
+            )
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(ctx.exception.code, "invalid_job")
+        self.assertIn("at least one full backup schedule", ctx.exception.message)
+        self.assertEqual(len(JOBS), before)
+
+    def test_create_keeps_a_suspended_full_schedule_when_another_one_runs(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Suspended Beside A Synthetic",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_days": ["wednesday"],
+                "active_full_enabled": False,
+                "synthetic_full_days": ["monday"],
+            }
+        )
+
+        self.assertEqual(job["active_full_schedule"]["days"], ["wednesday"])
+        self.assertFalse(job["active_full_schedule"]["enabled"])
+        self.assertIsNone(job["active_full_next_run_at"])
+        self.assertTrue(job["synthetic_full_schedule"]["enabled"])
+        self.assertIsNotNone(job["synthetic_full_next_run_at"])
+
+    def test_edit_suspends_a_schedule_that_only_legacy_days_describe(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Days Only Job",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "synthetic_full_days": ["monday"],
+            }
+        )
+
+        updated = abr_v41.edit_job_record(
+            job["id"], {"active_full_days": ["wednesday"], "active_full_enabled": False}
+        )
+
+        self.assertEqual(updated["active_full_schedule"]["days"], ["wednesday"])
+        self.assertFalse(updated["active_full_schedule"]["enabled"])
+        self.assertIsNone(updated["active_full_next_run_at"])
+
+        resumed = abr_v41.edit_job_record(job["id"], {"active_full_enabled": True})
+
+        self.assertTrue(resumed["active_full_schedule"]["enabled"])
+        self.assertEqual(resumed["active_full_schedule"]["days"], ["wednesday"])
+        self.assertIsNotNone(resumed["active_full_next_run_at"])
+
+    def test_edit_refuses_to_suspend_the_only_full_schedule(self) -> None:
+        job = abr_v41.create_backup_job(
+            {
+                "name": "Only Active Full",
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_days": ["wednesday"],
+            }
+        )
+
+        with self.assertRaises(abr_v41.ApiError) as ctx:
+            abr_v41.edit_job_record(job["id"], {"active_full_enabled": False})
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("at least one full backup schedule", ctx.exception.message)
+        self.assertTrue(abr_v41.resolve_job(record_id=job["id"])["active_full_schedule"]["enabled"])
 
     def test_create_copy_clones_existing_job_configuration(self) -> None:
         source = abr_v41.create_backup_job(

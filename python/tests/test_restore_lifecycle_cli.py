@@ -85,16 +85,21 @@ class RestoreLifecycleParserTests(unittest.TestCase):
 class RestoreContextRowsTests(unittest.TestCase):
     CONTEXT = {
         "source_vm": {
+            "disks": [
+                {"id": "disk-1", "label": "Hard disk 1", "datastore_path": "[src-ssd] vm/vm.vmdk"},
+                {"id": "disk-2", "label": "Hard disk 2", "datastore_path": "[src-bulk] vm/vm_1.vmdk"},
+            ],
             "nics": [
-                {"id": "nic-1", "source_network": "VM Network"},
+                {"id": "nic-1", "label": "Network adapter 1", "source_network": "VM Network"},
                 {"id": "nic-2", "source_network": "Storage"},
-            ]
+            ],
         },
         "targets": {
             "datastores": [{"id": "ds-a", "name": "fast-ssd"}, {"id": "ds-b", "name": "bulk"}],
             "networks": [{"id": "net-1", "name": "VM Network"}],
         },
         "defaults": {
+            "target_datastore_id": "ds-a",
             "datastore_mappings": [
                 {"source_datastore": "src-ssd", "target_datastore_id": "ds-a"},
                 {"source_datastore": "src-bulk", "target_datastore_id": "ds-b"},
@@ -114,8 +119,12 @@ class RestoreContextRowsTests(unittest.TestCase):
             [
                 {"kind": "datastore", "source": "src-ssd", "target": "fast-ssd"},
                 {"kind": "datastore", "source": "src-bulk", "target": "bulk"},
+                {"kind": "disk", "source": "Hard disk 1", "target": "fast-ssd"},
+                {"kind": "disk", "source": "Hard disk 2", "target": "bulk"},
                 {"kind": "network", "source": "VM Network", "target": "VM Network"},
                 {"kind": "network", "source": "Storage", "target": ""},
+                {"kind": "adapter", "source": "Network adapter 1", "target": "VM Network"},
+                {"kind": "adapter", "source": "nic-2", "target": ""},
             ],
         )
 
@@ -304,6 +313,62 @@ class RestorePayloadBuilderTests(unittest.TestCase):
         payload = self.service.build_start_payload(args)
 
         self.assertEqual(payload["datastore_map"], ["sata-bulk=sata-restore", "nvme=nvme-restore"])
+
+    def test_restore_start_carries_per_disk_and_per_adapter_placement(self) -> None:
+        args = SimpleNamespace(
+            restore_point="rp-1",
+            point_id=None,
+            backup=None,
+            vm=None,
+            new_name="vm-restored",
+            name=None,
+            target_inventory="vc-1",
+            target_inventory_id=None,
+            target_host="esx-1",
+            datastore="restore-target",
+            target_datastore=None,
+            network_map=[],
+            datastore_map=[],
+            disk_datastore=["Hard disk 2=fast-ssd"],
+            nic_network=["Network adapter 2=DMZ"],
+            repo=None,
+            repo_id=None,
+            power_on=False,
+            force=False,
+        )
+
+        payload = self.service.build_start_payload(args)
+
+        self.assertEqual(payload["disk_datastore_map"], ["Hard disk 2=fast-ssd"])
+        self.assertEqual(payload["nic_network_map"], ["Network adapter 2=DMZ"])
+
+    def test_restore_start_omits_empty_per_disk_and_per_adapter_placement(self) -> None:
+        args = SimpleNamespace(
+            restore_point="rp-1",
+            point_id=None,
+            backup=None,
+            vm=None,
+            new_name="vm-restored",
+            name=None,
+            target_inventory="vc-1",
+            target_inventory_id=None,
+            target_host="esx-1",
+            datastore="restore-target",
+            target_datastore=None,
+            network_map=[],
+            datastore_map=[],
+            disk_datastore=[],
+            nic_network=[],
+            repo=None,
+            repo_id=None,
+            power_on=False,
+            force=False,
+        )
+
+        payload = self.service.build_start_payload(args)
+
+        self.assertNotIn("disk_datastore_map", payload)
+        self.assertNotIn("nic_network_map", payload)
 
     def test_restore_start_omits_an_empty_datastore_map(self) -> None:
         args = SimpleNamespace(

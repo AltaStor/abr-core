@@ -235,6 +235,8 @@ class JobService:
                 continue
             if cls._is_empty_value(requested) and has_details:
                 if cls._only_days_detail(prefixed):
+                    if state_only:
+                        payloads[f"{prefix}_enabled"] = cls._schedule_enabled_override(prefixed)
                     continue
                 raise cls._prefixed_schedule_error(ValueError("Schedule details require --schedule"), prefix)
             try:

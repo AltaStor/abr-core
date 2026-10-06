@@ -1245,6 +1245,16 @@ class VCenterNode(Hypervisor):
             resulting_firmware or "unknown",
         )
         if resulting_firmware is not None and resulting_firmware != requested_firmware:
+            created_moref = str(getattr(vm, "_moId", "") or "")
+            if created_moref:
+                try:
+                    self.destroy_vm(vm_name, vm_moref=created_moref)
+                except Exception:
+                    logger.exception(
+                        "Failed to remove VM shell '%s' (moRef=%s) after its firmware did not match.",
+                        vm_name,
+                        created_moref,
+                    )
             raise RuntimeError(
                 "Restored VM firmware mismatch for "
                 f"'{vm_name}': requested {requested_firmware}, got {resulting_firmware}"
@@ -1481,9 +1491,7 @@ class VCenterNode(Hypervisor):
 
     def destroy_vm(self, vm_name: str, vm_moref: str | None = None) -> None:
         service_type = self.get_service_type()
-        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
-        if vm is None:
-            vm = self._get_vm(vm_name)
+        vm = self._get_vm_by_moref(vm_moref) if vm_moref else self._get_vm(vm_name)
         if not vm:
             logger.warning(
                 "VM '%s' (moRef=%s) not found on %s - nothing to destroy.",

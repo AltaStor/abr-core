@@ -13,7 +13,7 @@ from python.cli.core.logger_conf import setup_logging
 from .command_not_implemented_error import CommandNotImplementedError
 from .errors import CliError, cli_error_from_exception
 from .exit_codes import GENERAL_ERROR, INVALID_USAGE, UNAUTHORIZED
-from .parsing.parser_builder import AltaStorParserBuilder
+from .parsing.parser_builder import LOG_LEVEL_CHOICES, AltaStorParserBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,8 @@ def _scan_log_level(argv: list[str] | None) -> str:
     tokens = list(sys.argv[1:] if argv is None else argv)
     for index, token in enumerate(tokens):
         if token == "--log-level" and index + 1 < len(tokens):
-            return tokens[index + 1]
+            requested = tokens[index + 1]
+            return requested if requested in LOG_LEVEL_CHOICES else "info"
     return "info"
 
 

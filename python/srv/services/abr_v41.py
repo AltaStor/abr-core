@@ -937,7 +937,9 @@ def schedule_next_run(schedule: dict[str, Any], *, after: datetime) -> datetime:
             candidate_date = local_after.date() + timedelta(days=offset)
             if candidate_date.weekday() not in wanted:
                 continue
-            candidate = datetime.combine(candidate_date, time(hour=hour, minute=minute), tzinfo=local_after.tzinfo)
+            candidate = datetime.combine(
+                candidate_date, time(hour=hour, minute=minute, fold=local_after.fold), tzinfo=local_after.tzinfo
+            )
             if candidate > local_after:
                 return candidate.astimezone(timezone.utc)
         raise api_error(422, "invalid_schedule", "Unable to compute next weekly run")
@@ -953,7 +955,9 @@ def schedule_next_run(schedule: dict[str, Any], *, after: datetime) -> datetime:
         for _ in range(0, 14):
             last_day = calendar.monthrange(year, month)[1]
             candidate_day = min(day_of_month, last_day)
-            candidate = datetime(year, month, candidate_day, hour, minute, tzinfo=local_after.tzinfo)
+            candidate = datetime(
+                year, month, candidate_day, hour, minute, tzinfo=local_after.tzinfo, fold=local_after.fold
+            )
             if candidate > local_after:
                 return candidate.astimezone(timezone.utc)
             month += 1
@@ -979,7 +983,7 @@ def schedule_next_run(schedule: dict[str, Any], *, after: datetime) -> datetime:
             _cron_field_values(expression.split()[3], minimum=1, maximum=12),
             _cron_field_values(expression.split()[4], minimum=0, maximum=6, names=CRON_WEEKDAY_NAMES),
         )
-        probe = local_after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        probe = (local_after.replace(second=0, microsecond=0) + timedelta(minutes=1)).replace(fold=local_after.fold)
         limit = probe + timedelta(days=366)
         while probe <= limit:
             cron_weekday = (probe.weekday() + 1) % 7
@@ -991,7 +995,7 @@ def schedule_next_run(schedule: dict[str, Any], *, after: datetime) -> datetime:
                 and cron_weekday in weekday_values
             ):
                 return probe.astimezone(timezone.utc)
-            probe += timedelta(minutes=1)
+            probe = (probe + timedelta(minutes=1)).replace(fold=local_after.fold)
         raise api_error(422, "invalid_schedule", "Unable to compute next cron run", schedule=expression)
     raise api_error(422, "invalid_schedule", "Unsupported schedule kind", kind=kind)
 
@@ -3839,12 +3843,29 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "next_run_at": _earliest_next_run(normalized),
         "next_incremental_run_at": normalized.get("next_incremental_run_at"),
         "last_run_at": normalized.get("last_run_at"),
+        "clock_anomalies": job_clock_anomalies(normalized),
         "last_session_id": normalized.get("last_session_id"),
         "active_sessions": active_sessions,
         "active_session_count": len(active_sessions),
         "can_delete": not active_sessions,
         "delete_disabled_reason": "Job has queued or running sessions" if active_sessions else None,
     }
+
+
+def job_clock_anomalies(job: dict[str, Any]) -> list[dict[str, Any]]:
+    now = _now_utc()
+    anomalies: list[dict[str, Any]] = []
+    raw_last_run = str(job.get("last_run_at") or "")
+    last_run = _parse_dt(raw_last_run) if raw_last_run else None
+    if last_run is not None and last_run - now > CLOCK_SKEW_TOLERANCE:
+        anomalies.append(
+            {
+                "kind": "last_run_ahead_of_server_clock",
+                "last_run_at": raw_last_run,
+                "server_time": now.isoformat(),
+            }
+        )
+    return anomalies
 
 
 def list_jobs() -> list[dict[str, Any]]:
@@ -3861,6 +3882,30 @@ def _execution_schedule_next_run(schedule: dict[str, Any] | None) -> str | None:
     if not isinstance(schedule, dict) or not bool(schedule.get("enabled", True)):
         return None
     return schedule_next_run(schedule, after=_now_utc()).isoformat()
+
+
+def _execution_schedule_state_key(schedule_key: str) -> str:
+    return schedule_key.removesuffix("_schedule") + "_enabled"
+
+
+def _requested_execution_schedule_state(payload: dict[str, Any], schedule_key: str) -> bool | None:
+    value = payload.get(_execution_schedule_state_key(schedule_key))
+    return None if value is None else bool(value)
+
+
+def _execution_schedule_with_state(
+    schedule: Any,
+    state: bool | None,
+    legacy_days: Any,
+    base_schedule: Any,
+    created_at: Any,
+) -> Any:
+    if state is None:
+        return schedule
+    if isinstance(schedule, dict):
+        return dict(schedule, enabled=state)
+    derived = _schedule_from_legacy_days(_normalize_day_list(legacy_days), base_schedule, created_at)
+    return dict(derived, enabled=state) if isinstance(derived, dict) else schedule
 
 
 def _has_full_backup_schedule(schedule: Any, legacy_days: Any) -> bool:
@@ -3905,6 +3950,21 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         active_full_days = []
     if "synthetic_full_schedule" in payload and not _schedule_weekdays(synthetic_full_schedule):
         synthetic_full_days = []
+    now = utc_now()
+    active_full_schedule = _execution_schedule_with_state(
+        active_full_schedule,
+        _requested_execution_schedule_state(payload, "active_full_schedule"),
+        active_full_days,
+        schedule,
+        now,
+    )
+    synthetic_full_schedule = _execution_schedule_with_state(
+        synthetic_full_schedule,
+        _requested_execution_schedule_state(payload, "synthetic_full_schedule"),
+        synthetic_full_days,
+        schedule,
+        now,
+    )
     base_is_enabled = isinstance(schedule, dict) and bool(schedule.get("enabled", True))
     job_enabled = bool(payload.get("enabled", True)) if not isinstance(schedule, dict) else base_is_enabled
     description = str(payload.get("description") or "").strip()
@@ -3949,7 +4009,6 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         )
         inventory = candidate_inventories[0]
     vm_ids, vm_names = _resolve_vm_selection(str(inventory["id"]), tokens, auto_discover=True)
-    now = utc_now()
     job = {
         "id": str(uuid4()),
         "name": name,
@@ -4074,7 +4133,15 @@ def _touches_full_backup_policy(payload: dict[str, Any]) -> bool:
             return True
         if payload.get(days_key) is not None:
             return True
+        if payload.get(_execution_schedule_state_key(schedule_key)) is not None:
+            return True
     return False
+
+
+def _schedule_runs(schedule: Any) -> bool | None:
+    if not isinstance(schedule, dict):
+        return None
+    return bool(schedule.get("enabled", True))
 
 
 def _base_schedule_is_enabled(job: dict[str, Any]) -> bool:
@@ -4107,8 +4174,12 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     was_enabled = _job_is_enabled(updated)
     changed = False
     if "enabled" in payload and payload["enabled"] is not None:
-        updated["enabled"] = bool(payload["enabled"])
+        runs = bool(payload["enabled"])
+        updated["enabled"] = runs
         changed = True
+        if payload.get("schedule") is None and _schedule_runs(updated.get("schedule")) not in (None, runs):
+            updated["schedule"] = dict(updated["schedule"], enabled=runs)
+            updated["next_incremental_run_at"] = _execution_schedule_next_run(updated["schedule"])
     if payload.get("name"):
         new_name = str(payload["name"])
         _ensure(bool(new_name.strip()), 422, "invalid_job", "Job name must not be empty")
@@ -4121,9 +4192,10 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         updated["name"] = new_name
         changed = True
     if "schedule" in payload and payload["schedule"] is not None:
+        previously_ran = _schedule_runs(updated.get("schedule"))
         updated["schedule"] = normalize_schedule_payload(payload["schedule"])
         updated["next_incremental_run_at"] = schedule_next_run(updated["schedule"], after=_now_utc()).isoformat() if bool(updated["schedule"].get("enabled", True)) else None
-        if "enabled" not in payload:
+        if "enabled" not in payload and _schedule_runs(updated["schedule"]) != previously_ran:
             updated["enabled"] = bool(updated["schedule"].get("enabled", True))
         changed = True
     if "retention_days" in payload and payload["retention_days"] is not None:
@@ -4163,6 +4235,22 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if retuned != updated.get(schedule_key):
             updated[schedule_key] = retuned
             updated[next_run_key] = _execution_schedule_next_run(retuned)
+        changed = True
+    for schedule_key, days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
+        state = _requested_execution_schedule_state(payload, schedule_key)
+        if state is None:
+            continue
+        schedule_value = _execution_schedule_with_state(
+            updated.get(schedule_key),
+            state,
+            updated.get(days_key),
+            updated.get("schedule"),
+            updated.get("created_at"),
+        )
+        if schedule_value == updated.get(schedule_key):
+            continue
+        updated[schedule_key] = schedule_value
+        updated[next_run_key] = _execution_schedule_next_run(schedule_value)
         changed = True
     if "description" in payload:
         description = str(payload.get("description") or "").strip()
@@ -7085,6 +7173,164 @@ def _source_disk_datastore(disk: dict[str, Any]) -> str:
     return str(datastore_name or "").strip()
 
 
+def _collect_restore_mapping(
+    mappings: dict[str, str], source: str, target: str, *, flag: str, case_sensitive: bool = False
+) -> None:
+    def same(left: str, right: str) -> bool:
+        return left == right if case_sensitive else left.lower() == right.lower()
+
+    for existing_source, existing_target in mappings.items():
+        if not same(existing_source, source):
+            continue
+        _ensure(
+            same(existing_target, target),
+            422,
+            "invalid_restore",
+            f"{flag} maps the same source twice, to different targets",
+            source=existing_source,
+            targets=[existing_target, target],
+        )
+        return
+    mappings[source] = target
+
+
+def _parse_restore_identifier_map(value: Any, *, flag: str, source_key: str, target_key: str) -> dict[str, str]:
+    form = f"Each {flag} value must use the form <source>=<target> or <source>:<target>"
+    if isinstance(value, dict):
+        pairs = list(value.items())
+    elif not value:
+        return {}
+    elif isinstance(value, list):
+        pairs = []
+        for raw in value:
+            if isinstance(raw, dict):
+                pairs.append((raw.get(source_key), raw.get(target_key)))
+                continue
+            text = str(raw or "")
+            left, separator, right = text.partition("=")
+            if separator != "=":
+                left, separator, right = text.partition(":")
+            _ensure(separator in {"=", ":"} and bool(left.strip()) and bool(right.strip()), 422, "invalid_restore", form, value=text)
+            pairs.append((left, right))
+    else:
+        raise api_error(422, "invalid_restore", form)
+    mappings: dict[str, str] = {}
+    for source, target in pairs:
+        source_text = str(source or "").strip()
+        target_text = str(target or "").strip()
+        _ensure(bool(source_text) and bool(target_text), 422, "invalid_restore", form)
+        _collect_restore_mapping(mappings, source_text, target_text, flag=flag)
+    return mappings
+
+
+def _restore_disk_identities(source_vm: dict[str, Any]) -> list[dict[str, Any]]:
+    return [disk for disk in (source_vm.get("disks") or []) if isinstance(disk, dict)]
+
+
+def _resolve_restore_disk_placement(
+    source_vm: dict[str, Any],
+    *,
+    inventory_id: str,
+    host: dict[str, Any],
+    requested: Any,
+    restore_mode: str,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    overrides = _parse_restore_identifier_map(
+        requested, flag="--disk-datastore", source_key="source_disk", target_key="target_datastore"
+    )
+    if not overrides:
+        return [], {}
+    _ensure(
+        restore_mode != "in_place",
+        422,
+        "invalid_restore",
+        "In-place restore keeps every disk on its own datastore and cannot take a disk placement",
+    )
+    disks = _restore_disk_identities(source_vm)
+    position_by_identifier: dict[str, int] = {}
+    for position, disk in enumerate(disks, start=1):
+        for identifier in (str(disk.get("id") or ""), str(disk.get("label") or "")):
+            if identifier:
+                position_by_identifier.setdefault(identifier.lower(), position)
+    targets: list[dict[str, Any]] = []
+    resolved: dict[str, dict[str, Any]] = {}
+    for requested_disk, target_identifier in overrides.items():
+        position = position_by_identifier.get(requested_disk.lower())
+        _ensure(
+            position is not None,
+            422,
+            "invalid_restore",
+            "Disk placement names a disk this restore point does not carry",
+            disk=requested_disk,
+            disks=[{"id": disk.get("id"), "label": disk.get("label")} for disk in disks],
+        )
+        datastore = _resolve_restore_target_datastore(inventory_id, target_identifier, host=host)
+        target_name = str(datastore.get("name") or "").strip()
+        disk = disks[position - 1]
+        targets.append(
+            {
+                "index": position,
+                "disk_id": disk.get("id"),
+                "label": disk.get("label"),
+                "target_datastore": target_name,
+            }
+        )
+        resolved[target_name] = datastore
+    return sorted(targets, key=lambda item: int(item["index"])), resolved
+
+
+def _restore_disk_target_name(
+    disk: dict[str, Any],
+    position: int,
+    disk_targets: dict[int, str],
+    placement: dict[str, str],
+    default_name: str,
+) -> str:
+    override = str(disk_targets.get(position) or "").strip()
+    if override:
+        return override
+    return str(placement.get(_source_disk_datastore(disk)) or default_name).strip() or default_name
+
+
+def _resolve_restore_nic_network_mappings(
+    source_vm: dict[str, Any],
+    *,
+    inventory_id: str,
+    host: dict[str, Any] | None,
+    requested: Any,
+) -> list[dict[str, Any]]:
+    overrides = _parse_restore_identifier_map(
+        requested, flag="--nic-network", source_key="source_nic", target_key="target_network"
+    )
+    if not overrides:
+        return []
+    nics = [nic for nic in (source_vm.get("nics") or []) if isinstance(nic, dict)]
+    nic_by_identifier: dict[str, dict[str, Any]] = {}
+    for nic in nics:
+        for identifier in (str(nic.get("id") or ""), str(nic.get("label") or "")):
+            if identifier:
+                nic_by_identifier.setdefault(identifier.lower(), nic)
+    source_networks = [
+        str(nic.get("source_network") or "").strip() for nic in nics if str(nic.get("source_network") or "").strip()
+    ]
+    mappings: list[dict[str, Any]] = []
+    for requested_nic, target_identifier in overrides.items():
+        nic = nic_by_identifier.get(requested_nic.lower())
+        _ensure(
+            nic is not None,
+            404,
+            "network_adapter_not_found",
+            "Adapter placement names an adapter this restore point does not carry",
+            adapter=requested_nic,
+            adapters=[{"id": item.get("id"), "label": item.get("label")} for item in nics],
+        )
+        network = _resolve_restore_target_network(
+            inventory_id, target_identifier, source_networks=source_networks, host=host
+        )
+        mappings.append({"source_nic_id": nic.get("id"), "target_network_id": str(network.get("id") or "")})
+    return mappings
+
+
 def _resolve_restore_datastore_placement(
     source_vm: dict[str, Any],
     *,
@@ -7230,6 +7476,8 @@ def _normalize_restore_request_payload(payload: dict[str, Any], point: dict[str,
         "network_mappings": [item for item in network_mappings if isinstance(item, dict)],
         "legacy_network_map": payload.get("network_map"),
         "datastore_map": payload.get("datastore_map") or payload.get("datastore_mappings"),
+        "disk_datastore_map": payload.get("disk_datastore_map") or payload.get("disk_datastore_mappings"),
+        "nic_network_map": payload.get("nic_network_map") or payload.get("nic_network_mappings"),
         "force": force,
     }
 
@@ -7307,12 +7555,14 @@ def _resolve_restore_network_selection(
         # manifest's order, so a NIC's position here is its adapter's position
         # in vm_config.network_adapters -- which is what the engine indexes.
         source_index = {str(item.get("id") or ""): (position, item) for position, item in enumerate(source_nics)}
+        requested_targets: dict[str, str] = {}
         for entry in mappings:
             source_nic_id = str(entry.get("source_nic_id") or "").strip()
             target_network_id = str(entry.get("target_network_id") or "").strip()
             if not source_nic_id and not target_network_id:
                 continue
             _ensure(bool(source_nic_id and target_network_id), 422, "invalid_restore", "Each network mapping requires source_nic_id and target_network_id")
+            _collect_restore_mapping(requested_targets, source_nic_id, target_network_id, flag="--nic-network")
             position, source_nic = source_index.get(source_nic_id) or (None, None)
             _ensure(source_nic is not None, 404, "network_adapter_not_found", "Source network adapter not found", source_nic_id=source_nic_id)
             source_network = str(source_nic.get("source_network") or "").strip()
@@ -7336,10 +7586,23 @@ def _resolve_restore_network_selection(
                 "source_network": source_network,
                 "target_network": target_network_name,
             }
+        for position, item in enumerate(source_nics):
+            if position in adapter_targets:
+                continue
+            source_network = str(item.get("source_network") or "").strip()
+            if not source_network or source_network not in target_network_names:
+                continue
+            adapter_targets[position] = {
+                "index": position,
+                "label": item.get("label"),
+                "source_network": source_network,
+                "target_network": source_network,
+            }
+            resolved.setdefault(source_network, source_network)
         missing = [
             str(item.get("label") or item.get("id") or "network adapter")
-            for item in source_nics
-            if str(item.get("source_network") or "").strip() and str(item.get("source_network") or "").strip() not in resolved
+            for position, item in enumerate(source_nics)
+            if str(item.get("source_network") or "").strip() and position not in adapter_targets
         ]
         _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for all source adapters", adapters=missing)
         return resolved, [adapter_targets[position] for position in sorted(adapter_targets)]
@@ -7368,6 +7631,14 @@ def _resolve_restore_network_selection(
                     host=(host or {}).get("name"),
                     network=target_network_name,
                 )
+        legacy = {
+            **{
+                source_network: source_network
+                for source_network in source_networks
+                if source_network not in legacy and source_network in target_network_names
+            },
+            **legacy,
+        }
         missing = [source_network for source_network in source_networks if source_network not in legacy]
         _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for all source adapters", networks=missing)
         return legacy, []
@@ -7414,7 +7685,7 @@ def _parse_restore_network_map(value: Any) -> dict[str, str]:
             "Each --network-map value must use the form <source>=<target> or <source>:<target>",
             value=text,
         )
-        mappings[source_name] = target_name
+        _collect_restore_mapping(mappings, source_name, target_name, flag="--network-map", case_sensitive=True)
     return mappings
 
 
@@ -7458,7 +7729,7 @@ def _parse_restore_datastore_map(value: Any) -> dict[str, str]:
             "invalid_restore",
             "Each datastore mapping requires a source datastore and a target datastore",
         )
-        mappings[source_name] = target_name
+        _collect_restore_mapping(mappings, source_name, target_name, flag="--datastore-map")
     return mappings
 
 
@@ -7903,13 +8174,21 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         requested=request.get("datastore_map"),
         restore_mode=restore_mode,
     )
+    disk_targets, disk_target_datastores = _resolve_restore_disk_placement(
+        source_vm,
+        inventory_id=str(target_inventory["id"]),
+        host=host,
+        requested=request.get("disk_datastore_map"),
+        restore_mode=restore_mode,
+    )
+    disk_target_by_index = {int(item["index"]): str(item["target_datastore"]) for item in disk_targets}
     disk_provisioning = str(request.get("disk_provisioning") or "").strip() or None
-    for target_name, target_datastore in placement_datastores.items():
+    for target_name, target_datastore in {**placement_datastores, **disk_target_datastores}.items():
         landing = [
             disk
-            for disk in (source_vm.get("disks") or [])
+            for position, disk in enumerate(source_vm.get("disks") or [], start=1)
             if isinstance(disk, dict)
-            and datastore_placement.get(_source_disk_datastore(disk), target_datastore_name) == target_name
+            and _restore_disk_target_name(disk, position, disk_target_by_index, datastore_placement, target_datastore_name) == target_name
         ]
         if landing:
             _ensure_restore_target_capacity(landing, target_datastore, restore_mode, disk_provisioning)
@@ -7939,11 +8218,20 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             vm_name=target_vm_name,
         )
 
+    requested_network_mappings = [
+        *(request.get("network_mappings") if isinstance(request.get("network_mappings"), list) else []),
+        *_resolve_restore_nic_network_mappings(
+            source_vm,
+            inventory_id=str(target_inventory["id"]),
+            host=host,
+            requested=request.get("nic_network_map"),
+        ),
+    ]
     network_map, network_adapter_map = _resolve_restore_network_selection(
         point=point,
         manifest=manifest,
         target_inventory_id=str(target_inventory["id"]),
-        mappings=request.get("network_mappings") if isinstance(request.get("network_mappings"), list) else [],
+        mappings=requested_network_mappings,
         legacy_network_map=request.get("legacy_network_map"),
         host=host,
     )
@@ -7996,6 +8284,7 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             "target_datastore_id": resolved_target_datastore_id,
             "target_datastore_name": target_datastore_name,
             "datastore_map": datastore_placement or None,
+            "disk_datastore_map": disk_targets or None,
             "target_vm_name": target_vm_name,
             # The VM the restore point was taken from -- kept alongside the
             # target so a restore session can name both ends (see
@@ -8218,6 +8507,22 @@ def snapshot_configuration() -> dict[str, str]:
     return configuration
 
 
+SECRET_CONFIGURATION_KEY_PARTS = ("PASSWORD", "SECRET", "TOKEN", "PASSPHRASE")
+_URI_CREDENTIALS_PATTERN = re.compile(r"^([a-z][a-z0-9+.-]*://)[^/]*@", re.IGNORECASE)
+
+
+def configuration_without_secrets(configuration: dict[str, Any]) -> dict[str, Any]:
+    shown: dict[str, Any] = {}
+    for key, value in configuration.items():
+        if any(part in str(key).upper() for part in SECRET_CONFIGURATION_KEY_PARTS):
+            shown[key] = SECRET_MASK if value not in (None, "") else value
+        elif isinstance(value, str):
+            shown[key] = _URI_CREDENTIALS_PATTERN.sub(rf"\g<1>{SECRET_MASK}@", value)
+        else:
+            shown[key] = value
+    return shown
+
+
 def export_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     password = payload.get("password") if isinstance(payload, dict) else None
     if not isinstance(password, str) or not password:
@@ -8294,7 +8599,7 @@ def import_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         configuration = {}
 
     counts = restore_catalog(catalog)
-    return {"manifest": manifest, "restored": counts, "configuration": configuration}
+    return {"manifest": manifest, "restored": counts, "configuration": configuration_without_secrets(configuration)}
 
 
 def _verify_disk_artifact(

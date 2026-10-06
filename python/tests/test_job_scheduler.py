@@ -596,6 +596,79 @@ class SyntheticFullSchedulingTests(unittest.TestCase):
 
         self.assertEqual(self._types(self._dispatch()), [])
 
+    def _stored_next_incremental(self) -> datetime:
+        return datetime.fromisoformat(JOBS["job-1"]["next_incremental_run_at"])
+
+    def test_a_next_run_a_wrong_clock_pushed_away_is_recomputed_from_now(self) -> None:
+        self._register_job(next_incremental_run_at=(datetime.now(timezone.utc) + timedelta(days=4)).isoformat())
+        JOBS["job-1"]["schedule"] = self._due_daily()
+
+        self._dispatch()
+
+        recomputed = self._stored_next_incremental()
+        self.assertGreater(recomputed, datetime.now(timezone.utc))
+        self.assertLess(recomputed, datetime.now(timezone.utc) + timedelta(days=1, minutes=1))
+
+    def test_a_periodic_next_run_a_wrong_clock_pushed_away_is_recomputed_from_now(self) -> None:
+        self._register_job(next_incremental_run_at=(datetime.now(timezone.utc) + timedelta(days=4)).isoformat())
+
+        self._dispatch()
+
+        recomputed = self._stored_next_incremental()
+        self.assertLess(recomputed, datetime.now(timezone.utc) + timedelta(minutes=11))
+
+    def test_a_next_run_its_schedule_allows_is_left_alone(self) -> None:
+        tomorrow = datetime.now(timezone.utc) + timedelta(hours=23)
+        self._register_job(next_incremental_run_at=tomorrow.isoformat())
+        JOBS["job-1"]["schedule"] = self._due_daily()
+
+        self.assertEqual(self._types(self._dispatch()), [])
+        self.assertEqual(self._stored_next_incremental(), tomorrow)
+
+    def test_a_weekly_next_run_days_ahead_is_left_alone(self) -> None:
+        schedule = {"type": "weekly", "days": [self._weekday(1)], "time": "06:00", "timezone": "UTC"}
+        self._register_job()
+        JOBS["job-1"]["schedule"] = schedule
+        stored = abr_v41.schedule_next_run(
+            normalize_job_record(JOBS["job-1"])["schedule"], after=datetime.now(timezone.utc)
+        )
+        JOBS["job-1"]["next_incremental_run_at"] = stored.isoformat()
+
+        self._dispatch()
+
+        self.assertEqual(self._stored_next_incremental(), stored)
+
+    def test_a_monthly_next_run_weeks_ahead_is_left_alone(self) -> None:
+        self._register_job()
+        JOBS["job-1"]["schedule"] = {"type": "monthly", "day_of_month": 1, "time": "06:00", "timezone": "UTC"}
+        stored = abr_v41.schedule_next_run(
+            normalize_job_record(JOBS["job-1"])["schedule"], after=datetime.now(timezone.utc)
+        )
+        JOBS["job-1"]["next_incremental_run_at"] = stored.isoformat()
+
+        self._dispatch()
+
+        self.assertEqual(self._stored_next_incremental(), stored)
+
+    def test_an_overdue_next_run_still_fires_once(self) -> None:
+        overdue = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        self._register_job(next_incremental_run_at=overdue)
+        JOBS["job-1"]["schedule"] = self._due_daily()
+
+        self.assertEqual(self._types(self._dispatch()), ["Incremental"])
+
+    def test_a_job_switched_back_on_lets_an_overdue_base_schedule_fire(self) -> None:
+        overdue = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        self._register_job(enabled=False, next_incremental_run_at=overdue)
+        JOBS["job-1"]["schedule"] = dict(self._due_daily(), enabled=False)
+
+        self.assertEqual(self._types(self._dispatch()), [])
+
+        abr_v41.edit_job_record("job-1", {"enabled": True})
+        JOBS["job-1"]["next_incremental_run_at"] = overdue
+
+        self.assertEqual(self._types(self._dispatch()), ["Incremental"])
+
     def test_a_base_schedule_that_is_not_due_still_lets_the_active_full_fire(self) -> None:
         self._register_job(
             schedule={

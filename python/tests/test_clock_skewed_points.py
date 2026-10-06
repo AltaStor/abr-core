@@ -103,6 +103,50 @@ class ChainClockAnomalyTests(unittest.TestCase):
         self.assertEqual(abr_v41.chain_clock_anomalies("backup::nope::nope::nope"), [])
 
 
+class JobClockAnomalyTests(unittest.TestCase):
+    @staticmethod
+    def _job(last_run_at: str | None) -> dict:
+        return {
+            "id": "job-1",
+            "name": "nightly",
+            "job_type": "backup",
+            "last_run_at": last_run_at,
+        }
+
+    def test_a_last_run_dated_ahead_of_the_server_is_reported(self) -> None:
+        anomalies = abr_v41.job_clock_anomalies(self._job(_stamp(timedelta(days=4))))
+
+        self.assertEqual([item["kind"] for item in anomalies], ["last_run_ahead_of_server_clock"])
+        self.assertTrue(anomalies[0]["server_time"])
+
+    def test_a_last_run_a_few_seconds_ahead_is_not_reported(self) -> None:
+        self.assertEqual(abr_v41.job_clock_anomalies(self._job(_stamp(timedelta(seconds=20)))), [])
+
+    def test_an_ordinary_last_run_reports_nothing(self) -> None:
+        self.assertEqual(abr_v41.job_clock_anomalies(self._job(_stamp(timedelta(hours=-3)))), [])
+
+    def test_a_job_that_never_ran_reports_nothing(self) -> None:
+        self.assertEqual(abr_v41.job_clock_anomalies(self._job(None)), [])
+
+    def test_the_job_dto_carries_the_anomaly(self) -> None:
+        JOBS.clear()
+        self.addCleanup(JOBS.clear)
+        JOBS["job-1"] = {
+            "id": "job-1",
+            "name": "nightly",
+            "job_type": "backup",
+            "inventory_id": "hv-1",
+            "repo_id": "repo-1",
+            "vm_ids": ["vm-1"],
+            "schedule": {"type": "daily", "time": "06:00", "timezone": "UTC", "enabled": True},
+            "last_run_at": _stamp(timedelta(days=4)),
+        }
+
+        dto = abr_v41.job_to_dto(abr_v41.normalize_job_record(JOBS["job-1"]))
+
+        self.assertEqual([item["kind"] for item in dto["clock_anomalies"]], ["last_run_ahead_of_server_clock"])
+
+
 class RetentionWithAPointAheadOfTheClockTests(unittest.TestCase):
     def setUp(self) -> None:
         BACKUPS.clear()

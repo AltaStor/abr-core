@@ -133,18 +133,18 @@ class JobScheduler:
             schedule = normalized_job.get(schedule_key)
             if not isinstance(schedule, dict) or not bool(schedule.get("enabled", True)):
                 continue
-            next_run_at = self._slot_next_run_at(job, schedule, next_run_key)
+            next_run_at = self._slot_next_run_at(job, schedule, next_run_key, now)
             if next_run_at is None or now < next_run_at:
                 continue
             due.append((schedule_key, execution_type, next_run_key, schedule))
         return due
 
     def _slot_next_run_at(
-        self, job: dict[str, Any], schedule: dict[str, Any], next_run_key: str
+        self, job: dict[str, Any], schedule: dict[str, Any], next_run_key: str, now: datetime
     ) -> datetime | None:
         stored = _parse_timestamp(stored_slot_next_run(job, next_run_key))
         if stored is not None:
-            return stored
+            return self._trusted_slot_next_run(job, schedule, next_run_key, stored, now)
         base = _parse_timestamp(job.get("last_scheduled_at")) or _parse_timestamp(job.get("created_at"))
         if base is None:
             return None
@@ -159,6 +159,35 @@ class JobScheduler:
         job["updated_at"] = utc_now()
         persist_job(dict(job))
         return computed
+
+    def _trusted_slot_next_run(
+        self,
+        job: dict[str, Any],
+        schedule: dict[str, Any],
+        next_run_key: str,
+        stored: datetime,
+        now: datetime,
+    ) -> datetime:
+        try:
+            soonest = self._compute_next_run_after(schedule, now)
+        except ValueError:
+            return stored
+        if stored <= soonest:
+            return stored
+        logger.warning(
+            "Job '%s' had %s set to %s, later than the next run its schedule allows from %s. That value was "
+            "written while this server's clock was ahead, so it is recomputed to %s; the runs due in between "
+            "did not happen.",
+            job.get("id"),
+            next_run_key,
+            stored.isoformat(),
+            now.isoformat(),
+            soonest.isoformat(),
+        )
+        job[next_run_key] = soonest.isoformat()
+        job["updated_at"] = utc_now()
+        persist_job(dict(job))
+        return soonest
 
     def _advance_due_slots(
         self, job: dict[str, Any], due_slots: list[tuple[str, str, str, dict[str, Any]]]

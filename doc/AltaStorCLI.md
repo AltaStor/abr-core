@@ -535,17 +535,29 @@ abr restore point list --vm-id <id> [--output json]
 Example: 
 abr restore point list --vm-id vm-28491-prod 
 
+abr restore context 
+
+Description: Show what a restore point can be mapped to: its disks, network adapters, source datastores and source networks, each with the target it falls back to. 
+
+abr restore context --restore-point <id> [--output json] 
+
+Example: 
+abr restore context --restore-point rp-2026-05-16-0200-f1 
+
+Note: 
+The SOURCE column holds the exact names the mapping flags take: a datastore name for --datastore-map, a network name for --network-map, a disk label or ID for --disk-datastore, and an adapter label or ID for --nic-network. Two adapters on one source network produce one network row each but separate adapter rows, which is the difference between --network-map and --nic-network. JSON output carries the whole context, including every disk and adapter ID and the targets the restore point can reach. 
+
 abr restore start 
 
 Description: Start a full VM restore workflow from a selected restore point or backup chain. 
 
-abr restore start --restore-point <id> --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--datastore-map <src=dst>] [--power-on] [--wait] 
+abr restore start --restore-point <id> --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--power-on] [--wait] 
 
 Alternate source resolution:
-abr restore start --backup <backup-id> [--vm <name-or-id>] --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--datastore-map <src=dst>] [--power-on] [--wait] 
+abr restore start --backup <backup-id> [--vm <name-or-id>] --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--power-on] [--wait] 
 
 Legacy compatibility:
-abr restore start --point-id <id> [--name <new-name>] [--target-inventory <name>] [--target-host <host>] [--target-datastore <name>] [--network-map <src=dst>] [--datastore-map <src=dst>] [--repo <name>] [--power-on] [--in-place] [--force] [--wait] 
+abr restore start --point-id <id> [--name <new-name>] [--target-inventory <name>] [--target-host <host>] [--target-datastore <name>] [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--repo <name>] [--power-on] [--in-place] [--force] [--wait] 
 
 Targeted Restore Scenarios: 
  
@@ -563,8 +575,9 @@ Requires that the backup captured the VM's original host and datastore -- if the
  
 2. Out-of-Place / Advanced DR (Restore as a new VM on another host) 
 Description: A duplicate VM is deployed on a secondary host or recovery site for testing or disaster recovery. 
-Syntax: abr restore start --restore-point <id> --new-name <new-name> --target-inventory <name> --target-host <host> --datastore <name> [--network-map <src=dst>] [--datastore-map <src=dst>] [--power-on] 
+Syntax: abr restore start --restore-point <id> --new-name <new-name> --target-inventory <name> --target-host <host> --datastore <name> [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--power-on] 
 Example: abr restore start --restore-point rp-2026-05-16-0200-f1 --new-name VM-SQL-01-DR --target-inventory DR-Inventory --target-host esxi-dr-01.company.local --datastore DR-SSD --network-map Production=DR-Network --datastore-map SATA-BULK=DR-SATA --power-on 
+Example (one disk and one adapter placed on their own): abr restore start --restore-point rp-2026-05-16-0200-f1 --new-name VM-SQL-01-DR --target-inventory DR-Inventory --target-host esxi-dr-01.company.local --datastore DR-SSD --disk-datastore "Hard disk 2=DR-SATA" --nic-network "Network adapter 2=DR-DMZ" --power-on 
 
 DATASTORE PLACEMENT 
 
@@ -572,7 +585,19 @@ DATASTORE PLACEMENT
 
 The source datastore is read from the restore point's own manifest, so mapping works for restore points taken before this option existed, and even when the source VM no longer exists. A mapping that names a datastore the VM does not use is rejected rather than silently ignored, and each target is checked for free space against only the disks that actually land on it. 
 
-In-place restore takes no mapping: it returns every disk to the datastore it came from, so a VM spread over several datastores stays spread. 
+--disk-datastore places a single disk, named by the disk label or ID that abr restore context lists ("Hard disk 2"). It covers the layout --datastore-map cannot express: all disks on one datastore at the source, where only the data disk should move to faster storage at the target. Disks that shared a source datastore no longer have to travel together. 
+
+Precedence is disk, then source datastore, then whole VM: --disk-datastore wins over --datastore-map, which wins over --datastore. A disk the restore point does not carry is rejected rather than ignored, and free space is still checked against the datastore each disk actually lands on, per-disk placement included. 
+
+In-place restore takes no mapping and no disk placement: it returns every disk to the datastore it came from, so a VM spread over several datastores stays spread. 
+
+NETWORK PLACEMENT 
+
+--network-map is keyed by source network name: every adapter recorded on that network goes to the named target. --nic-network places a single adapter, named by the adapter label or ID that abr restore context lists ("Network adapter 2"), which is what two adapters on one source network need -- a map keyed by network name cannot tell them apart and sends both to the same target. 
+
+Adapters left unnamed keep the automatic same-name match, so naming one adapter or one network does not force you to name the rest: an adapter whose source network exists on the target host under the same name lands there by itself. Only an adapter whose network the target cannot match at all is refused. 
+
+A source named twice with different targets is refused for all four mapping flags instead of silently taking the last value; naming the same source twice with the same target is accepted. 
 
 JSON output:
 - `abr --output json restore list` returns `{ "items": [...] }`
