@@ -1025,8 +1025,21 @@ class HyperVNode(Hypervisor):
 
     def prepare_folders(self, node: str, folders: List[str], files: List[str]) -> List[str]:
         """Create ``folders`` on a node; return those of ``files`` that already exist."""
+        return self.create_folders(node, folders, files)[0]
+
+    def create_folders(self, node: str, folders: List[str], files: List[str]) -> tuple[List[str], List[str]]:
         rows = self._run_script("prepare_folders.ps1", {"folders": folders, "files": files}, node)
-        return [str(item) for item in ((rows[0] if rows else {}).get("existing") or [])]
+        row = rows[0] if rows else {}
+        return (
+            [str(item) for item in (row.get("existing") or [])],
+            [str(item) for item in (row.get("created") or [])],
+        )
+
+    def remove_empty_folders(self, node: str, folders: List[str]) -> List[str]:
+        if not folders:
+            return []
+        rows = self._run_script("remove_empty_folders.ps1", {"folders": folders}, node)
+        return [str(item) for item in ((rows[0] if rows else {}).get("kept") or [])]
 
     def create_vm_shell(
         self,

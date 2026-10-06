@@ -276,6 +276,7 @@ def run_hyperv_restore(
 
     warnings: list[str] = []
     written_files: list[str] = []
+    created_folders: list[str] = []
     created_vm_id: str | None = None
     swapped: list[dict[str, Any]] = []
     node: HyperVNode | None = None
@@ -418,7 +419,7 @@ def run_hyperv_restore(
                     _warn(progress_callback, "validate", 9, message)
                     warnings.append(message)
 
-            existing = node.prepare_folders(
+            existing, created_folders = node.create_folders(
                 node_name, sorted({item["folder"] for item in plan}), [item["path"] for item in plan]
             )
             if existing:
@@ -601,6 +602,7 @@ def run_hyperv_restore(
             # The VM is complete; nothing below undoes it.
             created_vm_id = None
             written_files = []
+            created_folders = []
             power_state = "Off"
             if power_on:
                 _emit(progress_callback, "finalize", 94, f"Starting {target_vm_name}")
@@ -611,6 +613,18 @@ def run_hyperv_restore(
                     _warn(progress_callback, "finalize", 95, message)
                     warnings.append(message)
 
+        try:
+            from ...services.abr_v41 import schedule_inventory_discovery
+
+            schedule_inventory_discovery(str(task["hypervisor_id"]), force=True)
+        except Exception:
+            logger.warning(
+                "Failed to schedule the inventory rescan after restore session %s; run `abr inventory rescan` "
+                "so the inventory shows %s",
+                task_id,
+                target_vm_name,
+                exc_info=True,
+            )
         duration = time.time() - start_time
         summary = (
             f"{mode_label} recovery of {source_vm_name} completed: {target_vm_name} on {node_name}, "
@@ -653,7 +667,9 @@ def run_hyperv_restore(
         }
     except (ProcessCancelled, TaskStopRequested) as exc:
         logger.info("Hyper-V restore session %s stopped; undoing what it had created", task_id)
-        _undo(connection, node_name, created_vm_id, swapped, written_files, target_vm_id, progress_callback)
+        _undo(
+            connection, node_name, created_vm_id, swapped, written_files, created_folders, target_vm_id, progress_callback
+        )
         raise TaskStopRequested("Session stop requested; the restore was undone") from exc
     except Exception as exc:
         logger.exception(
@@ -665,7 +681,9 @@ def run_hyperv_restore(
             time.time() - start_time,
             exc,
         )
-        _undo(connection, node_name, created_vm_id, swapped, written_files, target_vm_id, progress_callback)
+        _undo(
+            connection, node_name, created_vm_id, swapped, written_files, created_folders, target_vm_id, progress_callback
+        )
         if isinstance(exc, (HyperVError, vhdx_tool.VhdxToolError, VCenterBackupError)):
             raise HyperVRestoreError(str(exc)) from exc
         raise
@@ -677,20 +695,23 @@ def _undo(
     created_vm_id: str | None,
     swapped: list[dict[str, Any]],
     written_files: list[str],
+    created_folders: list[str],
     target_vm_id: str,
     progress_callback: ProgressCallback,
 ) -> None:
     """Leave the host as the restore found it, as far as that can be done."""
-    if not (created_vm_id or swapped or written_files):
+    if not (created_vm_id or swapped or written_files or created_folders):
         return
     try:
         with open_node(connection) as node:
+            if node_name:
+                node_name = node.resolve_node(node_name)
             if created_vm_id:
                 try:
                     node.destroy_vm(created_vm_id)
-                    _emit(progress_callback, "cleanup", 97, f"Removed the VM {created_vm_id} the restore had created")
+                    _undo_note(progress_callback, False, "cleanup", 97, f"Removed the VM {created_vm_id} the restore had created")
                 except Exception as exc:
-                    _warn(progress_callback, "cleanup", 97, f"Could not remove the VM {created_vm_id} the restore had created: {exc}")
+                    _undo_note(progress_callback, True, "cleanup", 97, f"Could not remove the VM {created_vm_id} the restore had created: {exc}")
             if swapped:
                 back = [
                     {
@@ -703,18 +724,29 @@ def _undo(
                 ]
                 try:
                     node.replace_vm_disks(target_vm_id, back)
-                    _emit(progress_callback, "cleanup", 97, "Pointed the VM back at its original disks")
+                    _undo_note(progress_callback, False, "cleanup", 97, "Pointed the VM back at its original disks")
                 except Exception as exc:
-                    _warn(progress_callback, "cleanup", 97, f"Could not point the VM back at its original disks: {exc}")
+                    _undo_note(progress_callback, True, "cleanup", 97, f"Could not point the VM back at its original disks: {exc}")
             if written_files and node_name:
                 failed = node.remove_files(node_name, written_files)
                 if failed:
-                    _warn(progress_callback, "cleanup", 98, f"Could not remove {', '.join(failed)}; delete by hand")
+                    _undo_note(progress_callback, True, "cleanup", 98, f"Could not remove {', '.join(failed)}; delete by hand")
                 else:
-                    _emit(progress_callback, "cleanup", 98, f"Removed {len(written_files)} partially restored file(s)")
+                    _undo_note(progress_callback, False, "cleanup", 98, f"Removed {len(written_files)} partially restored file(s)")
+            if created_folders and node_name:
+                kept = node.remove_empty_folders(node_name, sorted(created_folders, key=len, reverse=True))
+                if kept:
+                    _undo_note(progress_callback, True, "cleanup", 98, f"Kept {', '.join(kept)}: not empty; delete by hand")
+                else:
+                    _undo_note(progress_callback, False, "cleanup", 98, f"Removed {len(created_folders)} folder(s) the restore had created")
     except Exception as exc:
         logger.warning("Undoing the failed Hyper-V restore failed: %s", exc)
-        try:
-            _warn(progress_callback, "cleanup", 98, f"Undoing the failed restore failed: {exc}")
-        except TaskStopRequested:
-            pass
+        _undo_note(progress_callback, True, "cleanup", 98, f"Undoing the failed restore failed: {exc}")
+
+
+
+def _undo_note(progress_callback: ProgressCallback, warn: bool, stage: str, progress: int, message: str) -> None:
+    try:
+        (_warn if warn else _emit)(progress_callback, stage, progress, message)
+    except TaskStopRequested:
+        pass
