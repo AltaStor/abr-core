@@ -355,6 +355,7 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
                     "datastores": host_item.get("datastores", []),
                     "datastore_capacity": host_item.get("datastore_capacity", {}),
                     "networks": host_item.get("networks", []),
+                    "status": host_item.get("status"),
                 },
             }
         )

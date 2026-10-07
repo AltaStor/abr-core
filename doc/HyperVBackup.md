@@ -140,7 +140,11 @@ host: the disks go under `<volume>\Hyper-V\<new name>\Virtual Hard Disks`
 (at the root of a Cluster Shared Volume or share), the VM gets the backup's
 generation, processors, memory, Secure Boot settings and adapters, each adapter
 on the virtual switch the network mapping names, and boots from the disk it
-booted from. The source VM is not touched. Before anything is written the
+booted from. `--datastore-map` places the disks of each source storage location,
+and `--disk-datastore "SCSI0:1=E:"` one disk by its slot, which wins over the
+mapping of its location; `--network-map` connects the adapters of each source
+switch, and `--nic-network "nic2=Isolated"` one adapter by its name, so two
+adapters on one switch can land on different ones. The source VM is not touched. Before anything is written the
 restore checks, on the host itself, that every target storage location exists
 there and has room, that every mapped virtual switch exists, and that the name
 is free. A VM that had a virtual TPM gets a new one, so secrets sealed to the
@@ -152,7 +156,10 @@ with the typed confirmation in the console) keeps the VM itself -- its id,
 network adapters and cluster role -- and replaces its disks. The restored disks
 are written next to the current ones, then the VM is turned off, set back to the
 processor and memory the backup recorded, pointed at the restored files, and only
-then are the replaced files deleted. A VM with checkpoints is refused: replacing
+then are the replaced files deleted. Its network adapters go back to the virtual
+switches and access VLANs the backup recorded, and the session says which ones
+moved; a switch the backup recorded that the host no longer has refuses the
+restore before anything changes. A VM with checkpoints is refused: replacing
 disks under a checkpoint chain would break it. Its next backup is a full one,
 since the new disks start their change tracking over.
 
@@ -185,5 +192,6 @@ Lock validation. Credentials and encryption keys are never written to either.
 | `is busy (MergingDisks)` | A checkpoint merge from an earlier operation is still running; retry later |
 | `Application-consistent checkpoint ... failed` | The guest's *Backup (volume shadow copy)* integration service or VSS writers |
 | `no longer knows the previous backup's position` | Expected after a disk was moved or replaced; the run took a full backup |
-| `Virtual switch(es) ... do not exist on` | Map the adapters to switches the target host has |
+| `Virtual switch(es) ... do not exist on` | Map the adapters to switches the target host has; in place, recreate the switch the VM was connected to, or restore out of place |
+| `did not list its VMs within 90s` (server log) | That node's Hyper-V management service or cluster storage; the node is shown as unavailable and the rest of the cluster goes on |
 | `has N checkpoint(s); replacing its disks would break` | Delete the VM's checkpoints, or restore out of place |

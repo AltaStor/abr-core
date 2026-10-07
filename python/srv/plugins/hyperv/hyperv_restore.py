@@ -164,6 +164,25 @@ def vm_base_folder(datastore: str) -> str:
     return root
 
 
+def _disk_slot(disk: dict[str, Any]) -> str:
+    return str(disk.get("slot") or disk.get("disk_label") or "")
+
+
+def _disk_placements(parameters: dict[str, Any], manifest_disks: list[dict[str, Any]]) -> dict[str, str]:
+    placements: dict[str, str] = {}
+    entries = parameters.get("disk_datastore_map")
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        position = entry.get("index")
+        target = str(entry.get("target_datastore") or "").strip()
+        if not isinstance(position, int) or isinstance(position, bool) or not target:
+            continue
+        if 1 <= position <= len(manifest_disks):
+            placements[_disk_slot(manifest_disks[position - 1])] = target
+    return placements
+
+
 def _disk_file_name(disk: dict[str, Any], index: int) -> str:
     name = PureWindowsPath(str(disk.get("datastore_path") or "")).name or f"disk-{index}.vhdx"
     stem = PureWindowsPath(name).stem
@@ -209,10 +228,8 @@ def run_hyperv_restore(
     connection = connection_settings(hypervisor)
     manifest = _load_manifest(parameters)
     vm_config = manifest.get("vm_config") if isinstance(manifest.get("vm_config"), dict) else {}
-    disks = sorted(
-        (disk for disk in manifest.get("disks") or [] if isinstance(disk, dict)),
-        key=lambda disk: _slot_sort_key(str(disk.get("slot") or disk.get("disk_label") or "")),
-    )
+    manifest_disks = [disk for disk in manifest.get("disks") or [] if isinstance(disk, dict)]
+    disks = sorted(manifest_disks, key=lambda disk: _slot_sort_key(_disk_slot(disk)))
     if not disks:
         raise HyperVRestoreError("The restore point records no disks to restore")
     repository = REPOSITORIES.get(str(parameters.get("repository_id") or "")) or {"type": "local", "id": ""}
@@ -233,6 +250,7 @@ def run_hyperv_restore(
     requested_host = str(parameters.get("target_host_name") or parameters.get("target_host") or "")
     default_datastore = str(parameters.get("target_datastore_name") or "")
     datastore_map = parameters.get("datastore_map") if isinstance(parameters.get("datastore_map"), dict) else {}
+    disk_placements = _disk_placements(parameters, manifest_disks)
     power_on = bool(parameters.get("power_on"))
     mode_label = "In-place" if mode == "in_place" else "Out-of-place"
     adapters = _adapter_targets(vm_config, parameters)
@@ -267,6 +285,9 @@ def run_hyperv_restore(
             f"all disks -> {default_datastore}"
         )
         _emit(progress_callback, "prepare", 4, f"Datastore mapping: {mapping_text}")
+        if disk_placements:
+            placement_text = ", ".join(f"{slot} -> {target}" for slot, target in sorted(disk_placements.items()))
+            _emit(progress_callback, "prepare", 4, f"Disk placement: {placement_text}")
         network_text = ", ".join(
             f"{adapter.get('label')} ({adapter['source_network'] or 'not connected'}) -> "
             f"{adapter['target_switch'] or 'not connected'}"
@@ -337,7 +358,12 @@ def run_hyperv_restore(
                     target_datastore = _source_datastore(target_path)
                 else:
                     source_datastore = _source_datastore(str(disk.get("datastore_path") or ""))
-                    target_datastore = str(datastore_map.get(source_datastore) or default_datastore or source_datastore)
+                    target_datastore = str(
+                        disk_placements.get(slot)
+                        or datastore_map.get(source_datastore)
+                        or default_datastore
+                        or source_datastore
+                    )
                     folder = f"{vm_base_folder(target_datastore)}\\{target_vm_name}\\Virtual Hard Disks"
                     target_path = f"{folder}\\{_disk_file_name(disk, index)}"
                     current_path = ""
@@ -393,6 +419,20 @@ def run_hyperv_restore(
                     f"Storage location {datastore} on {node_name}: {_gib(free)} free, {_gib(needed)} needed",
                 )
 
+            if mode == "in_place":
+                switches = {str(item.get("name") or "") for item in resources["switches"]}
+                missing = sorted(
+                    {
+                        str(adapter.get("network") or "")
+                        for adapter in vm_config.get("network_adapters") or []
+                        if isinstance(adapter, dict) and str(adapter.get("network") or "") not in switches | {""}
+                    }
+                )
+                if missing:
+                    raise HyperVRestoreError(
+                        f"Virtual switch(es) {', '.join(missing)} the VM was connected to do not exist on {node_name}; "
+                        "it has " + (", ".join(sorted(switches)) or "none")
+                    )
             if mode == "new_vm":
                 if target_vm_name.lower() in {name.lower() for name in resources["vm_names"]}:
                     raise HyperVRestoreError(f"A VM named {target_vm_name} already exists on {node_name}")
@@ -603,6 +643,8 @@ def run_hyperv_restore(
             created_vm_id = None
             written_files = []
             created_folders = []
+            if mode == "in_place":
+                _reconnect_adapters(node, target_vm_id, target_vm_name, vm_config, warnings, progress_callback)
             power_state = "Off"
             if power_on:
                 _emit(progress_callback, "finalize", 94, f"Starting {target_vm_name}")
@@ -648,6 +690,7 @@ def run_hyperv_restore(
             "target_host_name": node_name,
             "target_datastore_name": plan[0]["datastore"] if plan else default_datastore,
             "datastore_map": datastore_map or None,
+            "disk_placements": disk_placements or None,
             "network_adapters": [
                 {"label": a.get("label"), "source_network": a["source_network"], "target_switch": a["target_switch"]}
                 for a in adapters
@@ -743,6 +786,61 @@ def _undo(
         logger.warning("Undoing the failed Hyper-V restore failed: %s", exc)
         _undo_note(progress_callback, True, "cleanup", 98, f"Undoing the failed restore failed: {exc}")
 
+
+
+def _reconnect_adapters(
+    node: HyperVNode,
+    vm_id: str,
+    vm_name: str,
+    vm_config: dict[str, Any],
+    warnings: list[str],
+    progress_callback: ProgressCallback,
+) -> None:
+    wanted = [
+        {
+            "label": str(adapter.get("label") or ""),
+            "switch": str(adapter.get("network") or ""),
+            "vlan_mode": str(adapter.get("vlan_mode") or ""),
+            "vlan_id": int(adapter.get("vlan_id") or 0),
+        }
+        for adapter in vm_config.get("network_adapters") or []
+        if isinstance(adapter, dict)
+    ]
+    if not wanted:
+        return
+    try:
+        rows = node.connect_vm_adapters(vm_id, wanted)
+    except HyperVError as exc:
+        message = f"{vm_name} is restored, but its network adapters could not be set back to the backup's switches: {exc}"
+        _warn(progress_callback, "configure", 92, message)
+        warnings.append(message)
+        return
+    for row in rows:
+        label = row.get("label") or "network adapter"
+        if row.get("status") == "missing":
+            message = f"{vm_name} no longer has the network adapter {label} the backup recorded on {row.get('switch') or 'no switch'}"
+            _warn(progress_callback, "configure", 92, message)
+            warnings.append(message)
+        elif row.get("status") == "reconnected":
+            _emit(
+                progress_callback,
+                "configure",
+                92,
+                f"Network adapter {label} of {vm_name} reconnected from {row.get('previous') or 'no switch'} "
+                f"to {row.get('switch') or 'no switch'}, as in the backup",
+            )
+        if row.get("vlan_changed"):
+            wanted_vlan = next((item for item in wanted if item["label"] == row.get("label")), {})
+            vlan_text = (
+                f"VLAN {wanted_vlan.get('vlan_id')}" if wanted_vlan.get("vlan_mode") == "Access" else "untagged"
+            )
+            _emit(
+                progress_callback,
+                "configure",
+                92,
+                f"Network adapter {label} of {vm_name} set back from {row.get('previous_vlan') or 'its VLAN'} "
+                f"to {vlan_text}, as in the backup",
+            )
 
 
 def _undo_note(progress_callback: ProgressCallback, warn: bool, stage: str, progress: int, message: str) -> None:

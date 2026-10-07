@@ -9,7 +9,7 @@ import re
 import socket
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -23,6 +23,7 @@ HTTP_PORT = 5985
 PROBE_TIMEOUT_SECONDS = 5
 OPERATION_TIMEOUT_SECONDS = 120
 READ_TIMEOUT_SECONDS = 180
+NODE_SNAPSHOT_TIMEOUT_SECONDS = 90
 SCRIPT_DIR = Path(__file__).resolve().parent / "scripts"
 
 
@@ -231,11 +232,34 @@ class HyperVNode(Hypervisor):
         missing = [node for node in self._nodes if node.lower() not in self._snapshots]
         if not missing:
             return
-        if len(missing) == 1:
-            self._node_snapshot(missing[0])
-            return
-        with ThreadPoolExecutor(max_workers=len(missing)) as pool:
-            list(pool.map(self._node_snapshot, missing))
+        pool = ThreadPoolExecutor(max_workers=len(missing))
+        futures = {pool.submit(self._node_snapshot, node): node for node in missing}
+        done, pending = wait(futures, timeout=NODE_SNAPSHOT_TIMEOUT_SECONDS)
+        pool.shutdown(wait=False, cancel_futures=True)
+        for future in done:
+            future.result()
+        if pending and len(pending) == len(self._nodes):
+            raise HyperVError(
+                f"No Hyper-V node of {self.host} listed its VMs within {NODE_SNAPSHOT_TIMEOUT_SECONDS}s "
+                f"({', '.join(sorted(futures[future] for future in pending))})"
+            )
+        for future in pending:
+            node = futures[future]
+            logger.warning(
+                "Hyper-V node %s did not list its VMs within %ds; treating it as unavailable for now",
+                node,
+                NODE_SNAPSHOT_TIMEOUT_SECONDS,
+            )
+            with self._lock:
+                self._snapshots.setdefault(
+                    node.lower(),
+                    {
+                        "host": {**self._host_record(node, {}), "status": "unavailable"},
+                        "virtual_machines": [],
+                        "disks": [],
+                        "network_adapters": [],
+                    },
+                )
 
     def get_all_vms(self) -> List[Dict[str, Any]]:
         return self.get_inventory()["virtual_machines"]
@@ -319,6 +343,7 @@ class HyperVNode(Hypervisor):
             "datastores": sorted(capacity),
             "datastore_capacity": capacity,
             "networks": [str(name) for name in (raw.get("networks") or [])],
+            "status": "connected",
         }
 
     def _vm_record(self, node: str, raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -1138,6 +1163,10 @@ class HyperVNode(Hypervisor):
                 "memory_maximum_mb": int(config.get("memory_maximum_mb") or 0),
             },
         )
+
+    def connect_vm_adapters(self, vm_name: str, adapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows = self._run_vm_script(vm_name, "connect_adapters.ps1", {"adapters": adapters})
+        return [dict(item) for item in rows]
 
     def replace_vm_disks(self, vm_name: str, disks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Point a VM's drives at other files, slot by slot; returns each
