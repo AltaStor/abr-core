@@ -4476,6 +4476,56 @@ def resolve_job_execution(
     return "Incremental", "StandardIncremental"
 
 
+def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
+    if str(task.get("task_type") or "") != "backup":
+        return task
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    job_id = str(task.get("job_id") or "")
+    if not job_id or job_id not in JOBS or parameters.get("copy_job") or parameters.get("requires_task_id"):
+        return task
+    queued_type = str(parameters.get("resolved_backup_type") or "")
+    queued_reason = str(parameters.get("resolved_backup_reason") or "")
+    if queued_reason in {"ForceFull", "ForceSynthetic"}:
+        return task
+    job = resolve_job(record_id=job_id)
+    vm_id = str(task.get("resource_external_id") or "")
+    has_point = _latest_successful_point(job_id, vm_id, str(job.get("repo_id") or "") or None) is not None
+    if queued_reason == "FirstRun" and has_point:
+        execution_type, execution_reason = resolve_job_execution(job, vm_id=vm_id, force_full=False)
+        if execution_type == "SyntheticFull":
+            execution_type, execution_reason = "Incremental", "StandardIncremental"
+    elif queued_type in {"Incremental", "SyntheticFull"} and not has_point:
+        execution_type, execution_reason = "ActiveFull", "FirstRun"
+    else:
+        return task
+    if (execution_type, execution_reason) == (queued_type, queued_reason):
+        return task
+    parameters.update(
+        {
+            "resolved_backup_type": execution_type,
+            "resolved_backup_reason": execution_reason,
+            "backup_mode_request": "full" if execution_type in {"ActiveFull", "SyntheticFull"} else "auto",
+            "incremental": execution_type == "Incremental",
+            "synthetic_full": execution_type == "SyntheticFull",
+            "active_full": execution_type == "ActiveFull",
+        }
+    )
+    task["parameters"] = parameters
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    result.update({"resolved_backup_type": execution_type, "resolved_backup_reason": execution_reason})
+    task["result"] = result
+    _append_task_log(
+        task,
+        level="info",
+        message=(
+            f"Runs as {execution_type} ({execution_reason}), decided when it started: it was queued as "
+            f"{queued_type} ({queued_reason}), and the backup chain has changed since"
+        ),
+        component="session",
+    )
+    persist_task(task)
+    return task
+
 def _point_period_key(point: dict[str, Any], *, kind: str) -> str:
     created = _parse_dt(point.get("created_at"))
     if kind == "weekly":
