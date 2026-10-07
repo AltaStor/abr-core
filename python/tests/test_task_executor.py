@@ -701,6 +701,53 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertNotIn("--type", commands[0])
         self.assertEqual(commands[0][commands[0].index("--vmdk") + 1], "[datastore1] demo-vm/demo-vm-000003.vmdk")
 
+    def test_a_first_full_with_cbt_just_turned_on_under_a_user_snapshot_reads_the_current_data(self) -> None:
+        default_change_ids = FakeVCenterNode.snapshot_change_ids
+        self.addCleanup(setattr, FakeVCenterNode, "snapshot_change_ids", default_change_ids)
+        FakeVCenterNode.snapshot_change_ids = [
+            {**default_change_ids[0], "datastore_path": "[datastore1] demo-vm/demo-vm-000001.vmdk", "change_id": ""}
+        ]
+        FakeVCenterNode.cbt_enabled_result = False
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {"host": "vc.local", "port": 443, "verify_ssl": False,
+                         "credentials": {"username": "administrator", "password": "secret"}},
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine", "external_id": "vm-uuid-1", "name": "demo-vm", "payload": {},
+            }
+        }
+        recorded_commands: list[list[str]] = []
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "task-first-full-cbt-off-user-snapshot",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {"destination_dir": temp_dir, "tool_path": EXISTING_TOOL_PATH, "active_full": True},
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                recorded_commands.append(command)
+                return FakeCompletedProcess(returncode=0, stdout="ok")
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
+                    result = run_task(task)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(FakeVCenterNode.cbt_enable_calls, ["demo-vm"])
+        self.assertEqual(len(recorded_commands), 1)
+        command = recorded_commands[0]
+        self.assertEqual(command[command.index("--vmdk") + 1], "[datastore1] demo-vm/demo-vm-000001.vmdk")
+        self.assertNotIn("--change-id", command)
+
     def test_a_full_backup_reads_the_disk_of_its_own_snapshot_when_the_vm_already_has_one(self) -> None:
         default_change_ids = FakeVCenterNode.snapshot_change_ids
         self.addCleanup(setattr, FakeVCenterNode, "snapshot_change_ids", default_change_ids)
@@ -2671,8 +2718,89 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed", result["result"].get("message"))
         self.assertEqual(result["result"]["resolved_backup_type"], "Incremental")
         self.assertEqual(manifest["disks"][0]["parent_manifest_path"], str(full))
-        self.assertIn("demo-vm-renamed", result["result"]["manifest_path"])
+        self.assertEqual(pathlib.Path(result["result"]["manifest_path"]).parent.parent.name, "demo-vm")
         self.assertTrue(any("incremental" in command for command in recorded_commands))
+
+    def test_a_vm_keeps_writing_into_the_folder_of_its_newest_backup(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import _vm_backup_folder
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            self._write_vm_manifest(root, "demo-vm", "task-full", "vm-uuid-1", "2026-10-07T10:00:00+00:00")
+            self._write_vm_manifest(root, "demo-vm-renamed", "task-forced-full", "vm-uuid-1", "2026-10-07T11:00:00+00:00")
+            self._write_vm_manifest(root, "other-vm", "task-other", "vm-uuid-2", "2026-10-07T12:00:00+00:00")
+            self.assertEqual(_vm_backup_folder(root, "demo-vm", "vm-uuid-1"), "demo-vm-renamed")
+            self.assertEqual(_vm_backup_folder(root, "new name/with:chars", "vm-uuid-3"), "new-name-with-chars")
+            self.assertEqual(_vm_backup_folder(root, "demo-vm", None), "demo-vm")
+            self.assertEqual(_vm_backup_folder(root / "missing", "demo-vm", "vm-uuid-1"), "demo-vm")
+
+    def test_a_full_after_a_rename_lands_beside_the_vms_earlier_backups(self) -> None:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {"host": "vc.local", "port": 443, "verify_ssl": False,
+                         "credentials": {"username": "administrator", "password": "secret"}},
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine", "external_id": "vm-uuid-1", "name": "demo-vm-renamed", "payload": {},
+            }
+        }
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            self._write_vm_manifest(root, "demo-vm", "task-full", "vm-uuid-1", "2026-10-07T10:00:00+00:00", backup_mode="full")
+            task = {
+                "id": "task-full-after-rename",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {"destination_dir": temp_dir, "tool_path": EXISTING_TOOL_PATH},
+            }
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch(
+                    "python.srv.plugins.vcenter.vcenter_backup.run_capped",
+                    side_effect=lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="Done"),
+                ):
+                    result = run_task(task)
+            self.assertFalse((root / "demo-vm-renamed").exists())
+
+        self.assertEqual(result["status"], "completed", result["result"].get("message"))
+        self.assertEqual(pathlib.Path(result["result"]["backup_root"]), (root / "demo-vm" / "task-full-after-rename").resolve())
+
+    def test_an_s3_chain_keeps_its_prefix_after_a_rename(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import _resolve_backup_storage_layout
+
+        repository = {
+            "id": "repo-s3",
+            "type": "s3",
+            "metadata": {"s3": {"bucket": "b", "prefix": "tenant", "region": "us-east-1"}},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            self._write_vm_manifest(root, "demo-vm", "task-full", "vm-uuid-1", "2026-10-07T10:00:00+00:00")
+            with patch("python.srv.plugins.vcenter.vcenter_backup.is_s3_repository", return_value=True), patch(
+                "python.srv.plugins.vcenter.vcenter_backup.extract_s3_config", return_value={"prefix": "tenant"}
+            ):
+                _root, task_root, abr_path = _resolve_backup_storage_layout(
+                    task={"id": "task-inc"},
+                    vm_name="demo-vm-renamed",
+                    parameters={"destination_dir": temp_dir},
+                    repository=repository,
+                    vm_external_id="vm-uuid-1",
+                )
+                _root, plain_root, plain_path = _resolve_backup_storage_layout(
+                    task={"id": "task-inc"},
+                    vm_name="demo-vm-renamed",
+                    parameters={"destination_dir": temp_dir},
+                    repository=repository,
+                )
+        self.assertEqual(task_root.parent.name, "demo-vm")
+        self.assertEqual(abr_path, "tenant/demo-vm/task-inc")
+        self.assertEqual(plain_root.parent.name, "demo-vm-renamed")
+        self.assertEqual(plain_path, "tenant/demo-vm-renamed/task-inc")
 
     def test_vcenter_incremental_backup_can_query_changed_areas_without_utility_copy(self) -> None:
         HYPERVISORS["hv-vc"] = {

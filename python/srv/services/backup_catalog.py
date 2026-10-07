@@ -629,6 +629,10 @@ def _interrupted_task_output_location(task: dict[str, Any]) -> tuple[dict[str, A
                 vm_name = str(point.get("vm_name"))
                 break
     vm_component = safe_path_component(vm_name or task.get("resource_external_id"), fallback="vm")
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    recorded_root = Path(str(result.get("backup_root") or "").strip() or ".")
+    if recorded_root.name == task_id and recorded_root.parent.name:
+        vm_component = recorded_root.parent.name
     if is_s3_repository(repository):
         return repository, join_s3_prefix(extract_s3_config(repository).get("prefix"), vm_component, task_id)
     root = str(repository.get("path") or "").strip()

@@ -718,21 +718,48 @@ def _stop_message(stranded: list[str], abr_path: str | None, task_root: Path) ->
     )
 
 
+def _vm_backup_manifests(destination_root: Path, vm_external_id: str) -> list[tuple[Path, dict[str, Any]]]:
+    found: list[tuple[Path, dict[str, Any]]] = []
+    if not vm_external_id:
+        return found
+    for manifest_path in destination_root.glob("*/*/manifest.json"):
+        resolved_path = manifest_path.resolve()
+        try:
+            manifest = _load_manifest(resolved_path)
+        except VCenterBackupError:
+            continue
+        if str(manifest.get("operation") or "") != "vm-backup":
+            continue
+        if str(manifest.get("vm_external_id") or "") != vm_external_id:
+            continue
+        found.append((resolved_path, manifest))
+    return found
+
+
+def _vm_backup_folder(destination_root: Path, vm_name: str, vm_external_id: str | None) -> str:
+    existing = _vm_backup_manifests(destination_root, str(vm_external_id or ""))
+    if existing:
+        newest = max(existing, key=lambda item: _manifest_sort_key(item[0], item[1]))
+        return newest[0].parent.parent.name
+    return safe_path_component(vm_name, fallback="vm")
+
+
 def _resolve_backup_storage_layout(
     *,
     task: dict[str, Any],
     vm_name: str,
     parameters: dict[str, Any],
     repository: dict[str, Any] | None,
+    vm_external_id: str | None = None,
 ) -> tuple[Path, Path, str | None]:
     configured_destination = parameters.get("destination_dir") or parameters.get("backup_root")
-    vm_path_component = safe_path_component(vm_name, fallback="vm")
 
     if is_s3_repository(repository):
         if configured_destination:
             destination_root = Path(str(configured_destination)).expanduser().resolve()
         else:
             destination_root = repository_cache_root(_default_backup_root(), repository).resolve()
+        vm_path_component = _vm_backup_folder(destination_root, vm_name, vm_external_id)
         task_root = destination_root / vm_path_component / str(task["id"])
         abr_path = join_s3_prefix(
             extract_s3_config(repository).get("prefix"),
@@ -745,6 +772,7 @@ def _resolve_backup_storage_layout(
         destination_root = Path(str(configured_destination)).expanduser().resolve()
     else:
         destination_root = _resolve_repository_backup_root(task) or _default_backup_root()
+    vm_path_component = _vm_backup_folder(destination_root, vm_name, vm_external_id)
     task_root = destination_root / vm_path_component / str(task["id"])
     # Local repositories now use the .abr file backend; the abr path is the
     # per-task filesystem directory the FileBackupManager writes into, and
@@ -1012,25 +1040,16 @@ def _resolve_parent_manifest(
         manifest_path = Path(str(explicit)).expanduser().resolve()
         return manifest_path, _load_manifest(manifest_path)
 
-    candidates: list[tuple[Path, dict[str, Any]]] = []
     current_manifest = (task_root / "manifest.json").resolve()
-    for manifest_path in destination_root.glob("*/*/manifest.json"):
-        resolved_path = manifest_path.resolve()
-        if resolved_path == current_manifest:
-            continue
-        try:
-            manifest = _load_manifest(resolved_path)
-        except VCenterBackupError:
-            continue
-        if str(manifest.get("operation") or "") != "vm-backup":
-            continue
-        if str(manifest.get("vm_external_id") or "") != vm_external_id:
-            continue
-        if differential:
-            backup_mode = str(manifest.get("backup_mode") or "").strip().lower()
-            if backup_mode not in {"", "full"}:
-                continue
-        candidates.append((resolved_path, manifest))
+    candidates = [
+        (path, manifest)
+        for path, manifest in _vm_backup_manifests(destination_root, vm_external_id)
+        if path != current_manifest
+        and (
+            not differential
+            or str(manifest.get("backup_mode") or "").strip().lower() in {"", "full"}
+        )
+    ]
 
     if not candidates:
         kind = "Differential" if differential else "Incremental"
@@ -1410,6 +1429,7 @@ def run_vcenter_backup(
         vm_name=vm_name,
         parameters=parameters,
         repository=repository,
+        vm_external_id=vm_id,
     )
     ensure_private_directory(task_root)
     # Every repository now uses the .abr format. When no repository record is

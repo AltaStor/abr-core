@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import errno
 import shutil
 import tempfile
@@ -332,6 +333,23 @@ class SyntheticFullRunTests(unittest.TestCase):
         self.assertEqual(result["repository_id"], "repo-2")
         self.assertEqual(result["source_repository_id"], REPO_ID)
         self.assertTrue(result["backup_root"].startswith(target))
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_renamed_vms_merge_is_written_into_its_chains_folder(self, copy_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
+        chain_folder = pathlib.Path(self._root) / "web01" / "task-a"
+        chain_folder.mkdir(parents=True)
+        (chain_folder / "manifest.json").write_text(
+            json.dumps({"operation": "vm-backup", "vm_external_id": VM_ID, "created_at": "2026-10-07T10:00:00+00:00"}),
+            encoding="utf-8",
+        )
+        for point in BACKUPS.values():
+            point["vm_name"] = "web01-renamed"
+
+        result = synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(pathlib.Path(result["manifest_path"]).parent.parent.name, "web01")
+        self.assertFalse((pathlib.Path(self._root) / "web01-renamed").exists())
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_chain_is_read_from_its_own_location(self, copy_mock) -> None:

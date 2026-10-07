@@ -451,3 +451,39 @@ class AccessLockReleaseTests(SweepTestCase):
         self.assertIn("access_lock", persist.call_args.args[0])
         self.assertIsNone(persist.call_args.args[0]["access_lock"])
 
+
+class InterruptedOutputLocationTests(SweepTestCase):
+    def test_the_recorded_task_folder_wins_over_the_vms_current_name(self) -> None:
+        task = _task("task-r1", "running", vm_name="web01-renamed")
+        task["result"] = {"backup_root": str(pathlib.Path(self._root) / "web01" / "task-r1")}
+        self.assertEqual(
+            backup_catalog._interrupted_task_output_location(task),
+            (REPOSITORIES[REPO_ID], str(pathlib.Path(self._root) / "web01" / "task-r1")),
+        )
+
+    def test_a_task_that_recorded_no_folder_is_found_by_its_vm_name(self) -> None:
+        task = _task("task-r2", "running", vm_name="web01-renamed")
+        self.assertEqual(
+            backup_catalog._interrupted_task_output_location(task),
+            (REPOSITORIES[REPO_ID], str(pathlib.Path(self._root) / "web01-renamed" / "task-r2")),
+        )
+
+    def test_a_recorded_folder_of_another_task_is_not_trusted(self) -> None:
+        task = _task("task-r3", "running", vm_name="web01")
+        task["result"] = {"backup_root": str(pathlib.Path(self._root) / "elsewhere" / "task-other")}
+        self.assertEqual(
+            backup_catalog._interrupted_task_output_location(task),
+            (REPOSITORIES[REPO_ID], str(pathlib.Path(self._root) / "web01" / "task-r3")),
+        )
+
+    def test_an_s3_task_uses_the_folder_it_recorded_in_its_prefix(self) -> None:
+        REPOSITORIES["repo-s3"] = {"id": "repo-s3", "name": "S3", "type": "s3",
+                                   "metadata": {"s3": {"bucket": "b", "prefix": "tenant", "region": "us-east-1"}}}
+        task = _task("task-r4", "running", vm_name="web01-renamed", repository_id="repo-s3")
+        task["result"] = {"backup_root": "/var/cache/abr/repo-s3/web01/task-r4"}
+        with patch("python.srv.services.backup_catalog.is_s3_repository", return_value=True), patch(
+            "python.srv.services.backup_catalog.extract_s3_config", return_value={"prefix": "tenant"}
+        ):
+            location = backup_catalog._interrupted_task_output_location(task)
+        self.assertEqual(location[1], "tenant/web01/task-r4")
+

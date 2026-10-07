@@ -366,7 +366,7 @@ def run_synthetic_full(
 
     vm_name = str(points[-1].get("vm_name") or parameters.get("vm_name") or vm_id)
     _destination_root, task_root, destination_path = _resolve_backup_storage_layout(
-        task=task, vm_name=vm_name, parameters=parameters, repository=repository
+        task=task, vm_name=vm_name, parameters=parameters, repository=repository, vm_external_id=vm_id
     )
     free_at_start = _free_bytes_at_start(repository)
     if not is_s3_repository(repository):
