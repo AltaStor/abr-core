@@ -3800,11 +3800,11 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
             "name": normalized.get("inventory_name") or None,
         },
         "vm_ids": list(normalized.get("vm_ids") or []),
-        "vm_names": list(normalized.get("vm_names") or []),
+        "vm_names": _job_vm_current_names(normalized) if len(normalized.get("vm_ids") or []) == len(normalized.get("vm_names") or []) else list(normalized.get("vm_names") or []),
         "vm_count": int(normalized.get("vm_count") or 0),
         "vms": [
             {"id": vm_id or None, "name": vm_name or None}
-            for vm_id, vm_name in zip(normalized.get("vm_ids") or [], normalized.get("vm_names") or [])
+            for vm_id, vm_name in zip(normalized.get("vm_ids") or [], _job_vm_current_names(normalized))
         ],
         "repository": {
             "id": normalized.get("repo_id") or None,
@@ -7933,6 +7933,15 @@ def _ensure_chain_can_be_merged(job: dict[str, Any]) -> None:
             ) from exc
 
 
+def _job_vm_current_names(job: dict[str, Any]) -> list[str]:
+    discovered = RESOURCES_BY_HV.get(str(job.get("inventory_id") or ""), {})
+    names: list[str] = []
+    for vm_id, stored_name in zip(job.get("vm_ids") or [], job.get("vm_names") or []):
+        resource = discovered.get(("virtual_machine", str(vm_id)))
+        names.append(str((resource or {}).get("name") or stored_name))
+    return names
+
+
 def start_job_record(
     job_id: str,
     *,
@@ -7969,7 +7978,7 @@ def start_job_record(
     if job["job_type"] == "backup-copy":
         sessions.append(_create_completed_copy_session(job))
     else:
-        for vm_id, vm_name in zip(job.get("vm_ids") or [], job.get("vm_names") or []):
+        for vm_id, vm_name in zip(job.get("vm_ids") or [], _job_vm_current_names(job)):
             execution_type, execution_reason = resolve_job_execution(
                 job, vm_id=vm_id, force_full=force_full, force_synthetic=force_synthetic
             )

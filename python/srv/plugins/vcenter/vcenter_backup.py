@@ -1012,19 +1012,9 @@ def _resolve_parent_manifest(
         manifest_path = Path(str(explicit)).expanduser().resolve()
         return manifest_path, _load_manifest(manifest_path)
 
-    vm_backup_root = destination_root / _sanitize_name(vm_name)
-    if not vm_backup_root.exists():
-        if differential:
-            raise VCenterBackupError(
-                "Differential backup requires parameters.parent_manifest_path or a previous full backup manifest in the VM backup directory"
-            )
-        raise VCenterBackupError(
-            "Incremental backup requires parameters.parent_manifest_path or a previous backup manifest in the VM backup directory"
-        )
-
     candidates: list[tuple[Path, dict[str, Any]]] = []
     current_manifest = (task_root / "manifest.json").resolve()
-    for manifest_path in vm_backup_root.glob("*/manifest.json"):
+    for manifest_path in destination_root.glob("*/*/manifest.json"):
         resolved_path = manifest_path.resolve()
         if resolved_path == current_manifest:
             continue
@@ -1043,12 +1033,11 @@ def _resolve_parent_manifest(
         candidates.append((resolved_path, manifest))
 
     if not candidates:
-        if differential:
-            raise VCenterBackupError(
-                "Differential backup requires a previous full VM backup manifest. Provide parameters.parent_manifest_path or create a full backup first."
-            )
+        kind = "Differential" if differential else "Incremental"
+        parent = "full backup" if differential else "backup"
         raise VCenterBackupError(
-            "Incremental backup requires a previous VM backup manifest. Provide parameters.parent_manifest_path or create a full backup first."
+            f"{kind} backup of {vm_name} found no previous {parent} manifest of this VM in the repository to "
+            "continue from. Run a full backup of the job (abr job start --full) to start a new chain."
         )
 
     candidates.sort(key=lambda item: _manifest_sort_key(item[0], item[1]), reverse=True)

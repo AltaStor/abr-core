@@ -1754,5 +1754,33 @@ class JobStartWaitTests(unittest.TestCase):
         self.assertEqual(exit_code, INVALID_STATE)
 
 
+class JobCurrentVmNameTests(unittest.TestCase):
+    def setUp(self) -> None:
+        RESOURCES_BY_HV.clear()
+        self.addCleanup(RESOURCES_BY_HV.clear)
+        RESOURCES_BY_HV["inv-1"] = {
+            ("virtual_machine", "vm-uuid-1"): {"resource_type": "virtual_machine", "external_id": "vm-uuid-1", "name": "web01-renamed"},
+        }
+        self.job = abr_v41.normalize_job_record(
+            {
+                "id": "job-1",
+                "name": "Nightly",
+                "inventory_id": "inv-1",
+                "vm_ids": ["vm-uuid-1", "vm-uuid-gone"],
+                "vm_names": ["web01", "db01"],
+            }
+        )
+
+    def test_a_renamed_vm_is_shown_under_its_current_name(self) -> None:
+        dto = abr_v41.job_to_dto(self.job)
+        self.assertEqual(dto["vm_ids"], ["vm-uuid-1", "vm-uuid-gone"])
+        self.assertEqual(dto["vm_names"], ["web01-renamed", "db01"])
+        self.assertEqual(dto["vms"], [{"id": "vm-uuid-1", "name": "web01-renamed"}, {"id": "vm-uuid-gone", "name": "db01"}])
+
+    def test_a_vm_missing_from_the_inventory_keeps_its_stored_name(self) -> None:
+        RESOURCES_BY_HV.clear()
+        self.assertEqual(abr_v41._job_vm_current_names(self.job), ["web01", "db01"])
+
+
 if __name__ == "__main__":
     unittest.main()
