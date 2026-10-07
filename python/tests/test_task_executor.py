@@ -588,6 +588,156 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(payload["compression_level"], 3)
         self.assertEqual(manifest_payload["compression_level"], 3)
 
+
+    def _full_copy_commands_inside_an_incremental(self, *, parent_change_id: str, incremental_fails: bool) -> list[list[str]]:
+        default_change_ids = FakeVCenterNode.snapshot_change_ids
+        self.addCleanup(setattr, FakeVCenterNode, "snapshot_change_ids", default_change_ids)
+        FakeVCenterNode.snapshot_change_ids = [
+            {**default_change_ids[0], "datastore_path": "[datastore1] demo-vm/demo-vm-000003.vmdk"}
+        ]
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+        recorded_commands: list[list[str]] = []
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous_task_root = pathlib.Path(temp_dir) / "demo-vm" / "task-prev"
+            previous_task_root.mkdir(parents=True)
+            parent_manifest = previous_task_root / "manifest.json"
+            parent_manifest.write_text(
+                json.dumps(
+                    {
+                        "operation": "vm-backup",
+                        "vm_name": "demo-vm",
+                        "vm_external_id": "vm-uuid-1",
+                        "created_at": "2026-04-20T09:00:00+00:00",
+                        "disks": [
+                            {
+                                "index": 1,
+                                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                                "uuid": "disk-uuid-1",
+                                "change_id": parent_change_id,
+                                "destination_path": "",
+                                "abr_path": str(previous_task_root),
+                                "abr_backup_name": "01-demo-vm.vmdk",
+                                "storage_mode": "local",
+                                "store_mode": "full",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task = {
+                "id": "task-full-copy-inside-incremental",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "incremental": True,
+                    "incremental_fallback_full": True,
+                    "destination_dir": temp_dir,
+                    "parent_manifest_path": str(parent_manifest),
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                recorded_commands.append(command)
+                if incremental_fails and "--type" in command:
+                    return FakeCompletedProcess(returncode=1, stderr="query changed areas failed")
+                return FakeCompletedProcess(returncode=0, stdout="Done")
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
+                    result = run_task(task)
+        self.assertEqual(result["status"], "completed")
+        return recorded_commands
+
+    def test_the_full_copy_after_a_failed_incremental_reads_the_snapshots_disk(self) -> None:
+        commands = self._full_copy_commands_inside_an_incremental(parent_change_id="parent-change-001", incremental_fails=True)
+
+        self.assertEqual(
+            [command[command.index("--vmdk") + 1] for command in commands],
+            ["[datastore1] demo-vm/demo-vm-000003.vmdk", "[datastore1] demo-vm/demo-vm-000003.vmdk"],
+        )
+        self.assertNotIn("--type", commands[1])
+
+    def test_the_full_copy_without_a_cbt_baseline_reads_the_snapshots_disk(self) -> None:
+        commands = self._full_copy_commands_inside_an_incremental(parent_change_id="", incremental_fails=False)
+
+        self.assertEqual(len(commands), 1)
+        self.assertNotIn("--type", commands[0])
+        self.assertEqual(commands[0][commands[0].index("--vmdk") + 1], "[datastore1] demo-vm/demo-vm-000003.vmdk")
+
+    def test_a_full_backup_reads_the_disk_of_its_own_snapshot_when_the_vm_already_has_one(self) -> None:
+        default_change_ids = FakeVCenterNode.snapshot_change_ids
+        self.addCleanup(setattr, FakeVCenterNode, "snapshot_change_ids", default_change_ids)
+        FakeVCenterNode.snapshot_change_ids = [
+            {**default_change_ids[0], "datastore_path": "[datastore1] demo-vm/demo-vm-000002.vmdk"}
+        ]
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+        recorded_commands: list[list[str]] = []
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "task-vcenter-prior-snapshot",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {"destination_dir": temp_dir, "tool_path": EXISTING_TOOL_PATH},
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                recorded_commands.append(command)
+                return FakeCompletedProcess(returncode=0, stdout="ok")
+
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
+                    result = run_task(task)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(recorded_commands), 1)
+        command = recorded_commands[0]
+        self.assertEqual(command[command.index("--vmdk") + 1], "[datastore1] demo-vm/demo-vm-000002.vmdk")
+        self.assertEqual(result["result"]["disks"][0]["datastore_path"], "[datastore1] demo-vm/demo-vm.vmdk")
     def test_vcenter_backup_records_real_size_and_compression_ratio_from_the_tool(self) -> None:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",

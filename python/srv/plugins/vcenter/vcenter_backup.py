@@ -1929,7 +1929,7 @@ def run_vcenter_backup(
                                 backup_name=disk_backup_name,
                                 repository=repository,
                                 abr_path=repository_abr_path,
-                                datastore_path=datastore_path,
+                                datastore_path=utility_datastore_path,
                                 host=host,
                                 port=port,
                                 username=username,
@@ -2125,7 +2125,7 @@ def run_vcenter_backup(
                                         backup_name=disk_backup_name,
                                         repository=repository,
                                         abr_path=repository_abr_path,
-                                        datastore_path=datastore_path,
+                                        datastore_path=utility_datastore_path,
                                         host=host,
                                         port=port,
                                         username=username,
@@ -2306,7 +2306,13 @@ def run_vcenter_backup(
                     if not datastore_path:
                         raise VCenterBackupError(f"Disk entry is missing datastore_path: {disk}")
                     formatted_vm_moref = _format_vm_spec(vm_moref, service_type)
-                    transfer_datastore_path = datastore_path
+                    uuid = str(payload.get("uuid") or disk.get("uuid") or "")
+                    snapshot_entry = (
+                        change_id_by_uuid.get(uuid)
+                        or change_id_by_datastore_path.get(datastore_path)
+                        or change_id_by_index.get(index)
+                    )
+                    transfer_datastore_path = str((snapshot_entry or {}).get("datastore_path") or "") or datastore_path
                     live_snapshot_datastore_path = live_disk_paths.get(datastore_path, datastore_path)
                     if not is_virtual_center and not formatted_vm_moref:
                         transfer_datastore_path = live_snapshot_datastore_path
