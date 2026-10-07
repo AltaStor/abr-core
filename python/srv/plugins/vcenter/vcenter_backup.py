@@ -22,10 +22,12 @@ from ...core.storage_tool import (
     StorageToolError,
     apply_repository_immutability,
     default_disk_tool_path,
+    describe_bytes,
     disk_tool_immutability_args,
     disk_tool_storage_args,
     ensure_private_directory,
     extract_s3_config,
+    filesystem_free_bytes,
     is_s3_repository,
     join_s3_prefix,
     read_storage_backup_info,
@@ -964,6 +966,49 @@ def _resolve_parent_manifest(
     return candidates[0]
 
 
+_WRITE_FAILURE = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
+_NO_SPACE = re.compile(r"no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
+
+
+def _repository_free_bytes(repository: dict[str, Any] | None) -> int | None:
+    if not isinstance(repository, dict) or is_s3_repository(repository):
+        return None
+    root = str(repository.get("path") or "").strip()
+    return filesystem_free_bytes(root) if root else None
+
+
+def _disk_failure_message(
+    repository: dict[str, Any] | None,
+    tool_error: str,
+    *,
+    needed_bytes: int | None,
+    needed_is_disk_size: bool,
+    free_before: int | None,
+) -> str:
+    if not isinstance(repository, dict) or not _WRITE_FAILURE.search(tool_error or ""):
+        return tool_error
+    short_before = bool(needed_bytes) and free_before is not None and free_before < int(needed_bytes or 0)
+    if not (short_before or _NO_SPACE.search(tool_error)):
+        return tool_error
+    name = str(repository.get("name") or repository.get("id") or "the destination")
+    root = str(repository.get("path") or "").strip()
+    label = f"repository {name!r}" + (f" at {root}" if root else "")
+    if needed_bytes and free_before is not None:
+        needed = (
+            f"up to {describe_bytes(int(needed_bytes))} (the size of the disk)"
+            if needed_is_disk_size
+            else f"about {describe_bytes(int(needed_bytes))} of changed data"
+        )
+        amounts = f": this disk needs {needed} and {describe_bytes(free_before)} were free before it was written"
+    else:
+        free_now = _repository_free_bytes(repository)
+        amounts = f" ({describe_bytes(free_now)} free)" if free_now is not None else ""
+    return (
+        f"The {label} ran out of space{amounts}. "
+        "Free space in that filesystem, or point the job at another repository"
+    )
+
+
 def _is_cbt_invalid_fault(exc: BaseException) -> bool:
     for message in getattr(exc, "faultMessage", None) or []:
         key = str(getattr(message, "key", "") or "").lower()
@@ -1607,6 +1652,7 @@ def run_vcenter_backup(
 
             if use_changed_block_backup:
                 for index, disk in enumerate(disks, start=1):
+                    free_before_disk = _repository_free_bytes(repository)
                     payload = disk.get("payload", {})
                     if not isinstance(payload, dict):
                         payload = {}
@@ -1872,7 +1918,13 @@ def run_vcenter_backup(
                                 raise VCenterBackupError(
                                     f"Full disk backup failed for {datastore_path} while "
                                     "recovering from a missing CBT change ID: "
-                                    f"{stderr or f'exit code {completed.returncode}'}"
+                                    + _disk_failure_message(
+                                        repository,
+                                        stderr or f"exit code {completed.returncode}",
+                                        needed_bytes=full_disk_bytes,
+                                        needed_is_disk_size=True,
+                                        free_before=free_before_disk,
+                                    )
                                 )
                             disk_store_mode = (
                                 "full-new-disk"
@@ -1977,7 +2029,14 @@ def run_vcenter_backup(
                                 )
                                 if not incremental_fallback_full and not incremental_fallback_metadata:
                                     raise VCenterBackupError(
-                                        f"Incremental disk backup failed for {datastore_path}: {stderr or f'exit code {completed.returncode}'}"
+                                        f"Incremental disk backup failed for {datastore_path}: "
+                                        + _disk_failure_message(
+                                            repository,
+                                            stderr or f"exit code {completed.returncode}",
+                                            needed_bytes=changed_bytes,
+                                            needed_is_disk_size=False,
+                                            free_before=free_before_disk,
+                                        )
                                     )
 
                                 if incremental_fallback_full:
@@ -2053,9 +2112,26 @@ def run_vcenter_backup(
                                     if not incremental_fallback_metadata:
                                         raise VCenterBackupError(
                                             "Incremental disk backup failed for "
-                                            f"{datastore_path}: {stderr or f'exit code {completed.returncode}'}. "
-                                            "Full fallback also failed: "
-                                            f"{fallback_error or 'not attempted'}"
+                                            f"{datastore_path}: "
+                                            + _disk_failure_message(
+                                                repository,
+                                                stderr or f"exit code {completed.returncode}",
+                                                needed_bytes=changed_bytes,
+                                                needed_is_disk_size=False,
+                                                free_before=free_before_disk,
+                                            )
+                                            + ". Full fallback also failed: "
+                                            + (
+                                                _disk_failure_message(
+                                                    repository,
+                                                    fallback_error,
+                                                    needed_bytes=full_disk_bytes,
+                                                    needed_is_disk_size=True,
+                                                    free_before=free_before_disk,
+                                                )
+                                                if fallback_error
+                                                else "not attempted"
+                                            )
                                         )
                                     incremental_metadata_fallback_used = True
                                     disk_store_mode = "metadata-fallback"
@@ -2152,6 +2228,7 @@ def run_vcenter_backup(
             else:
                 for index, disk in enumerate(disks, start=1):
                     disk_start_time = time.time()
+                    free_before_disk = _repository_free_bytes(repository)
                     payload = disk.get("payload", {})
                     if not isinstance(payload, dict):
                         payload = {}
@@ -2452,7 +2529,14 @@ def run_vcenter_backup(
                             stderr or f"exit code {completed.returncode}",
                         )
                         raise VCenterBackupError(
-                            f"Disk backup failed for {datastore_path}: {stderr or f'exit code {completed.returncode}'}"
+                            f"Disk backup failed for {datastore_path}: "
+                            + _disk_failure_message(
+                                repository,
+                                stderr or f"exit code {completed.returncode}",
+                                needed_bytes=disk_total_bytes,
+                                needed_is_disk_size=True,
+                                free_before=free_before_disk,
+                            )
                         )
 
                     disk_duration = time.time() - disk_start_time
