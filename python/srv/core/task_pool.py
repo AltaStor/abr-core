@@ -217,6 +217,8 @@ class TaskProcessPool:
             update = dict(update)
             log_entry = update.pop("log_entry", True)
             warning = update.pop("warning", None)
+            if "access_lock" in update:
+                task["access_lock"] = update.pop("access_lock") or None
             current_result = task.get("result")
             if not isinstance(current_result, dict):
                 current_result = {}

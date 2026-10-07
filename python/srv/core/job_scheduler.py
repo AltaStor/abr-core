@@ -7,6 +7,7 @@ import calendar
 from datetime import datetime, timedelta, timezone
 import logging
 import threading
+import time
 from uuid import uuid4
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -51,6 +52,8 @@ class JobScheduler:
         self._poll_interval_seconds = poll_interval_seconds
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._access_lock_sweep: threading.Thread | None = None
+        self._access_lock_sweep_at = time.monotonic()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -80,9 +83,29 @@ class JobScheduler:
                 self._dispatch_due_jobs()
             except Exception as exc:
                 logger.exception("Unexpected error in job scheduler loop: %s", exc)
+            try:
+                self._retry_access_locks()
+            except Exception as exc:
+                logger.exception("Could not start the relocation block retry: %s", exc)
             finally:
                 self._stop_event.wait(self._poll_interval_seconds)
         logger.debug("Job scheduler thread exiting.")
+
+    def _retry_access_locks(self) -> None:
+        now = time.monotonic()
+        if now - self._access_lock_sweep_at < env_int("BACKUPSERVER_ACCESS_LOCK_RETRY_SECONDS"):
+            return
+        if self._access_lock_sweep is not None and self._access_lock_sweep.is_alive():
+            return
+        self._access_lock_sweep_at = now
+        from python.srv.services.backup_catalog import release_pending_access_locks
+
+        self._access_lock_sweep = threading.Thread(
+            target=release_pending_access_locks,
+            name="access-lock-retry",
+            daemon=True,
+        )
+        self._access_lock_sweep.start()
 
     def _dispatch_due_jobs(self) -> None:
         now = datetime.fromisoformat(utc_now())

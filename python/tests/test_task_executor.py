@@ -98,6 +98,9 @@ class FakeVCenterNode:
     created_vm_firmware: str | None = None
     host_connected: bool = True
     keepalive_windows: int = 0
+    access_lock_held: bool = False
+    access_lock_releases: list[dict[str, object]] = []
+    raise_on_release_access_lock: Exception | None = None
     snapshot_change_ids: list[dict[str, object]] = [
         {
             "disk_label": "Hard disk 1",
@@ -243,6 +246,14 @@ class FakeVCenterNode:
 
     def remove_snapshot(self, vm_name: str, snapshot_name: str) -> None:
         self.snapshots_removed.append(snapshot_name)
+
+    def release_access_lock(self, vm_name: str, vm_moref: str | None = None) -> bool:
+        FakeVCenterNode.access_lock_releases.append({"vm_name": vm_name, "vm_moref": vm_moref})
+        if FakeVCenterNode.raise_on_release_access_lock is not None:
+            raise FakeVCenterNode.raise_on_release_access_lock
+        held = FakeVCenterNode.access_lock_held
+        FakeVCenterNode.access_lock_held = False
+        return held
 
     def attach_existing_disk(
         self,
@@ -427,6 +438,9 @@ class TaskExecutorTests(unittest.TestCase):
         FakeVCenterNode.raise_on_query_changed_disk_areas = None
         FakeVCenterNode.created_vm_firmware = None
         FakeVCenterNode.host_connected = True
+        FakeVCenterNode.access_lock_held = False
+        FakeVCenterNode.access_lock_releases.clear()
+        FakeVCenterNode.raise_on_release_access_lock = None
         FakeVCenterNode.snapshot_change_ids = [
             {
                 "disk_label": "Hard disk 1",
@@ -738,6 +752,151 @@ class TaskExecutorTests(unittest.TestCase):
         command = recorded_commands[0]
         self.assertEqual(command[command.index("--vmdk") + 1], "[datastore1] demo-vm/demo-vm-000002.vmdk")
         self.assertEqual(result["result"]["disks"][0]["datastore_path"], "[datastore1] demo-vm/demo-vm.vmdk")
+    def _run_backup_for_access_lock(self, fake_run) -> tuple[dict[str, object], list[dict[str, object]]]:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+        progress_updates: list[dict[str, object]] = []
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "task-vcenter-access-lock",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {"destination_dir": temp_dir, "tool_path": EXISTING_TOOL_PATH, "vm_name": "demo-vm"},
+            }
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
+                    result = run_task(task, progress_callback=progress_updates.append)
+        return result, progress_updates
+
+    @staticmethod
+    def _access_lock_records(progress_updates: list[dict[str, object]]) -> list[object]:
+        return [update["access_lock"] for update in progress_updates if "access_lock" in update]
+
+    @staticmethod
+    def _progress_messages(progress_updates: list[dict[str, object]]) -> str:
+        return " ".join(str(update.get("message") or "") for update in progress_updates)
+
+    def test_a_backup_that_fails_mid_transfer_lifts_the_relocation_block_the_mover_left(self) -> None:
+        FakeVCenterNode.access_lock_held = True
+
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            return FakeCompletedProcess(returncode=1, stderr="Error: failed to read disk data: The server refused connection")
+
+        result, progress_updates = self._run_backup_for_access_lock(fake_run)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(FakeVCenterNode.access_lock_releases, [{"vm_name": "demo-vm", "vm_moref": "vm-123"}])
+        self.assertIn("Lifted the block on relocating VM demo-vm", self._progress_messages(progress_updates))
+        records = self._access_lock_records(progress_updates)
+        self.assertEqual(records[0], {"vm_name": "demo-vm", "vm_moref": "vm-123"})
+        self.assertIsNone(records[-1])
+        self.assertFalse(any(update.get("warning") for update in progress_updates))
+
+    def test_a_stopped_backup_lifts_the_relocation_block_too(self) -> None:
+        FakeVCenterNode.access_lock_held = True
+
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            raise ProcessCancelled("cancellation requested")
+
+        result, progress_updates = self._run_backup_for_access_lock(fake_run)
+
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(len(FakeVCenterNode.access_lock_releases), 1)
+        self.assertIsNone(self._access_lock_records(progress_updates)[-1])
+
+    def test_a_successful_backup_checks_the_vm_once_and_clears_its_record(self) -> None:
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            return FakeCompletedProcess(returncode=0, stdout="ok")
+
+        result, progress_updates = self._run_backup_for_access_lock(fake_run)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(FakeVCenterNode.access_lock_releases, [{"vm_name": "demo-vm", "vm_moref": "vm-123"}])
+        self.assertNotIn("Lifted the block", self._progress_messages(progress_updates))
+        self.assertIsNone(self._access_lock_records(progress_updates)[-1])
+
+    def test_a_block_that_cannot_be_lifted_is_reported_and_kept_for_the_retry(self) -> None:
+        FakeVCenterNode.access_lock_held = True
+        FakeVCenterNode.raise_on_release_access_lock = RuntimeError("vCenter is unreachable")
+
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            return FakeCompletedProcess(returncode=1, stderr="Error: failed to read disk data")
+
+        result, progress_updates = self._run_backup_for_access_lock(fake_run)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Disk backup failed", result["result"]["message"])
+        warnings = [update["warning"] for update in progress_updates if update.get("warning")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("Could not lift the block on relocating VM demo-vm", warnings[0]["message"])
+        self.assertIn("vCenter is unreachable", warnings[0]["message"])
+        self.assertIn("keeps retrying", warnings[0]["message"])
+        self.assertEqual(
+            self._access_lock_records(progress_updates)[-1],
+            {"vm_name": "demo-vm", "vm_moref": "vm-123", "retry_noted": True},
+        )
+
+    def test_a_successful_backup_still_completes_when_the_block_cannot_be_checked(self) -> None:
+        FakeVCenterNode.raise_on_release_access_lock = RuntimeError("vCenter is unreachable")
+
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            return FakeCompletedProcess(returncode=0, stdout="ok")
+
+        result, progress_updates = self._run_backup_for_access_lock(fake_run)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(self._access_lock_records(progress_updates)[-1]["retry_noted"])
+
+    def test_a_backup_refused_before_its_snapshot_never_touches_the_block(self) -> None:
+        FakeVCenterNode.host_connected = False
+
+        result, progress_updates = self._run_backup_for_access_lock(
+            lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok")
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(FakeVCenterNode.access_lock_releases, [])
+        self.assertEqual(self._access_lock_records(progress_updates), [])
+
+    def test_the_block_is_left_alone_while_another_session_works_on_the_vm(self) -> None:
+        FakeVCenterNode.access_lock_held = True
+        TASKS["restore-in-place"] = {
+            "id": "restore-in-place",
+            "task_type": "restore",
+            "status": "running",
+            "hypervisor_id": "hv-vc",
+            "parameters": {"target_vm_name": "demo-vm"},
+        }
+        self.addCleanup(TASKS.pop, "restore-in-place", None)
+
+        result, progress_updates = self._run_backup_for_access_lock(
+            lambda command, **kwargs: FakeCompletedProcess(returncode=1, stderr="Error: failed to read disk data")
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(FakeVCenterNode.access_lock_releases, [])
+        self.assertEqual(self._access_lock_records(progress_updates)[-1], {"vm_name": "demo-vm", "vm_moref": "vm-123"})
+
     def test_vcenter_backup_records_real_size_and_compression_ratio_from_the_tool(self) -> None:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",
@@ -8230,6 +8389,25 @@ class TaskPoolProgressReportingTests(unittest.TestCase):
             [("warn", warning["message"]), ("info", "Backing up disk 1/1")],
         )
         self.assertNotIn("warning", task["result"])
+
+    def test_an_access_lock_record_lives_on_the_task_and_not_in_its_result(self) -> None:
+        from python.srv.core.task_pool import TaskProcessPool
+
+        TASKS["task-1"] = {"id": "task-1", "status": "running", "logs": []}
+        pool = TaskProcessPool(worker_count=1)
+        lock = {"vm_name": "demo-vm", "vm_moref": "vm-123"}
+
+        pool._report_progress("task-1", {"log_entry": False, "access_lock": lock})
+        self.assertEqual(TASKS["task-1"]["access_lock"], lock)
+        self.assertNotIn("access_lock", TASKS["task-1"]["result"])
+        self.assertEqual(TASKS["task-1"]["logs"], [])
+
+        pool._report_progress("task-1", {"stage": "transfer", "message": "Backing up disk 1/1"})
+        self.assertEqual(TASKS["task-1"]["access_lock"], lock)
+
+        pool._report_progress("task-1", {"log_entry": False, "access_lock": None})
+        self.assertIn("access_lock", TASKS["task-1"])
+        self.assertIsNone(TASKS["task-1"]["access_lock"])
 
     def test_status_is_not_reset_to_running_once_a_stop_was_requested(self) -> None:
         from python.srv.core.task_pool import TaskProcessPool

@@ -35,6 +35,9 @@ class FakeNode:
         self.removed: list[tuple[str, str]] = []
         self.raise_on_remove: Exception | None = None
         self.connected = 0
+        self.lock_releases: list[tuple[str, str | None]] = []
+        self.raise_on_release: Exception | None = None
+        self.lock_held = True
 
     def __enter__(self) -> "FakeNode":
         self.connected += 1
@@ -47,6 +50,12 @@ class FakeNode:
         if self.raise_on_remove is not None:
             raise self.raise_on_remove
         self.removed.append((vm_name, snapshot_name))
+
+    def release_access_lock(self, vm_name: str, vm_moref: str | None = None) -> bool:
+        self.lock_releases.append((vm_name, vm_moref))
+        if self.raise_on_release is not None:
+            raise self.raise_on_release
+        return self.lock_held
 
 
 class SweepTestCase(unittest.TestCase):
@@ -323,3 +332,122 @@ class InterruptedBackupSnapshotTests(SweepTestCase):
         self.assertEqual(TASKS["task-s7"]["result"]["progress"], 44)
         backup_catalog.forget_task_backup_snapshot("task-s7")
         backup_catalog.forget_task_backup_snapshot("no-such-task")
+
+
+class AccessLockReleaseTests(SweepTestCase):
+    def _with_lock(self, task_id: str, status: str, **parameters) -> dict:
+        task = _task(task_id, status, **parameters)
+        task["access_lock"] = {"vm_name": "web01", "vm_moref": "vm-42"}
+        return task
+
+    def _messages(self, task_id: str) -> list[tuple[str, str]]:
+        return [(entry["level"], entry["message"]) for entry in TASKS[task_id].get("logs") or []]
+
+    @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
+    @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value=set())
+    def test_the_relocation_block_an_abandoned_backup_left_is_lifted_at_startup(self, list_mock, remove_mock) -> None:
+        TASKS["task-l1"] = self._with_lock("task-l1", "running")
+
+        backup_catalog.fail_interrupted_tasks()
+
+        self.assertEqual(self.node.lock_releases, [("web01", "vm-42")])
+        self.assertIsNone(TASKS["task-l1"]["access_lock"])
+        self.assertEqual(TASKS["task-l1"]["status"], "failed")
+        self.assertIn("Lifted the block on relocating VM web01", self._messages("task-l1")[-1][1])
+
+    @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
+    @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value=set())
+    def test_a_block_that_cannot_be_lifted_yet_is_reported_once_and_retried_until_it_is(self, list_mock, remove_mock) -> None:
+        self.node.raise_on_release = RuntimeError("vCenter is unreachable")
+        TASKS["task-l2"] = self._with_lock("task-l2", "running")
+
+        backup_catalog.fail_interrupted_tasks()
+        self.assertEqual(backup_catalog.release_pending_access_locks(), 0)
+
+        self.assertEqual(len(self.node.lock_releases), 2)
+        self.assertTrue(TASKS["task-l2"]["access_lock"]["retry_noted"])
+        warnings = [message for level, message in self._messages("task-l2") if level == "warn"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("vCenter is unreachable", warnings[0])
+        self.assertIn("keeps retrying", warnings[0])
+        self.assertEqual([warning["message"] for warning in TASKS["task-l2"]["warnings"]], warnings)
+
+        self.node.raise_on_release = None
+        self.assertEqual(backup_catalog.release_pending_access_locks(), 1)
+
+        self.assertIsNone(TASKS["task-l2"]["access_lock"])
+        self.assertIn("Lifted the block on relocating VM web01", self._messages("task-l2")[-1][1])
+        self.assertEqual(backup_catalog.release_pending_access_locks(), 0)
+        self.assertEqual(len(self.node.lock_releases), 3)
+
+    def test_the_retry_leaves_the_blocks_of_sessions_still_in_progress_alone(self) -> None:
+        for status in ("queued", "running", "stopping"):
+            TASKS[f"task-{status}"] = self._with_lock(f"task-{status}", status)
+
+        self.assertEqual(backup_catalog.release_pending_access_locks(), 0)
+
+        self.build_plugin.assert_not_called()
+        self.assertTrue(all("access_lock" in task for task in TASKS.values()))
+
+    def test_the_retry_waits_while_another_session_works_on_the_vm(self) -> None:
+        TASKS["task-l3"] = self._with_lock("task-l3", "failed")
+        TASKS["restore-1"] = {
+            "id": "restore-1",
+            "task_type": "restore",
+            "status": "running",
+            "hypervisor_id": HV_ID,
+            "parameters": {"target_vm_name": "web01"},
+        }
+
+        self.assertEqual(backup_catalog.release_pending_access_locks(), 0)
+        self.build_plugin.assert_not_called()
+        self.assertIn("access_lock", TASKS["task-l3"])
+
+        TASKS["restore-1"]["status"] = "completed"
+        self.assertEqual(backup_catalog.release_pending_access_locks(), 1)
+        self.assertIsNone(TASKS["task-l3"]["access_lock"])
+
+    def test_a_vm_that_carries_no_block_is_forgotten_without_a_log_line(self) -> None:
+        self.node.lock_held = False
+        TASKS["task-l4"] = self._with_lock("task-l4", "failed")
+
+        self.assertEqual(backup_catalog.release_pending_access_locks(), 0)
+
+        self.assertEqual(self.node.lock_releases, [("web01", "vm-42")])
+        self.assertIsNone(TASKS["task-l4"]["access_lock"])
+        self.assertEqual(self._messages("task-l4"), [])
+
+    def test_a_hypervisor_that_is_gone_forgets_the_block(self) -> None:
+        HYPERVISORS.clear()
+        TASKS["task-l5"] = self._with_lock("task-l5", "failed")
+
+        self.assertEqual(backup_catalog.release_pending_access_locks(), 0)
+
+        self.build_plugin.assert_not_called()
+        self.assertIsNone(TASKS["task-l5"]["access_lock"])
+
+    def test_another_vm_or_hypervisor_does_not_count_as_in_use(self) -> None:
+        TASKS["other-vm"] = {"id": "other-vm", "status": "running", "hypervisor_id": HV_ID, "parameters": {"vm_name": "db01"}}
+        TASKS["other-hv"] = {"id": "other-hv", "status": "running", "hypervisor_id": "hv-2", "parameters": {"vm_name": "web01"}}
+        TASKS["mine"] = {"id": "mine", "status": "running", "hypervisor_id": HV_ID, "parameters": {"vm_name": "web01"}}
+
+        self.assertFalse(backup_catalog.vm_in_use_by_another_task(HV_ID, "web01", exclude_task_id="mine"))
+        self.assertTrue(backup_catalog.vm_in_use_by_another_task(HV_ID, "web01"))
+
+    def test_a_vcenter_that_cannot_be_reached_is_named_in_the_message(self) -> None:
+        self.assertEqual(
+            backup_catalog.access_lock_failure_reason("vc.local", OSError(22, "Invalid argument")),
+            "vCenter vc.local cannot be reached ([Errno 22] Invalid argument)",
+        )
+        self.assertEqual(
+            backup_catalog.access_lock_failure_reason("vc.local", RuntimeError("Permission denied")),
+            "Permission denied",
+        )
+
+    def test_a_cleared_record_is_written_as_none_so_a_restart_does_not_bring_it_back(self) -> None:
+        TASKS["task-l6"] = self._with_lock("task-l6", "failed")
+        with patch("python.srv.services.backup_catalog.persist_task", wraps=backup_catalog.persist_task) as persist:
+            backup_catalog.release_pending_access_locks()
+        self.assertIn("access_lock", persist.call_args.args[0])
+        self.assertIsNone(persist.call_args.args[0]["access_lock"])
+

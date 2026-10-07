@@ -329,6 +329,95 @@ def _record_backup_snapshot(
         pass
 
 
+def _record_access_lock(
+    progress_callback: ProgressCallback,
+    vm_name: str,
+    vm_moref: str | None,
+    **details: Any,
+) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(
+            {
+                "updated_at": utc_now(),
+                "log_entry": False,
+                "access_lock": {"vm_name": vm_name, "vm_moref": vm_moref, **details} if vm_moref else None,
+            }
+        )
+    except TaskStopRequested:
+        pass
+
+
+def _report_access_lock(progress_callback: ProgressCallback, message: str, **extra: Any) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(
+            {
+                "stage": "cleanup",
+                "message": message,
+                "updated_at": utc_now(),
+                "worker_mode": "vcenter-abr-vmdk-tool",
+                **extra,
+            }
+        )
+    except TaskStopRequested:
+        pass
+
+
+def _access_lock_not_released(
+    task: dict[str, Any],
+    progress_callback: ProgressCallback,
+    vm_name: str,
+    vm_moref: str,
+    exc: BaseException,
+) -> None:
+    from ...services.backup_catalog import access_lock_failure_reason
+
+    hypervisor = HYPERVISORS.get(str(task.get("hypervisor_id") or "")) or {}
+    host = str((hypervisor.get("metadata") or {}).get("host") or "")
+    message = (
+        f"Could not lift the block on relocating VM {vm_name} that the data mover set for this backup, "
+        f"so Storage vMotion and DRS cannot move the VM yet: {access_lock_failure_reason(host, exc)}. "
+        "The server keeps retrying."
+    )
+    logger.warning("%s (task %s)", message, task.get("id"))
+    _report_access_lock(progress_callback, message, warning={"message": message, "vm_name": vm_name})
+    _record_access_lock(progress_callback, vm_name, vm_moref, retry_noted=True)
+
+
+def _release_access_lock(
+    node: Any,
+    task: dict[str, Any],
+    progress_callback: ProgressCallback,
+    vm_name: str,
+    vm_moref: str,
+) -> None:
+    from ...services.backup_catalog import vm_in_use_by_another_task
+
+    task_id = str(task.get("id") or "")
+    if vm_in_use_by_another_task(str(task.get("hypervisor_id") or ""), vm_name, exclude_task_id=task_id):
+        logger.info(
+            "Leaving the relocation block on VM %s to the session that is still working on it (task %s).",
+            vm_name,
+            task_id,
+        )
+        return
+    try:
+        lifted = node.release_access_lock(vm_name, vm_moref or None)
+    except Exception as exc:
+        _access_lock_not_released(task, progress_callback, vm_name, vm_moref, exc)
+        return
+    if lifted:
+        _report_access_lock(
+            progress_callback,
+            f"Lifted the block on relocating VM {vm_name} that the data mover left in place when the disk "
+            "transfer ended",
+        )
+    _record_access_lock(progress_callback, vm_name, None)
+
+
 def _remove_stranded_backup_snapshots(
     node: Any,
     task: dict[str, Any],
@@ -1428,6 +1517,7 @@ def run_vcenter_backup(
     task_id = str(task.get("id") or "")
     written_backup_names: list[str] = []
     stop_requested_after_completion = False
+    access_lock_moref: str | None = None
 
     try:
         # The data mover carries the disk over its own VDDK connection, so this
@@ -1501,6 +1591,8 @@ def run_vcenter_backup(
             snapshot_moref = str(backup_params.get("snapshot_moref") or "")
             if not vm_moref or not snapshot_moref:
                 raise VCenterBackupError("vCenter did not return VM or snapshot MoRef values")
+            _record_access_lock(progress_callback, vm_name, vm_moref)
+            access_lock_moref = vm_moref
 
             thumbprint = node.get_thumbprint()
             live_disks = node.get_vm_disks(vm_name)
@@ -2908,6 +3000,8 @@ def run_vcenter_backup(
             )
             snapshot_name = None
             _record_backup_snapshot(progress_callback, vm_name, None)
+            _release_access_lock(node, task, progress_callback, vm_name, access_lock_moref)
+            access_lock_moref = None
 
         if not stop_requested_after_completion and cancel_requested(task_id):
             stop_requested_after_completion = True
@@ -3026,3 +3120,9 @@ def run_vcenter_backup(
                     )
                 except TaskStopRequested:
                     pass
+        if access_lock_moref:
+            try:
+                with VCenterNode(host, username, password, port=port, verify_ssl=verify_ssl) as node:
+                    _release_access_lock(node, task, progress_callback, vm_name, access_lock_moref)
+            except Exception as exc:
+                _access_lock_not_released(task, progress_callback, vm_name, access_lock_moref, exc)

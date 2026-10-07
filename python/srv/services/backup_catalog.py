@@ -16,6 +16,7 @@ from python.srv.core.mongo_db_wrapper import (
     JOBS,
     REPOSITORIES,
     RESOURCES_BY_HV,
+    TASK_LOCK,
     TASKS,
     catalog_entries,
     catalog_records,
@@ -693,6 +694,143 @@ def stranded_backup_snapshots(
     return pending
 
 
+_ACTIVE_TASK_STATES = {"queued", "running", "stopping"}
+
+
+def task_access_lock(task: dict[str, Any]) -> tuple[str, str] | None:
+    lock = task.get("access_lock") if isinstance(task.get("access_lock"), dict) else {}
+    vm_name = str(lock.get("vm_name") or "").strip()
+    vm_moref = str(lock.get("vm_moref") or "").strip()
+    if not vm_name and not vm_moref:
+        return None
+    return vm_name, vm_moref
+
+
+def _update_finished_task(task_id: str, change: Any) -> None:
+    with TASK_LOCK:
+        record = TASKS.get(task_id)
+        if not isinstance(record, dict):
+            return
+        updated = dict(record)
+        change(updated)
+        updated["updated_at"] = utc_now()
+        persist_task(updated)
+
+
+def forget_task_access_lock(task_id: str, *, released_message: str | None = None) -> None:
+    def change(record: dict[str, Any]) -> None:
+        record["access_lock"] = None
+        if released_message:
+            _append_task_log(record, level="info", message=released_message, component="engine")
+
+    _update_finished_task(task_id, change)
+
+
+def _note_access_lock_retry(task_id: str, message: str) -> None:
+    def change(record: dict[str, Any]) -> None:
+        lock = dict(record.get("access_lock") or {})
+        if lock.get("retry_noted"):
+            return
+        lock["retry_noted"] = True
+        record["access_lock"] = lock
+        _append_task_log(record, level="warn", message=message, component="engine")
+        warnings = record.get("warnings") if isinstance(record.get("warnings"), list) else []
+        record["warnings"] = [*warnings, {"message": message, "vm_name": lock.get("vm_name")}]
+
+    _update_finished_task(task_id, change)
+
+
+def access_lock_failure_reason(host: str, exc: BaseException) -> str:
+    if isinstance(exc, OSError):
+        return f"vCenter {host} cannot be reached ({exc})"
+    return str(exc)
+
+
+def vm_in_use_by_another_task(hypervisor_id: str, vm_name: str, exclude_task_id: str = "") -> bool:
+    for record in catalog_records(TASKS):
+        if str(record.get("id") or "") == exclude_task_id:
+            continue
+        if str(record.get("status") or "") not in {"running", "stopping"}:
+            continue
+        if str(record.get("hypervisor_id") or "") != hypervisor_id:
+            continue
+        parameters = record.get("parameters") if isinstance(record.get("parameters"), dict) else {}
+        names = {
+            str(parameters.get(key) or "").strip()
+            for key in ("vm_name", "target_vm_name", "source_vm_name")
+        }
+        if vm_name in names:
+            return True
+    return False
+
+
+def release_task_access_lock(task: dict[str, Any]) -> bool:
+    lock = task_access_lock(task)
+    if lock is None:
+        return False
+    vm_name, vm_moref = lock
+    task_id = str(task.get("id") or "")
+    hypervisor_id = str(task.get("hypervisor_id") or "")
+    hypervisor = HYPERVISORS.get(hypervisor_id)
+    if not isinstance(hypervisor, dict):
+        logger.warning(
+            "Task %s left VM %r blocked from relocation, but its hypervisor is no longer registered, "
+            "so the block has to be lifted in vCenter by hand.",
+            task_id,
+            vm_name,
+        )
+        forget_task_access_lock(task_id)
+        return False
+    if vm_in_use_by_another_task(hypervisor_id, vm_name, exclude_task_id=task_id):
+        return False
+    from python.srv.plugins import build_hypervisor_plugin
+
+    try:
+        with build_hypervisor_plugin(hypervisor) as node:
+            release = getattr(node, "release_access_lock", None)
+            lifted = bool(release(vm_name, vm_moref or None)) if callable(release) else False
+    except Exception as exc:
+        reason = access_lock_failure_reason(str((hypervisor.get("metadata") or {}).get("host") or ""), exc)
+        logger.warning(
+            "Could not lift the relocation block that task %s left on VM %r (%s); retrying later.",
+            task_id,
+            vm_name,
+            reason,
+        )
+        _note_access_lock_retry(
+            task_id,
+            f"Could not lift the block on relocating VM {vm_name} that this session's data mover left "
+            f"in place, so Storage vMotion and DRS cannot move the VM yet: {reason}. The server keeps "
+            "retrying.",
+        )
+        return False
+    forget_task_access_lock(
+        task_id,
+        released_message=(
+            f"Lifted the block on relocating VM {vm_name} that this session's data mover left in place; "
+            "Storage vMotion and DRS can move the VM again."
+            if lifted
+            else None
+        ),
+    )
+    if lifted:
+        logger.info("Lifted the relocation block that task %s left on VM %r.", task_id, vm_name)
+    return lifted
+
+
+def release_pending_access_locks() -> int:
+    lifted = 0
+    for record in catalog_records(TASKS):
+        if str(record.get("status") or "") in _ACTIVE_TASK_STATES or task_access_lock(record) is None:
+            continue
+        try:
+            if release_task_access_lock(dict(record)):
+                lifted += 1
+        except Exception:
+            logger.exception("Could not lift the relocation block task %s left behind", record.get("id"))
+    return lifted
+
+
 def _remove_interrupted_task_snapshot(task: dict[str, Any]) -> None:
     snapshot = _task_backup_snapshot(task)
     if snapshot is None:
@@ -830,4 +968,10 @@ def _sweep_interrupted_tasks(tasks: list[dict[str, Any]]) -> None:
         except Exception:
             logger.exception(
                 "Could not discard what interrupted task %s left behind", task.get("id")
+            )
+        try:
+            release_task_access_lock(task)
+        except Exception:
+            logger.exception(
+                "Could not lift the relocation block interrupted task %s left behind", task.get("id")
             )
