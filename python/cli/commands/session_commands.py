@@ -79,7 +79,7 @@ class SessionCommands:
 
     @staticmethod
     def _columns() -> list[tuple[str, str]]:
-        return [("id", "SESSION ID"), ("state", "STATE"), ("type", "TYPE"), ("job.id", "JOB ID"), ("started_at", "STARTED"), ("finished_at", "FINISHED"), ("resolved_backup_type", "BACKUP TYPE"), ("progress", "PROGRESS")]
+        return [("id", "SESSION ID"), ("state", "STATE"), ("type", "TYPE"), ("vm_name", "VM"), ("job.id", "JOB ID"), ("started_at", "STARTED"), ("finished_at", "FINISHED"), ("resolved_backup_type", "BACKUP TYPE"), ("progress", "PROGRESS")]
 
     def list(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
@@ -108,7 +108,15 @@ class SessionCommands:
 
     def log(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
-        deps.context.print_output(deps.context.api_client.get(f"api/v1/sessions/{args.id}/log"), [("id", "SESSION ID"), ("logs", "LOGS")])
+        payload = deps.context.api_client.get(f"api/v1/sessions/{args.id}/log")
+        if str(getattr(args, "output", "table")) == "table":
+            logs = payload.get("logs") if isinstance(payload, dict) and isinstance(payload.get("logs"), list) else []
+            deps.context.print_output(
+                {"items": [entry for entry in logs if isinstance(entry, dict)]},
+                [("timestamp", "TIME"), ("level", "LEVEL"), ("message", "MESSAGE")],
+            )
+        else:
+            deps.context.print_output(payload)
         return 0
 
     def stop(self, args: argparse.Namespace) -> int:

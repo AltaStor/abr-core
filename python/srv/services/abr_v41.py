@@ -7988,6 +7988,15 @@ def get_restore_context(restore_point_id: str) -> dict[str, Any]:
 def _resolve_restore_target_datastore(inventory_id: str, datastore_identifier: str, *, host: dict[str, Any]) -> dict[str, Any]:
     identifier = str(datastore_identifier or "").strip()
     _ensure(bool(identifier), 422, "invalid_restore", "Restore target datastore is required")
+    host_payload = host.get("payload") if isinstance(host.get("payload"), dict) else {}
+    _ensure(
+        str(host_payload.get("status") or "").strip().lower() != "unavailable",
+        409,
+        "host_unavailable",
+        f"Target host {host.get('name')} is unavailable: it did not answer the last inventory scan. Pick another "
+        "host, or run abr inventory rescan once it is back",
+        host=host.get("name"),
+    )
     for datastore in _build_restore_target_datastores(inventory_id):
         datastore_id = str(datastore.get("id") or "")
         datastore_name = str(datastore.get("name") or "")

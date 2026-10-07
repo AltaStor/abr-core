@@ -28,6 +28,8 @@ RESTORE_POINT_COLUMNS = [
     ("size", "SIZE"),
     ("compression_level", "COMPRESSION"),
     ("encryption_enabled", "ENCRYPTED"),
+    ("gfs", "GFS"),
+    ("immutability_expires_at", "IMMUTABLE UNTIL"),
 ]
 
 
@@ -117,7 +119,16 @@ class BackupCommands:
         deps.context.print_output(chain)
         if restore_points:
             print()
-            rows = [{**point, "size": human_size(point.get("size_bytes"))} for point in restore_points]
+            rows = [
+                {
+                    **point,
+                    "size": human_size(point.get("size_bytes")),
+                    "gfs": ",".join(
+                        mark for mark, held in (point.get("gfs_marks") or {}).items() if held
+                    ),
+                }
+                for point in restore_points
+            ]
             deps.context.print_output(rows, RESTORE_POINT_COLUMNS)
         return 0
 
