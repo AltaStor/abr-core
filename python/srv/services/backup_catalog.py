@@ -419,6 +419,7 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
             "backup_root": result.get("backup_root"),
             "disk_count": result.get("disk_count"),
             "disks": result.get("disks", []),
+            "skipped_disks": result.get("skipped_disks", []),
         },
         "placements": placements,
         "created_at": created_at,

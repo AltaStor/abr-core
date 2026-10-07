@@ -6358,6 +6358,196 @@ class TaskExecutorTests(unittest.TestCase):
         messages = " ".join(str(update.get("message") or "") for update in progress_updates)
         self.assertIn("VM configuration changed", messages)
 
+    def _vm_with_an_independent_disk(self, live_disks: list[dict[str, object]]) -> None:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            },
+            **{
+                ("disk", f"vm-uuid-1-disk-{index}"): {
+                    "resource_type": "disk",
+                    "external_id": f"vm-uuid-1-disk-{index}",
+                    "name": disk["disk_label"],
+                    "payload": {
+                        "vm_id": "vm-uuid-1",
+                        "datastore_path": disk["datastore_path"],
+                        "uuid": disk["uuid"],
+                        "capacity_gb": disk["capacity_gb"],
+                    },
+                }
+                for index, disk in enumerate(live_disks, start=1)
+            },
+        }
+        FakeVCenterNode.snapshot_change_ids = [
+            {
+                "disk_label": disk["disk_label"],
+                "datastore_path": disk["datastore_path"],
+                "change_id": f"change-{index}01",
+                "uuid": disk["uuid"],
+                "controller_key": 1000,
+                "unit_number": index - 1,
+                "key": 1999 + index,
+            }
+            for index, disk in enumerate(live_disks, start=1)
+        ]
+
+    def test_an_independent_disk_is_skipped_with_a_warning_and_the_other_disks_are_backed_up(self) -> None:
+        live_disks = [
+            {
+                "disk_label": "Hard disk 1",
+                "capacity_gb": 30,
+                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                "uuid": "disk-uuid-1",
+                "disk_mode": "persistent",
+                "source_disk_type_code": int(VddkDiskType.VMFS_THIN),
+                "source_disk_type_name": "vmfs_thin",
+            },
+            {
+                "disk_label": "Hard disk 2",
+                "capacity_gb": 1,
+                "datastore_path": "[datastore1] demo-vm/extra.vmdk",
+                "uuid": "disk-uuid-2",
+                "disk_mode": "independent_persistent",
+                "source_disk_type_code": int(VddkDiskType.VMFS_THIN),
+                "source_disk_type_name": "vmfs_thin",
+            },
+        ]
+        self._vm_with_an_independent_disk(live_disks)
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        recorded_commands: list[list[str]] = []
+        progress_updates: list[dict[str, object]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous_task_root = pathlib.Path(temp_dir) / "demo-vm" / "task-prev"
+            previous_task_root.mkdir(parents=True, exist_ok=True)
+            parent_manifest = previous_task_root / "manifest.json"
+            parent_manifest.write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "operation": "vm-backup",
+                        "vm_name": "demo-vm",
+                        "vm_external_id": "vm-uuid-1",
+                        "created_at": "2026-04-20T09:00:00+00:00",
+                        "disks": [
+                            {
+                                "index": 1,
+                                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                                "uuid": "disk-uuid-1",
+                                "change_id": "change-000",
+                                "capacity_gb": 30,
+                                "destination_path": "",
+                                "abr_path": str(previous_task_root),
+                                "abr_backup_name": "01-demo-vm.vmdk",
+                                "storage_mode": "local",
+                                "store_mode": "full",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task = {
+                "id": "task-vcenter-independent-disk",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "incremental": True,
+                    "destination_dir": temp_dir,
+                    "parent_manifest_path": str(parent_manifest),
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                recorded_commands.append(command)
+                return FakeCompletedProcess(returncode=0, stdout="Done")
+
+            with patch.object(FakeVCenterNode, "get_vm_disks", lambda self, vm_name: [dict(d) for d in live_disks]):
+                with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                    with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
+                        result = run_task(task, progress_callback=progress_updates.append)
+            manifest = json.loads(pathlib.Path(result["result"]["manifest_path"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "completed")
+        payload = result["result"]
+        self.assertEqual(payload["resolved_backup_type"], "Incremental")
+        self.assertFalse(payload["vm_config_changed_full_required"])
+        self.assertEqual([disk["datastore_path"] for disk in payload["disks"]], ["[datastore1] demo-vm/demo-vm.vmdk"])
+        self.assertFalse(any("extra.vmdk" in " ".join(command) for command in recorded_commands))
+        self.assertEqual(
+            [(disk["datastore_path"], disk["disk_mode"]) for disk in payload["skipped_disks"]],
+            [("[datastore1] demo-vm/extra.vmdk", "independent_persistent")],
+        )
+        self.assertEqual(manifest["skipped_disks"], payload["skipped_disks"])
+
+        warnings = [update["warning"] for update in progress_updates if update.get("warning")]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["datastore_path"], "[datastore1] demo-vm/extra.vmdk")
+        self.assertIn("[datastore1] demo-vm/extra.vmdk", warnings[0]["message"])
+        self.assertIn("independent disks are not part of a VM snapshot", warnings[0]["message"])
+        self.assertIn("dependent mode", warnings[0]["message"])
+
+    def test_a_vm_whose_disks_are_all_independent_is_refused_before_any_disk_is_read(self) -> None:
+        live_disks = [
+            {
+                "disk_label": "Hard disk 1",
+                "capacity_gb": 1,
+                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                "uuid": "disk-uuid-1",
+                "disk_mode": "independent_nonpersistent",
+                "source_disk_type_code": int(VddkDiskType.VMFS_THIN),
+                "source_disk_type_name": "vmfs_thin",
+            },
+        ]
+        self._vm_with_an_independent_disk(live_disks)
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        recorded_commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "task-vcenter-only-independent-disks",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {"destination_dir": temp_dir, "tool_path": EXISTING_TOOL_PATH},
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                recorded_commands.append(command)
+                return FakeCompletedProcess(returncode=0, stdout="Done")
+
+            with patch.object(FakeVCenterNode, "get_vm_disks", lambda self, vm_name: [dict(d) for d in live_disks]):
+                with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                    with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
+                        result = run_task(task)
+
+        self.assertEqual(result["status"], "failed")
+        message = result["result"]["message"]
+        self.assertIn("every disk of this VM is independent", message)
+        self.assertIn("[datastore1] demo-vm/demo-vm.vmdk (independent_nonpersistent)", message)
+        self.assertNotIn("access rights", message)
+        self.assertEqual(recorded_commands, [])
+        self.assertIn("demo-vm-snapshot", FakeVCenterNode.snapshots_removed)
+
     def test_vcenter_incremental_backup_reconciles_a_disk_added_since_the_last_inventory_rescan(self) -> None:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",
@@ -8022,6 +8212,24 @@ class TaskPoolProgressReportingTests(unittest.TestCase):
             any("Removing snapshot" in str(entry.get("message")) for entry in logs),
             f"expected the progress message to be logged before raising, got: {logs}",
         )
+
+    def test_a_progress_warning_is_logged_as_a_warning_and_kept_on_the_session(self) -> None:
+        from python.srv.core.task_pool import TaskProcessPool
+
+        TASKS["task-1"] = {"id": "task-1", "status": "running", "logs": []}
+        pool = TaskProcessPool(worker_count=1)
+        warning = {"message": "Skipped disk [ds] vm/extra.vmdk", "datastore_path": "[ds] vm/extra.vmdk"}
+
+        pool._report_progress("task-1", {"stage": "prepare", "message": warning["message"], "warning": warning})
+        pool._report_progress("task-1", {"stage": "transfer", "message": "Backing up disk 1/1"})
+
+        task = TASKS["task-1"]
+        self.assertEqual(task["warnings"], [warning])
+        self.assertEqual(
+            [(entry["level"], entry["message"]) for entry in task["logs"]],
+            [("warn", warning["message"]), ("info", "Backing up disk 1/1")],
+        )
+        self.assertNotIn("warning", task["result"])
 
     def test_status_is_not_reset_to_running_once_a_stop_was_requested(self) -> None:
         from python.srv.core.task_pool import TaskProcessPool

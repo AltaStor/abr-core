@@ -578,6 +578,7 @@ class VCenterNode(Hypervisor):
                     "datastore_path": source_path,
                     "current_datastore_path": current_path,
                     "uuid": getattr(device.backing, "uuid", None),
+                    "disk_mode": str(getattr(device.backing, "diskMode", "") or ""),
                     "source_disk_type_code": disk_type_code,
                     "source_disk_type_name": disk_type_name,
                     "source_disk_eager_zeroed": classify_vmware_disk_eager_zeroed(

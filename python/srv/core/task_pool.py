@@ -216,6 +216,7 @@ class TaskProcessPool:
                 task["status"] = "running"
             update = dict(update)
             log_entry = update.pop("log_entry", True)
+            warning = update.pop("warning", None)
             current_result = task.get("result")
             if not isinstance(current_result, dict):
                 current_result = {}
@@ -226,12 +227,16 @@ class TaskProcessPool:
                 logs.append(
                     {
                         "timestamp": utc_now(),
-                        "level": "info",
+                        "level": "warn" if warning else "info",
                         "component": "engine",
                         "message": str(update.get("message")),
                     }
                 )
             task["logs"] = logs
+            if isinstance(warning, dict):
+                warnings = task.get("warnings") if isinstance(task.get("warnings"), list) else []
+                warnings.append(warning)
+                task["warnings"] = warnings
             task["updated_at"] = utc_now()
             try:
                 persist_task(dict(task))

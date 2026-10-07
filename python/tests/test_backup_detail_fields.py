@@ -88,6 +88,29 @@ class RegisterBackupFieldsTests(unittest.TestCase):
         self.assertIsNone(record["compression_level"])
 
 
+    def test_a_disk_left_out_of_the_backup_is_recorded_on_the_restore_point(self) -> None:
+        skipped = {
+            "disk_label": "Hard disk 3",
+            "datastore_path": "[ds] demo-vm/extra.vmdk",
+            "uuid": "disk-uuid-3",
+            "capacity_gb": 1,
+            "disk_mode": "independent_persistent",
+            "reason": "independent disks are not part of a VM snapshot",
+        }
+        task = _completed_backup_task()
+        task["result"]["skipped_disks"] = [skipped]
+        record = backup_catalog.register_backup_from_completed_task(task)
+        self.assertEqual(record["artifact"]["skipped_disks"], [skipped])
+        self.assertEqual(abr_v41.restore_point_to_dto(record)["skipped_disks"], [skipped])
+        self.assertEqual(abr_v41.backup_chain_to_dto([record])["restore_points"][0]["skipped_disks"], [skipped])
+
+    def test_a_backup_that_left_nothing_out_records_no_skipped_disks(self) -> None:
+        record = backup_catalog.register_backup_from_completed_task(_completed_backup_task())
+        self.assertEqual(record["artifact"]["skipped_disks"], [])
+        self.assertEqual(abr_v41.restore_point_to_dto(record)["skipped_disks"], [])
+        self.assertEqual(abr_v41.restore_point_to_dto({"id": "legacy"})["skipped_disks"], [])
+        self.assertEqual(abr_v41.backup_chain_to_dto([record])["restore_points"][0]["skipped_disks"], [])
+
 class EmptySourceSizeTests(unittest.TestCase):
     def test_a_source_with_nothing_allocated_reports_a_logical_size_of_zero(self) -> None:
         self.assertEqual(backup_catalog.resolve_logical_size_bytes({"logical_bytes": 0}), 0)

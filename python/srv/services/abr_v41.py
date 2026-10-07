@@ -5297,6 +5297,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "compression_ratio": point.get("compression_ratio"),
             "compression_level": point.get("compression_level"),
             "encryption_enabled": point.get("encryption_enabled"),
+            "skipped_disks": _restore_point_artifact(point).get("skipped_disks") or [],
         }
         for point in points
     ]
@@ -6485,6 +6486,7 @@ def restore_point_to_dto(point: dict[str, Any]) -> dict[str, Any]:
         "status": point.get("status"),
         "available": _restore_point_is_available(point),
         "gfs_marks": point.get("gfs_marks"),
+        "skipped_disks": _restore_point_artifact(point).get("skipped_disks") or [],
     }
 
 

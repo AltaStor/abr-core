@@ -1225,6 +1225,62 @@ def _is_missing_parent_manifest_error(message: str) -> bool:
     return "previous" in normalized and "manifest" in normalized
 
 
+_INDEPENDENT_DISK_REASON = (
+    "independent disks are not part of a VM snapshot, so they cannot be backed up in a consistent state"
+)
+
+
+def _split_independent_disks(
+    disks: list[dict[str, Any]],
+    live_by_uuid: dict[str, dict[str, Any]],
+    live_by_path: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    kept: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for disk in disks:
+        payload = disk.get("payload") if isinstance(disk.get("payload"), dict) else {}
+        uuid = str(payload.get("uuid") or "")
+        datastore_path = str(payload.get("datastore_path") or "")
+        live_disk = (
+            (live_by_uuid.get(uuid) if uuid else None)
+            or (live_by_path.get(datastore_path) if datastore_path else None)
+            or {}
+        )
+        disk_mode = str(live_disk.get("disk_mode") or "")
+        if not disk_mode.startswith("independent"):
+            kept.append(disk)
+            continue
+        skipped.append(
+            {
+                "disk_label": str(live_disk.get("disk_label") or disk.get("name") or "disk"),
+                "datastore_path": datastore_path or str(live_disk.get("datastore_path") or ""),
+                "uuid": uuid or live_disk.get("uuid"),
+                "capacity_gb": live_disk.get("capacity_gb"),
+                "disk_mode": disk_mode,
+                "reason": _INDEPENDENT_DISK_REASON,
+            }
+        )
+    return kept, skipped
+
+
+def _skipped_disk_message(vm_name: str, skipped_disk: dict[str, Any]) -> str:
+    return (
+        f"Skipped disk {skipped_disk['datastore_path']} of {vm_name}: it is in "
+        f"{skipped_disk['disk_mode']} mode, and {_INDEPENDENT_DISK_REASON}. The other disks are "
+        "backed up and this restore point does not contain this disk. To back it up, switch the "
+        "disk to dependent mode in the VM settings."
+    )
+
+
+def _all_disks_independent_message(vm_name: str, skipped_disks: list[dict[str, Any]]) -> str:
+    paths = ", ".join(f"{disk['datastore_path']} ({disk['disk_mode']})" for disk in skipped_disks)
+    return (
+        f"Cannot back up {vm_name}: every disk of this VM is independent: {paths}. "
+        f"{_INDEPENDENT_DISK_REASON[0].upper()}{_INDEPENDENT_DISK_REASON[1:]}. To back the VM up, "
+        "switch its disks to dependent mode in the VM settings."
+    )
+
+
 def run_vcenter_backup(
     task: dict[str, Any],
     progress_callback: ProgressCallback = None,
@@ -1610,6 +1666,26 @@ def run_vcenter_backup(
                     "disk(s) removed since the last inventory scan; excluding them from this backup",
                     worker_mode="vcenter-abr-vmdk-tool",
                     vm_name=vm_name,
+                )
+
+            disks, skipped_disks = _split_independent_disks(disks, live_by_uuid, live_by_path)
+            if skipped_disks and not disks:
+                raise VCenterBackupError(_all_disks_independent_message(vm_name, skipped_disks))
+            for skipped_disk in skipped_disks:
+                message = _skipped_disk_message(vm_name, skipped_disk)
+                logger.warning("%s (task %s)", message, task.get("id"))
+                _emit_progress(
+                    progress_callback,
+                    "prepare",
+                    20,
+                    message,
+                    worker_mode="vcenter-abr-vmdk-tool",
+                    vm_name=vm_name,
+                    warning={
+                        "message": message,
+                        "datastore_path": skipped_disk["datastore_path"],
+                        "disk_mode": skipped_disk["disk_mode"],
+                    },
                 )
 
             if not disks:
@@ -2773,6 +2849,7 @@ def run_vcenter_backup(
                 "snapshot_name": snapshot_name,
                 "snapshot_moref": snapshot_moref,
                 "disks": disk_outputs,
+                "skipped_disks": skipped_disks,
                 "repository_id": str(repository.get("id") or "") if isinstance(repository, dict) else "",
                 "repository_type": repository_type or "local",
                 "storage_mode": "s3" if repository_type == "s3" else "local",
@@ -2882,6 +2959,7 @@ def run_vcenter_backup(
             "vm_config": vm_config,
             "disk_count": len(disk_outputs),
             "disks": disk_outputs,
+            "skipped_disks": skipped_disks,
             "transport_mode": transport_mode,
             "compression_level": compression_level,
             "encryption_enabled": bool(encryption_algorithm),
