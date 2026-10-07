@@ -197,6 +197,9 @@ class FakeVCenterNode:
         # Standalone ESXi host that is not part of any cluster.
         return None
 
+    def vm_host_name(self, vm_name: str) -> str | None:
+        return "esx-01.local"
+
     def ensure_vm_host_connected(self, vm_name: str) -> None:
         if not FakeVCenterNode.host_connected:
             raise RuntimeError(

@@ -624,6 +624,14 @@ class VCenterNode(Hypervisor):
                 "Reconnect the host in vCenter (or wait for it to reconnect) and retry the backup."
             )
 
+    def vm_host_name(self, vm_name: str) -> Optional[str]:
+        try:
+            vm = self._get_vm(vm_name)
+            host = getattr(getattr(vm, "runtime", None), "host", None) if vm else None
+            return str(getattr(host, "name", "") or "") or None
+        except Exception:
+            return None
+
     def create_backup_snapshot(self, vm_name: str) -> str:
         vm = self._get_vm(vm_name)
         if not vm:

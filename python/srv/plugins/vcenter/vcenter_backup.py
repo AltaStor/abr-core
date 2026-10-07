@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from ...core.subprocess_util import ProcessCancelled, run_capped
+from ...core.subprocess_util import DataPathStalled, ProcessCancelled, run_capped
 from ...core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV
 from ...core.server_defaults import env_int
 from ...core.task_executor import TaskStopRequested, cancel_requested
@@ -968,6 +968,7 @@ def _resolve_parent_manifest(
 
 _WRITE_FAILURE = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _NO_SPACE = re.compile(r"no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
+_CONNECTION_LOST = re.compile(r"refused connection|connection (?:was )?(?:reset|lost|timed out)|NBD_ERR_NETWORK", re.IGNORECASE)
 
 
 def _repository_free_bytes(repository: dict[str, Any] | None) -> int | None:
@@ -984,7 +985,14 @@ def _disk_failure_message(
     needed_bytes: int | None,
     needed_is_disk_size: bool,
     free_before: int | None,
+    data_host: str | None = None,
 ) -> str:
+    if _CONNECTION_LOST.search(tool_error or ""):
+        detail = next(
+            (line.strip()[len("Error:"):].strip() for line in reversed(tool_error.splitlines()) if line.strip().startswith("Error:")),
+            tool_error.strip().splitlines()[-1].strip(),
+        )
+        return f"Lost the connection to {f'ESXi host {data_host}' if data_host else 'the ESXi host'} ({detail})"
     if not isinstance(repository, dict) or not _WRITE_FAILURE.search(tool_error or ""):
         return tool_error
     short_before = bool(needed_bytes) and free_before is not None and free_before < int(needed_bytes or 0)
@@ -1007,6 +1015,51 @@ def _disk_failure_message(
         f"The {label} ran out of space{amounts}. "
         "Free space in that filesystem, or point the job at another repository"
     )
+
+
+def _run_watched_disk_tool(
+    command: list[str],
+    *,
+    data_host: str | None,
+    disk_label: str,
+    datastore_path: str,
+    progress_callback: ProgressCallback,
+    **kwargs: Any,
+):
+    limit = env_int("BACKUPSERVER_DATA_PATH_STALL_SECONDS")
+    host_text = f"ESXi host {data_host}" if data_host else "the ESXi host"
+
+    def on_stall(idle_seconds: float) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            {
+                "stage": "transfer",
+                "message": (
+                    f"No data from {host_text} for {int(idle_seconds)}s while backing up {disk_label}; "
+                    f"waiting up to {limit}s for the connection to come back"
+                ),
+                "updated_at": utc_now(),
+                "worker_mode": "vcenter-abr-vmdk-tool",
+            }
+        )
+
+    try:
+        return run_capped(command, stall_seconds=limit, on_stall=on_stall, **kwargs)
+    except DataPathStalled as exc:
+        logger.error(
+            "Data path to %s lost while backing up %s (%s): no data for %ds; stopped the data mover. %s",
+            host_text,
+            disk_label,
+            datastore_path,
+            int(exc.idle_seconds),
+            (exc.stderr or exc.stdout or "").strip() if isinstance(exc.stderr or exc.stdout, str) else "",
+        )
+        raise VCenterBackupError(
+            f"Lost the connection to {host_text} while backing up {disk_label} ({datastore_path}): no data "
+            f"reached the backup server for {int(exc.idle_seconds)}s, so the backup was stopped. Check the "
+            "network between the backup server and the host"
+        ) from exc
 
 
 def _is_cbt_invalid_fault(exc: BaseException) -> bool:
@@ -1358,6 +1411,7 @@ def run_vcenter_backup(
                 node.ensure_vm_host_connected(vm_name)
             except RuntimeError as exc:
                 raise VCenterBackupError(str(exc)) from exc
+            data_host = node.vm_host_name(vm_name)
             # CBT must be enabled BEFORE the snapshot that anchors a backup chain,
             # for EVERY backup including fulls. Enabling it only for incrementals
             # (the old behavior) meant an ActiveFull was captured with CBT off, so
@@ -1893,8 +1947,12 @@ def run_vcenter_backup(
                                 task.get("id"),
                                 _redact_command_for_logging(no_cbt_command),
                             )
-                            completed = run_capped(
+                            completed = _run_watched_disk_tool(
                                 no_cbt_command,
+                                data_host=data_host,
+                                disk_label=f"disk {index}/{len(disks)}",
+                                datastore_path=datastore_path,
+                                progress_callback=progress_callback,
                                 check=False,
                                 capture_output=True,
                                 text=True,
@@ -1924,6 +1982,7 @@ def run_vcenter_backup(
                                         needed_bytes=full_disk_bytes,
                                         needed_is_disk_size=True,
                                         free_before=free_before_disk,
+                                        data_host=data_host,
                                     )
                                 )
                             disk_store_mode = (
@@ -1969,8 +2028,12 @@ def run_vcenter_backup(
                                 task.get("id"),
                                 _redact_command_for_logging(command),
                             )
-                            completed = run_capped(
+                            completed = _run_watched_disk_tool(
                                 command,
+                                data_host=data_host,
+                                disk_label=f"disk {index}/{len(disks)}",
+                                datastore_path=datastore_path,
+                                progress_callback=progress_callback,
                                 check=False,
                                 capture_output=True,
                                 text=True,
@@ -2036,6 +2099,7 @@ def run_vcenter_backup(
                                             needed_bytes=changed_bytes,
                                             needed_is_disk_size=False,
                                             free_before=free_before_disk,
+                                            data_host=data_host,
                                         )
                                     )
 
@@ -2079,8 +2143,12 @@ def run_vcenter_backup(
                                         datastore_path,
                                         _redact_command_for_logging(fallback_command),
                                     )
-                                    fallback_completed = run_capped(
+                                    fallback_completed = _run_watched_disk_tool(
                                         fallback_command,
+                                        data_host=data_host,
+                                        disk_label=f"disk {index}/{len(disks)}",
+                                        datastore_path=datastore_path,
+                                        progress_callback=progress_callback,
                                         check=False,
                                         capture_output=True,
                                         text=True,
@@ -2119,6 +2187,7 @@ def run_vcenter_backup(
                                                 needed_bytes=changed_bytes,
                                                 needed_is_disk_size=False,
                                                 free_before=free_before_disk,
+                                                data_host=data_host,
                                             )
                                             + ". Full fallback also failed: "
                                             + (
@@ -2128,6 +2197,7 @@ def run_vcenter_backup(
                                                     needed_bytes=full_disk_bytes,
                                                     needed_is_disk_size=True,
                                                     free_before=free_before_disk,
+                                                    data_host=data_host,
                                                 )
                                                 if fallback_error
                                                 else "not attempted"
@@ -2327,8 +2397,12 @@ def run_vcenter_backup(
                         _redact_command_for_logging(command),
                     )
                     try:
-                        completed = run_capped(
+                        completed = _run_watched_disk_tool(
                             command,
+                            data_host=data_host,
+                            disk_label=f"disk {index}/{len(disks)}",
+                            datastore_path=datastore_path,
+                            progress_callback=progress_callback,
                             check=False,
                             capture_output=True,
                             text=True,
@@ -2392,8 +2466,12 @@ def run_vcenter_backup(
                             tool_output,
                         )
                         time.sleep(_TRANSIENT_DISK_ACCESS_RETRY_DELAY_SECONDS)
-                        completed = run_capped(
+                        completed = _run_watched_disk_tool(
                             command,
+                            data_host=data_host,
+                            disk_label=f"disk {index}/{len(disks)}",
+                            datastore_path=datastore_path,
+                            progress_callback=progress_callback,
                             check=False,
                             capture_output=True,
                             text=True,
@@ -2482,8 +2560,12 @@ def run_vcenter_backup(
                                 variant_name,
                                 _redact_command_for_logging(retry_command),
                             )
-                            retry_completed = run_capped(
+                            retry_completed = _run_watched_disk_tool(
                                 retry_command,
+                                data_host=data_host,
+                                disk_label=f"disk {index}/{len(disks)}",
+                                datastore_path=datastore_path,
+                                progress_callback=progress_callback,
                                 check=False,
                                 capture_output=True,
                                 text=True,
@@ -2536,6 +2618,7 @@ def run_vcenter_backup(
                                 needed_bytes=disk_total_bytes,
                                 needed_is_disk_size=True,
                                 free_before=free_before_disk,
+                                data_host=data_host,
                             )
                         )
 
