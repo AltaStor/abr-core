@@ -7,6 +7,12 @@ import argparse
 
 from ..compact_help_formatter import CompactHelpFormatter
 from ..parsing.common_arguments import add_name_or_id_selector
+from ..parsing.secret_arguments import (
+    INVENTORY_PASSWORD_ENV_VAR,
+    INVENTORY_TOKEN_ENV_VAR,
+    add_secret_argument,
+    resolve_secret,
+)
 from .base import CommandDependencies
 
 
@@ -31,11 +37,14 @@ class InventoryCommands:
                 "Add virtualization inventory.\n\n"
                 "VM discovery is not required up front: it runs automatically the first "
                 "time you reference VM names in job create.\n\n"
+                "The password is read from "
+                f"{INVENTORY_PASSWORD_ENV_VAR}, or prompted for when it is not set; avoid "
+                "--password VALUE, which shows it to every local user.\n\n"
                 "Examples:\n"
                 '  abr inventory add --name "vCenter-Prod" --type vsphere --address vcenter.example.com '
-                '--username administrator@vsphere.local --password "********"\n'
-                '  abr inventory add --name "HyperV-Host1" --type hyper-v --address 10.0.0.5 --port 5986 '
-                '--username Administrator --password "********" --insecure'
+                "--username administrator@vsphere.local\n"
+                f'  {INVENTORY_PASSWORD_ENV_VAR}=... abr inventory add --name "HyperV-Host1" --type hyper-v '
+                "--address 10.0.0.5 --port 5986 --username Administrator --insecure"
             ),
             formatter_class=CompactHelpFormatter,
         )
@@ -44,8 +53,8 @@ class InventoryCommands:
         add.add_argument("--address", required=True, help="Inventory endpoint address")
         add.add_argument("--port", type=int, help="Inventory connection port")
         add.add_argument("--username", help="Inventory username")
-        add.add_argument("--password", help="Inventory password")
-        add.add_argument("--token", help="Inventory token")
+        add_secret_argument(add, "--password", env_var=INVENTORY_PASSWORD_ENV_VAR, help_text="Inventory password")
+        add_secret_argument(add, "--token", env_var=INVENTORY_TOKEN_ENV_VAR, help_text="Inventory token")
         add.add_argument("--insecure", action="store_true", help="Disable SSL verification")
         add.set_defaults(handler=self.add)
 
@@ -101,7 +110,7 @@ class InventoryCommands:
             description=(
                 "Edit inventory settings.\n\n"
                 "Examples:\n"
-                '  abr inventory edit --name "vCenter-Prod" --password "********"\n'
+                '  abr inventory edit --name "vCenter-Prod" --password\n'
                 '  abr inventory edit --id <inventory-id> --new-name "vCenter-Prod-2" --secure'
             ),
             formatter_class=CompactHelpFormatter,
@@ -111,8 +120,8 @@ class InventoryCommands:
         edit.add_argument("--address", help="Updated endpoint address")
         edit.add_argument("--port", type=int, help="Updated connection port")
         edit.add_argument("--username", help="Updated username")
-        edit.add_argument("--password", help="Updated password")
-        edit.add_argument("--token", help="Updated token")
+        add_secret_argument(edit, "--password", env_var=INVENTORY_PASSWORD_ENV_VAR, help_text="Updated password")
+        add_secret_argument(edit, "--token", env_var=INVENTORY_TOKEN_ENV_VAR, help_text="Updated token")
         edit.add_argument("--insecure", action="store_true", help="Disable SSL verification")
         edit.add_argument("--secure", action="store_true", help="Enable SSL verification")
         edit.set_defaults(handler=self.edit)
@@ -138,14 +147,21 @@ class InventoryCommands:
 
     def add(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
+        token = resolve_secret(args.token, env_var=INVENTORY_TOKEN_ENV_VAR, prompt="Inventory token")
+        password = resolve_secret(
+            args.password,
+            env_var=INVENTORY_PASSWORD_ENV_VAR,
+            prompt="Inventory password",
+            needed=bool(args.username) and (args.type == "vsphere" or not token),
+        )
         result = deps.context.api_client.post("api/v1/inventories", json={
             "name": args.name,
             "type": args.type,
             "address": args.address,
             "port": args.port,
             "username": args.username,
-            "password": args.password,
-            "token": args.token,
+            "password": password,
+            "token": token,
             "insecure": args.insecure,
         })
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("endpoint", "ENDPOINT"), ("status", "STATUS")])
@@ -168,8 +184,8 @@ class InventoryCommands:
             "address": args.address,
             "port": args.port,
             "username": args.username,
-            "password": args.password,
-            "token": args.token,
+            "password": resolve_secret(args.password, env_var=INVENTORY_PASSWORD_ENV_VAR, prompt="Inventory password"),
+            "token": resolve_secret(args.token, env_var=INVENTORY_TOKEN_ENV_VAR, prompt="Inventory token"),
         }.items() if value is not None}
         if args.insecure and args.secure:
             raise ValueError("Use only one of --insecure or --secure")

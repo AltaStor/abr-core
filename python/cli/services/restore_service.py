@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..cli_context import CliContext
+from ..parsing.secret_arguments import ENCRYPTION_KEY_ENV_VAR, resolve_secret
 
 
 class RestoreService:
@@ -133,7 +134,11 @@ class RestoreService:
             "repo": repo_name,
             "repo_id": repo_id,
             "power_on": bool(getattr(args, "power_on", False)),
-            "encryption_key": str(getattr(args, "encryption_key", None) or "").strip() or None,
+            "encryption_key": str(
+                resolve_secret(getattr(args, "encryption_key", None), env_var=ENCRYPTION_KEY_ENV_VAR, prompt="Encryption key")
+                or ""
+            ).strip()
+            or None,
             "force": force,
         }
         return {key: value for key, value in payload.items() if value not in (None, [], "")}

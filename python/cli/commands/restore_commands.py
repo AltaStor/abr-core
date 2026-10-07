@@ -8,6 +8,7 @@ from typing import Any
 
 from ..compact_help_formatter import CompactHelpFormatter
 from ..exit_codes import INVALID_STATE
+from ..parsing.secret_arguments import ENCRYPTION_KEY_ENV_VAR, add_secret_argument
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
 
@@ -113,12 +114,13 @@ class RestoreCommands:
         start.add_argument("--repo", help="Repository name for backup-copy restore")
         start.add_argument("--repo-id", help="Repository ID for backup-copy restore")
         start.add_argument("--power-on", action="store_true", help="Power on after restore")
-        start.add_argument(
+        add_secret_argument(
+            start,
             "--encryption-key",
-            dest="encryption_key",
-            help=(
+            env_var=ENCRYPTION_KEY_ENV_VAR,
+            help_text=(
                 "Decryption key for this restore. Overrides the key stored with the job and with the restore point; "
-                "needed when the job that held the key is gone."
+                "needed when the job that held the key is gone"
             ),
         )
         start.add_argument(
