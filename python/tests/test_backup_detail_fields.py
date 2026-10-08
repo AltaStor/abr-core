@@ -111,6 +111,22 @@ class RegisterBackupFieldsTests(unittest.TestCase):
         self.assertEqual(abr_v41.restore_point_to_dto({"id": "legacy"})["skipped_disks"], [])
         self.assertEqual(abr_v41.backup_chain_to_dto([record])["restore_points"][0]["skipped_disks"], [])
 
+    def test_a_jobs_first_full_in_id_folders_flags_the_job_for_good(self) -> None:
+        JOBS["job-old"] = {"id": "job-old", "name": "Old", "job_type": "backup", "vm_ids": ["vm-1"], "vm_names": ["demo-vm"]}
+        task = _completed_backup_task(job_id="job-old")
+        task["result"]["storage_layout"] = "by_id"
+        backup_catalog.register_backup_from_completed_task(task)
+        self.assertEqual(JOBS["job-old"]["storage_layout"], "by_id")
+        self.assertEqual(abr_v41.job_to_dto(abr_v41.normalize_job_record(JOBS["job-old"]))["storage_layout"], "by_id")
+
+    def test_a_backup_in_name_folders_leaves_an_unflagged_job_as_it_is(self) -> None:
+        JOBS["job-old"] = {"id": "job-old", "name": "Old", "job_type": "backup", "vm_ids": ["vm-1"], "vm_names": ["demo-vm"]}
+        task = _completed_backup_task(id="task-detail-2", job_id="job-old")
+        task["result"]["storage_layout"] = "by_name"
+        backup_catalog.register_backup_from_completed_task(task)
+        self.assertNotIn("storage_layout", JOBS["job-old"])
+        self.assertEqual(abr_v41.job_to_dto(abr_v41.normalize_job_record(JOBS["job-old"]))["storage_layout"], "by_name")
+
 class EmptySourceSizeTests(unittest.TestCase):
     def test_a_source_with_nothing_allocated_reports_a_logical_size_of_zero(self) -> None:
         self.assertEqual(backup_catalog.resolve_logical_size_bytes({"logical_bytes": 0}), 0)

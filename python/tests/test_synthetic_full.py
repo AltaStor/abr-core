@@ -304,7 +304,7 @@ class SyntheticFullRunTests(unittest.TestCase):
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_a_local_merge_falls_back_to_the_written_size(self, copy_mock) -> None:
         def _write(**kwargs: object) -> dict[str, object]:
-            destination = Path(self._root) / "web01" / "task-new"
+            destination = Path(str(kwargs["destination_abr_path"]))
             destination.mkdir(parents=True, exist_ok=True)
             (destination / "01-disk.vmdk.abrd").write_bytes(b"x" * 4096)
             return {"raw_data_size": 0, "stored_data_size": 0, "merged_from": 3}
@@ -335,20 +335,42 @@ class SyntheticFullRunTests(unittest.TestCase):
         self.assertTrue(result["backup_root"].startswith(target))
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
-    def test_a_renamed_vms_merge_is_written_into_its_chains_folder(self, copy_mock) -> None:
+    def test_a_flagged_jobs_merge_is_written_under_its_job_and_vm(self, copy_mock) -> None:
         copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
-        chain_folder = pathlib.Path(self._root) / "web01" / "task-a"
-        chain_folder.mkdir(parents=True)
-        (chain_folder / "manifest.json").write_text(
-            json.dumps({"operation": "vm-backup", "vm_external_id": VM_ID, "created_at": "2026-10-07T10:00:00+00:00"}),
-            encoding="utf-8",
+        JOBS[JOB_ID]["storage_layout"] = "by_id"
+
+        result = synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(
+            pathlib.Path(result["manifest_path"]).parent.parent,
+            pathlib.Path(self._root).resolve() / JOB_ID / VM_ID,
         )
+        self.assertEqual(result["storage_layout"], "by_id")
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_an_unflagged_jobs_merge_starts_its_chain_by_id_while_reading_the_old_folder(self, copy_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
+        updates: list[dict[str, object]] = []
+
+        result = synthetic_full.run_synthetic_full(self._task(), progress_callback=updates.append)
+
+        self.assertEqual(result["storage_layout"], "by_id")
+        self.assertEqual(
+            pathlib.Path(result["manifest_path"]).parent.parent,
+            pathlib.Path(self._root).resolve() / JOB_ID / VM_ID,
+        )
+        self.assertEqual(copy_mock.call_args.kwargs["source_abr_path"], "lab/web01")
+        self.assertEqual(updates[0]["backup_root"], result["backup_root"])
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_renamed_vms_merge_is_not_written_under_its_new_name(self, copy_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
         for point in BACKUPS.values():
             point["vm_name"] = "web01-renamed"
 
         result = synthetic_full.run_synthetic_full(self._task())
 
-        self.assertEqual(pathlib.Path(result["manifest_path"]).parent.parent.name, "web01")
+        self.assertEqual(pathlib.Path(result["manifest_path"]).parent.parent.name, VM_ID)
         self.assertFalse((pathlib.Path(self._root) / "web01-renamed").exists())
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")

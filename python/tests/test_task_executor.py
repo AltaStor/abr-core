@@ -2802,6 +2802,146 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(plain_root.parent.name, "demo-vm-renamed")
         self.assertEqual(plain_path, "tenant/demo-vm-renamed/task-inc")
 
+    def _layout_hypervisor(self) -> None:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {"host": "vc.local", "port": 443, "verify_ssl": False,
+                         "credentials": {"username": "administrator", "password": "secret"}},
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine", "external_id": "vm-uuid-1", "name": "demo-vm", "payload": {},
+            }
+        }
+
+    def _run_layout_backup(self, temp_dir: str, task_id: str, *, job: dict | None, incremental: bool) -> dict:
+        from python.srv.core.mongo_db_wrapper import JOBS
+
+        self._layout_hypervisor()
+        if job is not None:
+            JOBS[job["id"]] = job
+            self.addCleanup(JOBS.pop, job["id"], None)
+        task = {
+            "id": task_id,
+            "status": "queued",
+            "task_type": "backup",
+            "job_id": job["id"] if job else None,
+            "hypervisor_id": "hv-vc",
+            "resource_type": "virtual_machine",
+            "resource_external_id": "vm-uuid-1",
+            "parameters": {
+                "incremental": incremental,
+                "resolved_backup_type": "Incremental" if incremental else "ActiveFull",
+                "destination_dir": temp_dir,
+                "tool_path": EXISTING_TOOL_PATH,
+            },
+        }
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+            with patch(
+                "python.srv.plugins.vcenter.vcenter_backup.run_capped",
+                side_effect=lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="Done"),
+            ):
+                return run_task(task)
+
+    def test_the_layout_follows_the_job_flag_or_a_new_chain(self) -> None:
+        from python.srv.core.mongo_db_wrapper import JOBS
+        from python.srv.plugins.vcenter.vcenter_backup import _job_storage_layout
+
+        JOBS["job-legacy"] = {"id": "job-legacy", "name": "Legacy"}
+        JOBS["job-by-id"] = {"id": "job-by-id", "name": "New", "storage_layout": "by_id"}
+        self.addCleanup(JOBS.pop, "job-legacy", None)
+        self.addCleanup(JOBS.pop, "job-by-id", None)
+        self.assertEqual(_job_storage_layout({"job_id": "job-by-id"}, starts_new_chain=False), "by_id")
+        self.assertEqual(_job_storage_layout({"job_id": "job-legacy"}, starts_new_chain=False), "by_name")
+        self.assertEqual(_job_storage_layout({"job_id": "job-legacy"}, starts_new_chain=True), "by_id")
+        self.assertEqual(_job_storage_layout({"job_id": "job-gone"}, starts_new_chain=True), "by_name")
+        self.assertEqual(_job_storage_layout({}, starts_new_chain=True), "by_name")
+
+    def test_the_id_layout_places_a_task_under_its_job_and_vm(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import _resolve_backup_storage_layout
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, task_root, abr_path = _resolve_backup_storage_layout(
+                task={"id": "task-1", "job_id": "job-1"}, vm_name="demo vm", parameters={"destination_dir": temp_dir},
+                repository=None, vm_external_id="vm-uuid-1", layout="by_id",
+            )
+            self.assertEqual(task_root, root / "job-1" / "vm-uuid-1" / "task-1")
+            self.assertEqual(abr_path, str(task_root))
+            with patch("python.srv.plugins.vcenter.vcenter_backup.is_s3_repository", return_value=True), patch(
+                "python.srv.plugins.vcenter.vcenter_backup.extract_s3_config", return_value={"prefix": "tenant"}
+            ):
+                _root, s3_root, s3_path = _resolve_backup_storage_layout(
+                    task={"id": "task-1", "job_id": "job-1"}, vm_name="demo vm", parameters={"destination_dir": temp_dir},
+                    repository={"id": "repo-s3", "type": "s3"}, vm_external_id="vm-uuid-1", layout="by_id",
+                )
+            self.assertEqual(s3_path, "tenant/job-1/vm-uuid-1/task-1")
+            _root, no_job_root, _path = _resolve_backup_storage_layout(
+                task={"id": "task-1"}, vm_name="demo vm", parameters={"destination_dir": temp_dir},
+                repository=None, vm_external_id="vm-uuid-1", layout="by_id",
+            )
+            self.assertEqual(no_job_root.parent.name, "demo-vm")
+
+    def test_the_id_layout_looks_for_the_parent_only_in_its_own_chain_folder(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import VCenterBackupError, _resolve_parent_manifest
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            self._write_vm_manifest(root, "demo-vm", "task-legacy", "vm-uuid-1", "2026-10-07T12:00:00+00:00")
+            (root / "job-1").mkdir()
+            own = self._write_vm_manifest(root / "job-1", "vm-uuid-1", "task-full", "vm-uuid-1", "2026-10-07T10:00:00+00:00", backup_mode="full")
+            self._write_vm_manifest(root / "job-1", "vm-uuid-1", "task-inc", "vm-uuid-1", "2026-10-07T11:00:00+00:00", backup_mode="incremental")
+            task_root = root / "job-1" / "vm-uuid-1" / "task-now"
+            newest, _ = _resolve_parent_manifest(
+                parameters={}, destination_root=root, vm_name="demo-vm", task_root=task_root,
+                vm_external_id="vm-uuid-1", layout="by_id",
+            )
+            full, _ = _resolve_parent_manifest(
+                parameters={}, destination_root=root, vm_name="demo-vm", task_root=task_root,
+                vm_external_id="vm-uuid-1", differential=True, layout="by_id",
+            )
+            with self.assertRaises(VCenterBackupError):
+                _resolve_parent_manifest(
+                    parameters={}, destination_root=root, vm_name="demo-vm",
+                    task_root=root / "job-2" / "vm-uuid-1" / "task-now", vm_external_id="vm-uuid-1", layout="by_id",
+                )
+        self.assertEqual(newest.parent.name, "task-inc")
+        self.assertEqual(full, own)
+
+    def test_a_flagged_job_writes_its_full_by_id_and_records_who_it_belongs_to(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self._run_layout_backup(
+                temp_dir, "task-new-job", job={"id": "job-1", "name": "Nightly", "storage_layout": "by_id"}, incremental=False
+            )
+            manifest = json.loads(pathlib.Path(result["result"]["manifest_path"]).read_text(encoding="utf-8"))
+            root = pathlib.Path(temp_dir).resolve()
+        self.assertEqual(result["status"], "completed", result["result"].get("message"))
+        self.assertEqual(pathlib.Path(result["result"]["backup_root"]), root / "job-1" / "vm-uuid-1" / "task-new-job")
+        self.assertEqual(result["result"]["storage_layout"], "by_id")
+        self.assertEqual((manifest["storage_layout"], manifest["job_id"], manifest["job_name"]), ("by_id", "job-1", "Nightly"))
+
+    def test_an_existing_jobs_incremental_stays_in_its_chain_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            parent = self._write_vm_manifest(root, "demo-vm", "task-full", "vm-uuid-1", "2026-10-07T10:00:00+00:00", backup_mode="full")
+            result = self._run_layout_backup(temp_dir, "task-legacy-inc", job={"id": "job-old", "name": "Old"}, incremental=True)
+            manifest = json.loads(pathlib.Path(result["result"]["manifest_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "completed", result["result"].get("message"))
+        self.assertEqual(result["result"]["resolved_backup_type"], "Incremental")
+        self.assertEqual(result["result"]["storage_layout"], "by_name")
+        self.assertEqual(pathlib.Path(result["result"]["backup_root"]).parent.name, "demo-vm")
+        self.assertEqual(manifest["disks"][0]["parent_manifest_path"], str(parent))
+
+    def test_an_existing_jobs_next_full_starts_its_chain_by_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            self._write_vm_manifest(root, "demo-vm", "task-full", "vm-uuid-1", "2026-10-07T10:00:00+00:00", backup_mode="full")
+            result = self._run_layout_backup(temp_dir, "task-legacy-full", job={"id": "job-old", "name": "Old"}, incremental=False)
+        self.assertEqual(result["status"], "completed", result["result"].get("message"))
+        self.assertEqual(result["result"]["storage_layout"], "by_id")
+        self.assertEqual(pathlib.Path(result["result"]["backup_root"]).parent, root.resolve() / "job-old" / "vm-uuid-1")
+
     def test_vcenter_incremental_backup_can_query_changed_areas_without_utility_copy(self) -> None:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",

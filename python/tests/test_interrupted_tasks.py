@@ -476,6 +476,26 @@ class InterruptedOutputLocationTests(SweepTestCase):
             (REPOSITORIES[REPO_ID], str(pathlib.Path(self._root) / "web01" / "task-r3")),
         )
 
+    def test_an_id_layout_task_folder_is_found_under_its_job_and_vm(self) -> None:
+        task = _task("task-r5", "running", vm_name="web01")
+        task["result"] = {"backup_root": str(pathlib.Path(self._root) / "job-1" / "vm-1" / "task-r5")}
+        self.assertEqual(
+            backup_catalog._interrupted_task_output_location(task),
+            (REPOSITORIES[REPO_ID], str(pathlib.Path(self._root) / "job-1" / "vm-1" / "task-r5")),
+        )
+
+    def test_an_id_layout_s3_task_keeps_both_levels_in_its_prefix(self) -> None:
+        REPOSITORIES["repo-s3"] = {"id": "repo-s3", "name": "S3", "type": "s3",
+                                   "metadata": {"s3": {"bucket": "b", "prefix": "tenant", "region": "us-east-1"}}}
+        cache_root = pathlib.Path(self._root) / "cache"
+        task = _task("task-r6", "running", vm_name="web01", repository_id="repo-s3")
+        task["result"] = {"backup_root": str(cache_root / ".catalog" / "repositories" / "repo-s3" / "job-1" / "vm-1" / "task-r6")}
+        with patch("python.srv.services.backup_catalog.is_s3_repository", return_value=True), patch(
+            "python.srv.services.backup_catalog.extract_s3_config", return_value={"prefix": "tenant"}
+        ), patch("python.srv.plugins.vcenter.vcenter_backup._default_backup_root", return_value=cache_root):
+            location = backup_catalog._interrupted_task_output_location(task)
+        self.assertEqual(location[1], "tenant/job-1/vm-1/task-r6")
+
     def test_an_s3_task_uses_the_folder_it_recorded_in_its_prefix(self) -> None:
         REPOSITORIES["repo-s3"] = {"id": "repo-s3", "name": "S3", "type": "s3",
                                    "metadata": {"s3": {"bucket": "b", "prefix": "tenant", "region": "us-east-1"}}}

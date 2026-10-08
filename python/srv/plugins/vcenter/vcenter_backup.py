@@ -38,6 +38,8 @@ from ...core.storage_tool import (
     s3_block_generation_days,
     with_immutability_retention_days,
     safe_path_component,
+    STORAGE_LAYOUT_BY_ID,
+    STORAGE_LAYOUT_BY_NAME,
 )
 from ...core.utils import utc_now
 from ...services.backup_mode import (
@@ -718,11 +720,13 @@ def _stop_message(stranded: list[str], abr_path: str | None, task_root: Path) ->
     )
 
 
-def _vm_backup_manifests(destination_root: Path, vm_external_id: str) -> list[tuple[Path, dict[str, Any]]]:
+def _vm_backup_manifests(
+    destination_root: Path, vm_external_id: str, pattern: str = "*/*/manifest.json"
+) -> list[tuple[Path, dict[str, Any]]]:
     found: list[tuple[Path, dict[str, Any]]] = []
     if not vm_external_id:
         return found
-    for manifest_path in destination_root.glob("*/*/manifest.json"):
+    for manifest_path in destination_root.glob(pattern):
         resolved_path = manifest_path.resolve()
         try:
             manifest = _load_manifest(resolved_path)
@@ -744,6 +748,25 @@ def _vm_backup_folder(destination_root: Path, vm_name: str, vm_external_id: str 
     return safe_path_component(vm_name, fallback="vm")
 
 
+def _job_storage_layout(task: dict[str, Any], *, starts_new_chain: bool) -> str:
+    job = JOBS.get(str(task.get("job_id") or ""))
+    if not isinstance(job, dict):
+        return STORAGE_LAYOUT_BY_NAME
+    if job.get("storage_layout") == STORAGE_LAYOUT_BY_ID or starts_new_chain:
+        return STORAGE_LAYOUT_BY_ID
+    return STORAGE_LAYOUT_BY_NAME
+
+
+def _chain_folder(
+    task: dict[str, Any], destination_root: Path, vm_name: str, vm_external_id: str | None, layout: str
+) -> Path:
+    if layout == STORAGE_LAYOUT_BY_ID and task.get("job_id"):
+        return Path(safe_path_component(task.get("job_id"), fallback="job")) / safe_path_component(
+            vm_external_id or vm_name, fallback="vm"
+        )
+    return Path(_vm_backup_folder(destination_root, vm_name, vm_external_id))
+
+
 def _resolve_backup_storage_layout(
     *,
     task: dict[str, Any],
@@ -751,6 +774,7 @@ def _resolve_backup_storage_layout(
     parameters: dict[str, Any],
     repository: dict[str, Any] | None,
     vm_external_id: str | None = None,
+    layout: str = STORAGE_LAYOUT_BY_NAME,
 ) -> tuple[Path, Path, str | None]:
     configured_destination = parameters.get("destination_dir") or parameters.get("backup_root")
 
@@ -759,11 +783,11 @@ def _resolve_backup_storage_layout(
             destination_root = Path(str(configured_destination)).expanduser().resolve()
         else:
             destination_root = repository_cache_root(_default_backup_root(), repository).resolve()
-        vm_path_component = _vm_backup_folder(destination_root, vm_name, vm_external_id)
-        task_root = destination_root / vm_path_component / str(task["id"])
+        chain_folder = _chain_folder(task, destination_root, vm_name, vm_external_id, layout)
+        task_root = destination_root / chain_folder / str(task["id"])
         abr_path = join_s3_prefix(
             extract_s3_config(repository).get("prefix"),
-            vm_path_component,
+            *chain_folder.parts,
             str(task["id"]),
         )
         return destination_root, task_root, abr_path
@@ -772,8 +796,8 @@ def _resolve_backup_storage_layout(
         destination_root = Path(str(configured_destination)).expanduser().resolve()
     else:
         destination_root = _resolve_repository_backup_root(task) or _default_backup_root()
-    vm_path_component = _vm_backup_folder(destination_root, vm_name, vm_external_id)
-    task_root = destination_root / vm_path_component / str(task["id"])
+    chain_folder = _chain_folder(task, destination_root, vm_name, vm_external_id, layout)
+    task_root = destination_root / chain_folder / str(task["id"])
     # Local repositories now use the .abr file backend; the abr path is the
     # per-task filesystem directory the FileBackupManager writes into, and
     # it is passed to the tool as --folder.
@@ -1034,6 +1058,7 @@ def _resolve_parent_manifest(
     task_root: Path,
     vm_external_id: str,
     differential: bool = False,
+    layout: str = STORAGE_LAYOUT_BY_NAME,
 ) -> tuple[Path, dict[str, Any]]:
     explicit = parameters.get("parent_manifest_path")
     if explicit not in (None, ""):
@@ -1041,9 +1066,13 @@ def _resolve_parent_manifest(
         return manifest_path, _load_manifest(manifest_path)
 
     current_manifest = (task_root / "manifest.json").resolve()
+    if layout == STORAGE_LAYOUT_BY_ID:
+        search_root, pattern = task_root.parent, "*/manifest.json"
+    else:
+        search_root, pattern = destination_root, "*/*/manifest.json"
     candidates = [
         (path, manifest)
-        for path, manifest in _vm_backup_manifests(destination_root, vm_external_id)
+        for path, manifest in _vm_backup_manifests(search_root, vm_external_id, pattern)
         if path != current_manifest
         and (
             not differential
@@ -1424,21 +1453,6 @@ def run_vcenter_backup(
 
     repository = _resolve_repository(task)
     repository_type = str(repository.get("type") or "").strip().lower() if isinstance(repository, dict) else ""
-    destination_root, task_root, repository_abr_path = _resolve_backup_storage_layout(
-        task=task,
-        vm_name=vm_name,
-        parameters=parameters,
-        repository=repository,
-        vm_external_id=vm_id,
-    )
-    ensure_private_directory(task_root)
-    # Every repository now uses the .abr format. When no repository record is
-    # configured, treat it as a local-file repo rooted at the task directory so
-    # the abr command builders have a concrete context to work with.
-    if repository is None:
-        repository = {"type": "local", "id": ""}
-        repository_type = "local"
-
     transport_mode_value = parameters.get("transport_mode")
     if transport_mode_value is None or transport_mode_value == "":
         transport_mode = "nbdssl"
@@ -1485,6 +1499,23 @@ def run_vcenter_backup(
         )
     if incremental_fallback_metadata and query_changed_areas_only:
         raise VCenterBackupError("parameters.incremental_fallback_metadata cannot be combined with parameters.query_changed_areas_only")
+
+    storage_layout = _job_storage_layout(task, starts_new_chain=not changed_block_backup)
+    destination_root, task_root, repository_abr_path = _resolve_backup_storage_layout(
+        task=task,
+        vm_name=vm_name,
+        parameters=parameters,
+        repository=repository,
+        vm_external_id=vm_id,
+        layout=storage_layout,
+    )
+    ensure_private_directory(task_root)
+    # Every repository now uses the .abr format. When no repository record is
+    # configured, treat it as a local-file repo rooted at the task directory so
+    # the abr command builders have a concrete context to work with.
+    if repository is None:
+        repository = {"type": "local", "id": ""}
+        repository_type = "local"
 
     tool_path = Path(str(parameters.get("tool_path") or _default_tool_path())).expanduser()
     logger.debug(
@@ -1834,6 +1865,7 @@ def run_vcenter_backup(
                         task_root=task_root,
                         vm_external_id=str(vm_resource["external_id"]),
                         differential=differential,
+                        layout=storage_layout,
                     )
                 except VCenterBackupError as exc:
                     if not incremental_fallback_full or not _is_missing_parent_manifest_error(str(exc)):
@@ -2951,6 +2983,9 @@ def run_vcenter_backup(
                 "snapshot_moref": snapshot_moref,
                 "disks": disk_outputs,
                 "skipped_disks": skipped_disks,
+                "storage_layout": storage_layout,
+                "job_id": str(task.get("job_id") or ""),
+                "job_name": str((JOBS.get(str(task.get("job_id") or "")) or {}).get("name") or ""),
                 "repository_id": str(repository.get("id") or "") if isinstance(repository, dict) else "",
                 "repository_type": repository_type or "local",
                 "storage_mode": "s3" if repository_type == "s3" else "local",
@@ -3063,6 +3098,7 @@ def run_vcenter_backup(
             "disk_count": len(disk_outputs),
             "disks": disk_outputs,
             "skipped_disks": skipped_disks,
+            "storage_layout": storage_layout,
             "transport_mode": transport_mode,
             "compression_level": compression_level,
             "encryption_enabled": bool(encryption_algorithm),

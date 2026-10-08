@@ -745,6 +745,24 @@ class BackupServerApiFlowTests(unittest.TestCase):
         listed = self.client.get("/api/v1/jobs")
         self.assertFalse(any(item["name"] == "retention-zero-job" for item in listed.json()["items"]))
 
+    def test_new_and_copied_jobs_keep_their_backups_in_id_named_folders(self) -> None:
+        inventory = self._create_mock_inventory("test-layout-hv")
+        repository = self._create_repository("layout-repo", "local", path="/backup/layout")
+        source_job = self._create_backup_job(
+            name="layout-source",
+            inventory_id=inventory["id"],
+            vm_names=["vm-1"],
+            repo_id=repository["id"],
+        )
+        copied = self.client.post("/api/v1/jobs/copy", json={"name": "layout-copy", "source_id": source_job["id"]})
+        self.assertEqual(copied.status_code, 200, copied.text)
+        edited = self.client.patch(f"/api/v1/jobs/{source_job['id']}", json={"description": "renamed later"})
+        self.assertEqual(edited.status_code, 200, edited.text)
+
+        self.assertEqual(source_job["storage_layout"], "by_id")
+        self.assertEqual(copied.json()["storage_layout"], "by_id")
+        self.assertEqual(edited.json()["storage_layout"], "by_id")
+
     def test_job_create_copy_rejects_retention_days_zero(self) -> None:
         inventory = self._create_mock_inventory("test-retention-zero-copy-hv")
         repository = self._create_repository("retention-zero-copy-repo", "local", path="/backup/retention-zero-copy")
