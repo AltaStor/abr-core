@@ -10,6 +10,7 @@ from typing import Any
 from ..compact_help_formatter import CompactHelpFormatter
 from ..exit_codes import INVALID_STATE, VALIDATION_FAILED
 from ..parsing.common_arguments import add_name_or_id_selector
+from ..parsing.secret_arguments import ENCRYPTION_KEY_ENV_VAR, add_secret_argument
 from ..parsing.validators import (
     parse_compression_level,
     parse_day_of_month,
@@ -48,7 +49,7 @@ class JobCommands:
                 '  abr job create --name "Weekly-Full" --inventory "vCenter-Prod" --vms "sql-01,sql-02" '
                 '--repository "S3-Repo" --schedule weekly --days mon,thu --time 02:00\n'
                 '  abr job create --name "Encrypted-Job" --inventory "vCenter-Prod" --vm "sql-01" '
-                '--repository "S3-Repo" --set-encryption --encryption-key "correct-horse-battery-staple"\n'
+                '--repository "S3-Repo" --set-encryption\n'
                 '  abr job create --name "Nightly-With-Fulls" --inventory "vCenter-Prod" --vm "sql-01" '
                 '--repository "Local-Repo-1" --schedule daily --time 22:00 --retention-days 30 '
                 '--active-full-schedule monthly --active-full-day-of-month 1 --active-full-time 02:00 '
@@ -235,16 +236,21 @@ class JobCommands:
             encryption_state.add_argument(
                 "--set-encryption",
                 action="store_true",
-                help="Enable AES-256 encryption of backup data blocks. Requires --encryption-key.",
+                help=(
+                    "Enable AES-256 encryption of backup data blocks. The key is read from "
+                    f"{ENCRYPTION_KEY_ENV_VAR}, or prompted for (twice) when it is not set."
+                ),
             )
             encryption_state.add_argument(
                 "--reset-encryption",
                 action="store_true",
                 help="Disable encryption for this job.",
             )
-            parser.add_argument(
+            add_secret_argument(
+                parser,
                 "--encryption-key",
-                help="Encryption key/passphrase. Required together with --set-encryption.",
+                env_var=ENCRYPTION_KEY_ENV_VAR,
+                help_text="Encryption key/passphrase, used together with --set-encryption",
             )
         if include_policy_flags:
             parser.add_argument("--gfs-weekly", type=int, default=gfs_default, help="Weekly GFS count")

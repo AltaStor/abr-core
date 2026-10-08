@@ -1458,3 +1458,129 @@ class SourceDiskEagerZeroedTests(unittest.TestCase):
 
         self.assertEqual(disks[0]["source_disk_type_name"], "vmfs_thin")
         self.assertIsNone(disks[0]["source_disk_eager_zeroed"])
+
+
+class _FakeSoapResponse:
+    def __init__(self, status: int, body: str) -> None:
+        self.status = status
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body.encode("utf-8")
+
+
+class _FakeSoapConnection:
+    def __init__(self, response: _FakeSoapResponse, on_request) -> None:
+        self.response = response
+        self.on_request = on_request
+        self.requests: list[tuple[str, str, bytes, dict]] = []
+        self.closed = False
+
+    def request(self, method: str, path: str, body: bytes, headers: dict) -> None:
+        self.requests.append((method, path, body, headers))
+        self.on_request()
+
+    def getresponse(self) -> _FakeSoapResponse:
+        return self.response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeSoapStub:
+    cookie = 'vmware_soap_session="abc"'
+    versionId = '"urn:vim25/8.0.3.0"'
+    path = "/sdk"
+
+    def __init__(self, connection: _FakeSoapConnection) -> None:
+        self.connection = connection
+        self.returned = 0
+
+    def GetConnection(self) -> _FakeSoapConnection:
+        return self.connection
+
+    def ReturnConnection(self, connection: _FakeSoapConnection) -> None:
+        self.returned += 1
+
+
+class ReleaseAccessLockTests(unittest.TestCase):
+    def _node(self, disabled: list[str], status: int = 200, body: str = "<EnableMethodsResponse/>") -> tuple:
+        vm = types.SimpleNamespace(_moId="vm-42", _wsdlName="VirtualMachine", disabledMethod=list(disabled))
+
+        def lift() -> None:
+            if status == 200:
+                vm.disabledMethod = [method for method in vm.disabledMethod if method != "RelocateVM_Task"]
+
+        connection = _FakeSoapConnection(_FakeSoapResponse(status, body), lift)
+        stub = _FakeSoapStub(connection)
+        node = VCenterNode("vc.local", "administrator", "secret")
+        node.si = types.SimpleNamespace(
+            _stub=stub,
+            RetrieveContent=lambda: types.SimpleNamespace(
+                authorizationManager=types.SimpleNamespace(_moId="AuthorizationManager")
+            ),
+        )
+        node._vm_holding_access_lock = lambda vm_name, vm_moref: vm
+        return node, vm, connection, stub
+
+    def test_a_vm_that_a_data_mover_left_blocked_is_re_enabled(self) -> None:
+        node, vm, connection, stub = self._node(["PowerOnVM_Task", "RelocateVM_Task"])
+
+        self.assertTrue(node.release_access_lock("web01", "vm-42"))
+
+        self.assertEqual(vm.disabledMethod, ["PowerOnVM_Task"])
+        method, path, body, headers = connection.requests[0]
+        self.assertEqual((method, path), ("POST", "/sdk"))
+        text = body.decode("utf-8")
+        self.assertIn('<_this type="AuthorizationManager">AuthorizationManager</_this>', text)
+        self.assertIn('<entity type="VirtualMachine">vm-42</entity>', text)
+        self.assertIn("<method>RelocateVM_Task</method>", text)
+        self.assertIn("<sourceId>abr-vmdk-tool</sourceId>", text)
+        self.assertEqual(headers["SOAPAction"], '"urn:vim25/8.0.3.0"')
+        self.assertEqual(headers["Cookie"], 'vmware_soap_session="abc"')
+        self.assertEqual(stub.returned, 1)
+
+    def test_a_vm_without_the_block_is_left_untouched(self) -> None:
+        node, vm, connection, _stub = self._node(["PowerOnVM_Task"])
+
+        self.assertFalse(node.release_access_lock("web01", "vm-42"))
+        self.assertEqual(connection.requests, [])
+
+    def test_a_vm_that_is_gone_has_nothing_to_release(self) -> None:
+        node, _vm, connection, _stub = self._node(["RelocateVM_Task"])
+        node._vm_holding_access_lock = lambda vm_name, vm_moref: None
+
+        self.assertFalse(node.release_access_lock("web01", "vm-42"))
+        self.assertEqual(connection.requests, [])
+
+    def test_a_fault_from_vcenter_is_raised_with_its_text(self) -> None:
+        node, vm, _connection, _stub = self._node(
+            ["RelocateVM_Task"],
+            status=500,
+            body="<soapenv:Fault><faultstring>Permission to perform this operation was denied.</faultstring></soapenv:Fault>",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Permission to perform this operation was denied"):
+            node.release_access_lock("web01", "vm-42")
+        self.assertIn("RelocateVM_Task", vm.disabledMethod)
+
+    def test_a_block_that_vcenter_keeps_is_reported(self) -> None:
+        node, vm, connection, _stub = self._node(["RelocateVM_Task"])
+        connection.on_request = lambda: None
+
+        with self.assertRaisesRegex(RuntimeError, "still blocks RelocateVM_Task"):
+            node.release_access_lock("web01", "vm-42")
+
+    def test_a_broken_connection_is_closed_not_returned_to_the_pool(self) -> None:
+        node, _vm, connection, stub = self._node(["RelocateVM_Task"])
+
+        def broken() -> None:
+            raise OSError("connection reset")
+
+        connection.on_request = broken
+
+        with self.assertRaises(OSError):
+            node.release_access_lock("web01", "vm-42")
+        self.assertTrue(connection.closed)
+        self.assertEqual(stub.returned, 0)
+

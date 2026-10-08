@@ -321,6 +321,7 @@ def run_synthetic_full(
 ) -> dict[str, Any]:
     from python.srv.plugins.vcenter.vcenter_backup import (
         _dir_size_bytes,
+        _job_storage_layout,
         _resolve_backup_storage_layout,
         _resolve_compression_level,
         _resolve_encryption_settings,
@@ -365,8 +366,14 @@ def run_synthetic_full(
     merges = build_disk_merges(points)
 
     vm_name = str(points[-1].get("vm_name") or parameters.get("vm_name") or vm_id)
+    storage_layout = _job_storage_layout(task, starts_new_chain=True)
     _destination_root, task_root, destination_path = _resolve_backup_storage_layout(
-        task=task, vm_name=vm_name, parameters=parameters, repository=repository
+        task=task,
+        vm_name=vm_name,
+        parameters=parameters,
+        repository=repository,
+        vm_external_id=vm_id,
+        layout=storage_layout,
     )
     free_at_start = _free_bytes_at_start(repository)
     if not is_s3_repository(repository):
@@ -419,7 +426,9 @@ def run_synthetic_full(
 
     def _emit(progress: int, message: str) -> None:
         if progress_callback is not None:
-            progress_callback({"progress": max(0, min(100, progress)), "message": message})
+            progress_callback(
+                {"progress": max(0, min(100, progress)), "message": message, "backup_root": str(task_root)}
+            )
 
     target_name = str(repository.get("name") or repository_id)
     source_name = str(source_repository.get("name") or source_repository_id)
@@ -531,6 +540,7 @@ def run_synthetic_full(
             "backup_mode": "full",
             "resolved_backup_type": "SyntheticFull",
             "resolved_backup_reason": str(parameters.get("resolved_backup_reason") or "SyntheticFullWindow"),
+            "storage_layout": storage_layout,
             "incremental": False,
             "differential": False,
             "synthetic_full": True,
@@ -579,6 +589,7 @@ def run_synthetic_full(
         "backup_mode": "full",
         "resolved_backup_type": "SyntheticFull",
         "resolved_backup_reason": str(parameters.get("resolved_backup_reason") or "SyntheticFullWindow"),
+        "storage_layout": storage_layout,
         "incremental": False,
         "synthetic_full": True,
         "merged_restore_point_ids": [str(point.get("id") or "") for point in points],

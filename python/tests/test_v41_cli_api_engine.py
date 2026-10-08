@@ -1209,6 +1209,26 @@ class AbrV41EngineTests(unittest.TestCase):
         self.assertEqual(task["parameters"]["restore_mode"], "in_place")
         self.assertTrue(task["parameters"]["force"])
 
+    def test_restore_start_in_place_refuses_a_network_mapping(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture()
+        for selection in (
+            {"nic_network_map": ["Network adapter 1=VM Network"]},
+            {"network_map": ["VM Network=VM Network"]},
+            {"network_mappings": [{"source_nic_id": "nic-1", "target_network_id": "net-1"}]},
+        ):
+            with self.subTest(selection=selection), self.assertRaises(ApiError) as ctx:
+                abr_v41.restore_start({"restore_point_id": point_id, "restore_mode": "in_place", "force": True, **selection})
+            self.assertEqual((ctx.exception.code, ctx.exception.status_code), ("invalid_restore", 422))
+            self.assertIn("In-place restore", ctx.exception.message)
+        self.assertEqual(TASKS, {})
+
+    def test_restore_start_in_place_without_a_network_mapping_still_starts(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture()
+        session = abr_v41.restore_start(
+            {"restore_point_id": point_id, "restore_mode": "in_place", "force": True, "network_map": [], "nic_network_map": []}
+        )
+        self.assertEqual(TASKS[session["id"]]["parameters"]["restore_mode"], "in_place")
+
     def test_restore_session_dto_names_the_restored_vm(self) -> None:
         _inventory, point_id = self._register_in_place_fixture()
 
@@ -3051,9 +3071,8 @@ class AbrV41EngineTests(unittest.TestCase):
                     }
                 )
 
-        self.assertEqual(ctx.exception.code, "network_adapter_not_found")
-        # 404 is what the CLI maps to exit code 3 (see cli_error_from_exception).
-        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.code, "invalid_restore")
+        self.assertEqual(ctx.exception.status_code, 422)
         # A pre-flight check that lets the flight start anyway is not one:
         # the failed validation must not have created a restore session.
         self.assertEqual(TASKS, {})
@@ -3341,6 +3360,113 @@ class AbrV41EngineTests(unittest.TestCase):
             [(item["index"], item["source_network"], item["target_network"]) for item in adapter_map],
             [(0, "VM Network", "VM Network"), (1, "VM Network", "BMC_Network")],
         )
+
+    def _shared_source_network_point(self, point_id: str, tmpdir: str) -> dict[str, object]:
+        inventory = self._two_host_network_inventory(point_id, tmpdir, source_host="esx-02.local")
+        manifest_path = f"{tmpdir}/manifest.json"
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        for adapter in manifest["vm_config"]["network_adapters"]:
+            adapter["network"] = "VM Network"
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        return inventory
+
+    def _restore_to_esx02(self, point_id: str, inventory: dict[str, object], **selection: object) -> dict[str, object]:
+        return abr_v41.restore_start(
+            {
+                "restore_point_id": point_id,
+                "target": {
+                    "inventory_id": inventory["id"],
+                    "host_id": "esx-02.local",
+                    "datastore_id": f"{inventory['id']}::datastore::tstds",
+                    "vm_name": "restoredtstvm",
+                },
+                **selection,
+            }
+        )
+
+    def test_restore_start_applies_the_network_map_to_adapters_the_adapter_flag_leaves_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._shared_source_network_point("p-nic-and-map", tmpdir)
+            session = self._restore_to_esx02(
+                "p-nic-and-map",
+                inventory,
+                network_map=["VM Network=BMC_Network"],
+                nic_network_map=["Network adapter 1=VM Network"],
+            )
+
+        adapter_map = TASKS[session["id"]]["parameters"]["network_adapter_map"]
+        self.assertEqual(
+            [(item["index"], item["source_network"], item["target_network"]) for item in adapter_map],
+            [(0, "VM Network", "VM Network"), (1, "VM Network", "BMC_Network")],
+        )
+
+    def test_restore_start_applies_the_network_map_next_to_rest_adapter_mappings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._shared_source_network_point("p-rest-and-map", tmpdir)
+            source_nics = abr_v41.get_restore_context("p-rest-and-map")["source_vm"]["nics"]
+            session = self._restore_to_esx02(
+                "p-rest-and-map",
+                inventory,
+                network_map=["VM Network=BMC_Network"],
+                network_mappings=[
+                    {"source_nic_id": source_nics[1]["id"], "target_network_id": f"{inventory['id']}::network::VM Network"}
+                ],
+            )
+
+        adapter_map = TASKS[session["id"]]["parameters"]["network_adapter_map"]
+        self.assertEqual(
+            [(item["index"], item["target_network"]) for item in adapter_map],
+            [(0, "BMC_Network"), (1, "VM Network")],
+        )
+
+    def test_restore_start_puts_the_adapter_flag_first_and_same_named_networks_last(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._two_host_network_inventory("p-nic-partial", tmpdir, source_host="esx-02.local")
+            session = self._restore_to_esx02(
+                "p-nic-partial",
+                inventory,
+                network_map=["DMZ=VM Network"],
+                nic_network_map=["Network adapter 2=BMC_Network"],
+            )
+
+        adapter_map = TASKS[session["id"]]["parameters"]["network_adapter_map"]
+        self.assertEqual(
+            [(item["index"], item["source_network"], item["target_network"]) for item in adapter_map],
+            [(0, "VM Network", "VM Network"), (1, "DMZ", "BMC_Network")],
+        )
+
+    def _refusal_with_adapters_placed(self, point_id: str, network_map: list[str]) -> ApiError:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._shared_source_network_point(point_id, tmpdir)
+            with self.assertRaises(ApiError) as ctx:
+                self._restore_to_esx02(
+                    point_id, inventory, network_map=network_map, nic_network_map=["Network adapter 1=VM Network"]
+                )
+        self.assertEqual(TASKS, {})
+        return ctx.exception
+
+    def test_restore_start_checks_the_network_map_source_when_adapters_are_placed_too(self) -> None:
+        error = self._refusal_with_adapters_placed("p-nic-map-typo", ["No Such Network=BMC_Network"])
+        self.assertEqual((error.code, error.status_code), ("invalid_restore", 422))
+
+    def test_restore_start_checks_the_network_map_target_when_adapters_are_placed_too(self) -> None:
+        error = self._refusal_with_adapters_placed("p-nic-map-off-host", ["VM Network=DMZ"])
+        self.assertEqual((error.code, error.status_code), ("network_not_found", 404))
+        self.assertIn("not available on the selected host", error.message)
+
+    def test_restore_start_refuses_an_unknown_source_adapter_as_an_invalid_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inventory = self._shared_source_network_point("p-nic-unknown", tmpdir)
+            for selection in (
+                {"nic_network_map": ["Network adapter 9=VM Network"]},
+                {"network_mappings": [{"source_nic_id": "no-such-nic", "target_network_id": f"{inventory['id']}::network::VM Network"}]},
+            ):
+                with self.subTest(selection=selection), self.assertRaises(ApiError) as ctx:
+                    self._restore_to_esx02("p-nic-unknown", inventory, **selection)
+                self.assertEqual((ctx.exception.code, ctx.exception.status_code), ("invalid_restore", 422))
+        self.assertEqual(TASKS, {})
 
     def _two_disk_one_datastore_point(self, point_id: str, tmpdir: str) -> dict[str, object]:
         inventory = abr_v41.create_inventory_record(

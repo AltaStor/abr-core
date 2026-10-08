@@ -9,6 +9,7 @@ from typing import Any
 
 from ..compact_help_formatter import CompactHelpFormatter
 from ..exit_codes import INVALID_STATE
+from ..parsing.secret_arguments import ENCRYPTION_KEY_ENV_VAR, add_secret_argument, resolve_secret
 from ..models.views import human_size
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
@@ -65,12 +66,13 @@ class BackupCommands:
             parser = commands.add_parser(name, help=help_text, description=description, formatter_class=CompactHelpFormatter)
             parser.add_argument("--id", required=True, help="Backup chain ID")
             if name == "verify":
-                parser.add_argument(
+                add_secret_argument(
+                    parser,
                     "--encryption-key",
-                    dest="encryption_key",
-                    help=(
+                    env_var=ENCRYPTION_KEY_ENV_VAR,
+                    help_text=(
                         "Decryption key to check against the chain. Overrides the key stored with the job and with "
-                        "the restore points; the data checksums are verified either way."
+                        "the restore points; the data checksums are verified either way"
                     ),
                 )
             if name == "delete":
@@ -158,7 +160,10 @@ class BackupCommands:
         if not str(args.id or "").strip():
             raise ValueError("Backup selection requires a non-empty --id")
         deps = CommandDependencies(args)
-        encryption_key = str(getattr(args, "encryption_key", None) or "").strip()
+        encryption_key = str(
+            resolve_secret(getattr(args, "encryption_key", None), env_var=ENCRYPTION_KEY_ENV_VAR, prompt="Encryption key")
+            or ""
+        ).strip()
         started = deps.context.api_client.post(
             f"api/v1/backups/{args.id}/verify",
             json={"encryption_key": encryption_key} if encryption_key else None,

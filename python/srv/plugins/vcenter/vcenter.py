@@ -2,6 +2,7 @@
 # Copyright © 2026 Norvitex OÜ
 
 import functools
+import re
 import socket
 import hashlib
 import logging
@@ -11,6 +12,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar
+from xml.sax.saxutils import escape
 
 from pyVim.connect import Disconnect, SmartConnect
 from pyVmomi import vim, vmodl
@@ -26,6 +28,9 @@ from .vcenter_disk_types import (
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+ACCESS_LOCK_METHOD = "RelocateVM_Task"
+ACCESS_LOCK_SOURCE = "abr-vmdk-tool"
 
 
 def _keepalive_interval_seconds() -> int:
@@ -578,6 +583,7 @@ class VCenterNode(Hypervisor):
                     "datastore_path": source_path,
                     "current_datastore_path": current_path,
                     "uuid": getattr(device.backing, "uuid", None),
+                    "disk_mode": str(getattr(device.backing, "diskMode", "") or ""),
                     "source_disk_type_code": disk_type_code,
                     "source_disk_type_name": disk_type_name,
                     "source_disk_eager_zeroed": classify_vmware_disk_eager_zeroed(
@@ -623,6 +629,14 @@ class VCenterNode(Hypervisor):
                 f"'{host_name or 'unknown'}' is {connection_state} in vCenter, not connected. "
                 "Reconnect the host in vCenter (or wait for it to reconnect) and retry the backup."
             )
+
+    def vm_host_name(self, vm_name: str) -> Optional[str]:
+        try:
+            vm = self._get_vm(vm_name)
+            host = getattr(getattr(vm, "runtime", None), "host", None) if vm else None
+            return str(getattr(host, "name", "") or "") or None
+        except Exception:
+            return None
 
     def create_backup_snapshot(self, vm_name: str) -> str:
         vm = self._get_vm(vm_name)
@@ -1271,6 +1285,61 @@ class VCenterNode(Hypervisor):
             "requested_secure_boot": bool(requested_secure_boot) if requested_secure_boot is not None else None,
             "network_adapters": restored_adapters,
         }
+
+    def _vm_holding_access_lock(self, vm_name: str, vm_moref: str | None) -> Optional[Any]:
+        if vm_moref:
+            vm = vim.VirtualMachine(vm_moref, self.si._stub)
+            try:
+                vm.name
+            except vmodl.fault.ManagedObjectNotFound:
+                return None
+            return vm
+        return self._get_vm(vm_name)
+
+    def _enable_methods(self, entity: Any, methods: List[str]) -> None:
+        stub = self.si._stub
+        content = self.si.RetrieveContent()
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Body>'
+            '<EnableMethods xmlns="urn:vim25">'
+            f'<_this type="AuthorizationManager">{escape(content.authorizationManager._moId)}</_this>'
+            f'<entity type="{escape(entity._wsdlName)}">{escape(entity._moId)}</entity>'
+            + "".join(f"<method>{escape(method)}</method>" for method in methods)
+            + f"<sourceId>{escape(ACCESS_LOCK_SOURCE)}</sourceId>"
+            "</EnableMethods></soapenv:Body></soapenv:Envelope>"
+        ).encode("utf-8")
+        headers = {
+            "Cookie": stub.cookie,
+            "SOAPAction": stub.versionId,
+            "Content-Type": "text/xml; charset=utf-8",
+        }
+        connection = stub.GetConnection()
+        try:
+            connection.request("POST", stub.path, body, headers)
+            response = connection.getresponse()
+            payload = response.read().decode("utf-8", errors="replace")
+        except Exception:
+            connection.close()
+            raise
+        stub.ReturnConnection(connection)
+        if response.status != 200:
+            fault = re.search(r"<faultstring>(.*?)</faultstring>", payload, re.S)
+            raise RuntimeError(
+                f"vCenter refused to re-enable {', '.join(methods)}: "
+                f"{fault.group(1).strip() if fault else f'HTTP {response.status}'}"
+            )
+
+    @_retry_on_expired_session
+    def release_access_lock(self, vm_name: str, vm_moref: str | None = None) -> bool:
+        vm = self._vm_holding_access_lock(vm_name, vm_moref)
+        if vm is None or ACCESS_LOCK_METHOD not in list(vm.disabledMethod or []):
+            return False
+        self._enable_methods(vm, [ACCESS_LOCK_METHOD])
+        if ACCESS_LOCK_METHOD in list(vm.disabledMethod or []):
+            raise RuntimeError(f"vCenter still blocks {ACCESS_LOCK_METHOD} on VM '{vm_name}' after it was re-enabled")
+        logger.info("Re-enabled %s on VM '%s', which a data mover left disabled.", ACCESS_LOCK_METHOD, vm_name)
+        return True
 
     def remove_snapshot(self, vm_name: str, snapshot_name: str) -> None:
         vm = self._get_vm(vm_name)

@@ -868,5 +868,42 @@ class LegacyFullDayMigrationTests(unittest.TestCase):
         self.assertIsNone(job["synthetic_full_schedule"])
 
 
+
+class AccessLockRetryTests(unittest.TestCase):
+    def test_the_retry_waits_for_its_interval_and_never_overlaps_itself(self) -> None:
+        import threading
+
+        scheduler = JobScheduler()
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_sweep() -> int:
+            started.set()
+            release.wait(5)
+            return 0
+
+        with patch.dict("os.environ", {"BACKUPSERVER_ACCESS_LOCK_RETRY_SECONDS": "60"}), patch(
+            "python.srv.services.backup_catalog.release_pending_access_locks", side_effect=slow_sweep
+        ) as sweep, patch("python.srv.core.job_scheduler.time.monotonic") as clock:
+            clock.return_value = scheduler._access_lock_sweep_at + 30
+            scheduler._retry_access_locks()
+            self.assertIsNone(scheduler._access_lock_sweep)
+
+            clock.return_value = scheduler._access_lock_sweep_at + 61
+            scheduler._retry_access_locks()
+            self.assertTrue(started.wait(5))
+
+            clock.return_value += 120
+            scheduler._retry_access_locks()
+            self.assertEqual(sweep.call_count, 1)
+
+            release.set()
+            scheduler._access_lock_sweep.join(5)
+            clock.return_value += 61
+            scheduler._retry_access_locks()
+            scheduler._access_lock_sweep.join(5)
+            self.assertEqual(sweep.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -267,7 +267,8 @@ class RestoreNicNetworkPlacementTests(unittest.TestCase):
     def test_an_adapter_the_restore_point_does_not_carry_is_refused(self) -> None:
         with self.assertRaises(ApiError) as error:
             self._resolve(["Network adapter 9=DMZ"])
-        self.assertEqual(error.exception.code, "network_adapter_not_found")
+        self.assertEqual(error.exception.code, "invalid_restore")
+        self.assertEqual(error.exception.status_code, 422)
 
     def test_an_adapter_placed_twice_to_different_targets_is_refused(self) -> None:
         with self.assertRaises(ApiError) as error:

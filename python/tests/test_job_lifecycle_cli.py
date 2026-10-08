@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from python.cli.cli_context import CliContext
 from python.cli.cli_output_renderer import CliOutputRenderer
+from python.cli.errors import CliStructuredError
 from python.cli.commands.job_commands import JobCommands
 from python.cli.exit_codes import INVALID_STATE
 from python.cli.parsing.parser_builder import AltaStorParserBuilder
@@ -712,8 +713,9 @@ class JobPayloadBuilderTests(unittest.TestCase):
     def test_create_backup_job_payload_rejects_set_encryption_without_key(self) -> None:
         args = self._base_create_args(set_encryption=True)
 
-        with self.assertRaisesRegex(ValueError, "--set-encryption requires --encryption-key"):
-            self.service.create_backup_job_payload(args)
+        with patch.dict("os.environ", {}, clear=True), patch("getpass.getpass", side_effect=EOFError):
+            with self.assertRaisesRegex(CliStructuredError, "No encryption key provided; set ABR_ENCRYPTION_KEY"):
+                self.service.create_backup_job_payload(args)
 
     def test_create_backup_job_payload_sends_explicit_zero_retention_days_as_is(self) -> None:
         args = self._base_create_args(retention_days=0)
@@ -818,8 +820,9 @@ class JobPayloadBuilderTests(unittest.TestCase):
     def test_create_payload_still_requires_a_key_with_set_encryption(self) -> None:
         args = self._base_create_args(set_encryption=True)
 
-        with self.assertRaisesRegex(ValueError, "requires --encryption-key"):
-            self.service.create_backup_job_payload(args)
+        with patch.dict("os.environ", {"ABR_ENCRYPTION_KEY": "   "}, clear=True):
+            with self.assertRaisesRegex(ValueError, "requires --encryption-key"):
+                self.service.create_backup_job_payload(args)
 
     def test_edit_payload_passes_through_preparsed_full_days(self) -> None:
         args = self._base_edit_args(active_full_days=["Sun"], synthetic_full_days=["Mon", "Wed"])
@@ -1749,6 +1752,34 @@ class JobStartWaitTests(unittest.TestCase):
 
         self.assertEqual(json.loads(stream.getvalue())["state"], "failed")
         self.assertEqual(exit_code, INVALID_STATE)
+
+
+class JobCurrentVmNameTests(unittest.TestCase):
+    def setUp(self) -> None:
+        RESOURCES_BY_HV.clear()
+        self.addCleanup(RESOURCES_BY_HV.clear)
+        RESOURCES_BY_HV["inv-1"] = {
+            ("virtual_machine", "vm-uuid-1"): {"resource_type": "virtual_machine", "external_id": "vm-uuid-1", "name": "web01-renamed"},
+        }
+        self.job = abr_v41.normalize_job_record(
+            {
+                "id": "job-1",
+                "name": "Nightly",
+                "inventory_id": "inv-1",
+                "vm_ids": ["vm-uuid-1", "vm-uuid-gone"],
+                "vm_names": ["web01", "db01"],
+            }
+        )
+
+    def test_a_renamed_vm_is_shown_under_its_current_name(self) -> None:
+        dto = abr_v41.job_to_dto(self.job)
+        self.assertEqual(dto["vm_ids"], ["vm-uuid-1", "vm-uuid-gone"])
+        self.assertEqual(dto["vm_names"], ["web01-renamed", "db01"])
+        self.assertEqual(dto["vms"], [{"id": "vm-uuid-1", "name": "web01-renamed"}, {"id": "vm-uuid-gone", "name": "db01"}])
+
+    def test_a_vm_missing_from_the_inventory_keeps_its_stored_name(self) -> None:
+        RESOURCES_BY_HV.clear()
+        self.assertEqual(abr_v41._job_vm_current_names(self.job), ["web01", "db01"])
 
 
 if __name__ == "__main__":

@@ -64,6 +64,8 @@ from python.srv.core.secure_archive import (
 from python.srv.core.storage_tool import (
     IMMUTABILITY_MODES,
     IMMUTABILITY_RETENTION_SCOPES,
+    STORAGE_LAYOUT_BY_ID,
+    STORAGE_LAYOUT_BY_NAME,
     StorageToolError,
     apply_repository_immutability,
     build_s3_location,
@@ -3799,12 +3801,13 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
             "id": normalized.get("inventory_id") or None,
             "name": normalized.get("inventory_name") or None,
         },
+        "storage_layout": str(normalized.get("storage_layout") or STORAGE_LAYOUT_BY_NAME),
         "vm_ids": list(normalized.get("vm_ids") or []),
-        "vm_names": list(normalized.get("vm_names") or []),
+        "vm_names": _job_vm_current_names(normalized) if len(normalized.get("vm_ids") or []) == len(normalized.get("vm_names") or []) else list(normalized.get("vm_names") or []),
         "vm_count": int(normalized.get("vm_count") or 0),
         "vms": [
             {"id": vm_id or None, "name": vm_name or None}
-            for vm_id, vm_name in zip(normalized.get("vm_ids") or [], normalized.get("vm_names") or [])
+            for vm_id, vm_name in zip(normalized.get("vm_ids") or [], _job_vm_current_names(normalized))
         ],
         "repository": {
             "id": normalized.get("repo_id") or None,
@@ -4030,6 +4033,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_next_run_at": _execution_schedule_next_run(synthetic_full_schedule) if base_is_enabled else None,
         "description": description,
         "task_parameters": dict(task_parameters),
+        "storage_layout": STORAGE_LAYOUT_BY_ID,
         "enabled": job_enabled,
         "status": "active" if job_enabled else "disabled",
         "created_at": now,
@@ -4097,6 +4101,7 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_schedule": _json_clone(source_job.get("synthetic_full_schedule")),
         "description": description,
         "task_parameters": dict(source_task_parameters),
+        "storage_layout": STORAGE_LAYOUT_BY_ID,
         "enabled": job_enabled,
         "status": "active" if job_enabled else "disabled",
         "created_at": now,
@@ -4475,6 +4480,56 @@ def resolve_job_execution(
         return "SyntheticFull", "SyntheticFullWindow"
     return "Incremental", "StandardIncremental"
 
+
+def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
+    if str(task.get("task_type") or "") != "backup":
+        return task
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    job_id = str(task.get("job_id") or "")
+    if not job_id or job_id not in JOBS or parameters.get("copy_job") or parameters.get("requires_task_id"):
+        return task
+    queued_type = str(parameters.get("resolved_backup_type") or "")
+    queued_reason = str(parameters.get("resolved_backup_reason") or "")
+    if queued_reason in {"ForceFull", "ForceSynthetic"}:
+        return task
+    job = resolve_job(record_id=job_id)
+    vm_id = str(task.get("resource_external_id") or "")
+    has_point = _latest_successful_point(job_id, vm_id, str(job.get("repo_id") or "") or None) is not None
+    if queued_reason == "FirstRun" and has_point:
+        execution_type, execution_reason = resolve_job_execution(job, vm_id=vm_id, force_full=False)
+        if execution_type == "SyntheticFull":
+            execution_type, execution_reason = "Incremental", "StandardIncremental"
+    elif queued_type in {"Incremental", "SyntheticFull"} and not has_point:
+        execution_type, execution_reason = "ActiveFull", "FirstRun"
+    else:
+        return task
+    if (execution_type, execution_reason) == (queued_type, queued_reason):
+        return task
+    parameters.update(
+        {
+            "resolved_backup_type": execution_type,
+            "resolved_backup_reason": execution_reason,
+            "backup_mode_request": "full" if execution_type in {"ActiveFull", "SyntheticFull"} else "auto",
+            "incremental": execution_type == "Incremental",
+            "synthetic_full": execution_type == "SyntheticFull",
+            "active_full": execution_type == "ActiveFull",
+        }
+    )
+    task["parameters"] = parameters
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    result.update({"resolved_backup_type": execution_type, "resolved_backup_reason": execution_reason})
+    task["result"] = result
+    _append_task_log(
+        task,
+        level="info",
+        message=(
+            f"Runs as {execution_type} ({execution_reason}), decided when it started: it was queued as "
+            f"{queued_type} ({queued_reason}), and the backup chain has changed since"
+        ),
+        component="session",
+    )
+    persist_task(task)
+    return task
 
 def _point_period_key(point: dict[str, Any], *, kind: str) -> str:
     created = _parse_dt(point.get("created_at"))
@@ -5247,6 +5302,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "compression_ratio": point.get("compression_ratio"),
             "compression_level": point.get("compression_level"),
             "encryption_enabled": point.get("encryption_enabled"),
+            "skipped_disks": _restore_point_artifact(point).get("skipped_disks") or [],
         }
         for point in points
     ]
@@ -6435,6 +6491,7 @@ def restore_point_to_dto(point: dict[str, Any]) -> dict[str, Any]:
         "status": point.get("status"),
         "available": _restore_point_is_available(point),
         "gfs_marks": point.get("gfs_marks"),
+        "skipped_disks": _restore_point_artifact(point).get("skipped_disks") or [],
     }
 
 
@@ -7318,8 +7375,8 @@ def _resolve_restore_nic_network_mappings(
         nic = nic_by_identifier.get(requested_nic.lower())
         _ensure(
             nic is not None,
-            404,
-            "network_adapter_not_found",
+            422,
+            "invalid_restore",
             "Adapter placement names an adapter this restore point does not carry",
             adapter=requested_nic,
             adapters=[{"id": item.get("id"), "label": item.get("label")} for item in nics],
@@ -7548,6 +7605,16 @@ def _resolve_restore_network_selection(
     target_network_ids = {str(item.get("id") or ""): item for item in target_networks}
     target_network_names = {str(item.get("name") or ""): item for item in target_networks}
 
+    legacy = _parse_restore_network_map(legacy_network_map)
+    _ensure_restore_network_map_targets(
+        legacy,
+        source_networks=source_networks,
+        target_networks=target_networks,
+        off_host_names=off_host_names,
+        target_inventory_id=target_inventory_id,
+        host=host,
+    )
+
     if mappings:
         resolved: dict[str, str] = {}
         adapter_targets: dict[int, dict[str, Any]] = {}
@@ -7564,7 +7631,7 @@ def _resolve_restore_network_selection(
             _ensure(bool(source_nic_id and target_network_id), 422, "invalid_restore", "Each network mapping requires source_nic_id and target_network_id")
             _collect_restore_mapping(requested_targets, source_nic_id, target_network_id, flag="--nic-network")
             position, source_nic = source_index.get(source_nic_id) or (None, None)
-            _ensure(source_nic is not None, 404, "network_adapter_not_found", "Source network adapter not found", source_nic_id=source_nic_id)
+            _ensure(source_nic is not None, 422, "invalid_restore", "Source network adapter not found", source_nic_id=source_nic_id)
             source_network = str(source_nic.get("source_network") or "").strip()
             _ensure(bool(source_network), 422, "invalid_restore", "Source network adapter is missing a source network", source_nic_id=source_nic_id)
             target_network = target_network_ids.get(target_network_id)
@@ -7590,15 +7657,16 @@ def _resolve_restore_network_selection(
             if position in adapter_targets:
                 continue
             source_network = str(item.get("source_network") or "").strip()
-            if not source_network or source_network not in target_network_names:
+            target_network_name = legacy.get(source_network) or (source_network if source_network in target_network_names else "")
+            if not source_network or not target_network_name:
                 continue
             adapter_targets[position] = {
                 "index": position,
                 "label": item.get("label"),
                 "source_network": source_network,
-                "target_network": source_network,
+                "target_network": target_network_name,
             }
-            resolved.setdefault(source_network, source_network)
+            resolved.setdefault(source_network, target_network_name)
         missing = [
             str(item.get("label") or item.get("id") or "network adapter")
             for position, item in enumerate(source_nics)
@@ -7607,30 +7675,7 @@ def _resolve_restore_network_selection(
         _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for all source adapters", adapters=missing)
         return resolved, [adapter_targets[position] for position in sorted(adapter_targets)]
 
-    legacy = _parse_restore_network_map(legacy_network_map)
     if legacy:
-        source_network_set = set(source_networks)
-        for source_network, target_network_name in legacy.items():
-            _ensure(
-                source_network in source_network_set,
-                404,
-                "network_adapter_not_found",
-                "Source network not found on this VM",
-                source_network=source_network,
-            )
-            if target_networks and target_network_name not in target_network_names:
-                raise api_error(
-                    404,
-                    "network_not_found",
-                    (
-                        "Target network is not available on the selected host"
-                        if target_network_name in off_host_names
-                        else "Target network not found in inventory"
-                    ),
-                    inventory_id=target_inventory_id,
-                    host=(host or {}).get("name"),
-                    network=target_network_name,
-                )
         legacy = {
             **{
                 source_network: source_network
@@ -7651,6 +7696,41 @@ def _resolve_restore_network_selection(
     missing = [source_network for source_network in source_networks if source_network and source_network not in automatic]
     _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for the selected restore target", networks=missing)
     return automatic, []
+
+
+def _ensure_restore_network_map_targets(
+    legacy: dict[str, str],
+    *,
+    source_networks: list[str],
+    target_networks: list[dict[str, Any]],
+    off_host_names: set[str],
+    target_inventory_id: str,
+    host: dict[str, Any] | None,
+) -> None:
+    source_network_set = set(source_networks)
+    target_network_names = {str(item.get("name") or "") for item in target_networks}
+    for source_network, target_network_name in legacy.items():
+        _ensure(
+            source_network in source_network_set,
+            422,
+            "invalid_restore",
+            "Network map names a source network this restore point does not carry",
+            source_network=source_network,
+            networks=sorted(source_network_set),
+        )
+        if target_networks and target_network_name not in target_network_names:
+            raise api_error(
+                404,
+                "network_not_found",
+                (
+                    "Target network is not available on the selected host"
+                    if target_network_name in off_host_names
+                    else "Target network not found in inventory"
+                ),
+                inventory_id=target_inventory_id,
+                host=(host or {}).get("name"),
+                network=target_network_name,
+            )
 
 
 def _parse_restore_network_map(value: Any) -> dict[str, str]:
@@ -7881,6 +7961,15 @@ def _ensure_chain_can_be_merged(job: dict[str, Any]) -> None:
             ) from exc
 
 
+def _job_vm_current_names(job: dict[str, Any]) -> list[str]:
+    discovered = RESOURCES_BY_HV.get(str(job.get("inventory_id") or ""), {})
+    names: list[str] = []
+    for vm_id, stored_name in zip(job.get("vm_ids") or [], job.get("vm_names") or []):
+        resource = discovered.get(("virtual_machine", str(vm_id)))
+        names.append(str((resource or {}).get("name") or stored_name))
+    return names
+
+
 def start_job_record(
     job_id: str,
     *,
@@ -7917,7 +8006,7 @@ def start_job_record(
     if job["job_type"] == "backup-copy":
         sessions.append(_create_completed_copy_session(job))
     else:
-        for vm_id, vm_name in zip(job.get("vm_ids") or [], job.get("vm_names") or []):
+        for vm_id, vm_name in zip(job.get("vm_ids") or [], _job_vm_current_names(job)):
             execution_type, execution_reason = resolve_job_execution(
                 job, vm_id=vm_id, force_full=force_full, force_synthetic=force_synthetic
             )
@@ -8218,6 +8307,17 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             vm_name=target_vm_name,
         )
 
+    _ensure(
+        restore_mode != "in_place"
+        or not (
+            request.get("network_mappings")
+            or _parse_restore_network_map(request.get("legacy_network_map"))
+            or request.get("nic_network_map")
+        ),
+        422,
+        "invalid_restore",
+        "In-place restore keeps every network adapter on its own network and cannot take a network mapping",
+    )
     requested_network_mappings = [
         *(request.get("network_mappings") if isinstance(request.get("network_mappings"), list) else []),
         *_resolve_restore_nic_network_mappings(

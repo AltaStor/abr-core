@@ -7,6 +7,7 @@ import copy
 from typing import Any
 
 from ..cli_context import CliContext
+from ..parsing.secret_arguments import ENCRYPTION_KEY_ENV_VAR, resolve_secret
 from ..parsing.validators import (
     STRICT_TIME_PATTERN,
     parse_csv_values,
@@ -90,10 +91,17 @@ class JobService:
         set_encryption = bool(getattr(args, "set_encryption", False))
         reset_encryption = bool(getattr(args, "reset_encryption", False))
         encryption_key = getattr(args, "encryption_key", None)
-        has_key = isinstance(encryption_key, str) and bool(encryption_key.strip())
 
         if encryption_key is not None and not set_encryption:
             raise ValueError("--encryption-key requires --set-encryption")
+        encryption_key = resolve_secret(
+            encryption_key,
+            env_var=ENCRYPTION_KEY_ENV_VAR,
+            prompt="Encryption key",
+            needed=set_encryption and creating,
+            confirm=True,
+        )
+        has_key = isinstance(encryption_key, str) and bool(encryption_key.strip())
         if set_encryption and creating and not has_key:
             raise ValueError("--set-encryption requires --encryption-key when creating a job")
 

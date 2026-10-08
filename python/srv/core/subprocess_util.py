@@ -54,6 +54,61 @@ _TRUNCATION_NOTICE = "...[output truncated: showing last {kept} of {total} bytes
 _PROGRESS_LINE_PATTERN = re.compile(rb"(\d{1,3})%(?:\s*\((\d+)\))?")
 
 
+DATA_PATH_ACTIVITY_BYTES = 64 * 1024
+DATA_PATH_NOTICE_SECONDS = 30
+
+
+class DataPathStalled(RuntimeError):
+    def __init__(self, idle_seconds: float, stdout: str | bytes = "", stderr: str | bytes = "") -> None:
+        super().__init__(f"no data moved for {int(idle_seconds)}s")
+        self.idle_seconds = idle_seconds
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _process_io_bytes(pid: int) -> int | None:
+    try:
+        with open(f"/proc/{pid}/io", encoding="ascii") as handle:
+            counters = dict(line.split(":", 1) for line in handle if ":" in line)
+        return int(counters["rchar"]) + int(counters["wchar"])
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+class _StallWatch:
+    def __init__(
+        self,
+        pid: int,
+        stall_seconds: float,
+        on_stall: Callable[[float], None] | None,
+    ) -> None:
+        self.pid = pid
+        self.stall_seconds = stall_seconds
+        self.on_stall = on_stall
+        self.notice_seconds = DATA_PATH_NOTICE_SECONDS
+        self.mark = _process_io_bytes(pid)
+        self.active_at = time.monotonic()
+        self.notices = 0
+
+    def check(self) -> None:
+        now = time.monotonic()
+        counter = _process_io_bytes(self.pid)
+        if counter is None or self.mark is None or counter - self.mark >= DATA_PATH_ACTIVITY_BYTES:
+            self.mark = counter
+            self.active_at = now
+            self.notices = 0
+            return
+        idle = now - self.active_at
+        if idle >= self.stall_seconds:
+            raise DataPathStalled(idle)
+        if self.on_stall is not None and idle >= self.notice_seconds * (self.notices + 1):
+            self.notices += 1
+            try:
+                self.on_stall(idle)
+            except Exception:
+                logger.warning("on_stall callback raised; ignoring.", exc_info=True)
+
+
 class ProcessCancelled(RuntimeError):
     pass
 
@@ -132,6 +187,7 @@ def _wait_with_progress(
     poll_seconds: float,
     timeout: float | None,
     should_cancel: Callable[[], bool] | None = None,
+    stall_watch: _StallWatch | None = None,
 ) -> None:
     deadline = time.monotonic() + timeout if timeout is not None else None
     pos = 0
@@ -173,6 +229,8 @@ def _wait_with_progress(
             raise ProcessCancelled("cancellation requested")
         if deadline is not None and time.monotonic() >= deadline:
             raise subprocess.TimeoutExpired(proc.args, timeout)
+        if stall_watch is not None:
+            stall_watch.check()
         time.sleep(poll_seconds)
 
 
@@ -180,14 +238,17 @@ def _wait_for_cancel(
     proc: subprocess.Popen,
     poll_seconds: float,
     timeout: float | None,
-    should_cancel: Callable[[], bool],
+    should_cancel: Callable[[], bool] | None,
+    stall_watch: _StallWatch | None = None,
 ) -> None:
     deadline = time.monotonic() + timeout if timeout is not None else None
     while proc.poll() is None:
-        if should_cancel():
+        if should_cancel is not None and should_cancel():
             raise ProcessCancelled("cancellation requested")
         if deadline is not None and time.monotonic() >= deadline:
             raise subprocess.TimeoutExpired(proc.args, timeout)
+        if stall_watch is not None:
+            stall_watch.check()
         time.sleep(poll_seconds)
 
 
@@ -214,6 +275,8 @@ def run_capped(
     on_progress: Callable[[int, int], None] | None = None,
     progress_poll_seconds: float = _DEFAULT_PROGRESS_POLL_SECONDS,
     should_cancel: Callable[[], bool] | None = None,
+    stall_seconds: float | None = None,
+    on_stall: Callable[[float], None] | None = None,
     **_ignored,
 ) -> CompletedProcess:
     """Run ``command`` capturing only a bounded tail of stdout/stderr.
@@ -236,13 +299,14 @@ def run_capped(
 
     with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
         proc = subprocess.Popen(full_cmd, stdout=out_f, stderr=err_f)
+        stall_watch = _StallWatch(proc.pid, stall_seconds, on_stall) if stall_seconds else None
         try:
             if on_progress is not None:
                 _wait_with_progress(
-                    proc, out_f, on_progress, progress_poll_seconds, timeout, should_cancel
+                    proc, out_f, on_progress, progress_poll_seconds, timeout, should_cancel, stall_watch
                 )
-            elif should_cancel is not None:
-                _wait_for_cancel(proc, progress_poll_seconds, timeout, should_cancel)
+            elif should_cancel is not None or stall_watch is not None:
+                _wait_for_cancel(proc, progress_poll_seconds, timeout, should_cancel, stall_watch)
             else:
                 proc.wait(timeout=timeout)
         except ProcessCancelled:
@@ -253,6 +317,18 @@ def run_capped(
                 proc.kill()
                 proc.wait()
             raise
+        except DataPathStalled as exc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            raise DataPathStalled(
+                exc.idle_seconds,
+                stdout=_read_tail(out_f, cap, text),
+                stderr=_read_tail(err_f, cap, text),
+            ) from None
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()

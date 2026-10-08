@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from ...core.subprocess_util import ProcessCancelled, run_capped
+from ...core.subprocess_util import DataPathStalled, ProcessCancelled, run_capped
 from ...core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV
 from ...core.server_defaults import env_int
 from ...core.task_executor import TaskStopRequested, cancel_requested
@@ -22,10 +22,12 @@ from ...core.storage_tool import (
     StorageToolError,
     apply_repository_immutability,
     default_disk_tool_path,
+    describe_bytes,
     disk_tool_immutability_args,
     disk_tool_storage_args,
     ensure_private_directory,
     extract_s3_config,
+    filesystem_free_bytes,
     is_s3_repository,
     join_s3_prefix,
     read_storage_backup_info,
@@ -36,6 +38,8 @@ from ...core.storage_tool import (
     s3_block_generation_days,
     with_immutability_retention_days,
     safe_path_component,
+    STORAGE_LAYOUT_BY_ID,
+    STORAGE_LAYOUT_BY_NAME,
 )
 from ...core.utils import utc_now
 from ...services.backup_mode import (
@@ -325,6 +329,95 @@ def _record_backup_snapshot(
         progress_callback(payload)
     except TaskStopRequested:
         pass
+
+
+def _record_access_lock(
+    progress_callback: ProgressCallback,
+    vm_name: str,
+    vm_moref: str | None,
+    **details: Any,
+) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(
+            {
+                "updated_at": utc_now(),
+                "log_entry": False,
+                "access_lock": {"vm_name": vm_name, "vm_moref": vm_moref, **details} if vm_moref else None,
+            }
+        )
+    except TaskStopRequested:
+        pass
+
+
+def _report_access_lock(progress_callback: ProgressCallback, message: str, **extra: Any) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(
+            {
+                "stage": "cleanup",
+                "message": message,
+                "updated_at": utc_now(),
+                "worker_mode": "vcenter-abr-vmdk-tool",
+                **extra,
+            }
+        )
+    except TaskStopRequested:
+        pass
+
+
+def _access_lock_not_released(
+    task: dict[str, Any],
+    progress_callback: ProgressCallback,
+    vm_name: str,
+    vm_moref: str,
+    exc: BaseException,
+) -> None:
+    from ...services.backup_catalog import access_lock_failure_reason
+
+    hypervisor = HYPERVISORS.get(str(task.get("hypervisor_id") or "")) or {}
+    host = str((hypervisor.get("metadata") or {}).get("host") or "")
+    message = (
+        f"Could not lift the block on relocating VM {vm_name} that the data mover set for this backup, "
+        f"so Storage vMotion and DRS cannot move the VM yet: {access_lock_failure_reason(host, exc)}. "
+        "The server keeps retrying."
+    )
+    logger.warning("%s (task %s)", message, task.get("id"))
+    _report_access_lock(progress_callback, message, warning={"message": message, "vm_name": vm_name})
+    _record_access_lock(progress_callback, vm_name, vm_moref, retry_noted=True)
+
+
+def _release_access_lock(
+    node: Any,
+    task: dict[str, Any],
+    progress_callback: ProgressCallback,
+    vm_name: str,
+    vm_moref: str,
+) -> None:
+    from ...services.backup_catalog import vm_in_use_by_another_task
+
+    task_id = str(task.get("id") or "")
+    if vm_in_use_by_another_task(str(task.get("hypervisor_id") or ""), vm_name, exclude_task_id=task_id):
+        logger.info(
+            "Leaving the relocation block on VM %s to the session that is still working on it (task %s).",
+            vm_name,
+            task_id,
+        )
+        return
+    try:
+        lifted = node.release_access_lock(vm_name, vm_moref or None)
+    except Exception as exc:
+        _access_lock_not_released(task, progress_callback, vm_name, vm_moref, exc)
+        return
+    if lifted:
+        _report_access_lock(
+            progress_callback,
+            f"Lifted the block on relocating VM {vm_name} that the data mover left in place when the disk "
+            "transfer ended",
+        )
+    _record_access_lock(progress_callback, vm_name, None)
 
 
 def _remove_stranded_backup_snapshots(
@@ -627,25 +720,74 @@ def _stop_message(stranded: list[str], abr_path: str | None, task_root: Path) ->
     )
 
 
+def _vm_backup_manifests(
+    destination_root: Path, vm_external_id: str, pattern: str = "*/*/manifest.json"
+) -> list[tuple[Path, dict[str, Any]]]:
+    found: list[tuple[Path, dict[str, Any]]] = []
+    if not vm_external_id:
+        return found
+    for manifest_path in destination_root.glob(pattern):
+        resolved_path = manifest_path.resolve()
+        try:
+            manifest = _load_manifest(resolved_path)
+        except VCenterBackupError:
+            continue
+        if str(manifest.get("operation") or "") != "vm-backup":
+            continue
+        if str(manifest.get("vm_external_id") or "") != vm_external_id:
+            continue
+        found.append((resolved_path, manifest))
+    return found
+
+
+def _vm_backup_folder(destination_root: Path, vm_name: str, vm_external_id: str | None) -> str:
+    existing = _vm_backup_manifests(destination_root, str(vm_external_id or ""))
+    if existing:
+        newest = max(existing, key=lambda item: _manifest_sort_key(item[0], item[1]))
+        return newest[0].parent.parent.name
+    return safe_path_component(vm_name, fallback="vm")
+
+
+def _job_storage_layout(task: dict[str, Any], *, starts_new_chain: bool) -> str:
+    job = JOBS.get(str(task.get("job_id") or ""))
+    if not isinstance(job, dict):
+        return STORAGE_LAYOUT_BY_NAME
+    if job.get("storage_layout") == STORAGE_LAYOUT_BY_ID or starts_new_chain:
+        return STORAGE_LAYOUT_BY_ID
+    return STORAGE_LAYOUT_BY_NAME
+
+
+def _chain_folder(
+    task: dict[str, Any], destination_root: Path, vm_name: str, vm_external_id: str | None, layout: str
+) -> Path:
+    if layout == STORAGE_LAYOUT_BY_ID and task.get("job_id"):
+        return Path(safe_path_component(task.get("job_id"), fallback="job")) / safe_path_component(
+            vm_external_id or vm_name, fallback="vm"
+        )
+    return Path(_vm_backup_folder(destination_root, vm_name, vm_external_id))
+
+
 def _resolve_backup_storage_layout(
     *,
     task: dict[str, Any],
     vm_name: str,
     parameters: dict[str, Any],
     repository: dict[str, Any] | None,
+    vm_external_id: str | None = None,
+    layout: str = STORAGE_LAYOUT_BY_NAME,
 ) -> tuple[Path, Path, str | None]:
     configured_destination = parameters.get("destination_dir") or parameters.get("backup_root")
-    vm_path_component = safe_path_component(vm_name, fallback="vm")
 
     if is_s3_repository(repository):
         if configured_destination:
             destination_root = Path(str(configured_destination)).expanduser().resolve()
         else:
             destination_root = repository_cache_root(_default_backup_root(), repository).resolve()
-        task_root = destination_root / vm_path_component / str(task["id"])
+        chain_folder = _chain_folder(task, destination_root, vm_name, vm_external_id, layout)
+        task_root = destination_root / chain_folder / str(task["id"])
         abr_path = join_s3_prefix(
             extract_s3_config(repository).get("prefix"),
-            vm_path_component,
+            *chain_folder.parts,
             str(task["id"]),
         )
         return destination_root, task_root, abr_path
@@ -654,7 +796,8 @@ def _resolve_backup_storage_layout(
         destination_root = Path(str(configured_destination)).expanduser().resolve()
     else:
         destination_root = _resolve_repository_backup_root(task) or _default_backup_root()
-    task_root = destination_root / vm_path_component / str(task["id"])
+    chain_folder = _chain_folder(task, destination_root, vm_name, vm_external_id, layout)
+    task_root = destination_root / chain_folder / str(task["id"])
     # Local repositories now use the .abr file backend; the abr path is the
     # per-task filesystem directory the FileBackupManager writes into, and
     # it is passed to the tool as --folder.
@@ -915,53 +1058,134 @@ def _resolve_parent_manifest(
     task_root: Path,
     vm_external_id: str,
     differential: bool = False,
+    layout: str = STORAGE_LAYOUT_BY_NAME,
 ) -> tuple[Path, dict[str, Any]]:
     explicit = parameters.get("parent_manifest_path")
     if explicit not in (None, ""):
         manifest_path = Path(str(explicit)).expanduser().resolve()
         return manifest_path, _load_manifest(manifest_path)
 
-    vm_backup_root = destination_root / _sanitize_name(vm_name)
-    if not vm_backup_root.exists():
-        if differential:
-            raise VCenterBackupError(
-                "Differential backup requires parameters.parent_manifest_path or a previous full backup manifest in the VM backup directory"
-            )
-        raise VCenterBackupError(
-            "Incremental backup requires parameters.parent_manifest_path or a previous backup manifest in the VM backup directory"
-        )
-
-    candidates: list[tuple[Path, dict[str, Any]]] = []
     current_manifest = (task_root / "manifest.json").resolve()
-    for manifest_path in vm_backup_root.glob("*/manifest.json"):
-        resolved_path = manifest_path.resolve()
-        if resolved_path == current_manifest:
-            continue
-        try:
-            manifest = _load_manifest(resolved_path)
-        except VCenterBackupError:
-            continue
-        if str(manifest.get("operation") or "") != "vm-backup":
-            continue
-        if str(manifest.get("vm_external_id") or "") != vm_external_id:
-            continue
-        if differential:
-            backup_mode = str(manifest.get("backup_mode") or "").strip().lower()
-            if backup_mode not in {"", "full"}:
-                continue
-        candidates.append((resolved_path, manifest))
+    if layout == STORAGE_LAYOUT_BY_ID:
+        search_root, pattern = task_root.parent, "*/manifest.json"
+    else:
+        search_root, pattern = destination_root, "*/*/manifest.json"
+    candidates = [
+        (path, manifest)
+        for path, manifest in _vm_backup_manifests(search_root, vm_external_id, pattern)
+        if path != current_manifest
+        and (
+            not differential
+            or str(manifest.get("backup_mode") or "").strip().lower() in {"", "full"}
+        )
+    ]
 
     if not candidates:
-        if differential:
-            raise VCenterBackupError(
-                "Differential backup requires a previous full VM backup manifest. Provide parameters.parent_manifest_path or create a full backup first."
-            )
+        kind = "Differential" if differential else "Incremental"
+        parent = "full backup" if differential else "backup"
         raise VCenterBackupError(
-            "Incremental backup requires a previous VM backup manifest. Provide parameters.parent_manifest_path or create a full backup first."
+            f"{kind} backup of {vm_name} found no previous {parent} manifest of this VM in the repository to "
+            "continue from. Run a full backup of the job (abr job start --full) to start a new chain."
         )
 
     candidates.sort(key=lambda item: _manifest_sort_key(item[0], item[1]), reverse=True)
     return candidates[0]
+
+
+_WRITE_FAILURE = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
+_NO_SPACE = re.compile(r"no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
+_CONNECTION_LOST = re.compile(r"refused connection|connection (?:was )?(?:reset|lost|timed out)|NBD_ERR_NETWORK", re.IGNORECASE)
+
+
+def _repository_free_bytes(repository: dict[str, Any] | None) -> int | None:
+    if not isinstance(repository, dict) or is_s3_repository(repository):
+        return None
+    root = str(repository.get("path") or "").strip()
+    return filesystem_free_bytes(root) if root else None
+
+
+def _disk_failure_message(
+    repository: dict[str, Any] | None,
+    tool_error: str,
+    *,
+    needed_bytes: int | None,
+    needed_is_disk_size: bool,
+    free_before: int | None,
+    data_host: str | None = None,
+) -> str:
+    if _CONNECTION_LOST.search(tool_error or ""):
+        detail = next(
+            (line.strip()[len("Error:"):].strip() for line in reversed(tool_error.splitlines()) if line.strip().startswith("Error:")),
+            tool_error.strip().splitlines()[-1].strip(),
+        )
+        return f"Lost the connection to {f'ESXi host {data_host}' if data_host else 'the ESXi host'} ({detail})"
+    if not isinstance(repository, dict) or not _WRITE_FAILURE.search(tool_error or ""):
+        return tool_error
+    short_before = bool(needed_bytes) and free_before is not None and free_before < int(needed_bytes or 0)
+    if not (short_before or _NO_SPACE.search(tool_error)):
+        return tool_error
+    name = str(repository.get("name") or repository.get("id") or "the destination")
+    root = str(repository.get("path") or "").strip()
+    label = f"repository {name!r}" + (f" at {root}" if root else "")
+    if needed_bytes and free_before is not None:
+        needed = (
+            f"up to {describe_bytes(int(needed_bytes))} (the size of the disk)"
+            if needed_is_disk_size
+            else f"about {describe_bytes(int(needed_bytes))} of changed data"
+        )
+        amounts = f": this disk needs {needed} and {describe_bytes(free_before)} were free before it was written"
+    else:
+        free_now = _repository_free_bytes(repository)
+        amounts = f" ({describe_bytes(free_now)} free)" if free_now is not None else ""
+    return (
+        f"The {label} ran out of space{amounts}. "
+        "Free space in that filesystem, or point the job at another repository"
+    )
+
+
+def _run_watched_disk_tool(
+    command: list[str],
+    *,
+    data_host: str | None,
+    disk_label: str,
+    datastore_path: str,
+    progress_callback: ProgressCallback,
+    **kwargs: Any,
+):
+    limit = env_int("BACKUPSERVER_DATA_PATH_STALL_SECONDS")
+    host_text = f"ESXi host {data_host}" if data_host else "the ESXi host"
+
+    def on_stall(idle_seconds: float) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            {
+                "stage": "transfer",
+                "message": (
+                    f"No data from {host_text} for {int(idle_seconds)}s while backing up {disk_label}; "
+                    f"waiting up to {limit}s for the connection to come back"
+                ),
+                "updated_at": utc_now(),
+                "worker_mode": "vcenter-abr-vmdk-tool",
+            }
+        )
+
+    try:
+        return run_capped(command, stall_seconds=limit, on_stall=on_stall, **kwargs)
+    except DataPathStalled as exc:
+        logger.error(
+            "Data path to %s lost while backing up %s (%s): no data for %ds; stopped the data mover. %s",
+            host_text,
+            disk_label,
+            datastore_path,
+            int(exc.idle_seconds),
+            (exc.stderr or exc.stdout or "").strip() if isinstance(exc.stderr or exc.stdout, str) else "",
+        )
+        raise VCenterBackupError(
+            f"Lost the connection to {host_text} while backing up {disk_label} ({datastore_path}): no data "
+            f"reached the backup server for {int(exc.idle_seconds)}s, so the backup was stopped. Check the "
+            "network between the backup server and the host"
+        ) from exc
 
 
 def _is_cbt_invalid_fault(exc: BaseException) -> bool:
@@ -1127,6 +1351,62 @@ def _is_missing_parent_manifest_error(message: str) -> bool:
     return "previous" in normalized and "manifest" in normalized
 
 
+_INDEPENDENT_DISK_REASON = (
+    "independent disks are not part of a VM snapshot, so they cannot be backed up in a consistent state"
+)
+
+
+def _split_independent_disks(
+    disks: list[dict[str, Any]],
+    live_by_uuid: dict[str, dict[str, Any]],
+    live_by_path: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    kept: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for disk in disks:
+        payload = disk.get("payload") if isinstance(disk.get("payload"), dict) else {}
+        uuid = str(payload.get("uuid") or "")
+        datastore_path = str(payload.get("datastore_path") or "")
+        live_disk = (
+            (live_by_uuid.get(uuid) if uuid else None)
+            or (live_by_path.get(datastore_path) if datastore_path else None)
+            or {}
+        )
+        disk_mode = str(live_disk.get("disk_mode") or "")
+        if not disk_mode.startswith("independent"):
+            kept.append(disk)
+            continue
+        skipped.append(
+            {
+                "disk_label": str(live_disk.get("disk_label") or disk.get("name") or "disk"),
+                "datastore_path": datastore_path or str(live_disk.get("datastore_path") or ""),
+                "uuid": uuid or live_disk.get("uuid"),
+                "capacity_gb": live_disk.get("capacity_gb"),
+                "disk_mode": disk_mode,
+                "reason": _INDEPENDENT_DISK_REASON,
+            }
+        )
+    return kept, skipped
+
+
+def _skipped_disk_message(vm_name: str, skipped_disk: dict[str, Any]) -> str:
+    return (
+        f"Skipped disk {skipped_disk['datastore_path']} of {vm_name}: it is in "
+        f"{skipped_disk['disk_mode']} mode, and {_INDEPENDENT_DISK_REASON}. The other disks are "
+        "backed up and this restore point does not contain this disk. To back it up, switch the "
+        "disk to dependent mode in the VM settings."
+    )
+
+
+def _all_disks_independent_message(vm_name: str, skipped_disks: list[dict[str, Any]]) -> str:
+    paths = ", ".join(f"{disk['datastore_path']} ({disk['disk_mode']})" for disk in skipped_disks)
+    return (
+        f"Cannot back up {vm_name}: every disk of this VM is independent: {paths}. "
+        f"{_INDEPENDENT_DISK_REASON[0].upper()}{_INDEPENDENT_DISK_REASON[1:]}. To back the VM up, "
+        "switch its disks to dependent mode in the VM settings."
+    )
+
+
 def run_vcenter_backup(
     task: dict[str, Any],
     progress_callback: ProgressCallback = None,
@@ -1173,20 +1453,6 @@ def run_vcenter_backup(
 
     repository = _resolve_repository(task)
     repository_type = str(repository.get("type") or "").strip().lower() if isinstance(repository, dict) else ""
-    destination_root, task_root, repository_abr_path = _resolve_backup_storage_layout(
-        task=task,
-        vm_name=vm_name,
-        parameters=parameters,
-        repository=repository,
-    )
-    ensure_private_directory(task_root)
-    # Every repository now uses the .abr format. When no repository record is
-    # configured, treat it as a local-file repo rooted at the task directory so
-    # the abr command builders have a concrete context to work with.
-    if repository is None:
-        repository = {"type": "local", "id": ""}
-        repository_type = "local"
-
     transport_mode_value = parameters.get("transport_mode")
     if transport_mode_value is None or transport_mode_value == "":
         transport_mode = "nbdssl"
@@ -1234,6 +1500,23 @@ def run_vcenter_backup(
     if incremental_fallback_metadata and query_changed_areas_only:
         raise VCenterBackupError("parameters.incremental_fallback_metadata cannot be combined with parameters.query_changed_areas_only")
 
+    storage_layout = _job_storage_layout(task, starts_new_chain=not changed_block_backup)
+    destination_root, task_root, repository_abr_path = _resolve_backup_storage_layout(
+        task=task,
+        vm_name=vm_name,
+        parameters=parameters,
+        repository=repository,
+        vm_external_id=vm_id,
+        layout=storage_layout,
+    )
+    ensure_private_directory(task_root)
+    # Every repository now uses the .abr format. When no repository record is
+    # configured, treat it as a local-file repo rooted at the task directory so
+    # the abr command builders have a concrete context to work with.
+    if repository is None:
+        repository = {"type": "local", "id": ""}
+        repository_type = "local"
+
     tool_path = Path(str(parameters.get("tool_path") or _default_tool_path())).expanduser()
     logger.debug(
         "Backup tool path=%s host=%s port=%s verify_ssl=%s",
@@ -1274,6 +1557,7 @@ def run_vcenter_backup(
     task_id = str(task.get("id") or "")
     written_backup_names: list[str] = []
     stop_requested_after_completion = False
+    access_lock_moref: str | None = None
 
     try:
         # The data mover carries the disk over its own VDDK connection, so this
@@ -1313,6 +1597,7 @@ def run_vcenter_backup(
                 node.ensure_vm_host_connected(vm_name)
             except RuntimeError as exc:
                 raise VCenterBackupError(str(exc)) from exc
+            data_host = node.vm_host_name(vm_name)
             # CBT must be enabled BEFORE the snapshot that anchors a backup chain,
             # for EVERY backup including fulls. Enabling it only for incrementals
             # (the old behavior) meant an ActiveFull was captured with CBT off, so
@@ -1346,6 +1631,8 @@ def run_vcenter_backup(
             snapshot_moref = str(backup_params.get("snapshot_moref") or "")
             if not vm_moref or not snapshot_moref:
                 raise VCenterBackupError("vCenter did not return VM or snapshot MoRef values")
+            _record_access_lock(progress_callback, vm_name, vm_moref)
+            access_lock_moref = vm_moref
 
             thumbprint = node.get_thumbprint()
             live_disks = node.get_vm_disks(vm_name)
@@ -1513,6 +1800,26 @@ def run_vcenter_backup(
                     vm_name=vm_name,
                 )
 
+            disks, skipped_disks = _split_independent_disks(disks, live_by_uuid, live_by_path)
+            if skipped_disks and not disks:
+                raise VCenterBackupError(_all_disks_independent_message(vm_name, skipped_disks))
+            for skipped_disk in skipped_disks:
+                message = _skipped_disk_message(vm_name, skipped_disk)
+                logger.warning("%s (task %s)", message, task.get("id"))
+                _emit_progress(
+                    progress_callback,
+                    "prepare",
+                    20,
+                    message,
+                    worker_mode="vcenter-abr-vmdk-tool",
+                    vm_name=vm_name,
+                    warning={
+                        "message": message,
+                        "datastore_path": skipped_disk["datastore_path"],
+                        "disk_mode": skipped_disk["disk_mode"],
+                    },
+                )
+
             if not disks:
                 raise VCenterBackupError(f"No disks found to back up for VM {vm_name!r}")
 
@@ -1558,6 +1865,7 @@ def run_vcenter_backup(
                         task_root=task_root,
                         vm_external_id=str(vm_resource["external_id"]),
                         differential=differential,
+                        layout=storage_layout,
                     )
                 except VCenterBackupError as exc:
                     if not incremental_fallback_full or not _is_missing_parent_manifest_error(str(exc)):
@@ -1607,6 +1915,7 @@ def run_vcenter_backup(
 
             if use_changed_block_backup:
                 for index, disk in enumerate(disks, start=1):
+                    free_before_disk = _repository_free_bytes(repository)
                     payload = disk.get("payload", {})
                     if not isinstance(payload, dict):
                         payload = {}
@@ -1829,7 +2138,7 @@ def run_vcenter_backup(
                                 backup_name=disk_backup_name,
                                 repository=repository,
                                 abr_path=repository_abr_path,
-                                datastore_path=datastore_path,
+                                datastore_path=utility_datastore_path,
                                 host=host,
                                 port=port,
                                 username=username,
@@ -1847,8 +2156,12 @@ def run_vcenter_backup(
                                 task.get("id"),
                                 _redact_command_for_logging(no_cbt_command),
                             )
-                            completed = run_capped(
+                            completed = _run_watched_disk_tool(
                                 no_cbt_command,
+                                data_host=data_host,
+                                disk_label=f"disk {index}/{len(disks)}",
+                                datastore_path=datastore_path,
+                                progress_callback=progress_callback,
                                 check=False,
                                 capture_output=True,
                                 text=True,
@@ -1872,7 +2185,14 @@ def run_vcenter_backup(
                                 raise VCenterBackupError(
                                     f"Full disk backup failed for {datastore_path} while "
                                     "recovering from a missing CBT change ID: "
-                                    f"{stderr or f'exit code {completed.returncode}'}"
+                                    + _disk_failure_message(
+                                        repository,
+                                        stderr or f"exit code {completed.returncode}",
+                                        needed_bytes=full_disk_bytes,
+                                        needed_is_disk_size=True,
+                                        free_before=free_before_disk,
+                                        data_host=data_host,
+                                    )
                                 )
                             disk_store_mode = (
                                 "full-new-disk"
@@ -1917,8 +2237,12 @@ def run_vcenter_backup(
                                 task.get("id"),
                                 _redact_command_for_logging(command),
                             )
-                            completed = run_capped(
+                            completed = _run_watched_disk_tool(
                                 command,
+                                data_host=data_host,
+                                disk_label=f"disk {index}/{len(disks)}",
+                                datastore_path=datastore_path,
+                                progress_callback=progress_callback,
                                 check=False,
                                 capture_output=True,
                                 text=True,
@@ -1977,7 +2301,15 @@ def run_vcenter_backup(
                                 )
                                 if not incremental_fallback_full and not incremental_fallback_metadata:
                                     raise VCenterBackupError(
-                                        f"Incremental disk backup failed for {datastore_path}: {stderr or f'exit code {completed.returncode}'}"
+                                        f"Incremental disk backup failed for {datastore_path}: "
+                                        + _disk_failure_message(
+                                            repository,
+                                            stderr or f"exit code {completed.returncode}",
+                                            needed_bytes=changed_bytes,
+                                            needed_is_disk_size=False,
+                                            free_before=free_before_disk,
+                                            data_host=data_host,
+                                        )
                                     )
 
                                 if incremental_fallback_full:
@@ -2002,7 +2334,7 @@ def run_vcenter_backup(
                                         backup_name=disk_backup_name,
                                         repository=repository,
                                         abr_path=repository_abr_path,
-                                        datastore_path=datastore_path,
+                                        datastore_path=utility_datastore_path,
                                         host=host,
                                         port=port,
                                         username=username,
@@ -2020,8 +2352,12 @@ def run_vcenter_backup(
                                         datastore_path,
                                         _redact_command_for_logging(fallback_command),
                                     )
-                                    fallback_completed = run_capped(
+                                    fallback_completed = _run_watched_disk_tool(
                                         fallback_command,
+                                        data_host=data_host,
+                                        disk_label=f"disk {index}/{len(disks)}",
+                                        datastore_path=datastore_path,
+                                        progress_callback=progress_callback,
                                         check=False,
                                         capture_output=True,
                                         text=True,
@@ -2053,9 +2389,28 @@ def run_vcenter_backup(
                                     if not incremental_fallback_metadata:
                                         raise VCenterBackupError(
                                             "Incremental disk backup failed for "
-                                            f"{datastore_path}: {stderr or f'exit code {completed.returncode}'}. "
-                                            "Full fallback also failed: "
-                                            f"{fallback_error or 'not attempted'}"
+                                            f"{datastore_path}: "
+                                            + _disk_failure_message(
+                                                repository,
+                                                stderr or f"exit code {completed.returncode}",
+                                                needed_bytes=changed_bytes,
+                                                needed_is_disk_size=False,
+                                                free_before=free_before_disk,
+                                                data_host=data_host,
+                                            )
+                                            + ". Full fallback also failed: "
+                                            + (
+                                                _disk_failure_message(
+                                                    repository,
+                                                    fallback_error,
+                                                    needed_bytes=full_disk_bytes,
+                                                    needed_is_disk_size=True,
+                                                    free_before=free_before_disk,
+                                                    data_host=data_host,
+                                                )
+                                                if fallback_error
+                                                else "not attempted"
+                                            )
                                         )
                                     incremental_metadata_fallback_used = True
                                     disk_store_mode = "metadata-fallback"
@@ -2152,6 +2507,7 @@ def run_vcenter_backup(
             else:
                 for index, disk in enumerate(disks, start=1):
                     disk_start_time = time.time()
+                    free_before_disk = _repository_free_bytes(repository)
                     payload = disk.get("payload", {})
                     if not isinstance(payload, dict):
                         payload = {}
@@ -2159,7 +2515,13 @@ def run_vcenter_backup(
                     if not datastore_path:
                         raise VCenterBackupError(f"Disk entry is missing datastore_path: {disk}")
                     formatted_vm_moref = _format_vm_spec(vm_moref, service_type)
-                    transfer_datastore_path = datastore_path
+                    uuid = str(payload.get("uuid") or disk.get("uuid") or "")
+                    snapshot_entry = (
+                        change_id_by_uuid.get(uuid)
+                        or change_id_by_datastore_path.get(datastore_path)
+                        or change_id_by_index.get(index)
+                    )
+                    transfer_datastore_path = str((snapshot_entry or {}).get("datastore_path") or "") or datastore_path
                     live_snapshot_datastore_path = live_disk_paths.get(datastore_path, datastore_path)
                     if not is_virtual_center and not formatted_vm_moref:
                         transfer_datastore_path = live_snapshot_datastore_path
@@ -2250,8 +2612,12 @@ def run_vcenter_backup(
                         _redact_command_for_logging(command),
                     )
                     try:
-                        completed = run_capped(
+                        completed = _run_watched_disk_tool(
                             command,
+                            data_host=data_host,
+                            disk_label=f"disk {index}/{len(disks)}",
+                            datastore_path=datastore_path,
+                            progress_callback=progress_callback,
                             check=False,
                             capture_output=True,
                             text=True,
@@ -2315,8 +2681,12 @@ def run_vcenter_backup(
                             tool_output,
                         )
                         time.sleep(_TRANSIENT_DISK_ACCESS_RETRY_DELAY_SECONDS)
-                        completed = run_capped(
+                        completed = _run_watched_disk_tool(
                             command,
+                            data_host=data_host,
+                            disk_label=f"disk {index}/{len(disks)}",
+                            datastore_path=datastore_path,
+                            progress_callback=progress_callback,
                             check=False,
                             capture_output=True,
                             text=True,
@@ -2405,8 +2775,12 @@ def run_vcenter_backup(
                                 variant_name,
                                 _redact_command_for_logging(retry_command),
                             )
-                            retry_completed = run_capped(
+                            retry_completed = _run_watched_disk_tool(
                                 retry_command,
+                                data_host=data_host,
+                                disk_label=f"disk {index}/{len(disks)}",
+                                datastore_path=datastore_path,
+                                progress_callback=progress_callback,
                                 check=False,
                                 capture_output=True,
                                 text=True,
@@ -2452,7 +2826,15 @@ def run_vcenter_backup(
                             stderr or f"exit code {completed.returncode}",
                         )
                         raise VCenterBackupError(
-                            f"Disk backup failed for {datastore_path}: {stderr or f'exit code {completed.returncode}'}"
+                            f"Disk backup failed for {datastore_path}: "
+                            + _disk_failure_message(
+                                repository,
+                                stderr or f"exit code {completed.returncode}",
+                                needed_bytes=disk_total_bytes,
+                                needed_is_disk_size=True,
+                                free_before=free_before_disk,
+                                data_host=data_host,
+                            )
                         )
 
                     disk_duration = time.time() - disk_start_time
@@ -2600,6 +2982,10 @@ def run_vcenter_backup(
                 "snapshot_name": snapshot_name,
                 "snapshot_moref": snapshot_moref,
                 "disks": disk_outputs,
+                "skipped_disks": skipped_disks,
+                "storage_layout": storage_layout,
+                "job_id": str(task.get("job_id") or ""),
+                "job_name": str((JOBS.get(str(task.get("job_id") or "")) or {}).get("name") or ""),
                 "repository_id": str(repository.get("id") or "") if isinstance(repository, dict) else "",
                 "repository_type": repository_type or "local",
                 "storage_mode": "s3" if repository_type == "s3" else "local",
@@ -2658,6 +3044,8 @@ def run_vcenter_backup(
             )
             snapshot_name = None
             _record_backup_snapshot(progress_callback, vm_name, None)
+            _release_access_lock(node, task, progress_callback, vm_name, access_lock_moref)
+            access_lock_moref = None
 
         if not stop_requested_after_completion and cancel_requested(task_id):
             stop_requested_after_completion = True
@@ -2709,6 +3097,8 @@ def run_vcenter_backup(
             "vm_config": vm_config,
             "disk_count": len(disk_outputs),
             "disks": disk_outputs,
+            "skipped_disks": skipped_disks,
+            "storage_layout": storage_layout,
             "transport_mode": transport_mode,
             "compression_level": compression_level,
             "encryption_enabled": bool(encryption_algorithm),
@@ -2775,3 +3165,9 @@ def run_vcenter_backup(
                     )
                 except TaskStopRequested:
                     pass
+        if access_lock_moref:
+            try:
+                with VCenterNode(host, username, password, port=port, verify_ssl=verify_ssl) as node:
+                    _release_access_lock(node, task, progress_callback, vm_name, access_lock_moref)
+            except Exception as exc:
+                _access_lock_not_released(task, progress_callback, vm_name, access_lock_moref, exc)

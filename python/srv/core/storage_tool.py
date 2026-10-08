@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -18,6 +19,8 @@ from uuid import uuid4
 
 from .server_defaults import env_int
 from .subprocess_util import CompletedProcess, ProcessCancelled, run_capped
+
+logger = logging.getLogger(__name__)
 
 APP_ROOT = Path("/opt/altastor-backup")
 DISK_TOOL_LAUNCHER = "abr-vmdk-tool.sh"
@@ -34,6 +37,8 @@ IMMUTABILITY_PROBE_NAME_PREFIX = "immutability-probe-"
 _IMMUTABILITY_PROBE_CLOCK_MARGIN_SECONDS = 3600
 _IMMUTABILITY_PROBE_UNDATED_SWEEP_LIMIT = 3
 IMMUTABILITY_PROBE_RETENTION_DAYS = 1
+STORAGE_LAYOUT_BY_NAME = "by_name"
+STORAGE_LAYOUT_BY_ID = "by_id"
 
 
 class StorageToolError(RuntimeError):
@@ -438,13 +443,13 @@ def copy_disk_tool_chain(
         progress_poll_seconds=VERIFY_PROGRESS_POLL_SECONDS if on_progress else None,
         should_cancel=should_cancel,
     )
-    return parse_disk_tool_json(completed.stdout)
+    return parse_disk_tool_result(completed, command)
 
 
 def redact_disk_tool_command(command: list[str]) -> list[str]:
     redacted = list(command)
     for index, value in enumerate(redacted[:-1]):
-        if value in {"--password", "--secret-key", "--key", "-k", "--source-secret-key", "--source-key"}:
+        if value in _SECRET_FLAGS:
             redacted[index + 1] = SECRET_MASK
         if value in {"--access-key", "--source-access-key"}:
             redacted[index + 1] = mask_access_key(redacted[index + 1]) or SECRET_MASK
@@ -617,9 +622,48 @@ def parse_disk_tool_json(stdout: str) -> dict[str, Any]:
     return document
 
 
+_UNREADABLE_RESULT_TAIL = 2000
+_SECRET_FLAGS = {"--password", "--secret-key", "--key", "-k", "--source-secret-key", "--source-key"}
+
+
+def _masked_tail(text: Any, secrets: list[str]) -> str:
+    tail = str(text or "")[-_UNREADABLE_RESULT_TAIL:]
+    for secret in secrets:
+        tail = tail.replace(secret, SECRET_MASK)
+    return tail.strip()
+
+
+def parse_disk_tool_result(completed: Any, command: list[str]) -> dict[str, Any]:
+    try:
+        return parse_disk_tool_json(str(getattr(completed, "stdout", "") or ""))
+    except StorageToolError as exc:
+        secrets = [
+            command[index + 1]
+            for index, flag in enumerate(command[:-1])
+            if flag in _SECRET_FLAGS and command[index + 1]
+        ]
+        returncode = getattr(completed, "returncode", None)
+        stderr_tail = _masked_tail(getattr(completed, "stderr", ""), secrets)
+        stdout_tail = _masked_tail(getattr(completed, "stdout", ""), secrets)
+        logger.error(
+            "Backup tool command %s exited with code %s but its result could not be read (%s). "
+            "stderr tail: %r. stdout tail: %r",
+            " ".join(redact_disk_tool_command(list(command))),
+            returncode,
+            exc,
+            stderr_tail,
+            stdout_tail,
+        )
+        last_line = next((line.strip() for line in reversed(stderr_tail.splitlines()) if line.strip()), "")
+        detail = f"exit code {returncode}; " + (
+            f"the tool said: {last_line[:300]}" if last_line else "the tool wrote nothing to stderr"
+        )
+        raise StorageToolError(f"{exc} ({detail})") from exc
+
+
 def run_disk_tool_json(args: list[str], *, timeout: int | None = None) -> dict[str, Any]:
     command = [args[0], "--json", *args[1:]] if args else ["--json"]
-    return parse_disk_tool_json(run_disk_tool(command, timeout=timeout).stdout)
+    return parse_disk_tool_result(run_disk_tool(command, timeout=timeout), command)
 
 
 def read_storage_folder_info(

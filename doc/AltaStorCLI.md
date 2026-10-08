@@ -174,13 +174,15 @@ abr repo add
 
 Description: Create a backup repository. 
 
-abr repo add --name <name> --type <local|nfs|smb|s3> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password <pass>] [--description <text>] 
+abr repo add --name <name> --type <local|nfs|smb|s3> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password [<pass>]] [--description <text>] 
 
-For --type s3: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] [--create-bucket] 
+For --type s3: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key [<key>]] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] [--create-bucket] 
+
+The SMB password comes from ABR_REPO_PASSWORD and the S3 secret key from ABR_REPO_SECRET_KEY, or is asked for interactively. A value typed after --password or --secret-key is still accepted, but every local user can read it (ps, /proc) while the command runs, and it stays in the shell history. 
 
 Example: 
 abr repo add --name MyLocal --type local --path /mnt/backup 
-abr repo add --name MyWorm --type s3 --bucket altastor-objectlock --region us-east-1 --endpoint-url http://minio.local:9000 --path-style --access-key AKIA... --secret-key ... --immutable governance --immutability-days 30 
+ABR_REPO_SECRET_KEY='...' abr repo add --name MyWorm --type s3 --bucket altastor-objectlock --region us-east-1 --endpoint-url http://minio.local:9000 --path-style --access-key AKIA... --immutable governance --immutability-days 30 
 
 Note: a local path that is world-writable is refused - its directory mode is the 
 only thing keeping other accounts on the host away from the backup data. Restrict 
@@ -247,9 +249,9 @@ abr repo edit
 
 Description: Update repository settings. 
 
-abr repo edit --name <name> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password <pass>] [--description <text>] 
+abr repo edit --name <name> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password [<pass>]] [--description <text>] 
 
-For an s3 repository: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key <key>] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] 
+For an s3 repository: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key [<key>]] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] 
 
 Example: 
 abr repo edit --name MyWorm --immutability-days 60 
@@ -297,10 +299,12 @@ abr inventory add
 
 Description: Register a new virtualization inventory source. 
 
-abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --address <host/ip> [--port <int>] [--username <user>] [--password <pass>] [--token <token>] [--insecure] 
+abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --address <host/ip> [--port <int>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] 
+
+The password comes from ABR_INVENTORY_PASSWORD and the token from ABR_INVENTORY_TOKEN, or the password is asked for interactively. A value typed after --password or --token is still accepted, but every local user can read it (ps, /proc) while the command runs, and it stays in the shell history. 
 
 Example: 
-abr inventory add --name Prod-vCenter --type vsphere --address 192.168.1.10 --username administrator@vsphere.local --password 'SecretPassword' 
+abr inventory add --name Prod-vCenter --type vsphere --address 192.168.1.10 --username administrator@vsphere.local 
 
 Note:
 VM discovery is not required up front. It runs automatically the first time you
@@ -333,7 +337,7 @@ abr inventory edit
 
 Description: Update server connection attributes or credentials. 
 
-abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--username <user>] [--password <pass>] [--token <token>] [--insecure] 
+abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] 
 
 abr inventory remove 
 

@@ -10,6 +10,12 @@ from urllib.parse import urlparse
 from ..compact_help_formatter import CompactHelpFormatter
 from ..exit_codes import INVALID_STATE
 from ..parsing.common_arguments import add_name_or_id_selector
+from ..parsing.secret_arguments import (
+    REPO_PASSWORD_ENV_VAR,
+    REPO_SECRET_KEY_ENV_VAR,
+    add_secret_argument,
+    resolve_secret,
+)
 from ..progress_watch import run_with_elapsed_indicator
 from .base import CommandDependencies
 
@@ -221,14 +227,17 @@ class RepositoryCommands:
             help="Add backup repository.",
             description=(
                 "Add backup repository.\n\n"
+                f"The SMB password is read from {REPO_PASSWORD_ENV_VAR} and the S3 secret key from "
+                f"{REPO_SECRET_KEY_ENV_VAR}, or prompted for when they are not set; avoid --password VALUE "
+                "and --secret-key VALUE, which show them to every local user.\n\n"
                 "Examples:\n"
                 '  abr repo add --name "Local-Repo-1" --type local --path /mnt/backups/repo1\n'
                 '  abr repo add --name "SMB-Repo" --type smb --address //fileserver/backups '
-                '--username backupsvc --password "********"\n'
+                "--username backupsvc\n"
                 '  abr repo add --name "S3-Repo" --type s3 --bucket altastor-backups --region us-east-1 '
-                "--access-key AKIA... --secret-key ...\n"
-                '  abr repo add --name "S3-WORM" --type s3 --bucket altastor-objectlock --region us-east-1 '
-                "--access-key AKIA... --secret-key ... --immutable governance --immutability-days 30"
+                "--access-key AKIA...\n"
+                f'  {REPO_SECRET_KEY_ENV_VAR}=... abr repo add --name "S3-WORM" --type s3 --bucket altastor-objectlock '
+                "--region us-east-1 --access-key AKIA... --immutable governance --immutability-days 30"
             ),
             formatter_class=CompactHelpFormatter,
         )
@@ -239,14 +248,14 @@ class RepositoryCommands:
         add.add_argument("--server", help="Remote repository server")
         add.add_argument("--share", help="Remote repository share/export")
         add.add_argument("--username", help="Repository username")
-        add.add_argument("--password", help="Repository password")
+        add_secret_argument(add, "--password", env_var=REPO_PASSWORD_ENV_VAR, help_text="Repository password")
         add.add_argument("--description", help="Repository description")
         add.add_argument("--bucket", help="S3 bucket name")
         add.add_argument("--prefix", help="S3 key prefix inside the bucket")
         add.add_argument("--region", help="S3 region")
         add.add_argument("--endpoint-url", dest="endpoint_url", help="Custom S3-compatible endpoint URL")
         add.add_argument("--access-key", dest="access_key", help="S3 access key")
-        add.add_argument("--secret-key", dest="secret_key", help="S3 secret key")
+        add_secret_argument(add, "--secret-key", env_var=REPO_SECRET_KEY_ENV_VAR, help_text="S3 secret key")
         add.add_argument("--profile", help="AWS profile name")
         add_path_style = add.add_mutually_exclusive_group()
         add_path_style.add_argument("--path-style", dest="path_style", action="store_true", default=None, help="Use path-style S3 addressing")
@@ -336,14 +345,14 @@ class RepositoryCommands:
         edit.add_argument("--server", help="Updated remote repository server")
         edit.add_argument("--share", help="Updated remote repository share/export")
         edit.add_argument("--username", help="Updated repository username")
-        edit.add_argument("--password", help="Updated repository password")
+        add_secret_argument(edit, "--password", env_var=REPO_PASSWORD_ENV_VAR, help_text="Updated repository password")
         edit.add_argument("--description", help="Updated repository description")
         edit.add_argument("--bucket", help="Updated S3 bucket name")
         edit.add_argument("--prefix", help="Updated S3 key prefix")
         edit.add_argument("--region", help="Updated S3 region")
         edit.add_argument("--endpoint-url", dest="endpoint_url", help="Updated custom S3 endpoint URL")
         edit.add_argument("--access-key", dest="access_key", help="Updated S3 access key")
-        edit.add_argument("--secret-key", dest="secret_key", help="Updated S3 secret key")
+        add_secret_argument(edit, "--secret-key", env_var=REPO_SECRET_KEY_ENV_VAR, help_text="Updated S3 secret key")
         edit.add_argument("--profile", help="Updated AWS profile name")
         edit_path_style = edit.add_mutually_exclusive_group()
         edit_path_style.add_argument("--path-style", dest="path_style", action="store_true", default=None, help="Use path-style S3 addressing")
@@ -444,6 +453,19 @@ class RepositoryCommands:
 
     def create(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
+        repo_type = str(args.type or "").lower()
+        args.password = resolve_secret(
+            getattr(args, "password", None),
+            env_var=REPO_PASSWORD_ENV_VAR,
+            prompt="Repository password",
+            needed=repo_type == "smb" and bool(getattr(args, "username", None)),
+        )
+        args.secret_key = resolve_secret(
+            getattr(args, "secret_key", None),
+            env_var=REPO_SECRET_KEY_ENV_VAR,
+            prompt="S3 secret key",
+            needed=repo_type == "s3" and bool(str(getattr(args, "access_key", None) or "").strip()),
+        )
         _validate_create_args(args)
         payload = {
             "name": args.name,
@@ -500,6 +522,12 @@ class RepositoryCommands:
         deps = CommandDependencies(args)
         repo_id = self._resolve_id(deps, args)
         current = deps.context.api_client.get(f"api/v1/repositories/{repo_id}")
+        args.password = resolve_secret(
+            getattr(args, "password", None), env_var=REPO_PASSWORD_ENV_VAR, prompt="Repository password"
+        )
+        args.secret_key = resolve_secret(
+            getattr(args, "secret_key", None), env_var=REPO_SECRET_KEY_ENV_VAR, prompt="S3 secret key"
+        )
         _validate_edit_args(current, args)
         payload = {key: value for key, value in {
             "name": args.new_name,

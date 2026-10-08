@@ -15,6 +15,16 @@ from .utils import utc_now
 logger = logging.getLogger(__name__)
 
 
+def _refresh_backup_decision(task: dict[str, object]) -> dict[str, object]:
+    try:
+        from python.srv.services.abr_v41 import refresh_queued_backup_decision
+
+        return refresh_queued_backup_decision(task)
+    except Exception:
+        logger.exception("Could not re-check the backup type of task '%s' at start; it runs as queued", task.get("id"))
+        return task
+
+
 def vm_key_for_task(task: dict[str, object]) -> tuple[str, str] | None:
     """Identity of the live VM a backup reads from, or ``None`` if unknown.
 
@@ -150,6 +160,8 @@ class TaskProcessPool:
             claimed = claim_task(task_id)
             if claimed is None:
                 continue
+            if task_type == "backup":
+                claimed = _refresh_backup_decision(claimed)
             self._submit_claimed_task(claimed)
             available_slots -= 1
             if task_type == "backup":
@@ -204,6 +216,9 @@ class TaskProcessPool:
                 task["status"] = "running"
             update = dict(update)
             log_entry = update.pop("log_entry", True)
+            warning = update.pop("warning", None)
+            if "access_lock" in update:
+                task["access_lock"] = update.pop("access_lock") or None
             current_result = task.get("result")
             if not isinstance(current_result, dict):
                 current_result = {}
@@ -214,12 +229,16 @@ class TaskProcessPool:
                 logs.append(
                     {
                         "timestamp": utc_now(),
-                        "level": "info",
+                        "level": "warn" if warning else "info",
                         "component": "engine",
                         "message": str(update.get("message")),
                     }
                 )
             task["logs"] = logs
+            if isinstance(warning, dict):
+                warnings = task.get("warnings") if isinstance(task.get("warnings"), list) else []
+                warnings.append(warning)
+                task["warnings"] = warnings
             task["updated_at"] = utc_now()
             try:
                 persist_task(dict(task))
@@ -229,8 +248,15 @@ class TaskProcessPool:
             raise TaskStopRequested("Session stop requested")
 
     def _complete_task(self, future: Future[dict[str, object]]) -> None:
+        try:
+            self._finish_task(future)
+        finally:
+            with self._futures_lock:
+                self._futures.pop(future, None)
+
+    def _finish_task(self, future: Future[dict[str, object]]) -> None:
         with self._futures_lock:
-            entry = self._futures.pop(future, None)
+            entry = self._futures.get(future)
         if not entry:
             logger.warning("Future completed but no task_id found in tracker.")
             return
