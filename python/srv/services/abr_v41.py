@@ -7375,8 +7375,8 @@ def _resolve_restore_nic_network_mappings(
         nic = nic_by_identifier.get(requested_nic.lower())
         _ensure(
             nic is not None,
-            404,
-            "network_adapter_not_found",
+            422,
+            "invalid_restore",
             "Adapter placement names an adapter this restore point does not carry",
             adapter=requested_nic,
             adapters=[{"id": item.get("id"), "label": item.get("label")} for item in nics],
@@ -7605,6 +7605,16 @@ def _resolve_restore_network_selection(
     target_network_ids = {str(item.get("id") or ""): item for item in target_networks}
     target_network_names = {str(item.get("name") or ""): item for item in target_networks}
 
+    legacy = _parse_restore_network_map(legacy_network_map)
+    _ensure_restore_network_map_targets(
+        legacy,
+        source_networks=source_networks,
+        target_networks=target_networks,
+        off_host_names=off_host_names,
+        target_inventory_id=target_inventory_id,
+        host=host,
+    )
+
     if mappings:
         resolved: dict[str, str] = {}
         adapter_targets: dict[int, dict[str, Any]] = {}
@@ -7621,7 +7631,7 @@ def _resolve_restore_network_selection(
             _ensure(bool(source_nic_id and target_network_id), 422, "invalid_restore", "Each network mapping requires source_nic_id and target_network_id")
             _collect_restore_mapping(requested_targets, source_nic_id, target_network_id, flag="--nic-network")
             position, source_nic = source_index.get(source_nic_id) or (None, None)
-            _ensure(source_nic is not None, 404, "network_adapter_not_found", "Source network adapter not found", source_nic_id=source_nic_id)
+            _ensure(source_nic is not None, 422, "invalid_restore", "Source network adapter not found", source_nic_id=source_nic_id)
             source_network = str(source_nic.get("source_network") or "").strip()
             _ensure(bool(source_network), 422, "invalid_restore", "Source network adapter is missing a source network", source_nic_id=source_nic_id)
             target_network = target_network_ids.get(target_network_id)
@@ -7647,15 +7657,16 @@ def _resolve_restore_network_selection(
             if position in adapter_targets:
                 continue
             source_network = str(item.get("source_network") or "").strip()
-            if not source_network or source_network not in target_network_names:
+            target_network_name = legacy.get(source_network) or (source_network if source_network in target_network_names else "")
+            if not source_network or not target_network_name:
                 continue
             adapter_targets[position] = {
                 "index": position,
                 "label": item.get("label"),
                 "source_network": source_network,
-                "target_network": source_network,
+                "target_network": target_network_name,
             }
-            resolved.setdefault(source_network, source_network)
+            resolved.setdefault(source_network, target_network_name)
         missing = [
             str(item.get("label") or item.get("id") or "network adapter")
             for position, item in enumerate(source_nics)
@@ -7664,30 +7675,7 @@ def _resolve_restore_network_selection(
         _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for all source adapters", adapters=missing)
         return resolved, [adapter_targets[position] for position in sorted(adapter_targets)]
 
-    legacy = _parse_restore_network_map(legacy_network_map)
     if legacy:
-        source_network_set = set(source_networks)
-        for source_network, target_network_name in legacy.items():
-            _ensure(
-                source_network in source_network_set,
-                404,
-                "network_adapter_not_found",
-                "Source network not found on this VM",
-                source_network=source_network,
-            )
-            if target_networks and target_network_name not in target_network_names:
-                raise api_error(
-                    404,
-                    "network_not_found",
-                    (
-                        "Target network is not available on the selected host"
-                        if target_network_name in off_host_names
-                        else "Target network not found in inventory"
-                    ),
-                    inventory_id=target_inventory_id,
-                    host=(host or {}).get("name"),
-                    network=target_network_name,
-                )
         legacy = {
             **{
                 source_network: source_network
@@ -7708,6 +7696,41 @@ def _resolve_restore_network_selection(
     missing = [source_network for source_network in source_networks if source_network and source_network not in automatic]
     _ensure(not missing or not target_networks, 422, "invalid_restore", "Network mappings are required for the selected restore target", networks=missing)
     return automatic, []
+
+
+def _ensure_restore_network_map_targets(
+    legacy: dict[str, str],
+    *,
+    source_networks: list[str],
+    target_networks: list[dict[str, Any]],
+    off_host_names: set[str],
+    target_inventory_id: str,
+    host: dict[str, Any] | None,
+) -> None:
+    source_network_set = set(source_networks)
+    target_network_names = {str(item.get("name") or "") for item in target_networks}
+    for source_network, target_network_name in legacy.items():
+        _ensure(
+            source_network in source_network_set,
+            422,
+            "invalid_restore",
+            "Network map names a source network this restore point does not carry",
+            source_network=source_network,
+            networks=sorted(source_network_set),
+        )
+        if target_networks and target_network_name not in target_network_names:
+            raise api_error(
+                404,
+                "network_not_found",
+                (
+                    "Target network is not available on the selected host"
+                    if target_network_name in off_host_names
+                    else "Target network not found in inventory"
+                ),
+                inventory_id=target_inventory_id,
+                host=(host or {}).get("name"),
+                network=target_network_name,
+            )
 
 
 def _parse_restore_network_map(value: Any) -> dict[str, str]:
@@ -8284,6 +8307,17 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             vm_name=target_vm_name,
         )
 
+    _ensure(
+        restore_mode != "in_place"
+        or not (
+            request.get("network_mappings")
+            or _parse_restore_network_map(request.get("legacy_network_map"))
+            or request.get("nic_network_map")
+        ),
+        422,
+        "invalid_restore",
+        "In-place restore keeps every network adapter on its own network and cannot take a network mapping",
+    )
     requested_network_mappings = [
         *(request.get("network_mappings") if isinstance(request.get("network_mappings"), list) else []),
         *_resolve_restore_nic_network_mappings(
