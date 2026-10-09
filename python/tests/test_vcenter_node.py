@@ -1009,6 +1009,57 @@ class VCenterNodeGetInventoryTests(unittest.TestCase):
         self.assertEqual(inventory["disks"], [])
         self.assertEqual(inventory["network_adapters"], [])
 
+    def test_get_inventory_skips_a_vm_deleted_after_the_listing_and_names_it(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        deleted = _DeletedAfterListingVm(name="ci-clone-7", moid="vm-19831")
+
+        node.si = _FakeServiceInstance(
+            [_fake_healthy_vm(name="web-01", uuid="uuid-web-01"), deleted, _fake_healthy_vm(name="web-02", uuid="uuid-web-02")]
+        )
+
+        with self.assertLogs("python.srv.plugins.vcenter.vcenter", level="WARNING") as logs:
+            inventory = node.get_inventory()
+
+        self.assertEqual([vm["name"] for vm in inventory["virtual_machines"]], ["web-01", "web-02"])
+        self.assertEqual({disk["vm_id"] for disk in inventory["disks"]}, {"uuid-web-01", "uuid-web-02"})
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("'ci-clone-7' (vm-19831)", logs.output[0])
+        self.assertIn("deleted from vCenter vc.local while the inventory rescan was reading it", logs.output[0])
+
+    def test_get_inventory_skips_a_vm_deleted_while_its_devices_are_read(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        vanishing = _fake_healthy_vm(name="dr-test-3", uuid="uuid-dr-3")
+        vanishing.config = _DeletedProperty()
+        node.si = _FakeServiceInstance([vanishing, _fake_healthy_vm(name="web-01", uuid="uuid-web-01")])
+
+        with self.assertLogs("python.srv.plugins.vcenter.vcenter", level="WARNING") as logs:
+            inventory = node.get_inventory()
+
+        self.assertEqual([vm["name"] for vm in inventory["virtual_machines"]], ["web-01"])
+        self.assertIn("'dr-test-3'", logs.output[0])
+        self.assertIn("deleted from vCenter", logs.output[0])
+
+
+def _managed_object_not_found(moid: str) -> vmodl.fault.ManagedObjectNotFound:
+    return vmodl.fault.ManagedObjectNotFound(
+        msg=f"The object 'vim.VirtualMachine:{moid}' has already been deleted or has not been completely created",
+        obj=vim.VirtualMachine(moid),
+    )
+
+
+class _DeletedAfterListingVm:
+    def __init__(self, *, name: str, moid: str) -> None:
+        self._collector_name = name
+        self._moId = moid
+
+    def __getattr__(self, attribute: str) -> object:
+        raise _managed_object_not_found(self._moId)
+
+
+class _DeletedProperty:
+    def __getattr__(self, attribute: str) -> object:
+        raise _managed_object_not_found("vm-20001")
+
 
 _DVS_SUMMARY = "DVSwitch: 50 16 aa bb"
 

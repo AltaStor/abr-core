@@ -256,8 +256,11 @@ class VCenterNode(Hypervisor):
             container.Destroy()
 
     @_retry_on_expired_session
+    def _list_named_vms(self) -> List[tuple]:
+        return [(vm, name) for vm, name in self._named_objects(vim.VirtualMachine) if not name.startswith("vCLS-")]
+
     def _list_vms(self) -> List[Any]:
-        return [vm for vm, name in self._named_objects(vim.VirtualMachine) if not name.startswith("vCLS-")]
+        return [vm for vm, _name in self._list_named_vms()]
 
     def connect(self) -> None:
         context = ssl.create_default_context() if self.verify_ssl else ssl._create_unverified_context()
@@ -1810,12 +1813,10 @@ class VCenterNode(Hypervisor):
                     host_names[key] = None
             return host_names[key]
 
-        for vm in self._list_vms():
-            summary = vm.summary
-            config = summary.config
-            vm_display_name = getattr(config, "name", None) or getattr(vm, "name", None) or "<unknown>"
-
+        for vm, vm_display_name in self._list_named_vms():
             try:
+                summary = vm.summary
+                config = summary.config
                 if getattr(vm, "config", None) is None:
                     raise RuntimeError(
                         "vm.config is unavailable; VM is likely inaccessible or orphaned in vCenter"
@@ -1870,6 +1871,14 @@ class VCenterNode(Hypervisor):
                             "connected": bool(getattr(device.connectable, "connected", False)),
                         }
                     )
+            except vmodl.fault.ManagedObjectNotFound:
+                logger.warning(
+                    "Skipping VM '%s' (%s): it was deleted from vCenter %s while the inventory rescan was reading it",
+                    vm_display_name,
+                    getattr(vm, "_moId", None),
+                    self.host,
+                )
+                continue
             except Exception as exc:
                 logger.warning(
                     "Skipping inaccessible/orphaned VM '%s' during vCenter inventory discovery on %s: %s",
