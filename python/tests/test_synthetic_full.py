@@ -213,7 +213,7 @@ class SyntheticFullRunTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self._root, ignore_errors=True)
         self._manifest_patch = patch(
             "python.srv.services.synthetic_full._source_manifest",
-            return_value={"format_version": 1, "vm_config": {"firmware": "efi"}},
+            return_value={"format_version": 1, "vm_config": {"firmware": "efi"}, "parent_point_id": "p2"},
         )
         self._manifest_patch.start()
         self.addCleanup(self._manifest_patch.stop)
@@ -300,6 +300,7 @@ class SyntheticFullRunTests(unittest.TestCase):
         self.assertFalse(manifest["incremental"])
         self.assertEqual(manifest["merged_restore_point_ids"], ["p1", "p2", "p3"])
         self.assertEqual(manifest["vm_config"], {"firmware": "efi"})
+        self.assertIsNone(manifest["parent_point_id"])
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_a_local_merge_falls_back_to_the_written_size(self, copy_mock) -> None:

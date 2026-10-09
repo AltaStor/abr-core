@@ -4440,6 +4440,55 @@ def _encryption_differs_from_point(job: dict[str, Any], point: dict[str, Any]) -
     return current_key != previous_key
 
 
+def _point_manifest(point: dict[str, Any]) -> dict[str, Any]:
+    artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+    try:
+        payload = json.loads(Path(str(artifact.get("manifest_path") or "")).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _chain_base_mismatches(job_id: str, vm_id: str, repository_id: str | None) -> list[str]:
+    from python.srv.plugins.vcenter.vcenter_backup import VCenterBackupError, _resolve_parent_disk_entry
+
+    segments = _segment_points(_points_for_job_vm_repo(job_id, vm_id, repository_id))
+    points = segments[-1] if segments else []
+    by_id = {str(point.get("id") or ""): point for point in points}
+    mismatched: list[str] = []
+    for point in points:
+        parent = by_id.get(str(point.get("parent_point_id") or ""))
+        if parent is None or str(point.get("execution_type") or "") != "Incremental":
+            continue
+        parent_manifest = _point_manifest(parent)
+        for disk in _point_manifest(point).get("disks") or []:
+            if not isinstance(disk, dict):
+                continue
+            base = str(disk.get("previous_change_id") or "").strip()
+            try:
+                parent_disk = _resolve_parent_disk_entry(
+                    parent_manifest,
+                    datastore_path=str(disk.get("datastore_path") or ""),
+                    uuid=str(disk.get("uuid") or ""),
+                    index=int(disk.get("index") or 0),
+                )
+            except (VCenterBackupError, TypeError, ValueError):
+                parent_disk = None
+            expected = str((parent_disk or {}).get("change_id") or (parent_disk or {}).get("next_change_id") or "").strip()
+            if base and base != "*" and expected and base != expected:
+                mismatched.append(str(point.get("id") or ""))
+                break
+    return mismatched
+
+
+def _chain_base_mismatch_message(points: list[str]) -> str:
+    return (
+        "This job's backup chain holds incremental backups that were taken on another job's backup of the same "
+        f"VM (restore points {', '.join(points)}), so they can miss changes and restore stale or damaged data. "
+        "This run is an active full that starts a clean chain."
+    )
+
+
 def resolve_job_execution(
     job: dict[str, Any],
     *,
@@ -4468,6 +4517,8 @@ def resolve_job_execution(
         return "ActiveFull", "FirstRun"
     if _encryption_differs_from_point(job, previous):
         return "ActiveFull", "EncryptionKeyChanged"
+    if _chain_base_mismatches(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None):
+        return "ActiveFull", "ChainBaseMismatch"
     if scheduled_type == "ActiveFull":
         return "ActiveFull", "ActiveFullSchedule"
     if scheduled_type == "SyntheticFull":
@@ -4510,7 +4561,20 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
     elif queued_type in {"Incremental", "SyntheticFull"} and not has_point:
         execution_type, execution_reason = "ActiveFull", "FirstRun"
     else:
-        return task
+        execution_type, execution_reason = queued_type, queued_reason
+    mismatched: list[str] = []
+    if execution_type in {"Incremental", "SyntheticFull"} or execution_reason == "ChainBaseMismatch":
+        mismatched = _chain_base_mismatches(job_id, vm_id, str(job.get("repo_id") or "") or None)
+        if mismatched:
+            execution_type, execution_reason = "ActiveFull", "ChainBaseMismatch"
+    warnings = task.get("warnings") if isinstance(task.get("warnings"), list) else []
+    if mismatched and not any(isinstance(item, dict) and item.get("code") == "chain_base_mismatch" for item in warnings):
+        message = _chain_base_mismatch_message(mismatched)
+        task["warnings"] = [*warnings, {"code": "chain_base_mismatch", "message": message, "restore_point_ids": mismatched}]
+        _append_task_log(task, level="warn", message=message, component="session")
+        LOGGER.warning("Backup session %s of job '%s', VM %s: %s", task.get("id"), job.get("name"), vm_id, message)
+        if (execution_type, execution_reason) == (queued_type, queued_reason):
+            persist_task(task)
     if (execution_type, execution_reason) == (queued_type, queued_reason):
         return task
     parameters.update(
@@ -4538,6 +4602,49 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
     )
     persist_task(task)
     return task
+
+def bind_backup_parent(task: dict[str, Any]) -> dict[str, Any]:
+    if str(task.get("task_type") or "") != "backup":
+        return task
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    job_id = str(task.get("job_id") or "")
+    if not job_id or job_id not in JOBS or parameters.get("copy_job"):
+        return task
+    binding: dict[str, Any] = {"parent_point_id": None, "parent_task_id": None, "parent_manifest_hint": None}
+    previous = None
+    if str(parameters.get("resolved_backup_type") or "") == "Incremental":
+        job = resolve_job(record_id=job_id)
+        previous = _latest_successful_point(
+            job_id, str(task.get("resource_external_id") or ""), str(job.get("repo_id") or "") or None
+        )
+    if previous is not None:
+        from python.srv.services.backup_catalog import _load_backup_manifest_payload
+
+        origin = previous.get("origin") if isinstance(previous.get("origin"), dict) else {}
+        artifact = previous.get("artifact") if isinstance(previous.get("artifact"), dict) else {}
+        _load_backup_manifest_payload(previous, artifact)
+        binding = {
+            "parent_point_id": str(previous.get("id") or "") or None,
+            "parent_task_id": str(origin.get("task_id") or "") or None,
+            "parent_manifest_hint": str(artifact.get("manifest_path") or "") or None,
+        }
+    if all(parameters.get(key) == value for key, value in binding.items()):
+        return task
+    parameters.update(binding)
+    task["parameters"] = parameters
+    if previous is not None:
+        _append_task_log(
+            task,
+            level="info",
+            message=(
+                f"Continues this job's backup chain from restore point {binding['parent_point_id']} "
+                f"(session {binding['parent_task_id']})"
+            ),
+            component="session",
+        )
+    persist_task(task)
+    return task
+
 
 def _point_period_key(point: dict[str, Any], *, kind: str) -> str:
     created = _parse_dt(point.get("created_at"))
@@ -7967,6 +8074,19 @@ def _ensure_chain_can_be_merged(job: dict[str, Any]) -> None:
                 vm_id=str(vm_id),
                 vm_name=str(vm_name),
             ) from exc
+        mismatched = _chain_base_mismatches(str(job["id"]), str(vm_id), repository_id)
+        _ensure(
+            not mismatched,
+            422,
+            "chain_cannot_be_merged",
+            f"The backup chain of {vm_name} holds incremental backups that were taken on another job's backup of "
+            f"the same VM (restore points {', '.join(mismatched)}), so a synthetic full would merge their gaps. "
+            "Run an active full instead (abr job start --full).",
+            job_id=str(job.get("id") or ""),
+            vm_id=str(vm_id),
+            vm_name=str(vm_name),
+            restore_point_ids=mismatched,
+        )
 
 
 def _job_vm_current_names(job: dict[str, Any]) -> list[str]:

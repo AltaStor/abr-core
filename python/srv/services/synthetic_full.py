@@ -540,6 +540,7 @@ def run_synthetic_full(
             "backup_mode": "full",
             "resolved_backup_type": "SyntheticFull",
             "resolved_backup_reason": str(parameters.get("resolved_backup_reason") or "SyntheticFullWindow"),
+            "parent_point_id": None,
             "storage_layout": storage_layout,
             "incremental": False,
             "differential": False,

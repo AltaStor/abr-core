@@ -2630,6 +2630,80 @@ class TaskExecutorTests(unittest.TestCase):
             )
         self.assertEqual(path, newest)
 
+    def test_an_incremental_continues_from_its_own_job_and_not_from_the_newest_backup_of_the_vm(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import _resolve_parent_manifest
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            own = self._write_vm_manifest(root, "demo-vm", "task-x1", "vm-uuid-1", "2026-10-07T10:00:00+00:00")
+            self._write_vm_manifest(root, "demo-vm", "task-y1", "vm-uuid-1", "2026-10-07T11:00:00+00:00")
+            path, manifest = _resolve_parent_manifest(
+                parameters={"parent_point_id": "point-x1", "parent_task_id": "task-x1"},
+                destination_root=root,
+                vm_name="demo-vm",
+                task_root=root / "demo-vm" / "task-x2",
+                vm_external_id="vm-uuid-1",
+            )
+        self.assertEqual(path, own)
+        self.assertEqual(manifest["disks"][0]["change_id"], "change-task-x1")
+
+    def test_an_incremental_finds_its_own_parent_in_the_id_layout_too(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import STORAGE_LAYOUT_BY_ID, _resolve_parent_manifest
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            own = self._write_vm_manifest(root / "job-x", "vm-uuid-1", "task-x1", "vm-uuid-1", "2026-10-07T10:00:00+00:00")
+            path, _manifest = _resolve_parent_manifest(
+                parameters={"parent_point_id": "point-x1", "parent_task_id": "task-x1"},
+                destination_root=root,
+                vm_name="demo-vm",
+                task_root=root / "job-x" / "vm-uuid-1" / "task-x2",
+                vm_external_id="vm-uuid-1",
+                layout=STORAGE_LAYOUT_BY_ID,
+            )
+        self.assertEqual(path, own)
+
+    def test_an_own_parent_outside_the_repository_folders_is_read_from_its_recorded_path(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import _resolve_parent_manifest
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            recorded = self._write_vm_manifest(root / "old-location", "demo-vm", "task-x1", "vm-uuid-1", "2026-10-07T10:00:00+00:00")
+            self._write_vm_manifest(root / "repo", "demo-vm", "task-y1", "vm-uuid-1", "2026-10-07T11:00:00+00:00")
+            path, _manifest = _resolve_parent_manifest(
+                parameters={"parent_point_id": "point-x1", "parent_task_id": "task-x1", "parent_manifest_hint": str(recorded)},
+                destination_root=root / "repo",
+                vm_name="demo-vm",
+                task_root=root / "repo" / "demo-vm" / "task-x2",
+                vm_external_id="vm-uuid-1",
+            )
+        self.assertEqual(path, recorded)
+
+    def test_an_incremental_whose_own_parent_is_gone_refuses_instead_of_taking_another_jobs_backup(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import (
+            VCenterBackupError,
+            _is_missing_parent_manifest_error,
+            _resolve_parent_manifest,
+        )
+
+        for parameters in (
+            {"parent_point_id": "point-x1", "parent_task_id": "task-x1", "parent_manifest_hint": "/nowhere/manifest.json"},
+            {"parent_point_id": None, "parent_task_id": None, "parent_manifest_hint": None},
+        ):
+            with self.subTest(parameters=parameters), tempfile.TemporaryDirectory() as temp_dir:
+                root = pathlib.Path(temp_dir)
+                self._write_vm_manifest(root, "demo-vm", "task-y1", "vm-uuid-1", "2026-10-07T11:00:00+00:00")
+                with self.assertRaises(VCenterBackupError) as ctx:
+                    _resolve_parent_manifest(
+                        parameters=parameters,
+                        destination_root=root,
+                        vm_name="demo-vm",
+                        task_root=root / "demo-vm" / "task-x2",
+                        vm_external_id="vm-uuid-1",
+                    )
+                self.assertTrue(_is_missing_parent_manifest_error(str(ctx.exception)))
+                self.assertIn("abr job start --full", str(ctx.exception))
+
     def test_a_differential_after_a_rename_chains_onto_the_full_under_the_old_name(self) -> None:
         from python.srv.plugins.vcenter.vcenter_backup import _resolve_parent_manifest
 

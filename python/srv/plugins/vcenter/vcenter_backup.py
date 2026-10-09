@@ -1070,6 +1070,10 @@ def _resolve_parent_manifest(
         search_root, pattern = task_root.parent, "*/manifest.json"
     else:
         search_root, pattern = destination_root, "*/*/manifest.json"
+    if "parent_task_id" in parameters:
+        return _job_parent_manifest(
+            parameters, _vm_backup_manifests(search_root, vm_external_id, pattern), vm_name, vm_external_id
+        )
     candidates = [
         (path, manifest)
         for path, manifest in _vm_backup_manifests(search_root, vm_external_id, pattern)
@@ -1090,6 +1094,37 @@ def _resolve_parent_manifest(
 
     candidates.sort(key=lambda item: _manifest_sort_key(item[0], item[1]), reverse=True)
     return candidates[0]
+
+
+def _job_parent_manifest(
+    parameters: dict[str, Any],
+    found: list[tuple[Path, dict[str, Any]]],
+    vm_name: str,
+    vm_external_id: str,
+) -> tuple[Path, dict[str, Any]]:
+    parent_task_id = str(parameters.get("parent_task_id") or "")
+    parent_point_id = str(parameters.get("parent_point_id") or "")
+    if parent_task_id:
+        for path, manifest in found:
+            if path.parent.name == parent_task_id:
+                return path, manifest
+        hint = str(parameters.get("parent_manifest_hint") or "")
+        if hint:
+            try:
+                manifest = _load_manifest(Path(hint).expanduser().resolve())
+            except VCenterBackupError:
+                manifest = {}
+            if str(manifest.get("vm_external_id") or "") == vm_external_id:
+                return Path(hint).expanduser().resolve(), manifest
+        raise VCenterBackupError(
+            f"Incremental backup of {vm_name} cannot read the manifest of its previous backup, restore point "
+            f"{parent_point_id or '?'} (session {parent_task_id}), so it has nothing of this job's own to continue "
+            "from. Run a full backup of the job (abr job start --full) to start a new chain."
+        )
+    raise VCenterBackupError(
+        f"Incremental backup of {vm_name} found no previous backup manifest of this job to continue from. "
+        "Run a full backup of the job (abr job start --full) to start a new chain."
+    )
 
 
 _WRITE_FAILURE = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
@@ -2953,12 +2988,18 @@ def run_vcenter_backup(
             if encryption_rotated and not incremental:
                 resolved_backup_type = "ActiveFull"
                 resolved_backup_reason = "EncryptionKeyChanged"
+            base_point_id = (
+                str(parameters.get("parent_point_id") or "") or None
+                if parent_manifest is not None and resolved_backup_type == "Incremental"
+                else None
+            )
             manifest_payload = {
                 "format_version": 1,
                 "operation": "vm-backup",
                 "backup_mode": backup_mode,
                 "resolved_backup_type": resolved_backup_type,
                 "resolved_backup_reason": resolved_backup_reason,
+                "parent_point_id": base_point_id,
                 "hypervisor_kind": "vcenter",
                 "hypervisor_id": str(task["hypervisor_id"]),
                 "vm_name": vm_name,
@@ -3071,6 +3112,7 @@ def run_vcenter_backup(
             "backup_mode": backup_mode,
             "resolved_backup_type": resolved_backup_type,
             "resolved_backup_reason": resolved_backup_reason,
+            "parent_point_id": base_point_id,
             "incremental": incremental,
             "differential": differential,
             "query_changed_areas_only": query_changed_areas_only,
