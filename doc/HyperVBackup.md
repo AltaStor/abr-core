@@ -39,7 +39,7 @@ NAS the appliance mounts at the repository's path) and give the repository the
 share every Hyper-V host reaches it by:
 
 ```bash
-abr repo edit --name "HV-Local" --server backup01 --share hv --username 'CORP\backupsvc' --password '...'
+abr repo edit --name "HV-Local" --server backup01 --share hv --username 'CORP\backupsvc' --password
 ```
 
 `--server` and `--share` name `\\backup01\hv`, which must be the repository's
@@ -48,6 +48,8 @@ abr-vhdx-tool then writes each backup to the same folder through the share,
 and the appliance reads it locally. A WinRM session has no network credentials
 of its own, so the host opens the share for each run with the repository's
 `--username` and `--password`, or the inventory's account when it has none.
+`--password` without a value reads `ABR_REPO_PASSWORD` or prompts for it, so the
+password never shows on the command line.
 
 The appliance creates every backup folder itself, owned by the user its server
 runs as and writable by nobody else (mode 0750), so the share must write as

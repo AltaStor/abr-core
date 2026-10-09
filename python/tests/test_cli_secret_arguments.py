@@ -181,6 +181,15 @@ class SecretCommandTests(unittest.TestCase):
         )
         self.assertEqual(payload["password"], "typed")
 
+    def test_repo_add_local_prompts_for_the_share_password_only_with_a_username(self) -> None:
+        base = ["repo", "add", "--name", "r", "--type", "local", "--path", "/srv/backups", "--server", "backup01", "--share", "hv"]
+        payload = self._run([*base, "--username", "CORP\\svc"], {}, prompt=["typed"])
+        self.assertEqual(payload["password"], "typed")
+        payload = self._run([*base, "--username", "CORP\\svc"], {"ABR_REPO_PASSWORD": "from-env"})
+        self.assertEqual(payload["password"], "from-env")
+        payload = self._run(base, {"ABR_REPO_PASSWORD": "from-env"})
+        self.assertIsNone(payload.get("password"))
+
     def test_repo_add_s3_takes_the_secret_key_from_the_environment_only_with_an_access_key(self) -> None:
         base = ["repo", "add", "--name", "r", "--type", "s3", "--bucket", "b", "--region", "us-east-1"]
         payload = self._run([*base, "--access-key", "AK"], {"ABR_REPO_SECRET_KEY": "from-env"})

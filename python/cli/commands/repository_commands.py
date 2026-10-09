@@ -233,7 +233,7 @@ class RepositoryCommands:
                 "Examples:\n"
                 '  abr repo add --name "Local-Repo-1" --type local --path /mnt/backups/repo1\n'
                 '  abr repo add --name "HV-Local" --type local --path /mnt/backups/hv --server backup01 '
-                '--share hv --username "CORP\\backupsvc" --password "********"\n'
+                '--share hv --username "CORP\\backupsvc"\n'
                 '  abr repo add --name "SMB-Repo" --type smb --address //fileserver/backups '
                 "--username backupsvc\n"
                 '  abr repo add --name "S3-Repo" --type s3 --bucket altastor-backups --region us-east-1 '
@@ -341,7 +341,7 @@ class RepositoryCommands:
                 "Examples:\n"
                 '  abr repo edit --name "Local-Repo-1" --description "Primary on-prem repository"\n'
                 '  abr repo edit --name "Local-Repo-1" --server backup01 --share repo1 --username "CORP\\backupsvc" '
-                '--password "********"\n'
+                "--password\n"
                 '  abr repo edit --id <repo-id> --new-name "Local-Repo-1-Renamed"\n'
                 '  abr repo edit --name "S3-WORM" --immutable governance --immutability-days 30\n'
                 '  abr repo edit --name "S3-WORM" --immutable none'
@@ -472,7 +472,7 @@ class RepositoryCommands:
             getattr(args, "password", None),
             env_var=REPO_PASSWORD_ENV_VAR,
             prompt="Repository password",
-            needed=repo_type == "smb" and bool(getattr(args, "username", None)),
+            needed=repo_type in {"smb", "local"} and bool(getattr(args, "username", None)),
         )
         args.secret_key = resolve_secret(
             getattr(args, "secret_key", None),
