@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 import json
+from datetime import datetime, timezone
 import subprocess
 import unittest
 from contextlib import contextmanager
@@ -8508,6 +8509,71 @@ class TaskExecutorTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "failed")
         self.assertEqual(leftovers, [])
+
+    @staticmethod
+    def _failed_disk_open(command: list[str], **kwargs) -> FakeCompletedProcess:
+        return FakeCompletedProcess(
+            returncode=7,
+            stderr="Error: failed to open disk '[datastore1] demo-vm/demo-vm.vmdk': Unknown error",
+        )
+
+    def _failed_backup_message(self, changes: list) -> tuple[str, object]:
+        started = datetime(2026, 10, 9, 17, 33, 9, tzinfo=timezone.utc)
+        with patch.object(FakeVCenterNode, "server_time", create=True, return_value=started), patch.object(
+            FakeVCenterNode, "vm_changes_since", create=True, return_value=changes
+        ) as asked:
+            result, _leftovers = self._run_stopped_backup(self._failed_disk_open)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(asked.call_args.args[2], started)
+        return str((result.get("result") or {}).get("message") or ""), asked
+
+    def test_a_failed_backup_says_the_vm_was_powered_off_and_deleted_while_it_ran(self) -> None:
+        at = datetime(2026, 10, 9, 17, 33, 41, tzinfo=timezone.utc)
+        admin = "VSPHERE.LOCAL\\Administrator"
+
+        message, _asked = self._failed_backup_message([("powered off", admin, at), ("deleted", admin, at)])
+
+        self.assertEqual(
+            message,
+            "VM 'demo-vm' was powered off, then deleted in vCenter by VSPHERE.LOCAL\\Administrator at 17:33:41 UTC "
+            "while this backup ran, so its disks could not be read.",
+        )
+
+    def test_different_people_are_each_named_with_their_own_action(self) -> None:
+        at = datetime(2026, 10, 9, 17, 33, 41, tzinfo=timezone.utc)
+
+        message, _asked = self._failed_backup_message([("powered off", "ops", at), ("removed from the inventory", "ci", at)])
+
+        self.assertIn(
+            "was powered off by ops at 17:33:41 UTC, then removed from the inventory by ci at 17:33:41 UTC in vCenter",
+            message,
+        )
+
+    def test_a_vm_only_powered_off_keeps_the_real_failure_beside_it(self) -> None:
+        at = datetime(2026, 10, 9, 17, 33, 41, tzinfo=timezone.utc)
+
+        message, _asked = self._failed_backup_message([("powered off", "ops", at)])
+
+        self.assertTrue(message.startswith("VM 'demo-vm' was powered off in vCenter by ops at 17:33:41 UTC while this backup ran. "))
+        self.assertIn("Disk backup failed for [datastore1] demo-vm/demo-vm.vmdk", message)
+        self.assertIn("Unknown error", message)
+
+    def test_a_failed_backup_of_an_untouched_vm_keeps_its_own_message(self) -> None:
+        with patch.object(
+            FakeVCenterNode, "server_time", create=True, return_value=datetime(2026, 10, 9, tzinfo=timezone.utc)
+        ), patch.object(FakeVCenterNode, "vm_changes_since", create=True, return_value=[]):
+            result, _leftovers = self._run_stopped_backup(self._failed_disk_open)
+
+        message = str((result.get("result") or {}).get("message") or "")
+        self.assertIn("Disk backup failed for [datastore1] demo-vm/demo-vm.vmdk", message)
+        self.assertNotIn("while this backup ran", message)
+
+    def test_without_the_vcenter_time_the_failure_is_not_explained_by_guesswork(self) -> None:
+        with patch.object(FakeVCenterNode, "vm_changes_since", create=True) as asked:
+            result, _leftovers = self._run_stopped_backup(self._failed_disk_open)
+
+        self.assertEqual(result["status"], "failed")
+        asked.assert_not_called()
 
     def test_a_single_disk_restore_stopped_mid_disk_settles_stopped(self) -> None:
         self._register_vcenter_stand()

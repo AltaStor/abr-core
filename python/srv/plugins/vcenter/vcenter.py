@@ -1700,6 +1700,62 @@ class VCenterNode(Hypervisor):
             "changed": True,
         }
 
+    @_retry_on_expired_session
+    def server_time(self) -> Any:
+        return self.si.CurrentTime()
+
+    @_retry_on_expired_session
+    def vm_changes_since(self, vm_name: str, vm_moref: str | None, since: Any) -> list[tuple[str, str, Any]]:
+        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
+        if vm is None and not vm_moref:
+            vm = self._get_vm(vm_name)
+        event_manager = self.si.RetrieveContent().eventManager
+        if vm is not None:
+            spec = vim.event.EventFilterSpec(
+                entity=vim.event.EventFilterSpec.ByEntity(entity=vm, recursion="self"),
+                time=vim.event.EventFilterSpec.ByTime(beginTime=since),
+            )
+            events = list(event_manager.QueryEvents(spec) or [])
+        else:
+            spec = vim.event.EventFilterSpec(
+                time=vim.event.EventFilterSpec.ByTime(beginTime=since),
+                type=[vim.event.VmPoweredOffEvent, vim.event.VmSuspendedEvent, vim.event.VmRemovedEvent, vim.event.TaskEvent],
+            )
+            events = [
+                event
+                for event in event_manager.QueryEvents(spec) or []
+                if str(getattr(getattr(getattr(event, "vm", None), "vm", None), "_moId", "") or "") == str(vm_moref or "")
+            ]
+        changes: list[tuple[str, str, Any]] = []
+        removed: list[tuple[str, str, Any]] = []
+        for event in events:
+            action = ""
+            if isinstance(event, vim.event.VmPoweredOffEvent):
+                action = "powered off"
+            elif isinstance(event, vim.event.VmSuspendedEvent):
+                action = "suspended"
+            elif isinstance(event, (vim.event.VmMigratedEvent, vim.event.VmRelocatedEvent)):
+                action = "moved to another host or datastore"
+            elif isinstance(event, vim.event.VmRemovedEvent):
+                action = "removed from vCenter"
+            elif isinstance(event, vim.event.TaskEvent):
+                description = str(getattr(getattr(event, "info", None), "descriptionId", "") or "")
+                action = {"VirtualMachine.destroy": "deleted", "VirtualMachine.unregister": "removed from the inventory"}.get(
+                    description, ""
+                )
+            if not action:
+                continue
+            change = (action, str(getattr(event, "userName", "") or ""), getattr(event, "createdTime", None))
+            if action == "removed from vCenter":
+                removed.append(change)
+            elif action not in [item[0] for item in changes]:
+                changes.append(change)
+        if removed and not any(item[0] in {"deleted", "removed from the inventory"} for item in changes):
+            changes.append(removed[0])
+        if vm is None and not changes:
+            changes.append(("deleted or removed from the inventory", "", None))
+        return changes
+
     def read_vm_identity(self, vm_name: str, vm_moref: str | None = None) -> dict[str, str]:
         vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
         if vm is None:

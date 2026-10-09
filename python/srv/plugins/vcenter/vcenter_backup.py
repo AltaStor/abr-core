@@ -1139,6 +1139,55 @@ def _repository_free_bytes(repository: dict[str, Any] | None) -> int | None:
     return filesystem_free_bytes(root) if root else None
 
 
+def _vm_changes_during_backup(
+    host: str,
+    username: str,
+    password: str,
+    port: int,
+    verify_ssl: bool,
+    vm_name: str,
+    vm_moref: str,
+    since: Any,
+) -> list[tuple[str, str, Any]]:
+    if since is None:
+        return []
+    from .vcenter import VCenterNode
+
+    try:
+        with VCenterNode(host, username, password, port=port, verify_ssl=verify_ssl) as node:
+            return node.vm_changes_since(vm_name, vm_moref or None, since)
+    except Exception:
+        logger.warning("Could not check what happened to VM %s during the failed backup", vm_name, exc_info=True)
+        return []
+
+
+_VM_TAKEN_AWAY = {
+    "deleted",
+    "removed from the inventory",
+    "removed from vCenter",
+    "moved to another host or datastore",
+    "deleted or removed from the inventory",
+}
+
+
+def _vm_changes_message(vm_name: str, changes: list[tuple[str, str, Any]], failure: Exception) -> str:
+    def by(user: str, when: Any) -> str:
+        return (f" by {user}" if user else "") + (f" at {when.strftime('%H:%M:%S')} UTC" if when is not None else "")
+
+    users = {user for _action, user, _when in changes}
+    if len(users) == 1:
+        first = changes[0]
+        described = ", then ".join(action for action, _user, _when in changes) + " in vCenter" + by(first[1], first[2])
+    else:
+        described = ", then ".join(f"{action}{by(user, when)}" for action, user, when in changes) + " in vCenter"
+    if any(action in _VM_TAKEN_AWAY for action, _user, _when in changes):
+        consequence = (
+            "its disks could not be read" if str(failure).startswith("Disk backup failed") else "the backup could not finish"
+        )
+        return f"VM '{vm_name}' was {described} while this backup ran, so {consequence}."
+    return f"VM '{vm_name}' was {described} while this backup ran. {failure}"
+
+
 def _disk_failure_message(
     repository: dict[str, Any] | None,
     tool_error: str,
@@ -1593,6 +1642,8 @@ def run_vcenter_backup(
     written_backup_names: list[str] = []
     stop_requested_after_completion = False
     access_lock_moref: str | None = None
+    watch_since: Any = None
+    watch_moref = ""
 
     try:
         # The data mover carries the disk over its own VDDK connection, so this
@@ -1659,10 +1710,15 @@ def run_vcenter_backup(
                 f"Creating backup snapshot for {vm_name}",
                 worker_mode="vcenter-abr-vmdk-tool",
             )
+            try:
+                watch_since = node.server_time()
+            except Exception:
+                logger.debug("Could not read the vCenter time at the start of backup %s", task.get("id"), exc_info=True)
             snapshot_name = node.create_backup_snapshot(vm_name)
             _record_backup_snapshot(progress_callback, vm_name, snapshot_name)
             backup_params = node.get_backup_parameters(vm_name, snapshot_name)
             vm_moref = str(backup_params.get("vm_moref") or "")
+            watch_moref = vm_moref
             snapshot_moref = str(backup_params.get("snapshot_moref") or "")
             if not vm_moref or not snapshot_moref:
                 raise VCenterBackupError("vCenter did not return VM or snapshot MoRef values")
@@ -3173,6 +3229,11 @@ def run_vcenter_backup(
     except Exception as exc:
         logger.exception("Task %s failed critically during vCenter interaction: %s", task.get("id"), exc)
         _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root)
+        changes = _vm_changes_during_backup(
+            host, username, password, port, verify_ssl, vm_name, watch_moref, watch_since
+        )
+        if changes:
+            raise VCenterBackupError(_vm_changes_message(vm_name, changes, exc)) from exc
         raise
     finally:
         if snapshot_name:

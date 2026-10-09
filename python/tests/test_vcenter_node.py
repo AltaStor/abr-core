@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import types
+from datetime import datetime, timezone
 import unittest
 
 try:
@@ -1038,6 +1039,87 @@ class VCenterNodeGetInventoryTests(unittest.TestCase):
         self.assertEqual([vm["name"] for vm in inventory["virtual_machines"]], ["web-01"])
         self.assertIn("'dr-test-3'", logs.output[0])
         self.assertIn("deleted from vCenter", logs.output[0])
+
+
+class VmChangesDuringBackupTests(unittest.TestCase):
+    STARTED = datetime(2026, 10, 9, 17, 33, 9, tzinfo=timezone.utc)
+    AT = datetime(2026, 10, 9, 17, 33, 41, tzinfo=timezone.utc)
+    ADMIN = "VSPHERE.LOCAL\\Administrator"
+
+    def _node(self, events: list, vm: object | None) -> tuple[VCenterNode, list]:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        asked: list = []
+
+        def query(spec):
+            asked.append(spec)
+            return events
+
+        content = types.SimpleNamespace(eventManager=types.SimpleNamespace(QueryEvents=query))
+        node.si = types.SimpleNamespace(RetrieveContent=lambda: content)
+        node._get_vm_by_moref = lambda moref: vm
+        node._get_vm = lambda name: vm
+        return node, asked
+
+    @staticmethod
+    def _vm() -> object:
+        return vim.VirtualMachine("vm-1")
+
+    def _task_event(self, description: str) -> object:
+        return vim.event.TaskEvent(
+            info=vim.TaskInfo(descriptionId=description),
+            userName=self.ADMIN,
+            createdTime=self.AT,
+            vm=vim.event.VmEventArgument(vm=vim.VirtualMachine("vm-1")),
+        )
+
+    def _removed(self, moref: str = "vm-1") -> object:
+        return vim.event.VmRemovedEvent(userName="ops", createdTime=self.AT, vm=vim.event.VmEventArgument(vm=vim.VirtualMachine(moref)))
+
+    def test_a_power_off_and_a_delete_are_told_with_who_and_when(self) -> None:
+        events = [
+            self._task_event("VirtualMachine.createSnapshot"),
+            self._task_event("VirtualMachine.reconfigure"),
+            vim.event.VmPoweredOffEvent(userName=self.ADMIN, createdTime=self.AT),
+            self._task_event("VirtualMachine.destroy"),
+        ]
+        node, asked = self._node(events, self._vm())
+
+        changes = node.vm_changes_since("et-test-del", "vm-1", self.STARTED)
+
+        self.assertEqual(changes, [("powered off", self.ADMIN, self.AT), ("deleted", self.ADMIN, self.AT)])
+        self.assertEqual(asked[0].time.beginTime, self.STARTED)
+
+    def test_a_vm_whose_delete_went_through_is_found_in_the_events_by_its_moref(self) -> None:
+        node, _asked = self._node([self._removed("vm-1"), self._removed("vm-2")], None)
+
+        self.assertEqual(node.vm_changes_since("et-test-del", "vm-1", self.STARTED), [("removed from vCenter", "ops", self.AT)])
+
+    def test_a_vm_that_vanished_without_a_trace_is_still_named_as_gone(self) -> None:
+        node, _asked = self._node([], None)
+
+        self.assertEqual(
+            node.vm_changes_since("et-test-del", "vm-1", self.STARTED), [("deleted or removed from the inventory", "", None)]
+        )
+
+    def test_an_unregister_is_not_called_a_delete(self) -> None:
+        events = [self._task_event("VirtualMachine.unregister"), self._removed()]
+        node, _asked = self._node(events, None)
+
+        self.assertEqual(
+            node.vm_changes_since("et-test-del", "vm-1", self.STARTED), [("removed from the inventory", self.ADMIN, self.AT)]
+        )
+
+    def test_a_completed_delete_is_told_once(self) -> None:
+        node, _asked = self._node([self._task_event("VirtualMachine.destroy"), self._removed()], None)
+
+        self.assertEqual(node.vm_changes_since("et-test-del", "vm-1", self.STARTED), [("deleted", self.ADMIN, self.AT)])
+
+    def test_a_vm_the_backup_alone_touched_reports_nothing(self) -> None:
+        node, _asked = self._node(
+            [self._task_event("VirtualMachine.createSnapshot"), self._task_event("VirtualMachine.removeSnapshot")], self._vm()
+        )
+
+        self.assertEqual(node.vm_changes_since("et-test-del", "vm-1", self.STARTED), [])
 
 
 def _managed_object_not_found(moid: str) -> vmodl.fault.ManagedObjectNotFound:
