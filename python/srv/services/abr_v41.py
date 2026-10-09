@@ -3859,13 +3859,21 @@ def job_clock_anomalies(job: dict[str, Any]) -> list[dict[str, Any]]:
     now = _now_utc()
     anomalies: list[dict[str, Any]] = []
     raw_last_run = str(job.get("last_run_at") or "")
-    last_run = _parse_dt(raw_last_run) if raw_last_run else None
+    try:
+        last_run = _parse_dt(raw_last_run) if raw_last_run else None
+    except ValueError:
+        last_run = None
     if last_run is not None and last_run - now > CLOCK_SKEW_TOLERANCE:
         anomalies.append(
             {
                 "kind": "last_run_ahead_of_server_clock",
                 "last_run_at": raw_last_run,
                 "server_time": now.isoformat(),
+                "message": (
+                    f"The last run is dated {raw_last_run}, ahead of this server's time ({now.isoformat()}). "
+                    "It was recorded while this server's clock was ahead, so the job shows a last run later "
+                    "than its next run until the clock reaches that date. Check the clock on this server."
+                ),
             }
         )
     return anomalies

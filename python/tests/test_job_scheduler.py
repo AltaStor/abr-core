@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 import pathlib
 import sys
 import unittest
@@ -449,6 +450,53 @@ class JobSchedulerTests(unittest.TestCase):
         self.scheduler._dispatch_due_jobs()
 
         self.assertEqual(TASKS["task-stale"]["status"], "failed")
+
+
+class JobClockAnomalyLogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        JOBS.clear()
+        TASKS.clear()
+        self.addCleanup(JOBS.clear)
+        self.addCleanup(TASKS.clear)
+        self.scheduler = JobScheduler(poll_interval_seconds=0.1)
+
+    @staticmethod
+    def _job(job_id: str, last_run_at: str) -> None:
+        JOBS[job_id] = {"id": job_id, "name": f"name-{job_id}", "job_type": "backup", "last_run_at": last_run_at}
+
+    @staticmethod
+    def _stamp(delta: timedelta) -> str:
+        return (datetime.now(timezone.utc) + delta).isoformat()
+
+    def _clock_lines(self, passes: int = 1) -> list[str]:
+        with self.assertLogs("python.srv.core.job_scheduler", level="WARNING") as logs:
+            for _ in range(passes):
+                self.scheduler._dispatch_due_jobs()
+            logging.getLogger("python.srv.core.job_scheduler").warning("end of passes")
+        return [line for line in logs.output if "ahead of this server's time" in line]
+
+    def test_a_last_run_ahead_of_the_clock_is_logged_once_with_the_job_and_both_times(self) -> None:
+        last_run_at = self._stamp(timedelta(days=4))
+        self._job("job-1", last_run_at)
+
+        lines = self._clock_lines(passes=5)
+
+        self.assertEqual(len(lines), 1)
+        self.assertIn("'name-job-1' (job-1)", lines[0])
+        self.assertIn(last_run_at, lines[0])
+
+    def test_a_new_anomaly_on_the_same_job_is_logged_again(self) -> None:
+        self._job("job-1", self._stamp(timedelta(days=4)))
+        self.assertEqual(len(self._clock_lines()), 1)
+        self._job("job-1", self._stamp(timedelta(hours=-1)))
+        self.assertEqual(self._clock_lines(), [])
+        self._job("job-1", self._stamp(timedelta(days=2)))
+        self.assertEqual(len(self._clock_lines()), 1)
+
+    def test_a_job_on_a_sane_clock_is_not_logged(self) -> None:
+        self._job("job-1", self._stamp(timedelta(hours=-1)))
+        self._job("job-2", "not-a-date")
+        self.assertEqual(self._clock_lines(passes=2), [])
 
 
 class SyntheticFullSchedulingTests(unittest.TestCase):
