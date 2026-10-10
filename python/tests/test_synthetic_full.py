@@ -303,6 +303,28 @@ class SyntheticFullRunTests(unittest.TestCase):
         self.assertIsNone(manifest["parent_point_id"])
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_merge_is_flushed_to_stable_storage_before_it_is_reported(self, copy_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1024, "stored_data_size": 512, "merged_from": 3}
+
+        with patch("python.srv.services.synthetic_full.make_durable") as flushed:
+            result = synthetic_full.run_synthetic_full(self._task())
+
+        flushed.assert_called_once()
+        self.assertEqual(Path(flushed.call_args.args[0]), Path(result["manifest_path"]).parent)
+
+    @patch("python.srv.services.synthetic_full._discard_partial_merge")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_merge_that_cannot_be_flushed_is_discarded(self, copy_mock, discard_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1024, "stored_data_size": 512, "merged_from": 3}
+
+        with patch("python.srv.services.synthetic_full.make_durable", side_effect=OSError(5, "Input/output error")):
+            with self.assertRaises(synthetic_full.SyntheticFullError) as ctx:
+                synthetic_full.run_synthetic_full(self._task())
+
+        self.assertIn("could not be flushed to stable storage", str(ctx.exception))
+        discard_mock.assert_called_once()
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_a_local_merge_falls_back_to_the_written_size(self, copy_mock) -> None:
         def _write(**kwargs: object) -> dict[str, object]:
             destination = Path(str(kwargs["destination_abr_path"]))

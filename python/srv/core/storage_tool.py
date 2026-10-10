@@ -280,6 +280,48 @@ def ensure_private_directory(path: Path) -> None:
             pass
 
 
+def _fsync_path(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def write_file_durably(path: Path, text: str) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    _fsync_path(path.parent)
+
+
+def make_durable(root: Path, *, up_to: Path | None = None) -> None:
+    if not root.is_dir():
+        return
+    directories = [root]
+    for entry in sorted(root.rglob("*")):
+        if entry.is_symlink():
+            continue
+        if entry.is_dir():
+            directories.append(entry)
+        elif entry.is_file():
+            _fsync_path(entry)
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        _fsync_path(directory)
+    if up_to is None:
+        return
+    stop = up_to.resolve()
+    current = root.resolve().parent
+    while current != current.parent and (current == stop or stop in current.parents):
+        _fsync_path(current)
+        if current == stop:
+            break
+        current = current.parent
+
+
 def repository_cache_root(base_root: Path, repository: dict[str, Any]) -> Path:
     repo_id = safe_path_component(repository.get("id"), fallback="unknown-repository")
     return base_root / ".catalog" / "repositories" / repo_id

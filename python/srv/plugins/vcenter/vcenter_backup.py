@@ -30,6 +30,7 @@ from ...core.storage_tool import (
     filesystem_free_bytes,
     is_s3_repository,
     join_s3_prefix,
+    make_durable,
     read_storage_backup_info,
     redact_disk_tool_command,
     remove_disk_tool_backup,
@@ -40,6 +41,7 @@ from ...core.storage_tool import (
     safe_path_component,
     STORAGE_LAYOUT_BY_ID,
     STORAGE_LAYOUT_BY_NAME,
+    write_file_durably,
 )
 from ...core.utils import utc_now
 from ...services.backup_mode import (
@@ -3094,10 +3096,7 @@ def run_vcenter_backup(
                 "compression_ratio": backup_compression_ratio,
                 "created_at": utc_now(),
             }
-            manifest_path.write_text(
-                json.dumps(manifest_payload, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            write_file_durably(manifest_path, json.dumps(manifest_payload, indent=2, sort_keys=True))
             try:
                 run_disk_tool(
                     [
@@ -3115,6 +3114,13 @@ def run_vcenter_backup(
                 apply_repository_immutability(repository, repository_abr_path, "manifest", timeout=120)
             except StorageToolError:
                 logger.debug("Ignoring manifest metadata mirror failure for %s", manifest_path, exc_info=True)
+            try:
+                make_durable(task_root, up_to=destination_root)
+            except OSError as exc:
+                raise VCenterBackupError(
+                    f"The backup of {vm_name} was written but could not be flushed to stable storage in "
+                    f"{task_root}: {exc}. It is not kept, so a crash cannot leave a restore point with empty files."
+                ) from exc
 
             try:
                 _emit_progress(

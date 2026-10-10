@@ -8575,6 +8575,30 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         asked.assert_not_called()
 
+    def _completed_disk_copy(self, command: list[str], **kwargs) -> FakeCompletedProcess:
+        self._write_abr_artifacts(command)
+        return FakeCompletedProcess(returncode=0, stdout="ok")
+
+    def test_a_backup_is_flushed_to_stable_storage_before_it_completes(self) -> None:
+        with patch("python.srv.plugins.vcenter.vcenter_backup.make_durable") as flushed:
+            result, _leftovers = self._run_stopped_backup(self._completed_disk_copy)
+
+        self.assertEqual(result["status"], "completed")
+        flushed.assert_called_once()
+        session_folder = pathlib.Path(flushed.call_args.args[0])
+        self.assertEqual(session_folder.name, "task-vcenter-stop")
+        self.assertIn(pathlib.Path(flushed.call_args.kwargs["up_to"]), session_folder.parents)
+
+    def test_a_backup_that_cannot_be_flushed_fails_and_keeps_nothing(self) -> None:
+        with patch(
+            "python.srv.plugins.vcenter.vcenter_backup.make_durable", side_effect=OSError(5, "Input/output error")
+        ):
+            result, leftovers = self._run_stopped_backup(self._completed_disk_copy)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("could not be flushed to stable storage", str((result.get("result") or {}).get("message")))
+        self.assertEqual(leftovers, [])
+
     def test_a_single_disk_restore_stopped_mid_disk_settles_stopped(self) -> None:
         self._register_vcenter_stand()
         fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
