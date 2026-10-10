@@ -5200,6 +5200,7 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     error = task.get("error") if isinstance(task.get("error"), dict) else {}
     job = resolve_job(record_id=str(task.get("job_id") or "")) if task.get("job_id") and str(task.get("job_id")) in JOBS else None
     vm_name, source_vm_name = _session_vm_names(task)
+    finished_at, message = _session_end(task, result)
     dto: dict[str, Any] = {
         "id": task.get("id"),
         "state": _session_state(task),
@@ -5212,7 +5213,7 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
         "vm_name": vm_name,
         "source_vm_name": source_vm_name,
         "started_at": task.get("created_at"),
-        "finished_at": result.get("finished_at"),
+        "finished_at": finished_at,
         "resolved_backup_type": result.get("resolved_backup_type"),
         "resolved_backup_reason": result.get("resolved_backup_reason"),
         # "schedule" only for tasks the JobScheduler enqueued on its own; every
@@ -5220,12 +5221,12 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
         # human clicking a button, so default to "manual" when unset.
         "triggered_by": task.get("trigger") or "manual",
         "progress": result.get("progress"),
-        "message": result.get("message"),
+        "message": message,
         # Best-effort byte counters (see run_vcenter_backup) -- absent/0 for
         # non-vCenter (mock) engines and for restores, which don't track them.
         "processed_bytes": result.get("processed_bytes"),
         "transferred_bytes": result.get("transferred_bytes"),
-        "errors": error or ([] if not result.get("message") or _session_state(task) == "completed" else [{"message": result.get("message")}]),
+        "errors": error or ([] if not message or _session_state(task) == "completed" else [{"message": message}]),
         "warnings": task.get("warnings") if isinstance(task.get("warnings"), list) else [],
     }
     if result.get("failure_kind"):
@@ -5352,10 +5353,32 @@ def get_session_log(session_id: str) -> dict[str, Any]:
     }
 
 
+STOPPED_BEFORE_START_MESSAGE = "Stopped before execution started"
+_TERMINAL_SESSION_STATES = {"completed", "failed", "stopped", "canceled"}
+
+
+def _session_end(task: dict[str, Any], result: dict[str, Any]) -> tuple[Any, Any]:
+    finished_at = result.get("finished_at")
+    message = result.get("message")
+    if _session_state(task) not in _TERMINAL_SESSION_STATES:
+        return finished_at, message
+    if not finished_at and task.get("updated_at"):
+        try:
+            finished_at = _parse_dt(task.get("updated_at")).isoformat()
+        except ValueError:
+            finished_at = task.get("updated_at")
+    logs = task.get("logs") if isinstance(task.get("logs"), list) else []
+    if not message and any(
+        isinstance(entry, dict) and entry.get("message") == "Session stopped before execution started" for entry in logs
+    ):
+        message = STOPPED_BEFORE_START_MESSAGE
+    return finished_at, message
+
+
 def stop_session(session_id: str, *, force: bool = False) -> dict[str, Any]:
     task = _find_by_id(catalog_records(TASKS), session_id, label="Session")
     current_state = _session_state(task)
-    if current_state in {"completed", "failed", "stopped", "canceled"}:
+    if current_state in _TERMINAL_SESSION_STATES:
         return {
             "id": task["id"],
             "state": current_state,
@@ -5363,6 +5386,8 @@ def stop_session(session_id: str, *, force: bool = False) -> dict[str, Any]:
         }
     if current_state == "queued":
         task["status"] = "stopped"
+        result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        task["result"] = {**result, "message": STOPPED_BEFORE_START_MESSAGE, "finished_at": utc_now()}
         _append_task_log(task, level="warn", message="Session stopped before execution started", component="session")
     else:
         task["status"] = "stopping"
