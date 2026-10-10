@@ -30,6 +30,7 @@ from ...core.storage_tool import (
     filesystem_free_bytes,
     is_s3_repository,
     join_s3_prefix,
+    make_durable,
     read_storage_backup_info,
     redact_disk_tool_command,
     remove_disk_tool_backup,
@@ -40,6 +41,7 @@ from ...core.storage_tool import (
     safe_path_component,
     STORAGE_LAYOUT_BY_ID,
     STORAGE_LAYOUT_BY_NAME,
+    write_file_durably,
 )
 from ...core.utils import utc_now
 from ...services.backup_mode import (
@@ -1070,6 +1072,10 @@ def _resolve_parent_manifest(
         search_root, pattern = task_root.parent, "*/manifest.json"
     else:
         search_root, pattern = destination_root, "*/*/manifest.json"
+    if "parent_task_id" in parameters:
+        return _job_parent_manifest(
+            parameters, _vm_backup_manifests(search_root, vm_external_id, pattern), vm_name, vm_external_id
+        )
     candidates = [
         (path, manifest)
         for path, manifest in _vm_backup_manifests(search_root, vm_external_id, pattern)
@@ -1092,6 +1098,37 @@ def _resolve_parent_manifest(
     return candidates[0]
 
 
+def _job_parent_manifest(
+    parameters: dict[str, Any],
+    found: list[tuple[Path, dict[str, Any]]],
+    vm_name: str,
+    vm_external_id: str,
+) -> tuple[Path, dict[str, Any]]:
+    parent_task_id = str(parameters.get("parent_task_id") or "")
+    parent_point_id = str(parameters.get("parent_point_id") or "")
+    if parent_task_id:
+        for path, manifest in found:
+            if path.parent.name == parent_task_id:
+                return path, manifest
+        hint = str(parameters.get("parent_manifest_hint") or "")
+        if hint:
+            try:
+                manifest = _load_manifest(Path(hint).expanduser().resolve())
+            except VCenterBackupError:
+                manifest = {}
+            if str(manifest.get("vm_external_id") or "") == vm_external_id:
+                return Path(hint).expanduser().resolve(), manifest
+        raise VCenterBackupError(
+            f"Incremental backup of {vm_name} cannot read the manifest of its previous backup, restore point "
+            f"{parent_point_id or '?'} (session {parent_task_id}), so it has nothing of this job's own to continue "
+            "from. Run a full backup of the job (abr job start --full) to start a new chain."
+        )
+    raise VCenterBackupError(
+        f"Incremental backup of {vm_name} found no previous backup manifest of this job to continue from. "
+        "Run a full backup of the job (abr job start --full) to start a new chain."
+    )
+
+
 _WRITE_FAILURE = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _NO_SPACE = re.compile(r"no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _CONNECTION_LOST = re.compile(r"refused connection|connection (?:was )?(?:reset|lost|timed out)|NBD_ERR_NETWORK", re.IGNORECASE)
@@ -1102,6 +1139,55 @@ def _repository_free_bytes(repository: dict[str, Any] | None) -> int | None:
         return None
     root = str(repository.get("path") or "").strip()
     return filesystem_free_bytes(root) if root else None
+
+
+def _vm_changes_during_backup(
+    host: str,
+    username: str,
+    password: str,
+    port: int,
+    verify_ssl: bool,
+    vm_name: str,
+    vm_moref: str,
+    since: Any,
+) -> list[tuple[str, str, Any]]:
+    if since is None:
+        return []
+    from .vcenter import VCenterNode
+
+    try:
+        with VCenterNode(host, username, password, port=port, verify_ssl=verify_ssl) as node:
+            return node.vm_changes_since(vm_name, vm_moref or None, since)
+    except Exception:
+        logger.warning("Could not check what happened to VM %s during the failed backup", vm_name, exc_info=True)
+        return []
+
+
+_VM_TAKEN_AWAY = {
+    "deleted",
+    "removed from the inventory",
+    "removed from vCenter",
+    "moved to another host or datastore",
+    "deleted or removed from the inventory",
+}
+
+
+def _vm_changes_message(vm_name: str, changes: list[tuple[str, str, Any]], failure: Exception) -> str:
+    def by(user: str, when: Any) -> str:
+        return (f" by {user}" if user else "") + (f" at {when.strftime('%H:%M:%S')} UTC" if when is not None else "")
+
+    users = {user for _action, user, _when in changes}
+    if len(users) == 1:
+        first = changes[0]
+        described = ", then ".join(action for action, _user, _when in changes) + " in vCenter" + by(first[1], first[2])
+    else:
+        described = ", then ".join(f"{action}{by(user, when)}" for action, user, when in changes) + " in vCenter"
+    if any(action in _VM_TAKEN_AWAY for action, _user, _when in changes):
+        consequence = (
+            "its disks could not be read" if str(failure).startswith("Disk backup failed") else "the backup could not finish"
+        )
+        return f"VM '{vm_name}' was {described} while this backup ran, so {consequence}."
+    return f"VM '{vm_name}' was {described} while this backup ran. {failure}"
 
 
 def _disk_failure_message(
@@ -1558,6 +1644,8 @@ def run_vcenter_backup(
     written_backup_names: list[str] = []
     stop_requested_after_completion = False
     access_lock_moref: str | None = None
+    watch_since: Any = None
+    watch_moref = ""
 
     try:
         # The data mover carries the disk over its own VDDK connection, so this
@@ -1624,10 +1712,15 @@ def run_vcenter_backup(
                 f"Creating backup snapshot for {vm_name}",
                 worker_mode="vcenter-abr-vmdk-tool",
             )
+            try:
+                watch_since = node.server_time()
+            except Exception:
+                logger.debug("Could not read the vCenter time at the start of backup %s", task.get("id"), exc_info=True)
             snapshot_name = node.create_backup_snapshot(vm_name)
             _record_backup_snapshot(progress_callback, vm_name, snapshot_name)
             backup_params = node.get_backup_parameters(vm_name, snapshot_name)
             vm_moref = str(backup_params.get("vm_moref") or "")
+            watch_moref = vm_moref
             snapshot_moref = str(backup_params.get("snapshot_moref") or "")
             if not vm_moref or not snapshot_moref:
                 raise VCenterBackupError("vCenter did not return VM or snapshot MoRef values")
@@ -2953,12 +3046,18 @@ def run_vcenter_backup(
             if encryption_rotated and not incremental:
                 resolved_backup_type = "ActiveFull"
                 resolved_backup_reason = "EncryptionKeyChanged"
+            base_point_id = (
+                str(parameters.get("parent_point_id") or "") or None
+                if parent_manifest is not None and resolved_backup_type == "Incremental"
+                else None
+            )
             manifest_payload = {
                 "format_version": 1,
                 "operation": "vm-backup",
                 "backup_mode": backup_mode,
                 "resolved_backup_type": resolved_backup_type,
                 "resolved_backup_reason": resolved_backup_reason,
+                "parent_point_id": base_point_id,
                 "hypervisor_kind": "vcenter",
                 "hypervisor_id": str(task["hypervisor_id"]),
                 "vm_name": vm_name,
@@ -2997,10 +3096,7 @@ def run_vcenter_backup(
                 "compression_ratio": backup_compression_ratio,
                 "created_at": utc_now(),
             }
-            manifest_path.write_text(
-                json.dumps(manifest_payload, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            write_file_durably(manifest_path, json.dumps(manifest_payload, indent=2, sort_keys=True))
             try:
                 run_disk_tool(
                     [
@@ -3018,6 +3114,13 @@ def run_vcenter_backup(
                 apply_repository_immutability(repository, repository_abr_path, "manifest", timeout=120)
             except StorageToolError:
                 logger.debug("Ignoring manifest metadata mirror failure for %s", manifest_path, exc_info=True)
+            try:
+                make_durable(task_root, up_to=destination_root)
+            except OSError as exc:
+                raise VCenterBackupError(
+                    f"The backup of {vm_name} was written but could not be flushed to stable storage in "
+                    f"{task_root}: {exc}. It is not kept, so a crash cannot leave a restore point with empty files."
+                ) from exc
 
             try:
                 _emit_progress(
@@ -3071,6 +3174,7 @@ def run_vcenter_backup(
             "backup_mode": backup_mode,
             "resolved_backup_type": resolved_backup_type,
             "resolved_backup_reason": resolved_backup_reason,
+            "parent_point_id": base_point_id,
             "incremental": incremental,
             "differential": differential,
             "query_changed_areas_only": query_changed_areas_only,
@@ -3131,6 +3235,11 @@ def run_vcenter_backup(
     except Exception as exc:
         logger.exception("Task %s failed critically during vCenter interaction: %s", task.get("id"), exc)
         _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root)
+        changes = _vm_changes_during_backup(
+            host, username, password, port, verify_ssl, vm_name, watch_moref, watch_since
+        )
+        if changes:
+            raise VCenterBackupError(_vm_changes_message(vm_name, changes, exc)) from exc
         raise
     finally:
         if snapshot_name:

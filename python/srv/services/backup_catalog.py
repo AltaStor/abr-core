@@ -361,9 +361,13 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
             and str((point.get("placements") or [{}])[0].get("repository_id") if isinstance(point.get("placements"), list) and point.get("placements") else point.get("repository_id") or "") == str(repository_id or "")
         ]
         prior_points.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")))
-        if prior_points:
-            parent_point_id = prior_points[-1].get("id")
-            segment_id = str(prior_points[-1].get("segment_id") or prior_points[-1].get("id") or "")
+        base = next(
+            (point for point in prior_points if point.get("id") and point.get("id") == result.get("parent_point_id")),
+            prior_points[-1] if prior_points else None,
+        )
+        if base is not None:
+            parent_point_id = base.get("id")
+            segment_id = str(base.get("segment_id") or base.get("id") or "")
     if full_backup:
         segment_id = None
         parent_point_id = None

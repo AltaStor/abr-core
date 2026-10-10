@@ -31,6 +31,11 @@ def _session_failure_exit_code(session: Any) -> int:
     return INVALID_STATE
 
 
+def _clock_anomalies(job: object) -> list[dict[str, Any]]:
+    anomalies = job.get("clock_anomalies") if isinstance(job, dict) else None
+    return [anomaly for anomaly in anomalies if isinstance(anomaly, dict)] if isinstance(anomalies, list) else []
+
+
 class JobCommands:
     def register(self, registry) -> None:
         job_group = registry.add_parser("job", help="Job management", description="Job commands", formatter_class=CompactHelpFormatter)
@@ -392,14 +397,40 @@ class JobCommands:
         payload = deps.context.api_client.get("api/v1/jobs")
         items = payload.get("items") if isinstance(payload, dict) else None
         if isinstance(items, list):
-            payload = {**payload, "items": [self._decorate_job(item) for item in items]}
+            items = [self._decorate_job(item) for item in items]
+            shown = items
+            if deps.context.output == "table":
+                shown = [
+                    {**item, "last_run_at": f"{item.get('last_run_at')} (!)"} if _clock_anomalies(item) else item
+                    for item in items
+                ]
+            payload = {**payload, "items": shown}
         deps.context.print_output(payload, self._columns())
+        for item in items if isinstance(items, list) else []:
+            if _clock_anomalies(item):
+                print(
+                    f"Warning: job {item.get('name')!r} last ran at {item.get('last_run_at')}, ahead of this "
+                    f"server's clock (!); see abr job info --name {item.get('name')!r}",
+                    file=sys.stderr,
+                )
         return 0
 
     def info(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
         payload = self._decorate_job(deps.context.api_client.get(f"api/v1/jobs/{self._resolve_id(deps, args)}"))
+        anomalies = _clock_anomalies(payload)
+        warnings = [str(anomaly.get("message") or anomaly.get("kind")) for anomaly in anomalies]
+        if deps.context.output == "table" and warnings:
+            shown: dict[str, Any] = {}
+            for key, value in payload.items():
+                if key == "clock_anomalies":
+                    shown["clock_warning"] = " ".join(warnings)
+                else:
+                    shown[key] = value
+            payload = shown
         deps.context.print_output(payload)
+        for warning in warnings:
+            print(f"Warning: {warning}", file=sys.stderr)
         return 0
 
     def edit(self, args: argparse.Namespace) -> int:

@@ -118,6 +118,11 @@ class JobClockAnomalyTests(unittest.TestCase):
 
         self.assertEqual([item["kind"] for item in anomalies], ["last_run_ahead_of_server_clock"])
         self.assertTrue(anomalies[0]["server_time"])
+        self.assertIn(anomalies[0]["last_run_at"], anomalies[0]["message"])
+        self.assertIn(anomalies[0]["server_time"], anomalies[0]["message"])
+
+    def test_a_last_run_that_is_not_a_date_reports_nothing(self) -> None:
+        self.assertEqual(abr_v41.job_clock_anomalies(self._job("not-a-date")), [])
 
     def test_a_last_run_a_few_seconds_ahead_is_not_reported(self) -> None:
         self.assertEqual(abr_v41.job_clock_anomalies(self._job(_stamp(timedelta(seconds=20)))), [])

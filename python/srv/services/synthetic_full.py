@@ -24,8 +24,10 @@ from python.srv.core.storage_tool import (
     ensure_private_directory,
     is_abr_repository,
     join_s3_prefix,
+    make_durable,
     run_disk_tool,
     s3_block_generation_days,
+    write_file_durably,
 )
 from python.srv.core.subprocess_util import ProcessCancelled
 from python.srv.core.utils import utc_now
@@ -288,7 +290,7 @@ def _write_synthetic_manifest(
     manifest_path = task_root / "manifest.json"
     try:
         ensure_private_directory(task_root)
-        manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        write_file_durably(manifest_path, json.dumps(payload, indent=2, sort_keys=True))
     except OSError as exc:
         if exc.errno != errno.ENOSPC:
             raise
@@ -367,7 +369,7 @@ def run_synthetic_full(
 
     vm_name = str(points[-1].get("vm_name") or parameters.get("vm_name") or vm_id)
     storage_layout = _job_storage_layout(task, starts_new_chain=True)
-    _destination_root, task_root, destination_path = _resolve_backup_storage_layout(
+    destination_root, task_root, destination_path = _resolve_backup_storage_layout(
         task=task,
         vm_name=vm_name,
         parameters=parameters,
@@ -540,6 +542,7 @@ def run_synthetic_full(
             "backup_mode": "full",
             "resolved_backup_type": "SyntheticFull",
             "resolved_backup_reason": str(parameters.get("resolved_backup_reason") or "SyntheticFullWindow"),
+            "parent_point_id": None,
             "storage_layout": storage_layout,
             "incremental": False,
             "differential": False,
@@ -564,6 +567,14 @@ def run_synthetic_full(
     manifest_path = _write_synthetic_manifest(
         repository, task_root, destination_path, manifest_payload, retention_days=retention_days
     )
+    try:
+        make_durable(task_root, up_to=destination_root)
+    except OSError as exc:
+        _discard_partial_merge(repository, destination_path, written_names, task_root)
+        raise SyntheticFullError(
+            f"The synthetic full was written but could not be flushed to stable storage in {task_root}: {exc}. "
+            "It is not kept, so a crash cannot leave a restore point with empty files."
+        ) from exc
     _emit(
         100,
         f"Synthetic full written to '{target_name}' from {len(points)} restore point(s): "

@@ -16,12 +16,21 @@ logger = logging.getLogger(__name__)
 
 
 def _refresh_backup_decision(task: dict[str, object]) -> dict[str, object]:
-    try:
-        from python.srv.services.abr_v41 import refresh_queued_backup_decision
+    from python.srv.services.abr_v41 import bind_backup_parent, refresh_queued_backup_decision
 
-        return refresh_queued_backup_decision(task)
+    try:
+        task = refresh_queued_backup_decision(task)
     except Exception:
         logger.exception("Could not re-check the backup type of task '%s' at start; it runs as queued", task.get("id"))
+    try:
+        return bind_backup_parent(task)
+    except Exception:
+        logger.exception(
+            "Could not find the restore point task '%s' continues from; an incremental refuses to guess one", task.get("id")
+        )
+        parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+        parameters.update({"parent_point_id": None, "parent_task_id": None, "parent_manifest_hint": None})
+        task["parameters"] = parameters
         return task
 
 

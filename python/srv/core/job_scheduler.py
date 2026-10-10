@@ -15,7 +15,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .mongo_db_wrapper import HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, catalog_records, persist_job, persist_task
 from .server_defaults import env_int
 from .utils import utc_now
-from python.srv.services.abr_v41 import normalize_job_record, resolve_job_execution, schedule_next_run, stored_slot_next_run
+from python.srv.services.abr_v41 import (
+    job_clock_anomalies,
+    normalize_job_record,
+    resolve_job_execution,
+    schedule_next_run,
+    stored_slot_next_run,
+)
 
 logger = logging.getLogger(__name__)
 WEEKDAY_INDEX = {
@@ -54,6 +60,7 @@ class JobScheduler:
         self._thread: threading.Thread | None = None
         self._access_lock_sweep: threading.Thread | None = None
         self._access_lock_sweep_at = time.monotonic()
+        self._reported_clock_anomalies: dict[str, str] = {}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -110,6 +117,7 @@ class JobScheduler:
     def _dispatch_due_jobs(self) -> None:
         now = datetime.fromisoformat(utc_now())
         jobs = sorted(catalog_records(JOBS), key=lambda item: str(item.get("created_at", "")))
+        self._report_clock_anomalies(jobs)
         for job in jobs:
             if not self._is_supported_backup_job(job):
                 continue
@@ -231,6 +239,20 @@ class JobScheduler:
         if not bool(schedule.get("enabled", True)):
             return False
         return schedule.get("kind") in cls.SCHEDULE_KINDS
+
+    def _report_clock_anomalies(self, jobs: list[dict[str, Any]]) -> None:
+        reported: dict[str, str] = {}
+        for job in jobs:
+            job_id = str(job.get("id") or "")
+            anomalies = job_clock_anomalies(job)
+            if not job_id or not anomalies:
+                continue
+            reported[job_id] = str(job.get("last_run_at") or "")
+            if self._reported_clock_anomalies.get(job_id) == reported[job_id]:
+                continue
+            for anomaly in anomalies:
+                logger.warning("Job '%s' (%s): %s", job.get("name"), job_id, anomaly.get("message"))
+        self._reported_clock_anomalies = reported
 
     def _is_supported_backup_job(self, job: dict[str, Any]) -> bool:
         normalized_job = normalize_job_record(job)

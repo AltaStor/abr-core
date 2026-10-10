@@ -256,8 +256,11 @@ class VCenterNode(Hypervisor):
             container.Destroy()
 
     @_retry_on_expired_session
+    def _list_named_vms(self) -> List[tuple]:
+        return [(vm, name) for vm, name in self._named_objects(vim.VirtualMachine) if not name.startswith("vCLS-")]
+
     def _list_vms(self) -> List[Any]:
-        return [vm for vm, name in self._named_objects(vim.VirtualMachine) if not name.startswith("vCLS-")]
+        return [vm for vm, _name in self._list_named_vms()]
 
     def connect(self) -> None:
         context = ssl.create_default_context() if self.verify_ssl else ssl._create_unverified_context()
@@ -1697,6 +1700,62 @@ class VCenterNode(Hypervisor):
             "changed": True,
         }
 
+    @_retry_on_expired_session
+    def server_time(self) -> Any:
+        return self.si.CurrentTime()
+
+    @_retry_on_expired_session
+    def vm_changes_since(self, vm_name: str, vm_moref: str | None, since: Any) -> list[tuple[str, str, Any]]:
+        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
+        if vm is None and not vm_moref:
+            vm = self._get_vm(vm_name)
+        event_manager = self.si.RetrieveContent().eventManager
+        if vm is not None:
+            spec = vim.event.EventFilterSpec(
+                entity=vim.event.EventFilterSpec.ByEntity(entity=vm, recursion="self"),
+                time=vim.event.EventFilterSpec.ByTime(beginTime=since),
+            )
+            events = list(event_manager.QueryEvents(spec) or [])
+        else:
+            spec = vim.event.EventFilterSpec(
+                time=vim.event.EventFilterSpec.ByTime(beginTime=since),
+                type=[vim.event.VmPoweredOffEvent, vim.event.VmSuspendedEvent, vim.event.VmRemovedEvent, vim.event.TaskEvent],
+            )
+            events = [
+                event
+                for event in event_manager.QueryEvents(spec) or []
+                if str(getattr(getattr(getattr(event, "vm", None), "vm", None), "_moId", "") or "") == str(vm_moref or "")
+            ]
+        changes: list[tuple[str, str, Any]] = []
+        removed: list[tuple[str, str, Any]] = []
+        for event in events:
+            action = ""
+            if isinstance(event, vim.event.VmPoweredOffEvent):
+                action = "powered off"
+            elif isinstance(event, vim.event.VmSuspendedEvent):
+                action = "suspended"
+            elif isinstance(event, (vim.event.VmMigratedEvent, vim.event.VmRelocatedEvent)):
+                action = "moved to another host or datastore"
+            elif isinstance(event, vim.event.VmRemovedEvent):
+                action = "removed from vCenter"
+            elif isinstance(event, vim.event.TaskEvent):
+                description = str(getattr(getattr(event, "info", None), "descriptionId", "") or "")
+                action = {"VirtualMachine.destroy": "deleted", "VirtualMachine.unregister": "removed from the inventory"}.get(
+                    description, ""
+                )
+            if not action:
+                continue
+            change = (action, str(getattr(event, "userName", "") or ""), getattr(event, "createdTime", None))
+            if action == "removed from vCenter":
+                removed.append(change)
+            elif action not in [item[0] for item in changes]:
+                changes.append(change)
+        if removed and not any(item[0] in {"deleted", "removed from the inventory"} for item in changes):
+            changes.append(removed[0])
+        if vm is None and not changes:
+            changes.append(("deleted or removed from the inventory", "", None))
+        return changes
+
     def read_vm_identity(self, vm_name: str, vm_moref: str | None = None) -> dict[str, str]:
         vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
         if vm is None:
@@ -1810,12 +1869,10 @@ class VCenterNode(Hypervisor):
                     host_names[key] = None
             return host_names[key]
 
-        for vm in self._list_vms():
-            summary = vm.summary
-            config = summary.config
-            vm_display_name = getattr(config, "name", None) or getattr(vm, "name", None) or "<unknown>"
-
+        for vm, vm_display_name in self._list_named_vms():
             try:
+                summary = vm.summary
+                config = summary.config
                 if getattr(vm, "config", None) is None:
                     raise RuntimeError(
                         "vm.config is unavailable; VM is likely inaccessible or orphaned in vCenter"
@@ -1870,6 +1927,14 @@ class VCenterNode(Hypervisor):
                             "connected": bool(getattr(device.connectable, "connected", False)),
                         }
                     )
+            except vmodl.fault.ManagedObjectNotFound:
+                logger.warning(
+                    "Skipping VM '%s' (%s): it was deleted from vCenter %s while the inventory rescan was reading it",
+                    vm_display_name,
+                    getattr(vm, "_moId", None),
+                    self.host,
+                )
+                continue
             except Exception as exc:
                 logger.warning(
                     "Skipping inaccessible/orphaned VM '%s' during vCenter inventory discovery on %s: %s",
