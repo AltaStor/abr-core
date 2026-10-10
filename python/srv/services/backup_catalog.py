@@ -465,12 +465,21 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
             )
         else:
             for failure in report["failures"]:
+                reason = str(failure.get("message") or "unknown reason")
+                logger.warning(
+                    "Could not extend the Object Lock of restore point %s (%s) to the new block generation: %s",
+                    failure.get("restore_point_id"),
+                    failure.get("backup_name"),
+                    reason,
+                )
                 _record_session_warning(
                     task,
                     "Object Lock could not be extended to the new block generation for restore point "
-                    f"{failure.get('restore_point_id')}; the backup it belongs to may lose protection before "
-                    "the newer backups that depend on it",
-                    **failure,
+                    f"{failure.get('restore_point_id')} ({failure.get('backup_name')}: {reason}); the backup it "
+                    "belongs to may lose protection before the newer backups that depend on it",
+                    restore_point_id=failure.get("restore_point_id"),
+                    backup_name=failure.get("backup_name"),
+                    reason=reason,
                 )
     if normalized_job is not None:
         retention_vm_id = str(normalized_record.get("vm_id") or "")
