@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 from urllib.parse import urlparse
 
+from python.srv.core.credential_encryption import StoredCredentialUnreadable
 from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, TASKS, catalog_records, persist_hypervisor, replace_resources_for_hypervisor
 from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
@@ -161,7 +162,7 @@ class VsphereInventoryProvider(InventoryProvider):
                     cluster_name = node.clustered_host_name()
                     if cluster_name:
                         raise EsxHostInClusterError(cluster_name)
-        except EsxHostInClusterError:
+        except (EsxHostInClusterError, StoredCredentialUnreadable):
             raise
         except Exception as exc:
             raise RuntimeError("Unable to connect to virtualization environment") from exc

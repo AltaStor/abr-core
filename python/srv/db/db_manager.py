@@ -7,6 +7,7 @@ import copy
 import logging
 import random
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 from functools import wraps
@@ -170,6 +171,18 @@ class Database:
     @_retry()
     def find(self, collection: str, query: dict[str, Any]) -> list[dict[str, Any]]:
         return list(self._db[collection].find(query, {"_id": 0}))
+
+    @_retry()
+    def rehash_legacy_session_tokens(self, digest: Callable[[str], str]) -> int:
+        sessions = self._db["sessions"]
+        rehashed = 0
+        for document in sessions.find({"token": {"$not": {"$regex": "^[0-9a-f]{64}$"}}}, {"_id": 1, "token": 1}):
+            token = document.get("token")
+            if not isinstance(token, str) or not token:
+                continue
+            sessions.update_one({"_id": document["_id"]}, {"$set": {"token": digest(token)}})
+            rehashed += 1
+        return rehashed
 
     @_retry()
     def delete(self, collection: str, id_field: str, doc_id: str) -> bool:

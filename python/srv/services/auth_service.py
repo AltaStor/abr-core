@@ -17,13 +17,13 @@ from typing import Any
 from uuid import uuid4
 
 from python.srv.core.mongo_db_wrapper import (
-    SESSIONS,
     USERS,
     catalog_records,
     delete_other_sessions_for_user,
     delete_session,
     delete_sessions_for_user,
     delete_user,
+    get_session,
     persist_session,
     persist_user,
     renew_session,
@@ -275,7 +275,7 @@ def extend_session(token: str, duration_seconds: int) -> dict[str, Any]:
     Settings -> Security token-lifetime slider) -- takes effect immediately
     rather than waiting for the next login. CLI sessions have no adjustable
     duration and are rejected."""
-    session = SESSIONS.get(token)
+    session = get_session(token)
     if session is None:
         raise api_error(401, "unauthorized", "Missing, invalid, or expired session token.")
     if str(session.get("client") or "") != "web":
@@ -329,7 +329,7 @@ def _renew_session_in_background(token: str, fields: dict[str, Any]) -> None:
 def authenticate(token: str | None) -> dict[str, Any] | None:
     if not token:
         return None
-    session = SESSIONS.get(token)
+    session = get_session(token)
     if session is None:
         return None
 

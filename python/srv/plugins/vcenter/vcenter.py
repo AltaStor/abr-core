@@ -16,6 +16,7 @@ from xml.sax.saxutils import escape
 
 from pyVim.connect import Disconnect, SmartConnect
 from pyVmomi import vim, vmodl
+from ...core.credential_encryption import StoredCredentialUnreadable, is_encrypted, unreadable_credential_message
 from ...core.server_defaults import env_int
 from ..hypervisor import Hypervisor
 from .vcenter_disk_types import (
@@ -263,6 +264,8 @@ class VCenterNode(Hypervisor):
         return [vm for vm, _name in self._list_named_vms()]
 
     def connect(self) -> None:
+        if is_encrypted(self.password):
+            raise StoredCredentialUnreadable(unreadable_credential_message(f"for vCenter {self.host}"))
         context = ssl.create_default_context() if self.verify_ssl else ssl._create_unverified_context()
         self.si = SmartConnect(
             host=self.host,

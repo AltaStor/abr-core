@@ -15,6 +15,17 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 from python.srv.db.db_manager import Database
 from python.srv.services.api_errors import api_error
 
+from .credential_encryption import (
+    KEY_REPAIR_HINT,
+    CredentialKeyUnavailable,
+    credential_key_path,
+    credential_key_problem,
+    decrypt_secret,
+    encrypt_secret,
+    is_encrypted,
+    is_token_digest,
+    token_digest,
+)
 from .server_defaults import env_int
 from .utils import utc_now
 
@@ -148,16 +159,90 @@ def close_database() -> None:
         _DATABASE = None
 
 
+HYPERVISOR_SECRET_PATHS = (("metadata", "credentials", "password"), ("metadata", "token"))
+
+
+def _hypervisor_secret_holders(record: dict[str, Any]) -> list[tuple[dict[str, Any], str]]:
+    holders: list[tuple[dict[str, Any], str]] = []
+    for path in HYPERVISOR_SECRET_PATHS:
+        holder: Any = record
+        for key in path[:-1]:
+            holder = holder.get(key) if isinstance(holder, dict) else None
+        if isinstance(holder, dict) and path[-1] in holder:
+            holders.append((holder, path[-1]))
+    return holders
+
+
+def _with_hypervisor_secrets(record: dict[str, Any], convert: Callable[[Any], Any]) -> dict[str, Any]:
+    converted = _normalize_record(record)
+    for holder, key in _hypervisor_secret_holders(converted):
+        holder[key] = convert(holder[key])
+    return converted
+
+
+def _hypervisor_secret_values(record: dict[str, Any] | None) -> list[tuple[str, Any]]:
+    return [(key, holder[key]) for holder, key in _hypervisor_secret_holders(record or {})]
+
+
+def _hypervisor_for_storage(normalized: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
+    try:
+        return _with_hypervisor_secrets(normalized, encrypt_secret)
+    except CredentialKeyUnavailable as exc:
+        if _hypervisor_secret_values(normalized) != _hypervisor_secret_values(previous):
+            raise api_error(
+                503,
+                "credential_key_unavailable",
+                f"{exc}. The new password is not stored. {KEY_REPAIR_HINT}, then enter the password again.",
+                inventory_id=normalized.get("id"),
+            ) from exc
+        return normalized
+
+
+def _hypervisor_holds_a_clear_secret(record: dict[str, Any]) -> bool:
+    return any(
+        isinstance(holder[key], str) and holder[key] and not is_encrypted(holder[key])
+        for holder, key in _hypervisor_secret_holders(record)
+    )
+
+
 def load_registered_hypervisors() -> dict[str, dict[str, Any]]:
     db = get_database()
     if db is None:
         return {}
 
-    return {
-        item["id"]: _normalize_record(item)
-        for item in db.find("hypervisors", {})
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
+    key_problem = credential_key_problem()
+    loaded: dict[str, dict[str, Any]] = {}
+    unreadable: list[str] = []
+    for item in db.find("hypervisors", {}):
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        record = _normalize_record(item)
+        name = str(record.get("name") or record["id"])
+        if key_problem is None and _hypervisor_holds_a_clear_secret(record):
+            stored = _with_hypervisor_secrets(record, encrypt_secret)
+            _run_db_write(lambda stored=stored: db.upsert("hypervisors", "id", stored))
+            LOGGER.info("Encrypted the stored credentials of inventory %s.", name)
+        loaded[record["id"]] = _with_hypervisor_secrets(record, decrypt_secret)
+        if any(is_encrypted(value) for _key, value in _hypervisor_secret_values(loaded[record["id"]])):
+            unreadable.append(name)
+            if key_problem is None:
+                LOGGER.error(
+                    "The stored password of inventory %s cannot be decrypted with the credential key at %s: it "
+                    "was encrypted with another key. The inventory cannot connect until its password is entered "
+                    "again: abr inventory edit --name %s --password",
+                    name,
+                    credential_key_path(),
+                    name,
+                )
+    if key_problem is not None:
+        LOGGER.error(
+            "%s. Stored inventory credentials are left as they are until it is fixed: none is encrypted%s. "
+            "%s, or move it away and enter each inventory's password again.",
+            key_problem,
+            f", and inventories {', '.join(unreadable)} cannot connect" if unreadable else "",
+            KEY_REPAIR_HINT,
+        )
+    return loaded
 
 
 def persist_hypervisor(record: dict[str, Any]) -> None:
@@ -165,7 +250,8 @@ def persist_hypervisor(record: dict[str, Any]) -> None:
     with CATALOG_LOCK:
         db = get_database()
         if db is not None:
-            _run_db_write(lambda: db.upsert("hypervisors", "id", normalized))
+            stored = _hypervisor_for_storage(normalized, HYPERVISORS.get(record["id"]))
+            _run_db_write(lambda: db.upsert("hypervisors", "id", stored))
         HYPERVISORS[record["id"]] = normalized
 
 
@@ -315,30 +401,45 @@ def delete_user(user_id: str) -> bool:
         return deleted
 
 
+def session_key(token: str) -> str:
+    return token_digest(token)
+
+
+def get_session(token: str) -> dict[str, Any] | None:
+    return SESSIONS.get(session_key(token))
+
+
 def load_sessions() -> dict[str, dict[str, Any]]:
     db = get_database()
     if db is None:
         return {}
 
+    rehashed = db.rehash_legacy_session_tokens(token_digest)
+    if rehashed:
+        LOGGER.info("Replaced %d stored session token(s) with their digests.", rehashed)
     return {
         item["token"]: _normalize_record(item)
         for item in db.find("sessions", {})
-        if isinstance(item, dict) and isinstance(item.get("token"), str)
+        if isinstance(item, dict) and is_token_digest(item.get("token"))
     }
 
 
 def persist_session(record: dict[str, Any]) -> None:
-    normalized = _normalize_record(record)
+    stored = dict(record)
+    if isinstance(stored.get("token"), str) and not is_token_digest(stored["token"]):
+        stored["token"] = session_key(stored["token"])
+    normalized = _normalize_record(stored)
     with CATALOG_LOCK:
         db = get_database()
         if db is not None:
             _run_db_write(lambda: db.upsert("sessions", "token", normalized))
-        SESSIONS[record["token"]] = normalized
+        SESSIONS[normalized["token"]] = normalized
 
 
 def renew_session(token: str, fields: dict[str, Any]) -> dict[str, Any] | None:
+    key = session_key(token)
     with CATALOG_LOCK:
-        current = SESSIONS.get(token)
+        current = SESSIONS.get(key)
         if current is None:
             return None
         merged = dict(current)
@@ -347,16 +448,17 @@ def renew_session(token: str, fields: dict[str, Any]) -> dict[str, Any] | None:
         db = get_database()
         if db is not None:
             _run_db_write(lambda: db.upsert("sessions", "token", normalized))
-        SESSIONS[token] = normalized
+        SESSIONS[key] = normalized
         return normalized
 
 
 def delete_session(token: str) -> bool:
+    key = session_key(token)
     with CATALOG_LOCK:
-        SESSIONS.pop(token, None)
+        SESSIONS.pop(key, None)
         db = get_database()
         if db is not None:
-            return db.delete("sessions", "token", token)
+            return db.delete("sessions", "token", key)
     return True
 
 
@@ -373,16 +475,17 @@ def delete_sessions_for_user(user_id: str) -> None:
 
 
 def delete_other_sessions_for_user(user_id: str, keep_token: str) -> None:
+    keep_key = session_key(keep_token)
     with CATALOG_LOCK:
         for token in [
-            tok for tok, session in SESSIONS.items() if session.get("user_id") == user_id and tok != keep_token
+            tok for tok, session in SESSIONS.items() if session.get("user_id") == user_id and tok != keep_key
         ]:
             SESSIONS.pop(token, None)
         db = get_database()
         if db is not None:
             for session in db.find("sessions", {"user_id": user_id}):
                 token = session.get("token")
-                if isinstance(token, str) and token != keep_token:
+                if isinstance(token, str) and token != keep_key:
                     db.delete("sessions", "token", token)
 
 
@@ -555,7 +658,8 @@ def update_hypervisor_fields(
 
         db = get_database()
         if db is not None:
-            _run_db_write(lambda: db.upsert("hypervisors", "id", normalized))
+            stored = _hypervisor_for_storage(normalized, current)
+            _run_db_write(lambda: db.upsert("hypervisors", "id", stored))
 
         HYPERVISORS[hypervisor_id] = normalized
         return normalized
