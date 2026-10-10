@@ -42,7 +42,9 @@ from ...core.storage_tool import (
     ensure_private_directory,
     extract_s3_config,
     is_s3_repository,
+    make_durable,
     run_disk_tool,
+    write_file_durably,
 )
 from ...core.subprocess_util import ProcessCancelled
 from ...core.task_executor import TaskStopRequested, cancel_requested
@@ -569,6 +571,9 @@ def run_hyperv_backup(
                 "reference_point_id": reference_point_id,
             }
             backup_mode = "incremental" if incremental else "full"
+            base_point_id = (
+                str(parameters.get("parent_point_id") or "") or None if incremental and previous is not None else None
+            )
             manifest_path = task_root / "manifest.json"
             manifest_payload = {
                 "format_version": 1,
@@ -576,6 +581,7 @@ def run_hyperv_backup(
                 "backup_mode": backup_mode,
                 "resolved_backup_type": "Incremental" if incremental else "ActiveFull" if resolved_backup_type == "Incremental" else resolved_backup_type,
                 "resolved_backup_reason": resolved_backup_reason,
+                "parent_point_id": base_point_id,
                 "hypervisor_kind": HYPERVISOR_KIND,
                 "hypervisor_id": str(task.get("hypervisor_id") or ""),
                 "job_id": str(task.get("job_id") or ""),
@@ -607,7 +613,7 @@ def run_hyperv_backup(
                 "created_at": utc_now(),
             }
             resolved_backup_type = manifest_payload["resolved_backup_type"]
-            manifest_path.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True), encoding="utf-8")
+            write_file_durably(manifest_path, json.dumps(manifest_payload, indent=2, sort_keys=True))
             try:
                 run_disk_tool(
                     [
@@ -630,6 +636,13 @@ def run_hyperv_backup(
                     manifest_path,
                     exc_info=True,
                 )
+            try:
+                make_durable(task_root, up_to=destination_root)
+            except OSError as exc:
+                raise HyperVBackupError(
+                    f"The backup of {vm_name} was written but could not be flushed to stable storage in "
+                    f"{task_root}: {exc}. It is not kept, so a crash cannot leave a restore point with empty files."
+                ) from exc
 
         if not stop_requested_after_completion and cancel_requested(task_id):
             stop_requested_after_completion = True
@@ -672,6 +685,7 @@ def run_hyperv_backup(
             "backup_mode": backup_mode,
             "resolved_backup_type": resolved_backup_type,
             "resolved_backup_reason": resolved_backup_reason,
+            "parent_point_id": base_point_id,
             "incremental": incremental,
             "differential": False,
             "snapshot_removed": True,

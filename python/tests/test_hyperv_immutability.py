@@ -126,13 +126,17 @@ class HyperVRetentionUnderObjectLockTests(unittest.TestCase):
 
     def test_expired_points_still_under_lock_are_held_and_never_deleted(self) -> None:
         report = abr_v41._new_retention_report(JOBS["job-1"], "vm-1", "repo-1")
-        with patch.object(abr_v41, "remove_disk_tool_backup") as remove, patch.object(abr_v41, "persist_backup"):
+        locked = {"immutability": "governance", "retention_days": 30}
+        with patch.object(abr_v41, "remove_disk_tool_backup") as remove, patch.object(abr_v41, "persist_backup"), patch.object(
+            abr_v41, "read_storage_backup_info", return_value=locked
+        ) as asked:
             failures = abr_v41.apply_retention_to_chain(JOBS["job-1"], vm_id="vm-1", repository_id="repo-1", report=report)
 
         remove.assert_not_called()
         self.assertEqual(failures, [])
         self.assertEqual(report["removed"], [])
-        self.assertEqual([item["point_id"] for item in report["held"]], ["inc-1"])
+        self.assertEqual(report["held"], [{"point_id": "inc-1", "until": "2999-01-01T00:00:00+00:00"}])
+        self.assertEqual([call.args[1:3] for call in asked.call_args_list], [("prefix/vm/inc-1", "01-vm.vhdx")])
         self.assertEqual(report["kept_for_chain"], ["full-1"])
         self.assertIn("full-1", BACKUPS)
         self.assertIn("inc-1", BACKUPS)

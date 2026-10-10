@@ -5534,8 +5534,9 @@ def _point_object_lock(point: dict[str, Any], now: datetime) -> tuple[str, str] 
         else:
             days_left = int(info.get("retention_days") or 0) if isinstance(info, dict) else 0
             if isinstance(info, dict) and str(info.get("immutability") or "none") != "none" and days_left > 0:
-                until = stored_expiry if stored_until is not None and stored_until > now else (now + timedelta(days=days_left)).isoformat()
-                return until, f"for {days_left} more day(s)"
+                if stored_until is not None and stored_until > now:
+                    return stored_expiry, f"for {days_left} more day(s)"
+                return (now + timedelta(days=days_left)).replace(microsecond=0).isoformat(), f"for {days_left} more day(s)"
             return None
     if stored_until is not None and stored_until > now:
         return stored_expiry, f"until {stored_expiry}"
