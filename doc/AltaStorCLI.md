@@ -214,7 +214,7 @@ reach the moment the whole chain stops being needed: the next full backup, plus 
 --retention-days. Every point of one chain therefore lands on the same date, and the chain is 
 freed in a single pass. --immutability-days is the floor under that figure, for an environment 
 with a fixed minimum of its own; it is not added to it. --immutability-days must be between 1 
-and 999. 
+and 36500. 
 
 A job with weekly full backups keeping 30 days writes a 37-day lock on the day of the full and 
 a 31-day lock on the day before the next one - both expiring on the same date. With monthly 

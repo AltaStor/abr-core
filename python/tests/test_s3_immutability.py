@@ -244,8 +244,15 @@ class S3ImmutabilityRepositoryTests(unittest.TestCase):
 
     def test_retention_period_over_the_cap_is_rejected(self) -> None:
         with self.assertRaises(ApiError) as error:
-            self._create_repository({"mode": "governance", "retention_days": 1000})
-        self.assertIn("must not exceed", error.exception.message)
+            self._create_repository({"mode": "governance", "retention_days": 36501})
+        self.assertIn("must not exceed 36500 days", error.exception.message)
+
+    def test_retention_periods_up_to_the_console_maximum_are_accepted(self) -> None:
+        for days in (999, 1000, 36500):
+            with self.subTest(days=days):
+                abr_v41._validate_s3_configuration(
+                    {"bucket": "b", "region": "us-east-1", "immutability": {"mode": "governance", "retention_days": days}}
+                )
 
     def test_unknown_retention_scope_is_rejected(self) -> None:
         with self.assertRaises(ApiError) as error:
