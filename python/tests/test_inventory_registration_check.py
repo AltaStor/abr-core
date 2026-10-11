@@ -206,6 +206,35 @@ class DirectEsxiRegistrationTests(unittest.TestCase):
 
         self.assertIn(created["id"], HYPERVISORS)
 
+    def test_the_restore_check_tells_a_direct_esxi_host_from_a_vcenter(self) -> None:
+        for label, endpoint, expected in (
+            ("standalone ESXi", _Endpoint("HostAgent"), True),
+            ("ESXi in a cluster", _Endpoint("HostAgent", cluster="cluster-1"), True),
+            ("vCenter", _Endpoint("VirtualCenter"), False),
+        ):
+            with self.subTest(label), self._connect_to(endpoint):
+                self.assertIs(inventory_management.is_direct_esxi_connection(_record()), expected)
+
+    def test_the_restore_check_lets_the_restore_go_on_when_it_cannot_tell(self) -> None:
+        def broken(*args, **kwargs):
+            raise RuntimeError("the server closed the connection")
+
+        with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": types.SimpleNamespace(VCenterNode=broken)}):
+            self.assertFalse(inventory_management.is_direct_esxi_connection(_record()))
+
+        with patch.object(inventory_management, "_endpoint_reachable", return_value=False), patch.object(
+            inventory_management.VsphereInventoryProvider, "test_connection"
+        ) as connect:
+            self.assertFalse(inventory_management.is_direct_esxi_connection(_record()))
+        connect.assert_not_called()
+
+        record = _record()
+        record["type"] = "hyper-v"
+        record["kind"] = "hyperv"
+        with patch.object(inventory_management.VsphereInventoryProvider, "test_connection") as connect:
+            self.assertFalse(inventory_management.is_direct_esxi_connection(record))
+        connect.assert_not_called()
+
     def test_an_esxi_inventory_registered_earlier_still_tests_as_connected(self) -> None:
         HYPERVISORS["inv-1"] = _record()
         with self._connect_to(_Endpoint("HostAgent")):

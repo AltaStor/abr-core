@@ -431,6 +431,22 @@ def assert_inventory_registrable(record: dict[str, Any]) -> None:
         raise EsxDirectConnectionUnsupported()
 
 
+def is_direct_esxi_connection(record: dict[str, Any]) -> bool:
+    if inventory_type_from_record(record) != "vsphere":
+        return False
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    host = str(metadata.get("host") or "")
+    port = int(metadata.get("port", 443) or 443)
+    if not host or not _endpoint_reachable(host, port, timeout=float(inventory_connect_timeout())):
+        return False
+    try:
+        return InventoryProviderRegistry.resolve(record).test_connection(record) == "HostAgent"
+    except EsxHostInClusterError:
+        return True
+    except Exception:
+        return False
+
+
 def test_inventory_connection(record: dict[str, Any]) -> dict[str, Any]:
     provider = InventoryProviderRegistry.resolve(record)
     try:

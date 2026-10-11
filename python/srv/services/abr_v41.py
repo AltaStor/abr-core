@@ -107,6 +107,7 @@ from python.srv.services.inventory_management import (
     default_port_for_type,
     extract_host,
     inventory_references,
+    is_direct_esxi_connection,
     inventory_type_from_record,
     normalize_inventory_type,
 )
@@ -8655,6 +8656,13 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         "explicit encryption key.",
         point_id=point_id,
     )
+    if is_direct_esxi_connection(_inventory_record_for_update(str(target_inventory["id"]))):
+        raise api_error(
+            409,
+            "esx_direct_connection_unsupported",
+            str(EsxDirectConnectionUnsupported()),
+            inventory_id=target_inventory["id"],
+        )
     task = {
         "id": str(uuid4()),
         "job_id": None,

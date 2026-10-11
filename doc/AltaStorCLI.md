@@ -314,7 +314,9 @@ inventory add.
 A vsphere inventory must be a vCenter Server for now. A standalone ESXi host is
 refused with "A direct ESXi connection is not supported": backups through such a
 connection do not work yet, because the data mover asks VDDK for a vCenter-only
-operation. Register the vCenter Server that manages the host instead.
+operation. Register the vCenter Server that manages the host instead. A restore
+onto an ESXi inventory registered before this check is refused the same way,
+before any VM is created.
 
 abr inventory list 
 
