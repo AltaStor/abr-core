@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -134,6 +136,83 @@ class RegistrationRefusesAnEndpointItCannotUseTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "esx_host_in_cluster")
         self.assertEqual(list(HYPERVISORS), [])
+
+
+class _Endpoint:
+    def __init__(self, service_type: str, cluster: str | None = None) -> None:
+        self.service_type = service_type
+        self.cluster = cluster
+
+    def node(self, *args, **kwargs):
+        endpoint = self
+
+        class _Node:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get_service_type(self):
+                return endpoint.service_type
+
+            def clustered_host_name(self):
+                return endpoint.cluster
+
+        return _Node()
+
+
+class DirectEsxiRegistrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        HYPERVISORS.clear()
+        RESOURCES_BY_HV.clear()
+        self.addCleanup(HYPERVISORS.clear)
+        self.addCleanup(RESOURCES_BY_HV.clear)
+        for patcher in (
+            patch.object(inventory_management, "_endpoint_reachable", return_value=True),
+            patch.object(abr_v41, "AUTO_DISCOVER_ON_INVENTORY_ADD", False),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _connect_to(self, endpoint: _Endpoint):
+        module = types.SimpleNamespace(VCenterNode=endpoint.node)
+        return patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": module})
+
+    def test_a_standalone_esxi_host_is_refused_with_the_reason_and_nothing_is_registered(self) -> None:
+        with self._connect_to(_Endpoint("HostAgent")):
+            with self.assertRaises(ApiError) as caught:
+                abr_v41.create_inventory_record(dict(PAYLOAD))
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(caught.exception.code, "esx_direct_connection_unsupported")
+        self.assertEqual(
+            caught.exception.message,
+            "A direct ESXi connection is not supported. Register the vCenter Server that manages this host instead.",
+        )
+        self.assertEqual(list(HYPERVISORS), [])
+
+    def test_an_esxi_host_in_a_cluster_keeps_its_own_code(self) -> None:
+        with self._connect_to(_Endpoint("HostAgent", cluster="cluster-1")):
+            with self.assertRaises(ApiError) as caught:
+                abr_v41.create_inventory_record(dict(PAYLOAD))
+
+        self.assertEqual(caught.exception.code, "esx_host_in_cluster")
+        self.assertEqual(list(HYPERVISORS), [])
+
+    def test_a_vcenter_is_registered_as_before(self) -> None:
+        with self._connect_to(_Endpoint("VirtualCenter")):
+            created = abr_v41.create_inventory_record(dict(PAYLOAD))
+
+        self.assertIn(created["id"], HYPERVISORS)
+
+    def test_an_esxi_inventory_registered_earlier_still_tests_as_connected(self) -> None:
+        HYPERVISORS["inv-1"] = _record()
+        with self._connect_to(_Endpoint("HostAgent")):
+            result = abr_v41.test_inventory("inv-1")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["message"], "Connection successful")
 
 
 class RegistrationCheckShapeTests(unittest.TestCase):

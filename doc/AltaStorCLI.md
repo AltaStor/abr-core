@@ -311,10 +311,10 @@ VM discovery is not required up front. It runs automatically the first time you
 reference VM names in job create, so no manual inventory rescan is needed after
 inventory add.
 
-A vsphere inventory can be a vCenter Server or a standalone ESXi host. When an
-ESXi host is managed by a vCenter Server, register the vCenter instead: through
-the host directly, vCenter can still move a VM with Storage vMotion or DRS while
-it is being backed up, without the backup server knowing.
+A vsphere inventory must be a vCenter Server for now. A standalone ESXi host is
+refused with "A direct ESXi connection is not supported": backups through such a
+connection do not work yet, because the data mover asks VDDK for a vCenter-only
+operation. Register the vCenter Server that manages the host instead.
 
 abr inventory list 
 

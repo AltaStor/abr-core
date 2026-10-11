@@ -97,6 +97,7 @@ from python.srv.core.storage_tool import (
 from python.srv.core.utils import utc_now
 from python.srv.services.inventory_management import (
     INVENTORY_KIND_BY_TYPE,
+    EsxDirectConnectionUnsupported,
     EsxHostInClusterError,
     InventoryProviderRegistry,
     apply_inventory_updates,
@@ -1528,6 +1529,8 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             str(exc),
             cluster=exc.cluster_name,
         ) from exc
+    except EsxDirectConnectionUnsupported as exc:
+        raise api_error(409, "esx_direct_connection_unsupported", str(exc)) from exc
     except InventoryUnreachableError as exc:
         raise api_error(
             422,

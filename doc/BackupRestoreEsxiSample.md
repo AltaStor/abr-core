@@ -61,9 +61,11 @@ default, and `--tool-path` can then be left off.
 
 ## 4. Register the ESXi host
 
-Register the host directly only when no vCenter Server manages it. Otherwise
-register the vCenter: through the host, vCenter can still move a VM with
-Storage vMotion or DRS while it is being backed up.
+The server currently refuses a direct ESXi connection with "A direct ESXi
+connection is not supported": backups through it do not work yet, because the
+data mover asks VDDK for a vCenter-only operation. Register the vCenter Server
+that manages the host instead. The steps below apply once direct connections
+are supported.
 
 ```bash
 cd /path/to/backup-server
