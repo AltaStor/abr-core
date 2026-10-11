@@ -586,6 +586,7 @@ def _lax_int(value: Any) -> Any:
 LaxStr = SkipValidation[str]
 LaxBool = SkipValidation[bool]
 LaxInt = Annotated[int | None, BeforeValidator(_lax_int)]
+RawInt = SkipValidation[int]
 
 
 class ScheduleRequest(_LenientModel):
@@ -725,7 +726,7 @@ class CreateJobRequest(_LenientModel):
     repo_id: LaxStr | None = None
     schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
     enabled: LaxBool | None = None
-    retention_days: LaxInt = None
+    retention_days: RawInt | None = None
     gfs: SkipValidation[GfsRequest] | None = None
     active_full_days: list[Any] | LaxStr | None = None
     active_full_days_csv: LaxStr | None = None
@@ -752,7 +753,7 @@ class CreateCopyJobRequest(_LenientModel):
     repository_id: LaxStr | None = None
     schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
     enabled: LaxBool | None = None
-    retention_days: LaxInt = None
+    retention_days: RawInt | None = None
     description: LaxStr | None = None
 
 
@@ -760,10 +761,10 @@ class UpdateJobRequest(_LenientModel):
     name: LaxStr | None = None
     schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
     enabled: LaxBool | None = None
-    retention_days: LaxInt = None
-    gfs_weekly: LaxInt = None
-    gfs_monthly: LaxInt = None
-    gfs_yearly: LaxInt = None
+    retention_days: RawInt | None = None
+    gfs_weekly: RawInt | None = None
+    gfs_monthly: RawInt | None = None
+    gfs_yearly: RawInt | None = None
     gfs_enabled: LaxBool | None = None
     active_full_days: list[Any] | LaxStr | None = None
     synthetic_full_days: list[Any] | LaxStr | None = None

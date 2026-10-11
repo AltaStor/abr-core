@@ -10,6 +10,19 @@ from .auth_guard import require_session
 router = APIRouter(prefix="/api/v1/dashboard", tags=["Dashboard"], dependencies=[Depends(require_session)])
 
 
+SESSION_TYPE_LABELS = {"backup": "Backup", "restore": "Restore", "verify": "Verify", "delete": "Delete"}
+
+
+def _activity_name(task: dict) -> str:
+    from ..services.abr_v41 import session_to_dto
+
+    job = JOBS.get(str(task.get("job_id") or ""))
+    if isinstance(job, dict) and job.get("name"):
+        return str(job["name"])
+    session = session_to_dto(task, include_logs=False)
+    return str(session.get("vm_name") or SESSION_TYPE_LABELS.get(str(task.get("task_type") or ""), "Unknown Job"))
+
+
 class JobActivity(BaseModel):
     id: str
     name: str
@@ -116,8 +129,8 @@ def get_dashboard_summary():
         recent_jobs_list.append(
             JobActivity(
                 id=str(t.get("id", f"task_{idx}")),
-                name=t.get("job_name", "Unknown Job"),
-                type=t.get("type", "Backup"),
+                name=_activity_name(t),
+                type=SESSION_TYPE_LABELS.get(str(t.get("task_type") or "backup"), str(t.get("task_type") or "").capitalize()),
                 status=t.get("status", "Success").capitalize(),
                 time="Just now",
                 error_text=error_text or None,

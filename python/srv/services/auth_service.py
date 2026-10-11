@@ -36,7 +36,9 @@ from .api_errors import api_error
 LOGGER = logging.getLogger(__name__)
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+MAX_USER_NAME_LENGTH = 64
 MIN_PASSWORD_LENGTH = 8
+MAX_PASSWORD_LENGTH = 128
 
 _LOCKOUT_LOCK = threading.Lock()
 _FAILED_ATTEMPTS: dict[str, list[float]] = {}
@@ -135,6 +137,18 @@ def list_users() -> list[dict[str, Any]]:
     ]
 
 
+def password_problem(name: str, password: Any) -> str | None:
+    if not isinstance(password, str) or len(password) < MIN_PASSWORD_LENGTH:
+        return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+    if len(password) > MAX_PASSWORD_LENGTH:
+        return f"Password must be at most {MAX_PASSWORD_LENGTH} characters."
+    if not password.strip():
+        return "Password cannot be only spaces."
+    if password.strip().lower() == name.strip().lower():
+        return "Password cannot be the user name."
+    return None
+
+
 def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True) -> dict[str, Any]:
     name = str(payload.get("name") or "").strip()
     full_name = str(payload.get("fullName") or "").strip()
@@ -147,9 +161,11 @@ def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True
             "User name must use Latin letters, numbers, spaces, dots, underscores, or hyphens, "
             "and cannot start with a separator.",
         )
-    password_too_short = not isinstance(password, str) or len(password) < MIN_PASSWORD_LENGTH
-    if password_too_short and enforce_password_policy:
-        raise api_error(422, "invalid_user", f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
+    if len(name) > MAX_USER_NAME_LENGTH:
+        raise api_error(422, "invalid_user", f"User name must be at most {MAX_USER_NAME_LENGTH} characters.")
+    problem = password_problem(name, password)
+    if problem and enforce_password_policy:
+        raise api_error(422, "invalid_user", problem)
     if _find_user_by_name(name) is not None:
         raise api_error(409, "user_exists", f"A user named {name!r} already exists.")
 
@@ -161,11 +177,11 @@ def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True
         "passwd": hash_password(name, password),
         "created_at": now,
         "updated_at": now,
-        # True only when the actual password fails the length policy (so a
+        # True only when the actual password fails the password policy (so a
         # bootstrap account using a strong password isn't nagged just because
         # enforcement was skipped for it). Surfaced to callers so CLI/UI can
         # prompt to fix it until there's a real change-password flow.
-        "password_policy_exempt": password_too_short,
+        "password_policy_exempt": problem is not None,
     }
     persist_user(record)
     return _public_user(record)
@@ -205,8 +221,11 @@ def change_password(user_id: str, current_password: str, new_password: str, *, k
         raise api_error(401, "invalid_credentials", "Current password is incorrect.")
     _clear_failures(key)
 
-    if not isinstance(new_password, str) or len(new_password) < MIN_PASSWORD_LENGTH:
-        raise api_error(422, "invalid_user", f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
+    problem = password_problem(name, new_password)
+    if problem:
+        raise api_error(422, "invalid_user", problem)
+    if _verify_password(name, new_password, user["passwd"]):
+        raise api_error(422, "invalid_user", "The new password must differ from the current one.")
 
     updated = dict(user)
     updated["passwd"] = hash_password(name, new_password)
