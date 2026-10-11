@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import sys
 
 from ..compact_help_formatter import CompactHelpFormatter
 from ..parsing.common_arguments import add_name_or_id_selector
@@ -15,11 +14,6 @@ from ..parsing.secret_arguments import (
     resolve_secret,
 )
 from .base import CommandDependencies
-
-
-def _print_warnings(result: object) -> None:
-    for warning in (result.get("warnings") if isinstance(result, dict) else None) or []:
-        print(f"Warning: {warning}", file=sys.stderr)
 
 
 class InventoryCommands:
@@ -171,7 +165,6 @@ class InventoryCommands:
             "insecure": args.insecure,
         })
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("endpoint", "ENDPOINT"), ("status", "STATUS")])
-        _print_warnings(result)
         return 0
 
     def list(self, args: argparse.Namespace) -> int:
@@ -216,9 +209,7 @@ class InventoryCommands:
 
     def test(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
-        result = deps.context.api_client.post(f"api/v1/inventories/{self._resolve_id(deps, args)}/test")
-        deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("status", "STATUS"), ("message", "MESSAGE")])
-        _print_warnings(result)
+        deps.context.print_output(deps.context.api_client.post(f"api/v1/inventories/{self._resolve_id(deps, args)}/test"), [("id", "ID"), ("name", "NAME"), ("status", "STATUS"), ("message", "MESSAGE")])
         return 0
 
     @staticmethod

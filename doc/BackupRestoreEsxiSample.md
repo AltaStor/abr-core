@@ -61,6 +61,10 @@ default, and `--tool-path` can then be left off.
 
 ## 4. Register the ESXi host
 
+Register the host directly only when no vCenter Server manages it. Otherwise
+register the vCenter: through the host, vCenter can still move a VM with
+Storage vMotion or DRS while it is being backed up.
+
 ```bash
 cd /path/to/backup-server
 source .venv/bin/activate

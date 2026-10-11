@@ -125,16 +125,9 @@ def _summarize_resources(resources: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
-ESXI_DIRECT_BACKUP_WARNING = "Backups through a direct ESXi connection are not supported yet."
-
-
-def inventory_warnings(service_type: str | None) -> list[str]:
-    return [ESXI_DIRECT_BACKUP_WARNING] if service_type == "HostAgent" else []
-
-
 class InventoryProvider(ABC):
     @abstractmethod
-    def test_connection(self, record: dict[str, Any]) -> str | None:
+    def test_connection(self, record: dict[str, Any]) -> None:
         pass
 
     @abstractmethod
@@ -143,7 +136,7 @@ class InventoryProvider(ABC):
 
 
 class VsphereInventoryProvider(InventoryProvider):
-    def test_connection(self, record: dict[str, Any]) -> str | None:
+    def test_connection(self, record: dict[str, Any]) -> None:
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         credentials = _credentials_from_record(record)
         host = metadata.get("host")
@@ -165,12 +158,10 @@ class VsphereInventoryProvider(InventoryProvider):
             with VCenterNode(str(host), str(username), str(password), port=port, verify_ssl=verify_ssl) as node:
                 # Reject a standalone ESXi host that has been added to a cluster:
                 # it must be backed up through its managing vCenter, not directly.
-                service_type = node.get_service_type()
-                if service_type == "HostAgent":
+                if node.get_service_type() == "HostAgent":
                     cluster_name = node.clustered_host_name()
                     if cluster_name:
                         raise EsxHostInClusterError(cluster_name)
-                return service_type
         except (EsxHostInClusterError, StoredCredentialUnreadable):
             raise
         except Exception as exc:
@@ -402,7 +393,7 @@ def _connection_failure(
     )
 
 
-def assert_inventory_registrable(record: dict[str, Any]) -> str | None:
+def assert_inventory_registrable(record: dict[str, Any]) -> None:
     """Refuse an inventory whose endpoint cannot be reached and authenticated.
 
     This is a connectivity check, not discovery: it authenticates and asks the
@@ -410,7 +401,7 @@ def assert_inventory_registrable(record: dict[str, Any]) -> str | None:
     inventory still happens in the background after registration succeeds.
     """
     if inventory_type_from_record(record) != "vsphere":
-        return None
+        return
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     host = str(metadata.get("host") or "")
     port = int(metadata.get("port", 443) or 443)
@@ -420,7 +411,7 @@ def assert_inventory_registrable(record: dict[str, Any]) -> str | None:
         )
     provider = InventoryProviderRegistry.resolve(record)
     try:
-        return provider.test_connection(record)
+        provider.test_connection(record)
     except EsxHostInClusterError:
         raise
     except Exception as exc:

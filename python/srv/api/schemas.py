@@ -296,7 +296,6 @@ class InventoryDTO(_LenientModel):
     id: str
     name: str
     type: str
-    warnings: DocStrArray = None
     status: str
     created_at: str
     updated_at: str
@@ -1212,7 +1211,6 @@ class InventoryTestResult(_LenientModel):
     id: DocStr = None
     name: DocStr = None
     type: DocStr = None
-    warnings: DocStrArray = None
     status: DocStr = None
     code: DocStr = None
     message: DocStr = None
