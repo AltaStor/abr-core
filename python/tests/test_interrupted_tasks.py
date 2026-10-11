@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pathlib
 import tempfile
+import types
 import threading
 import time
 import unittest
@@ -354,6 +355,34 @@ class AccessLockReleaseTests(SweepTestCase):
         self.assertIsNone(TASKS["task-l1"]["access_lock"])
         self.assertEqual(TASKS["task-l1"]["status"], "failed")
         self.assertIn("Lifted the block on relocating VM web01", self._messages("task-l1")[-1][1])
+
+    def test_a_lock_record_on_a_direct_esxi_host_is_dropped_without_a_warning(self) -> None:
+        from python.srv.plugins.vcenter.vcenter import VCenterNode
+
+        class _DirectEsxiNode(VCenterNode):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def _enable_methods(self, entity, methods):
+                raise AssertionError("EnableMethods must not be sent to an ESXi host")
+
+        esxi = _DirectEsxiNode("esxi.local", "root", "secret")
+        esxi.si = types.SimpleNamespace(RetrieveContent=lambda: types.SimpleNamespace(about=types.SimpleNamespace(apiType="HostAgent")))
+        esxi._vm_holding_access_lock = lambda vm_name, vm_moref: types.SimpleNamespace(
+            disabledMethod=["CloneVM_Task", "MigrateVM_Task", "RelocateVM_Task"]
+        )
+        self.build_plugin.return_value = esxi
+        TASKS["task-e1"] = self._with_lock("task-e1", "completed")
+
+        self.assertEqual(backup_catalog.release_pending_access_locks(), 0)
+
+        self.assertIsNone(TASKS["task-e1"]["access_lock"])
+        self.assertFalse([message for level, message in self._messages("task-e1") if level == "warn"])
+        self.assertFalse(TASKS["task-e1"].get("warnings"))
+        self.assertEqual(backup_catalog.release_pending_access_locks(), 0)
 
     @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
     @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value=set())

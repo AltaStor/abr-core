@@ -107,6 +107,7 @@ from python.srv.services.inventory_management import (
     extract_host,
     inventory_references,
     inventory_type_from_record,
+    inventory_warnings,
     normalize_inventory_type,
 )
 from python.srv.services.backup_mode import object_lock_actual_retention_days
@@ -1520,7 +1521,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
         },
     }
     try:
-        assert_inventory_registrable(record)
+        service_type = assert_inventory_registrable(record)
     except EsxHostInClusterError as exc:
         raise api_error(
             409,
@@ -1544,7 +1545,9 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
         # responsive by doing it in the background. Lazy discovery in
         # `job create` still covers the case where this has not finished.
         schedule_inventory_discovery(record["id"])
-    return normalize_inventory_record(record)
+    created = normalize_inventory_record(record)
+    warnings = inventory_warnings(service_type)
+    return {**created, "warnings": warnings} if warnings else created
 
 
 def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1580,7 +1583,7 @@ def test_inventory(record_id: str) -> dict[str, Any]:
     record = _inventory_record_for_update(record_id)
     provider = InventoryProviderRegistry.resolve(record)
     try:
-        provider.test_connection(record)
+        service_type = provider.test_connection(record)
     except EsxHostInClusterError as exc:
         update_hypervisor_fields(record["id"], {"status": "unavailable", "updated_at": utc_now()})
         return {
@@ -1604,13 +1607,15 @@ def test_inventory(record_id: str) -> dict[str, Any]:
             "error": str(exc),
         }
     update_hypervisor_fields(record["id"], {"status": "available", "updated_at": utc_now()})
-    return {
+    result = {
         "id": record["id"],
         "name": record.get("name"),
         "type": inventory_type_from_record(record),
         "status": "success",
         "message": "Connection successful",
     }
+    warnings = inventory_warnings(service_type)
+    return {**result, "warnings": warnings} if warnings else result
 
 
 def _reconcile_jobs_after_vm_identity_change(

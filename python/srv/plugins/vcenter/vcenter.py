@@ -1338,6 +1338,8 @@ class VCenterNode(Hypervisor):
 
     @_retry_on_expired_session
     def release_access_lock(self, vm_name: str, vm_moref: str | None = None) -> bool:
+        if self.get_service_type() == "HostAgent":
+            return False
         vm = self._vm_holding_access_lock(vm_name, vm_moref)
         if vm is None or ACCESS_LOCK_METHOD not in list(vm.disabledMethod or []):
             return False

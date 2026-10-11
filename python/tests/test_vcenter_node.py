@@ -1638,7 +1638,9 @@ class _FakeSoapStub:
 
 
 class ReleaseAccessLockTests(unittest.TestCase):
-    def _node(self, disabled: list[str], status: int = 200, body: str = "<EnableMethodsResponse/>") -> tuple:
+    def _node(
+        self, disabled: list[str], status: int = 200, body: str = "<EnableMethodsResponse/>", api_type: str = "VirtualCenter"
+    ) -> tuple:
         vm = types.SimpleNamespace(_moId="vm-42", _wsdlName="VirtualMachine", disabledMethod=list(disabled))
 
         def lift() -> None:
@@ -1651,7 +1653,8 @@ class ReleaseAccessLockTests(unittest.TestCase):
         node.si = types.SimpleNamespace(
             _stub=stub,
             RetrieveContent=lambda: types.SimpleNamespace(
-                authorizationManager=types.SimpleNamespace(_moId="AuthorizationManager")
+                authorizationManager=types.SimpleNamespace(_moId="AuthorizationManager"),
+                about=types.SimpleNamespace(apiType=api_type),
             ),
         )
         node._vm_holding_access_lock = lambda vm_name, vm_moref: vm
@@ -1673,6 +1676,15 @@ class ReleaseAccessLockTests(unittest.TestCase):
         self.assertEqual(headers["SOAPAction"], '"urn:vim25/8.0.3.0"')
         self.assertEqual(headers["Cookie"], 'vmware_soap_session="abc"')
         self.assertEqual(stub.returned, 1)
+
+    def test_a_direct_esxi_connection_never_tries_to_re_enable_vcenter_only_methods(self) -> None:
+        baseline = ["CloneVM_Task", "MigrateVM_Task", "RelocateVM_Task"]
+        node, vm, connection, _stub = self._node(list(baseline), api_type="HostAgent")
+
+        self.assertFalse(node.release_access_lock("esxi-src", "vm-42"))
+
+        self.assertEqual(connection.requests, [])
+        self.assertEqual(vm.disabledMethod, baseline)
 
     def test_a_vm_without_the_block_is_left_untouched(self) -> None:
         node, vm, connection, _stub = self._node(["PowerOnVM_Task"])
