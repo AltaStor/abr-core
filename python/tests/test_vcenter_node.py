@@ -10,6 +10,7 @@ import time
 import types
 from datetime import datetime, timezone
 import unittest
+from unittest.mock import patch
 
 try:
     from python.srv.plugins.vcenter.vcenter import VCenterNode, _normalize_disk_uuid
@@ -1700,9 +1701,39 @@ class ReleaseAccessLockTests(unittest.TestCase):
     def test_a_block_that_vcenter_keeps_is_reported(self) -> None:
         node, vm, connection, _stub = self._node(["RelocateVM_Task"])
         connection.on_request = lambda: None
+        clock = iter(range(0, 1000))
 
-        with self.assertRaisesRegex(RuntimeError, "still blocks RelocateVM_Task"):
+        with patch("python.srv.plugins.vcenter.vcenter.time.sleep"), patch(
+            "python.srv.plugins.vcenter.vcenter.time.monotonic", side_effect=lambda: next(clock)
+        ), self.assertRaisesRegex(RuntimeError, "still blocks RelocateVM_Task"):
             node.release_access_lock("web01", "vm-42")
+
+    def test_a_block_vcenter_holds_for_its_own_task_is_waited_out_without_a_warning(self) -> None:
+        node, vm, connection, _stub = self._node(["PowerOnVM_Task", "RelocateVM_Task"])
+        connection.on_request = lambda: None
+        reads = {"count": 0}
+
+        class _VmUnderVCenterTask:
+            _moId = "vm-42"
+            _wsdlName = "VirtualMachine"
+
+            @property
+            def disabledMethod(self) -> list[str]:
+                reads["count"] += 1
+                return ["PowerOnVM_Task", "RelocateVM_Task"] if reads["count"] <= 3 else ["PowerOnVM_Task"]
+
+        held = _VmUnderVCenterTask()
+        node._vm_holding_access_lock = lambda vm_name, vm_moref: held
+
+        with patch("python.srv.plugins.vcenter.vcenter.time.sleep") as sleep, self.assertLogs(
+            "python.srv.plugins.vcenter.vcenter", level="INFO"
+        ) as logs:
+            lifted = node.release_access_lock("web01", "vm-42")
+
+        self.assertFalse(lifted)
+        self.assertEqual(len(connection.requests), 1)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertTrue(any("vCenter's own task" in line for line in logs.output))
 
     def test_a_broken_connection_is_closed_not_returned_to_the_pool(self) -> None:
         node, _vm, connection, stub = self._node(["RelocateVM_Task"])

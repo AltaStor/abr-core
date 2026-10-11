@@ -1342,10 +1342,21 @@ class VCenterNode(Hypervisor):
         if vm is None or ACCESS_LOCK_METHOD not in list(vm.disabledMethod or []):
             return False
         self._enable_methods(vm, [ACCESS_LOCK_METHOD])
-        if ACCESS_LOCK_METHOD in list(vm.disabledMethod or []):
-            raise RuntimeError(f"vCenter still blocks {ACCESS_LOCK_METHOD} on VM '{vm_name}' after it was re-enabled")
-        logger.info("Re-enabled %s on VM '%s', which a data mover left disabled.", ACCESS_LOCK_METHOD, vm_name)
-        return True
+        if ACCESS_LOCK_METHOD not in list(vm.disabledMethod or []):
+            logger.info("Re-enabled %s on VM '%s', which a data mover left disabled.", ACCESS_LOCK_METHOD, vm_name)
+            return True
+        deadline = time.monotonic() + env_int("BACKUPSERVER_ACCESS_LOCK_SETTLE_SECONDS")
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            if ACCESS_LOCK_METHOD not in list(vm.disabledMethod or []):
+                logger.info(
+                    "%s on VM '%s' was blocked by vCenter's own task on the VM, not by a data mover; "
+                    "it cleared when that task ended.",
+                    ACCESS_LOCK_METHOD,
+                    vm_name,
+                )
+                return False
+        raise RuntimeError(f"vCenter still blocks {ACCESS_LOCK_METHOD} on VM '{vm_name}' after it was re-enabled")
 
     def remove_snapshot(self, vm_name: str, snapshot_name: str) -> None:
         vm = self._get_vm(vm_name)
