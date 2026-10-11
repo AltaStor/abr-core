@@ -64,6 +64,14 @@ abr system import --file <path>
 
 Prompts for the password from step 1.
 
+- The users in the export replace those of the same name on this server, such
+  as the `admin` the fresh install created. Their sessions end, so log in again
+  with the password the user had on the exported server. Users the export does
+  not name are kept.
+- An export that cannot be imported whole (two different users of the same
+  name, or a credential key this server cannot use) is refused before anything
+  is written.
+
 - Recovered server configuration (if any) is written to a file next to the
   export, not applied automatically - paths/ports can differ on the new
   host. Review and merge into `/etc/default/altastor-backup-server` by hand.

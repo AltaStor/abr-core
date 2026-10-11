@@ -607,9 +607,37 @@ def snapshot_catalog() -> dict[str, Any]:
         }
 
 
+def users_replaced_by_import(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    incoming: dict[str, dict[str, Any]] = {}
+    for user in (snapshot.get("users") or {}).values():
+        name = str(user.get("name") or "")
+        if name in incoming and incoming[name].get("id") != user.get("id"):
+            raise api_error(422, "invalid_export", f"The export holds two different users named {name!r}.")
+        incoming[name] = user
+    return [
+        existing
+        for existing in USERS.values()
+        if str(existing.get("name") or "") in incoming
+        and incoming[str(existing.get("name") or "")].get("id") != existing.get("id")
+    ]
+
+
 def restore_catalog(snapshot: dict[str, Any]) -> dict[str, int]:
     counts: dict[str, int] = {}
     with CATALOG_LOCK:
+        replaced = users_replaced_by_import(snapshot)
+        if get_database() is not None:
+            for hypervisor in (snapshot.get("hypervisors") or {}).values():
+                _hypervisor_for_storage(_normalize_record(hypervisor), HYPERVISORS.get(hypervisor.get("id")))
+
+        for existing in replaced:
+            delete_sessions_for_user(str(existing["id"]))
+            delete_user(str(existing["id"]))
+            LOGGER.info("Import replaces user %s with the one from the export.", existing.get("name"))
+        for user in (snapshot.get("users") or {}).values():
+            persist_user(user)
+        counts["users"] = len(snapshot.get("users") or {})
+
         for hypervisor in (snapshot.get("hypervisors") or {}).values():
             persist_hypervisor(hypervisor)
         counts["hypervisors"] = len(snapshot.get("hypervisors") or {})
@@ -629,10 +657,6 @@ def restore_catalog(snapshot: dict[str, Any]) -> dict[str, int]:
         for task in (snapshot.get("tasks") or {}).values():
             persist_task(task)
         counts["tasks"] = len(snapshot.get("tasks") or {})
-
-        for user in (snapshot.get("users") or {}).values():
-            persist_user(user)
-        counts["users"] = len(snapshot.get("users") or {})
 
         resource_count = 0
         for hypervisor_id, resources in (snapshot.get("resources") or {}).items():

@@ -52,6 +52,7 @@ from python.srv.core.mongo_db_wrapper import (
     restore_catalog,
     snapshot_catalog,
     update_hypervisor_fields,
+    users_replaced_by_import,
 )
 from python.srv.core.server_defaults import env_int
 from python.srv.core.subprocess_util import run_capped
@@ -8903,8 +8904,14 @@ def import_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(configuration, dict):
         configuration = {}
 
+    replaced_users = sorted(str(user.get("name") or "") for user in users_replaced_by_import(catalog))
     counts = restore_catalog(catalog)
-    return {"manifest": manifest, "restored": counts, "configuration": configuration_without_secrets(configuration)}
+    return {
+        "manifest": manifest,
+        "restored": counts,
+        "replaced_users": replaced_users,
+        "configuration": configuration_without_secrets(configuration),
+    }
 
 
 def _verify_disk_artifact(

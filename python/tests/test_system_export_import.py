@@ -309,6 +309,30 @@ class SystemCatalogSnapshotApiTests(unittest.TestCase):
         self.assertEqual(import_response.json()["restored"]["users"], 1)
         self.assertEqual(USERS["user1"]["name"], "alice")
 
+    def test_import_onto_a_fresh_install_replaces_its_bootstrap_admin(self) -> None:
+        USERS.clear()
+        USERS["old-admin"] = {"id": "old-admin", "name": "admin", "passwd": "old-server-hash"}
+        archive_base64 = self._export().json()["archive_base64"]
+        _reset_catalog()
+        USERS["bootstrap-admin"] = {"id": "bootstrap-admin", "name": "admin", "passwd": "bootstrap-hash"}
+
+        import_response = self._restore(archive_base64)
+
+        self.assertEqual(import_response.status_code, 200, import_response.text)
+        self.assertEqual(import_response.json()["replaced_users"], ["admin"])
+        self.assertEqual(list(USERS), ["old-admin"])
+
+    def test_import_onto_the_same_server_replaces_nobody(self) -> None:
+        USERS.clear()
+        USERS["user1"] = {"id": "user1", "name": "alice", "passwd": "deadbeef"}
+        archive_base64 = self._export().json()["archive_base64"]
+
+        import_response = self._restore(archive_base64)
+
+        self.assertEqual(import_response.status_code, 200, import_response.text)
+        self.assertEqual(import_response.json()["replaced_users"], [])
+        self.assertEqual(list(USERS), ["user1"])
+
     def test_export_falls_back_to_server_defaults_file_when_not_in_process_env(
         self,
     ) -> None:

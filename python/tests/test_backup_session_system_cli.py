@@ -790,6 +790,30 @@ class SystemCommandTests(unittest.TestCase):
         )
 
     @patch("python.cli.api.client.requests.request")
+    def test_import_says_which_users_were_replaced_and_that_they_must_log_in_again(self, request_mock: object) -> None:
+        archive_bytes = encrypt_payload({"manifest": {"format_version": 1}}, "TestPassword123", iterations=1000)
+
+        for replaced, expected in ((["admin"], True), ([], False)):
+            with self.subTest(replaced=replaced):
+                request_mock.return_value = _FakeResponse(
+                    {"restored": {"users": 1}, "replaced_users": replaced, "configuration": None}
+                )
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    archive_path = Path(tmpdir) / "export.enc"
+                    archive_path.write_bytes(archive_bytes)
+                    args = SimpleNamespace(
+                        base_url="http://example.test", output="table", log_level="info", file=str(archive_path)
+                    )
+                    with patch.dict(os.environ, {PASSWORD_ENV_VAR: "TestPassword123"}):
+                        stream = io.StringIO()
+                        with redirect_stdout(stream):
+                            exit_code = self._command().import_(args)
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual("User(s) admin on this server were replaced" in stream.getvalue(), expected)
+                self.assertEqual("log in again" in stream.getvalue(), expected)
+
+    @patch("python.cli.api.client.requests.request")
     def test_import_writes_recovered_configuration_sidecar_file(self, request_mock: object) -> None:
         archive_bytes = encrypt_payload({"manifest": {"format_version": 1}}, "TestPassword123", iterations=1000)
         request_mock.return_value = _FakeResponse(

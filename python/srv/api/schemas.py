@@ -1270,6 +1270,7 @@ class CatalogSnapshotResult(_LenientModel):
 class CatalogRestoreResult(_LenientModel):
     manifest: CatalogManifestDTO | DocObject = None
     restored: DocObject = None
+    replaced_users: DocStrArray = None
     configuration: DocObject = None
 
 
