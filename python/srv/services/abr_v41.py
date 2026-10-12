@@ -637,6 +637,8 @@ def resolve_selector(
     name: str | None = None,
     record_id: str | None = None,
     label: str,
+    name_option: str = "--name",
+    id_option: str = "--id",
 ) -> dict[str, Any]:
     resolved_by_name = _find_by_name(items, name, label=label) if name else None
     resolved_by_id = _find_by_id(items, record_id, label=label) if record_id else None
@@ -645,7 +647,7 @@ def resolve_selector(
             raise api_error(
                 409,
                 "selector_mismatch",
-                f"{label} selector mismatch: --name and --id refer to different records",
+                f"{label} selector mismatch: {name_option} and {id_option} refer to different records",
                 name=name,
                 record_id=record_id,
             )
@@ -654,7 +656,7 @@ def resolve_selector(
         return resolved_by_name
     if resolved_by_id is not None:
         return resolved_by_id
-    raise api_error(422, "missing_selector", f"{label} selection requires --name or --id")
+    raise api_error(422, "missing_selector", f"{label} selection requires {name_option} or {id_option}")
 
 
 def _duration_to_minutes(value: str) -> int:
@@ -1111,8 +1113,23 @@ def _inventory_record_for_update(record_id: str) -> dict[str, Any]:
     return _find_by_id(catalog_records(HYPERVISORS), record_id, label="Inventory")
 
 
-def resolve_inventory(name: str | None = None, record_id: str | None = None) -> dict[str, Any]:
-    return normalize_inventory_record(resolve_selector(list_inventory_records(), name=name, record_id=record_id, label="Inventory"))
+def resolve_inventory(
+    name: str | None = None,
+    record_id: str | None = None,
+    *,
+    name_option: str = "--name",
+    id_option: str = "--id",
+) -> dict[str, Any]:
+    return normalize_inventory_record(
+        resolve_selector(
+            list_inventory_records(),
+            name=name,
+            record_id=record_id,
+            label="Inventory",
+            name_option=name_option,
+            id_option=id_option,
+        )
+    )
 
 
 def _normalize_inventory_tree_health(raw: Any) -> str:
@@ -8494,10 +8511,17 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     placement = _select_restore_point_placement(point, repo)
     manifest_path = _resolve_restore_manifest_path(point, placement)
 
-    target_inventory_id = str(request.get("target_inventory_id") or defaults.get("target_inventory_id") or "").strip()
+    target_inventory_id = str(request.get("target_inventory_id") or "").strip()
     target_inventory_name = str(request.get("target_inventory_name") or "").strip() or None
+    if not target_inventory_id and not target_inventory_name:
+        target_inventory_id = str(defaults.get("target_inventory_id") or "").strip()
     _ensure(bool(target_inventory_id or target_inventory_name), 422, "invalid_restore", "Restore target inventory is required")
-    target_inventory = resolve_inventory(name=target_inventory_name, record_id=target_inventory_id or None)
+    target_inventory = resolve_inventory(
+        name=target_inventory_name,
+        record_id=target_inventory_id or None,
+        name_option="--target-inventory",
+        id_option="--target-inventory-id",
+    )
     _ensure(
         str(target_inventory.get("status") or "unknown").strip().lower() != "unavailable",
         409,
