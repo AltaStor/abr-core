@@ -134,7 +134,7 @@ abr auth logout
 
 abr auth change-password 
 
-Description: Change your own password. Prompts for the current and new password. Invalidates your other sessions; this one stays valid. 
+Description: Change your own password. Prompts for the current and new password. The new password follows the same rules as for a new user and must differ from the current one. Invalidates your other sessions; this one stays valid. 
 
 abr auth change-password 
 
@@ -147,7 +147,7 @@ Manage accounts allowed to authenticate. Requires an existing session. The first
 
 abr user add 
 
-Description: Add a new user. Prompts for the password; there is no --password flag. 
+Description: Add a new user. Prompts for the password; there is no --password flag. The name is 1 to 64 Latin letters, numbers, spaces, dots, underscores or hyphens and starts with a letter or number. The password is 8 to 128 characters, not only spaces, and not the user name. 
 
 abr user add --name <name> [--full-name <text>] 
 
@@ -214,7 +214,7 @@ reach the moment the whole chain stops being needed: the next full backup, plus 
 --retention-days. Every point of one chain therefore lands on the same date, and the chain is 
 freed in a single pass. --immutability-days is the floor under that figure, for an environment 
 with a fixed minimum of its own; it is not added to it. --immutability-days must be between 1 
-and 999. 
+and 36500. 
 
 A job with weekly full backups keeping 30 days writes a 37-day lock on the day of the full and 
 a 31-day lock on the day before the next one - both expiring on the same date. With monthly 
@@ -311,6 +311,13 @@ VM discovery is not required up front. It runs automatically the first time you
 reference VM names in job create, so no manual inventory rescan is needed after
 inventory add.
 
+A vsphere inventory must be a vCenter Server for now. A standalone ESXi host is
+refused with "A direct ESXi connection is not supported": backups through such a
+connection do not work yet, because the data mover asks VDDK for a vCenter-only
+operation. Register the vCenter Server that manages the host instead. A restore
+onto an ESXi inventory registered before this check is refused the same way,
+before any VM is created.
+
 abr inventory list 
 
 Description: Show all registered inventories. 
@@ -367,7 +374,7 @@ Jobs bind protected workloads (VMs) to a repository.
 
 abr job create 
 
-Description: Create a backup job for one or more virtual machines and optionally attach an enabled or disabled schedule. Supported schedule types are daily, weekly, monthly, and periodic. 
+Description: Create a backup job for one or more virtual machines and optionally attach an enabled or disabled schedule. Supported schedule types are daily, weekly, monthly, and periodic. Each VM may be listed once. --retention-days is a whole number from 1 to 3650 (14 when omitted); the GFS counts are whole numbers up to 520 weekly, 120 monthly and 99 yearly; a schedule's time zone, when given through the API, must be an IANA name such as Europe/Kyiv or UTC. 
 
 abr job create --name <name> (--repository <name> | --repository-id <id>) [--inventory <name> | --inventory-id <id>] (--vm <vm> ... | --vms "<vm1,vm2,...>") [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] 
 
@@ -555,10 +562,10 @@ abr restore start
 
 Description: Start a full VM restore workflow from a selected restore point or backup chain. 
 
-abr restore start --restore-point <id> --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--power-on] [--wait] 
+abr restore start --restore-point <id> --target-inventory <name> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--power-on] [--wait] 
 
 Alternate source resolution:
-abr restore start --backup <backup-id> [--vm <name-or-id>] --target-inventory <name-or-id> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--power-on] [--wait] 
+abr restore start --backup <backup-id> [--vm <name-or-id>] --target-inventory <name> --target-host <host-or-id> --datastore <name-or-id> --new-name <name> [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--power-on] [--wait] 
 
 Legacy compatibility:
 abr restore start --point-id <id> [--name <new-name>] [--target-inventory <name>] [--target-host <host>] [--target-datastore <name>] [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--repo <name>] [--power-on] [--in-place] [--force] [--wait] 

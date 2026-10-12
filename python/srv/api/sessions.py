@@ -22,6 +22,7 @@ router = build_router("/sessions", tag="sessions")
 
 def list_sessions(
     job: str | None = Query(default=None),
+    type: str | None = Query(default=None, description="Only sessions of this type: backup, restore, verify or delete"),
     limit: int | None = Query(default=None, ge=1, le=abr_v41.SESSION_PAGE_LIMIT_MAX),
     offset: int = Query(default=0, ge=0),
     page: int | None = Query(default=None, ge=1),
@@ -44,7 +45,7 @@ def list_sessions(
     if page is not None or per_page is not None:
         limit = per_page or limit or abr_v41.SESSION_PAGE_DEFAULT
         offset = ((page or 1) - 1) * limit
-    return abr_v41.list_sessions_page(job_name=job, limit=limit, offset=offset, since=since)
+    return abr_v41.list_sessions_page(job_name=job, session_type=type, limit=limit, offset=offset, since=since)
 
 
 def get_session(session_id: str) -> SessionDTO:

@@ -179,6 +179,13 @@ class SystemCommands:
 
         print("Import complete. Restored: " + _label_counts(restored))
 
+        replaced_users = result.get("replaced_users") or []
+        if replaced_users:
+            print(
+                f"User(s) {', '.join(replaced_users)} on this server were replaced by the ones from the export, "
+                "and their sessions ended: log in again with the password they had on the exported server"
+            )
+
         recovered_configuration_file = result.get("recovered_configuration_file")
         if recovered_configuration_file:
             print(

@@ -52,6 +52,7 @@ from python.srv.core.mongo_db_wrapper import (
     restore_catalog,
     snapshot_catalog,
     update_hypervisor_fields,
+    users_replaced_by_import,
 )
 from python.srv.core.server_defaults import env_int
 from python.srv.core.subprocess_util import run_capped
@@ -96,6 +97,7 @@ from python.srv.core.storage_tool import (
 from python.srv.core.utils import utc_now
 from python.srv.services.inventory_management import (
     INVENTORY_KIND_BY_TYPE,
+    EsxDirectConnectionUnsupported,
     EsxHostInClusterError,
     InventoryProviderRegistry,
     apply_inventory_updates,
@@ -105,6 +107,7 @@ from python.srv.services.inventory_management import (
     default_port_for_type,
     extract_host,
     inventory_references,
+    is_direct_esxi_connection,
     inventory_type_from_record,
     normalize_inventory_type,
 )
@@ -311,7 +314,7 @@ NO_CONTROL_CHARS_PATTERN = re.compile(r"^[^\x00-\x1f\x7f]*$")
 MAX_NAME_LENGTH = 125
 MAX_TEXT_LENGTH = 255
 MAX_LONG_TEXT_LENGTH = 1024
-MAX_IMMUTABILITY_RETENTION_DAYS = 999
+MAX_IMMUTABILITY_RETENTION_DAYS = 36500
 NFS_PATTERN = re.compile(r"^[^:/]+:.+$")
 SMB_PATTERN = re.compile(r"^(//|\\\\)[^/\\\\]+[/\\\\].+$")
 ZONEINFO_ROOT = Path("/usr/share/zoneinfo")
@@ -634,6 +637,8 @@ def resolve_selector(
     name: str | None = None,
     record_id: str | None = None,
     label: str,
+    name_option: str = "--name",
+    id_option: str = "--id",
 ) -> dict[str, Any]:
     resolved_by_name = _find_by_name(items, name, label=label) if name else None
     resolved_by_id = _find_by_id(items, record_id, label=label) if record_id else None
@@ -642,7 +647,7 @@ def resolve_selector(
             raise api_error(
                 409,
                 "selector_mismatch",
-                f"{label} selector mismatch: --name and --id refer to different records",
+                f"{label} selector mismatch: {name_option} and {id_option} refer to different records",
                 name=name,
                 record_id=record_id,
             )
@@ -651,7 +656,7 @@ def resolve_selector(
         return resolved_by_name
     if resolved_by_id is not None:
         return resolved_by_id
-    raise api_error(422, "missing_selector", f"{label} selection requires --name or --id")
+    raise api_error(422, "missing_selector", f"{label} selection requires {name_option} or {id_option}")
 
 
 def _duration_to_minutes(value: str) -> int:
@@ -1108,8 +1113,23 @@ def _inventory_record_for_update(record_id: str) -> dict[str, Any]:
     return _find_by_id(catalog_records(HYPERVISORS), record_id, label="Inventory")
 
 
-def resolve_inventory(name: str | None = None, record_id: str | None = None) -> dict[str, Any]:
-    return normalize_inventory_record(resolve_selector(list_inventory_records(), name=name, record_id=record_id, label="Inventory"))
+def resolve_inventory(
+    name: str | None = None,
+    record_id: str | None = None,
+    *,
+    name_option: str = "--name",
+    id_option: str = "--id",
+) -> dict[str, Any]:
+    return normalize_inventory_record(
+        resolve_selector(
+            list_inventory_records(),
+            name=name,
+            record_id=record_id,
+            label="Inventory",
+            name_option=name_option,
+            id_option=id_option,
+        )
+    )
 
 
 def _normalize_inventory_tree_health(raw: Any) -> str:
@@ -1527,6 +1547,8 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             str(exc),
             cluster=exc.cluster_name,
         ) from exc
+    except EsxDirectConnectionUnsupported as exc:
+        raise api_error(409, "esx_direct_connection_unsupported", str(exc)) from exc
     except InventoryUnreachableError as exc:
         raise api_error(
             422,
@@ -3632,15 +3654,80 @@ def resolve_job(name: str | None = None, record_id: str | None = None) -> dict[s
     return normalize_job_record(resolve_selector(normalized_job_records(), name=name, record_id=record_id, label="Job"))
 
 
+MAX_RETENTION_DAYS = 3650
+MAX_GFS_COUNTS = {"weekly": 520, "monthly": 120, "yearly": 99}
+
+
+def _whole_number(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _validate_retention_days(value: Any) -> int:
+    days = _whole_number(value)
+    _ensure(days is not None, 422, "invalid_job", "retention-days must be a whole number", retention_days=value)
+    _ensure(days > 0, 422, "invalid_job", "retention-days must be greater than 0", retention_days=value)
+    _ensure(
+        days <= MAX_RETENTION_DAYS,
+        422,
+        "invalid_job",
+        f"retention-days must be at most {MAX_RETENTION_DAYS}",
+        retention_days=value,
+    )
+    return days
+
+
 def _validate_gfs_counts(gfs: dict[str, Any]) -> dict[str, int]:
     result = {}
     for key in ("weekly", "monthly", "yearly"):
-        try:
-            result[key] = int(gfs.get(key) or 0)
-        except (TypeError, ValueError) as exc:
-            raise api_error(422, "invalid_job", "GFS counts must be integers", field=key) from exc
-        _ensure(result[key] >= 0, 422, "invalid_job", "GFS counts must be >= 0", field=key)
+        value = gfs.get(key)
+        count = 0 if value is None else _whole_number(value)
+        _ensure(count is not None, 422, "invalid_job", "GFS counts must be integers", field=key)
+        _ensure(count >= 0, 422, "invalid_job", "GFS counts must be >= 0", field=key)
+        _ensure(
+            count <= MAX_GFS_COUNTS[key],
+            422,
+            "invalid_job",
+            f"GFS {key} count must be at most {MAX_GFS_COUNTS[key]}",
+            field=key,
+        )
+        result[key] = count
     return result
+
+
+def _ensure_known_timezone(schedule: dict[str, Any] | None) -> dict[str, Any] | None:
+    name = str((schedule or {}).get("timezone") or "").strip()
+    if not name:
+        return schedule
+    try:
+        ZoneInfo(name)
+        return schedule
+    except (ZoneInfoNotFoundError, ValueError):
+        pass
+    _ensure(
+        name.upper() in _server_timezone_aliases(),
+        422,
+        "invalid_job",
+        f"Unknown time zone {name!r}: use an IANA time zone name such as Europe/Kyiv or UTC",
+        timezone=name,
+    )
+    return schedule
+
+
+def _schedule_from_request(raw: Any) -> dict[str, Any] | None:
+    return _ensure_known_timezone(normalize_schedule_payload(raw))
+
+
+def _ensure_unique_vms(vm_ids: list[str], vm_names: list[str]) -> None:
+    seen: set[str] = set()
+    for vm_id, vm_name in zip(vm_ids, vm_names):
+        _ensure(
+            vm_id not in seen,
+            422,
+            "invalid_job",
+            f"VM {vm_name} is listed more than once",
+            vm=vm_name,
+        )
+        seen.add(vm_id)
 
 
 def _coerce_gfs_enabled(value: Any, *, default: bool = True) -> bool:
@@ -3694,11 +3781,13 @@ def _record_encryption_key(keys: list[dict[str, Any]], key: str) -> tuple[list[d
 def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] | None = None) -> dict[str, Any]:
     result = dict(params)
     if "compression_level" in result and result["compression_level"] is not None:
-        try:
-            level = int(result["compression_level"])
-        except (TypeError, ValueError) as exc:
-            raise api_error(422, "invalid_job", "task_parameters.compression_level must be an integer between 0 and 9") from exc
-        _ensure(0 <= level <= 9, 422, "invalid_job", "task_parameters.compression_level must be an integer between 0 and 9")
+        level = _whole_number(result["compression_level"])
+        _ensure(
+            level is not None and 0 <= level <= 9,
+            422,
+            "invalid_job",
+            "task_parameters.compression_level must be an integer between 0 and 9",
+        )
         result["compression_level"] = level
 
     if result.get("encryption_enabled"):
@@ -3948,16 +4037,15 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     inventory_name = payload.get("inventory")
     inventory_id = payload.get("inventory_id")
     raw_schedule = payload.get("schedule")
-    schedule = normalize_schedule_payload(raw_schedule) if raw_schedule not in (None, "") else None
-    raw_retention_days = payload.get("retention_days")
-    retention_days = int(raw_retention_days) if raw_retention_days is not None else 14
+    schedule = _schedule_from_request(raw_schedule) if raw_schedule not in (None, "") else None
+    retention_days = _validate_retention_days(payload["retention_days"]) if "retention_days" in payload else 14
     raw_gfs = payload.get("gfs")
     gfs = _validate_gfs_counts(raw_gfs if isinstance(raw_gfs, dict) else payload)
     gfs["enabled"] = _coerce_gfs_enabled(raw_gfs.get("enabled") if isinstance(raw_gfs, dict) else None)
     active_full_days = _normalize_day_list(payload.get("active_full_days") or _split_csv(payload.get("active_full_days_csv")))
     synthetic_full_days = _normalize_day_list(payload.get("synthetic_full_days") or _split_csv(payload.get("synthetic_full_days_csv")))
-    active_full_schedule = normalize_schedule_payload(payload.get("active_full_schedule"))
-    synthetic_full_schedule = normalize_schedule_payload(payload.get("synthetic_full_schedule"))
+    active_full_schedule = _schedule_from_request(payload.get("active_full_schedule"))
+    synthetic_full_schedule = _schedule_from_request(payload.get("synthetic_full_schedule"))
     if "active_full_schedule" in payload and not _schedule_weekdays(active_full_schedule):
         active_full_days = []
     if "synthetic_full_schedule" in payload and not _schedule_weekdays(synthetic_full_schedule):
@@ -4021,6 +4109,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         )
         inventory = candidate_inventories[0]
     vm_ids, vm_names = _resolve_vm_selection(str(inventory["id"]), tokens, auto_discover=True)
+    _ensure_unique_vms(vm_ids, vm_names)
     job = {
         "id": str(uuid4()),
         "name": name,
@@ -4064,17 +4153,18 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     repository_selector_id = payload.get("repo_id") or payload.get("repository_id")
     repository = resolve_repository(name=repository_selector_name, record_id=repository_selector_id) if (repository_selector_name or repository_selector_id) else None
     raw_schedule = payload.get("schedule")
-    schedule = normalize_schedule_payload(raw_schedule) if raw_schedule not in (None, "") else _json_clone(source_job.get("schedule"))
+    schedule = _schedule_from_request(raw_schedule) if raw_schedule not in (None, "") else _json_clone(source_job.get("schedule"))
     enabled_override = payload.get("enabled")
     if isinstance(schedule, dict) and enabled_override is not None:
         schedule["enabled"] = bool(enabled_override)
     job_enabled = bool(enabled_override) if enabled_override is not None else (
         bool(schedule.get("enabled", True)) if isinstance(schedule, dict) else True
     )
-    raw_retention_days = payload.get("retention_days")
-    if raw_retention_days is None:
+    if "retention_days" in payload:
+        retention_days = _validate_retention_days(payload["retention_days"])
+    else:
         raw_retention_days = source_job.get("retention_days")
-    retention_days = int(raw_retention_days) if raw_retention_days is not None else 14
+        retention_days = int(raw_retention_days) if raw_retention_days is not None else 14
     description = str(payload.get("description") or source_job.get("description") or "").strip()
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
@@ -4207,15 +4297,13 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         changed = True
     if "schedule" in payload and payload["schedule"] is not None:
         previously_ran = _schedule_runs(updated.get("schedule"))
-        updated["schedule"] = normalize_schedule_payload(payload["schedule"])
+        updated["schedule"] = _schedule_from_request(payload["schedule"])
         updated["next_incremental_run_at"] = schedule_next_run(updated["schedule"], after=_now_utc()).isoformat() if bool(updated["schedule"].get("enabled", True)) else None
         if "enabled" not in payload and _schedule_runs(updated["schedule"]) != previously_ran:
             updated["enabled"] = bool(updated["schedule"].get("enabled", True))
         changed = True
     if "retention_days" in payload and payload["retention_days"] is not None:
-        retention_days = int(payload["retention_days"])
-        _ensure(retention_days > 0, 422, "invalid_job", "retention-days must be greater than 0")
-        updated["retention_days"] = retention_days
+        updated["retention_days"] = _validate_retention_days(payload["retention_days"])
         changed = True
     gfs_enabled_given = payload.get("gfs_enabled") is not None
     if gfs_enabled_given or any(key in payload for key in ("gfs_weekly", "gfs_monthly", "gfs_yearly")):
@@ -4235,7 +4323,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     for schedule_key, days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
         if schedule_key not in payload:
             continue
-        schedule_value = normalize_schedule_payload(payload[schedule_key])
+        schedule_value = _schedule_from_request(payload[schedule_key])
         updated[schedule_key] = schedule_value
         updated[next_run_key] = _execution_schedule_next_run(schedule_value)
         updated[days_key] = _schedule_weekdays(schedule_value)
@@ -4292,6 +4380,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if "vms" in payload and payload["vms"] is not None:
             tokens = payload["vms"] if isinstance(payload["vms"], list) else _split_csv(str(payload["vms"]))
             vm_ids, vm_names = _resolve_vm_selection(str(updated["inventory_id"]), tokens, auto_discover=True)
+            _ensure_unique_vms(vm_ids, vm_names)
             updated["vm_ids"] = vm_ids
             updated["vm_names"] = vm_names
             changed = True
@@ -5301,8 +5390,23 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     return dto
 
 
-def list_sessions(*, job_name: str | None = None, include_logs: bool = True) -> list[dict[str, Any]]:
-    sessions = [session_to_dto(task, include_logs=include_logs) for task in catalog_records(TASKS)]
+SESSION_TYPES = ("backup", "restore", "verify", "delete")
+
+
+def list_sessions(
+    *, job_name: str | None = None, session_type: str | None = None, include_logs: bool = True
+) -> list[dict[str, Any]]:
+    tasks = catalog_records(TASKS)
+    if session_type:
+        _ensure(
+            session_type in SESSION_TYPES,
+            422,
+            "invalid_argument",
+            f"type must be one of: {', '.join(SESSION_TYPES)}",
+            type=session_type,
+        )
+        tasks = [task for task in tasks if str(task.get("task_type") or "") == session_type]
+    sessions = [session_to_dto(task, include_logs=include_logs) for task in tasks]
     if job_name:
         lowered = job_name.lower()
         sessions = [
@@ -5341,6 +5445,7 @@ def _started_after(session: dict[str, Any], cutoff: datetime) -> bool:
 def list_sessions_page(
     *,
     job_name: str | None = None,
+    session_type: str | None = None,
     limit: int | None = None,
     offset: int = 0,
     since: str | None = None,
@@ -5359,7 +5464,7 @@ def list_sessions_page(
     match set itself -- the console asks for the window it actually renders
     instead of paging back through years of runs to build a 14-day chart.
     """
-    sessions = list_sessions(job_name=job_name, include_logs=False)
+    sessions = list_sessions(job_name=job_name, session_type=session_type, include_logs=False)
     if since:
         cutoff = _parse_dt(since)
         sessions = [session for session in sessions if _started_after(session, cutoff)]
@@ -5376,7 +5481,7 @@ def list_sessions_page(
     has_next = start + len(items) < total
     has_prev = start > 0
 
-    link_params = {"job": job_name, "since": since}
+    link_params = {"job": job_name, "type": session_type, "since": since}
     return {
         "items": items,
         "total": total,
@@ -8406,10 +8511,17 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     placement = _select_restore_point_placement(point, repo)
     manifest_path = _resolve_restore_manifest_path(point, placement)
 
-    target_inventory_id = str(request.get("target_inventory_id") or defaults.get("target_inventory_id") or "").strip()
+    target_inventory_id = str(request.get("target_inventory_id") or "").strip()
     target_inventory_name = str(request.get("target_inventory_name") or "").strip() or None
+    if not target_inventory_id and not target_inventory_name:
+        target_inventory_id = str(defaults.get("target_inventory_id") or "").strip()
     _ensure(bool(target_inventory_id or target_inventory_name), 422, "invalid_restore", "Restore target inventory is required")
-    target_inventory = resolve_inventory(name=target_inventory_name, record_id=target_inventory_id or None)
+    target_inventory = resolve_inventory(
+        name=target_inventory_name,
+        record_id=target_inventory_id or None,
+        name_option="--target-inventory",
+        id_option="--target-inventory-id",
+    )
     _ensure(
         str(target_inventory.get("status") or "unknown").strip().lower() != "unavailable",
         409,
@@ -8568,6 +8680,13 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         "explicit encryption key.",
         point_id=point_id,
     )
+    if is_direct_esxi_connection(_inventory_record_for_update(str(target_inventory["id"]))):
+        raise api_error(
+            409,
+            "esx_direct_connection_unsupported",
+            str(EsxDirectConnectionUnsupported()),
+            inventory_id=target_inventory["id"],
+        )
     task = {
         "id": str(uuid4()),
         "job_id": None,
@@ -8903,8 +9022,14 @@ def import_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(configuration, dict):
         configuration = {}
 
+    replaced_users = sorted(str(user.get("name") or "") for user in users_replaced_by_import(catalog))
     counts = restore_catalog(catalog)
-    return {"manifest": manifest, "restored": counts, "configuration": configuration_without_secrets(configuration)}
+    return {
+        "manifest": manifest,
+        "restored": counts,
+        "replaced_users": replaced_users,
+        "configuration": configuration_without_secrets(configuration),
+    }
 
 
 def _verify_disk_artifact(

@@ -84,7 +84,7 @@ class RestoreCommands:
         start.add_argument("--vm", help="Source VM name or ID when resolving from --backup")
         start.add_argument("--new-name", help="Name for the restored VM")
         start.add_argument("--name", help="New VM name for out-of-place restore (legacy alias)")
-        start.add_argument("--target-inventory", help="Target inventory name or ID")
+        start.add_argument("--target-inventory", help="Target inventory name")
         start.add_argument("--target-inventory-id", help="Target inventory ID")
         start.add_argument("--target-host", help="Target host name or ID")
         start.add_argument("--datastore", help="Target datastore name or ID")

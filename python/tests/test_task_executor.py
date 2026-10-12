@@ -2493,6 +2493,59 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(payload["resolved_backup_type"], "ActiveFull")
         self.assertEqual(payload["resolved_backup_reason"], "IncrementalFallbackToFull")
 
+    def _run_direct_esxi_full_backup(self, stderr: str) -> tuple[dict, list[list[str]]]:
+        FakeVCenterNode.service_type = "HostAgent"
+        HYPERVISORS["hv-esxi"] = {
+            "id": "hv-esxi",
+            "kind": "vcenter",
+            "metadata": {"host": "esxi.local", "port": 443, "verify_ssl": False, "credentials": {"username": "root", "password": "secret"}},
+        }
+        RESOURCES_BY_HV["hv-esxi"] = {
+            ("virtual_machine", "vm-uuid-1"): {"resource_type": "virtual_machine", "external_id": "vm-uuid-1", "name": "demo-vm", "payload": {}}
+        }
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        backups: list[list[str]] = []
+
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            if len(command) > 1 and command[1] == "backup":
+                backups.append(command)
+                return FakeCompletedProcess(returncode=1, stderr=stderr)
+            return FakeCompletedProcess(returncode=0, stdout="Done")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "task-direct-esxi",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-esxi",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {"destination_dir": temp_dir, "tool_path": EXISTING_TOOL_PATH},
+            }
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
+                with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
+                    with self.assertLogs("python.srv.plugins.vcenter.vcenter_backup", level="ERROR"):
+                        result = run_task(task)
+        return result, backups
+
+    def test_a_direct_esxi_connection_refused_by_vddk_is_not_retried_and_is_explained(self) -> None:
+        result, backups = self._run_direct_esxi_full_backup(
+            "Error: failed to prepare the virtual machine for access: The command is not supported on remote objects"
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(backups), 1)
+        message = result["result"]["message"]
+        self.assertIn("backups through a direct ESXi connection (esxi.local) are not supported yet", message)
+        self.assertNotIn("prepare the virtual machine", message)
+
+    def test_other_disk_failures_on_an_esxi_host_are_still_retried(self) -> None:
+        result, backups = self._run_direct_esxi_full_backup("Error: failed to open disk: Unknown error")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertGreater(len(backups), 1)
+        self.assertNotIn("direct ESXi connection", result["result"]["message"])
+
     def test_vcenter_incremental_backup_without_parent_manifest_falls_back_to_full(self) -> None:
         HYPERVISORS["hv-esxi"] = {
             "id": "hv-esxi",

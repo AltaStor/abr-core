@@ -24,7 +24,7 @@ except ModuleNotFoundError:
 
 from python.srv.backup_server import app
 from python.srv.core import mongo_db_wrapper
-from python.srv.core.mongo_db_wrapper import REPOSITORIES, SESSIONS, USERS
+from python.srv.core.mongo_db_wrapper import REPOSITORIES, SESSIONS, USERS, session_key
 from python.srv.services import auth_service
 
 BOOTSTRAP_ENV = {
@@ -188,8 +188,8 @@ class AuthenticationDuringOutageTests(SystemHealthTestCase):
 
     def test_an_expired_session_is_still_401_and_evicted(self) -> None:
         token = "expired-token"
-        SESSIONS[token] = {
-            "token": token,
+        SESSIONS[session_key(token)] = {
+            "token": session_key(token),
             "user_id": next(iter(USERS)),
             "expires_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
         }
@@ -198,12 +198,12 @@ class AuthenticationDuringOutageTests(SystemHealthTestCase):
                 "/api/v1/system/health", headers={"Authorization": f"Bearer {token}"}
             )
         self.assertEqual(response.status_code, 401)
-        self.assertNotIn(token, SESSIONS)
+        self.assertNotIn(session_key(token), SESSIONS)
 
     def test_a_session_whose_user_is_gone_is_still_401(self) -> None:
         token = "orphan-token"
-        SESSIONS[token] = {
-            "token": token,
+        SESSIONS[session_key(token)] = {
+            "token": session_key(token),
             "user_id": "no-such-user",
             "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
         }
@@ -241,15 +241,15 @@ class AuthenticationDuringOutageTests(SystemHealthTestCase):
                 "the background renewal never reached the database write",
             )
             auth_service.logout(token)
-            self.assertNotIn(token, SESSIONS)
+            self.assertNotIn(session_key(token), SESSIONS)
 
             slow_db.release.set()
             deadline = time.monotonic() + 2
-            while token in SESSIONS and time.monotonic() < deadline:
+            while session_key(token) in SESSIONS and time.monotonic() < deadline:
                 time.sleep(0.02)
 
             self.assertNotIn(
-                token, SESSIONS, "a delayed renewal resurrected a logged-out session"
+                session_key(token), SESSIONS, "a delayed renewal resurrected a logged-out session"
             )
 
 

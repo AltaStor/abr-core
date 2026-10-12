@@ -10,6 +10,7 @@ import time
 import types
 from datetime import datetime, timezone
 import unittest
+from unittest.mock import patch
 
 try:
     from python.srv.plugins.vcenter.vcenter import VCenterNode, _normalize_disk_uuid
@@ -1637,7 +1638,9 @@ class _FakeSoapStub:
 
 
 class ReleaseAccessLockTests(unittest.TestCase):
-    def _node(self, disabled: list[str], status: int = 200, body: str = "<EnableMethodsResponse/>") -> tuple:
+    def _node(
+        self, disabled: list[str], status: int = 200, body: str = "<EnableMethodsResponse/>", api_type: str = "VirtualCenter"
+    ) -> tuple:
         vm = types.SimpleNamespace(_moId="vm-42", _wsdlName="VirtualMachine", disabledMethod=list(disabled))
 
         def lift() -> None:
@@ -1650,7 +1653,8 @@ class ReleaseAccessLockTests(unittest.TestCase):
         node.si = types.SimpleNamespace(
             _stub=stub,
             RetrieveContent=lambda: types.SimpleNamespace(
-                authorizationManager=types.SimpleNamespace(_moId="AuthorizationManager")
+                authorizationManager=types.SimpleNamespace(_moId="AuthorizationManager"),
+                about=types.SimpleNamespace(apiType=api_type),
             ),
         )
         node._vm_holding_access_lock = lambda vm_name, vm_moref: vm
@@ -1672,6 +1676,15 @@ class ReleaseAccessLockTests(unittest.TestCase):
         self.assertEqual(headers["SOAPAction"], '"urn:vim25/8.0.3.0"')
         self.assertEqual(headers["Cookie"], 'vmware_soap_session="abc"')
         self.assertEqual(stub.returned, 1)
+
+    def test_a_direct_esxi_connection_never_tries_to_re_enable_vcenter_only_methods(self) -> None:
+        baseline = ["CloneVM_Task", "MigrateVM_Task", "RelocateVM_Task"]
+        node, vm, connection, _stub = self._node(list(baseline), api_type="HostAgent")
+
+        self.assertFalse(node.release_access_lock("esxi-src", "vm-42"))
+
+        self.assertEqual(connection.requests, [])
+        self.assertEqual(vm.disabledMethod, baseline)
 
     def test_a_vm_without_the_block_is_left_untouched(self) -> None:
         node, vm, connection, _stub = self._node(["PowerOnVM_Task"])
@@ -1700,9 +1713,39 @@ class ReleaseAccessLockTests(unittest.TestCase):
     def test_a_block_that_vcenter_keeps_is_reported(self) -> None:
         node, vm, connection, _stub = self._node(["RelocateVM_Task"])
         connection.on_request = lambda: None
+        clock = iter(range(0, 1000))
 
-        with self.assertRaisesRegex(RuntimeError, "still blocks RelocateVM_Task"):
+        with patch("python.srv.plugins.vcenter.vcenter.time.sleep"), patch(
+            "python.srv.plugins.vcenter.vcenter.time.monotonic", side_effect=lambda: next(clock)
+        ), self.assertRaisesRegex(RuntimeError, "still blocks RelocateVM_Task"):
             node.release_access_lock("web01", "vm-42")
+
+    def test_a_block_vcenter_holds_for_its_own_task_is_waited_out_without_a_warning(self) -> None:
+        node, vm, connection, _stub = self._node(["PowerOnVM_Task", "RelocateVM_Task"])
+        connection.on_request = lambda: None
+        reads = {"count": 0}
+
+        class _VmUnderVCenterTask:
+            _moId = "vm-42"
+            _wsdlName = "VirtualMachine"
+
+            @property
+            def disabledMethod(self) -> list[str]:
+                reads["count"] += 1
+                return ["PowerOnVM_Task", "RelocateVM_Task"] if reads["count"] <= 3 else ["PowerOnVM_Task"]
+
+        held = _VmUnderVCenterTask()
+        node._vm_holding_access_lock = lambda vm_name, vm_moref: held
+
+        with patch("python.srv.plugins.vcenter.vcenter.time.sleep") as sleep, self.assertLogs(
+            "python.srv.plugins.vcenter.vcenter", level="INFO"
+        ) as logs:
+            lifted = node.release_access_lock("web01", "vm-42")
+
+        self.assertFalse(lifted)
+        self.assertEqual(len(connection.requests), 1)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertTrue(any("vCenter's own task" in line for line in logs.output))
 
     def test_a_broken_connection_is_closed_not_returned_to_the_pool(self) -> None:
         node, _vm, connection, stub = self._node(["RelocateVM_Task"])

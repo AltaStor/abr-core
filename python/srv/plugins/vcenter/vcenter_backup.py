@@ -1129,6 +1129,13 @@ def _job_parent_manifest(
     )
 
 
+_DIRECT_HOST_ACCESS_REFUSED = re.compile(r"not supported on remote objects", re.IGNORECASE)
+
+
+def _direct_host_access_refused_message(datastore_path: str, host: str) -> str:
+    return f"Disk backup failed for {datastore_path}: backups through a direct ESXi connection ({host}) are not supported yet."
+
+
 _WRITE_FAILURE = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _NO_SPACE = re.compile(r"no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _CONNECTION_LOST = re.compile(r"refused connection|connection (?:was )?(?:reset|lost|timed out)|NBD_ERR_NETWORK", re.IGNORECASE)
@@ -2800,7 +2807,12 @@ def run_vcenter_backup(
                             for part in (completed.stdout or "", completed.stderr or "")
                             if part and part.strip()
                         )
-                    if completed.returncode != 0 and not is_virtual_center:
+                    direct_host_refused = (
+                        completed.returncode != 0
+                        and not is_virtual_center
+                        and bool(_DIRECT_HOST_ACCESS_REFUSED.search(tool_output))
+                    )
+                    if completed.returncode != 0 and not is_virtual_center and not direct_host_refused:
                         hostagent_retry_variants = []
                         for variant_vm_moref in _hostagent_vm_retry_specs(vm_moref):
                             hostagent_retry_variants.append(
@@ -2918,6 +2930,8 @@ def run_vcenter_backup(
                             datastore_path,
                             stderr or f"exit code {completed.returncode}",
                         )
+                        if direct_host_refused:
+                            raise VCenterBackupError(_direct_host_access_refused_message(datastore_path, host))
                         raise VCenterBackupError(
                             f"Disk backup failed for {datastore_path}: "
                             + _disk_failure_message(

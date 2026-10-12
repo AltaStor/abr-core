@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 from urllib.parse import urlparse
 
+from python.srv.core.credential_encryption import StoredCredentialUnreadable
 from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, TASKS, catalog_records, persist_hypervisor, replace_resources_for_hypervisor
 from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
@@ -126,7 +127,7 @@ def _summarize_resources(resources: list[dict[str, Any]]) -> dict[str, int]:
 
 class InventoryProvider(ABC):
     @abstractmethod
-    def test_connection(self, record: dict[str, Any]) -> None:
+    def test_connection(self, record: dict[str, Any]) -> str | None:
         pass
 
     @abstractmethod
@@ -135,7 +136,7 @@ class InventoryProvider(ABC):
 
 
 class VsphereInventoryProvider(InventoryProvider):
-    def test_connection(self, record: dict[str, Any]) -> None:
+    def test_connection(self, record: dict[str, Any]) -> str | None:
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         credentials = _credentials_from_record(record)
         host = metadata.get("host")
@@ -157,11 +158,13 @@ class VsphereInventoryProvider(InventoryProvider):
             with VCenterNode(str(host), str(username), str(password), port=port, verify_ssl=verify_ssl) as node:
                 # Reject a standalone ESXi host that has been added to a cluster:
                 # it must be backed up through its managing vCenter, not directly.
-                if node.get_service_type() == "HostAgent":
+                service_type = node.get_service_type()
+                if service_type == "HostAgent":
                     cluster_name = node.clustered_host_name()
                     if cluster_name:
                         raise EsxHostInClusterError(cluster_name)
-        except EsxHostInClusterError:
+                return service_type
+        except (EsxHostInClusterError, StoredCredentialUnreadable):
             raise
         except Exception as exc:
             raise RuntimeError("Unable to connect to virtualization environment") from exc
@@ -353,6 +356,13 @@ def _endpoint_reachable(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+class EsxDirectConnectionUnsupported(ValueError):
+    def __init__(self) -> None:
+        super().__init__(
+            "A direct ESXi connection is not supported. Register the vCenter Server that manages this host instead."
+        )
+
+
 class InventoryUnreachableError(RuntimeError):
     def __init__(self, message: str, *, reason: str) -> None:
         super().__init__(message)
@@ -410,13 +420,31 @@ def assert_inventory_registrable(record: dict[str, Any]) -> None:
         )
     provider = InventoryProviderRegistry.resolve(record)
     try:
-        provider.test_connection(record)
+        service_type = provider.test_connection(record)
     except EsxHostInClusterError:
         raise
     except Exception as exc:
         raise _connection_failure(
             exc, host, port, verify_ssl=bool(metadata.get("verify_ssl", True))
         ) from exc
+    if service_type == "HostAgent":
+        raise EsxDirectConnectionUnsupported()
+
+
+def is_direct_esxi_connection(record: dict[str, Any]) -> bool:
+    if inventory_type_from_record(record) != "vsphere":
+        return False
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    host = str(metadata.get("host") or "")
+    port = int(metadata.get("port", 443) or 443)
+    if not host or not _endpoint_reachable(host, port, timeout=float(inventory_connect_timeout())):
+        return False
+    try:
+        return InventoryProviderRegistry.resolve(record).test_connection(record) == "HostAgent"
+    except EsxHostInClusterError:
+        return True
+    except Exception:
+        return False
 
 
 def test_inventory_connection(record: dict[str, Any]) -> dict[str, Any]:

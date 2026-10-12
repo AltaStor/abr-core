@@ -61,6 +61,12 @@ default, and `--tool-path` can then be left off.
 
 ## 4. Register the ESXi host
 
+The server currently refuses a direct ESXi connection with "A direct ESXi
+connection is not supported": backups through it do not work yet, because the
+data mover asks VDDK for a vCenter-only operation. Register the vCenter Server
+that manages the host instead. The steps below apply once direct connections
+are supported.
+
 ```bash
 cd /path/to/backup-server
 source .venv/bin/activate
