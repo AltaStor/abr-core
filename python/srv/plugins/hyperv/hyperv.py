@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List
 
+from ...core.credential_encryption import StoredCredentialUnreadable, is_encrypted, unreadable_credential_message
 from ..hypervisor import Hypervisor, ProgressCallback
 from . import vhdx_tool
 
@@ -407,6 +408,8 @@ class HyperVNode(Hypervisor):
         return [HTTPS_PORT, HTTP_PORT]
 
     def _build_client(self, host: str, port: int) -> Any:
+        if is_encrypted(self.password):
+            raise StoredCredentialUnreadable(unreadable_credential_message(f"for Hyper-V host {self.host}"))
         try:
             from pypsrp.client import Client
         except ModuleNotFoundError as exc:

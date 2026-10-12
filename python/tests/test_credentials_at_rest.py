@@ -299,6 +299,34 @@ class UnreadablePasswordIsNeverSentTests(_KeyFileTestCase):
         self.assertEqual(smart_connect.call_args.kwargs["pwd"], VCENTER_PASSWORD)
 
 
+class UnreadableHyperVPasswordIsNeverSentTests(_KeyFileTestCase):
+    def test_a_password_this_key_cannot_open_is_not_tried_against_a_hyperv_host(self) -> None:
+        from python.srv.plugins.hyperv import hyperv
+
+        foreign = credential_encryption.ENCRYPTED_PREFIX + Fernet(Fernet.generate_key()).encrypt(b"other").decode()
+        node = hyperv.HyperVNode("hv.local", "CORP\\backupsvc", credential_encryption.decrypt_secret(foreign))
+
+        with patch.object(hyperv, "_port_is_open", return_value=True), patch("pypsrp.client.Client") as client:
+            with self.assertRaises(credential_encryption.StoredCredentialUnreadable) as raised:
+                node.connect()
+
+        client.assert_not_called()
+        self.assertIn("hv.local", str(raised.exception))
+        self.assertIn("abr inventory edit", str(raised.exception))
+        self.assertNotIn(foreign, str(raised.exception))
+
+    def test_a_readable_password_still_reaches_a_hyperv_host(self) -> None:
+        from python.srv.plugins.hyperv import hyperv
+
+        stored = credential_encryption.encrypt_secret("hyperv-secret")
+        node = hyperv.HyperVNode("hv.local", "CORP\\backupsvc", credential_encryption.decrypt_secret(stored))
+
+        with patch("pypsrp.client.Client") as client:
+            node._build_client("hv.local", hyperv.HTTPS_PORT)
+
+        self.assertEqual(client.call_args.kwargs["password"], "hyperv-secret")
+
+
 class KeyFileDurabilityTests(_KeyFileTestCase):
     def test_a_new_key_is_flushed_and_published_whole(self) -> None:
         synced: list[int] = []

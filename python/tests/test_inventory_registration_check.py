@@ -199,6 +199,14 @@ class DirectEsxiRegistrationTests(unittest.TestCase):
 
         self.assertIn(created["id"], HYPERVISORS)
 
+    def test_editing_an_esxi_inventory_registered_earlier_keeps_it_available(self) -> None:
+        HYPERVISORS["inv-1"] = _record()
+        with self._connect_to(_Endpoint("HostAgent")), self.assertNoLogs(abr_v41.LOGGER, level="WARNING"):
+            edited = abr_v41.edit_inventory_record("inv-1", {"password": "new-secret"})
+
+        self.assertEqual(edited["status"], "available")
+        self.assertIsNone(edited["status_error"])
+
     def test_an_esxi_inventory_tests_as_connected(self) -> None:
         HYPERVISORS["inv-1"] = _record()
         with self._connect_to(_Endpoint("HostAgent")):
