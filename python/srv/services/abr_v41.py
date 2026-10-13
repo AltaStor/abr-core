@@ -2504,7 +2504,7 @@ def _repository_storage_location_mismatch(repository: dict[str, Any]) -> str | N
     )
 
 
-def _verify_local_repository(repository: dict[str, Any]) -> dict[str, Any]:
+def _verify_local_repository(repository: dict[str, Any], *, whole_chains: bool = False) -> dict[str, Any]:
     path = Path(str(repository.get("path") or ""))
     checks: list[dict[str, Any]] = []
     exists, is_dir, access_error = _stat_operator_path(path)
@@ -2556,7 +2556,7 @@ def _verify_local_repository(repository: dict[str, Any]) -> dict[str, Any]:
     if location_mismatch:
         return {"status": "error", "checks": checks, "message": location_mismatch}
 
-    backup_health = _verify_repository_backup_health(str(repository.get("id") or ""))
+    backup_health = _verify_repository_backup_health(str(repository.get("id") or ""), whole_chains=whole_chains)
     checks.append(
         {
             "name": "block_consistency",
@@ -2683,7 +2683,7 @@ def _s3_connectivity_checks(
     return checks, None
 
 
-def _verify_s3_repository(repository: dict[str, Any]) -> dict[str, Any]:
+def _verify_s3_repository(repository: dict[str, Any], *, whole_chains: bool = False) -> dict[str, Any]:
     config = extract_s3_config(repository)
     checks, error = _s3_connectivity_checks(config)
     if error is not None:
@@ -2709,7 +2709,7 @@ def _verify_s3_repository(repository: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    backup_health = _verify_repository_backup_health(str(repository.get("id") or ""))
+    backup_health = _verify_repository_backup_health(str(repository.get("id") or ""), whole_chains=whole_chains)
     checks.append(
         {
             "name": "block_consistency",
@@ -3293,9 +3293,9 @@ def test_s3_connection(payload: dict[str, Any]) -> dict[str, Any]:
 def _repository_verification_result(repository: dict[str, Any]) -> dict[str, Any]:
     repo_type = str(repository.get("type") or "")
     if repo_type == "local":
-        return _verify_local_repository(repository)
+        return _verify_local_repository(repository, whole_chains=True)
     if repo_type == "s3":
-        return _verify_s3_repository(repository)
+        return _verify_s3_repository(repository, whole_chains=True)
     return _verify_remote_repository(repository)
 
 
@@ -9103,11 +9103,26 @@ def _repository_latest_points(repository_id: str) -> list[dict[str, Any]]:
     return latest_points
 
 
-def _verify_repository_backup_health(repository_id: str) -> dict[str, Any]:
-    latest_points = _repository_latest_points(repository_id)
+def _repository_chain_points(repository_id: str) -> list[list[dict[str, Any]]]:
+    chains: list[list[dict[str, Any]]] = []
+    for points in grouped_backup_points().values():
+        held = [point for point in points if str(point.get("repository_id") or "") == repository_id]
+        if held:
+            chains.append(held)
+    return chains
+
+
+def _verify_repository_backup_health(repository_id: str, *, whole_chains: bool = False) -> dict[str, Any]:
+    if whole_chains:
+        chains = _repository_chain_points(repository_id)
+        checked_points = [point for chain in chains for point in chain]
+        chain_count = len(chains)
+    else:
+        checked_points = _repository_latest_points(repository_id)
+        chain_count = len(checked_points)
     work_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
-    for point in latest_points:
+    for point in checked_points:
         artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
 
         for disk in artifact.get("disks", []):
@@ -9117,7 +9132,8 @@ def _verify_repository_backup_health(repository_id: str) -> dict[str, Any]:
     if not work_items:
         return {
             "status": "skipped",
-            "checked_chains": len(latest_points),
+            "checked_chains": chain_count,
+            "checked_restore_points": len(checked_points),
             "checked_artifacts": 0,
             "errors": [],
             "message": "No backup artifacts to verify",
@@ -9147,14 +9163,18 @@ def _verify_repository_backup_health(repository_id: str) -> dict[str, Any]:
                 )
 
     status = "failed" if errors else "ok"
+    covered = f"{len(checked_points)} restore point(s) across {chain_count} chain(s)"
+    if not whole_chains:
+        covered = f"the newest restore point of each of {chain_count} chain(s)"
     message = (
-        f"{len(errors)} of {len(work_items)} backup artifact(s) failed verification"
+        f"{len(errors)} of {len(work_items)} backup artifact(s) of {covered} failed verification"
         if errors
-        else f"Verified {len(work_items)} backup artifact(s) across {len(latest_points)} chain(s)"
+        else f"Verified {len(work_items)} backup artifact(s) of {covered}"
     )
     return {
         "status": status,
-        "checked_chains": len(latest_points),
+        "checked_chains": chain_count,
+        "checked_restore_points": len(checked_points),
         "checked_artifacts": len(work_items),
         "errors": errors,
         "message": message,
