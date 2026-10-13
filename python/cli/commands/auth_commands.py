@@ -10,10 +10,19 @@ import sys
 from .. import token_store
 from ..cli_context import TOKEN_ENV_VAR
 from ..compact_help_formatter import CompactHelpFormatter
+from ..errors import CliStructuredError
+from ..exit_codes import INVALID_USAGE
 from .base import CommandDependencies
 
 USERNAME_ENV_VAR = "ABR_USERNAME"
 PASSWORD_ENV_VAR = "ABR_PASSWORD"
+
+
+def _prompt(read, prompt: str, *, missing: str) -> str:
+    try:
+        return read(prompt)
+    except EOFError as exc:
+        raise CliStructuredError(code="invalid_argument", message=missing, exit_code=INVALID_USAGE) from exc
 
 
 class AuthCommands:
@@ -79,8 +88,16 @@ class AuthCommands:
         deps = CommandDependencies(args)
         name = args.name or os.environ.get(USERNAME_ENV_VAR)
         if not name:
-            name = input("User name: ")
-        password = os.environ.get(PASSWORD_ENV_VAR) or getpass.getpass("Password: ")
+            name = _prompt(
+                input,
+                "User name: ",
+                missing=f"No user name provided; pass --name, set {USERNAME_ENV_VAR} or run interactively",
+            )
+        password = os.environ.get(PASSWORD_ENV_VAR) or _prompt(
+            getpass.getpass,
+            "Password: ",
+            missing=f"No password provided; set {PASSWORD_ENV_VAR} or run interactively",
+        )
 
         result = deps.context.api_client.post("api/v1/auth/login", json={"name": name, "password": password})
         token_store.save_token(deps.context.base_url, result["token"], result["expires_at"])
