@@ -14,13 +14,19 @@ virtual disk service and reads exactly the sectors the guest sees -- VHD, VHDX
 and differencing chains alike. The backup server starts it there over WinRM,
 one disk at a time, and follows its progress.
 
-The appliance copies the tool to every host that lacks it, or has another
-build, the first time it needs it there. `ALTASTOR_VHDX_TOOL_PATH` names the
-appliance's copy of `abr-vhdx-tool.exe` (by default
-`tools/abr-vhdx-tool/abr-vhdx-tool.exe` under the install root);
-`ALTASTOR_HYPERV_TOOL_PATH` says where it goes on the hosts (by default
-`C:\Program Files\AltaStor\abr-vhdx-tool.exe`). With no copy on the appliance,
-each host must have the tool installed at that path already.
+At the start of each backup or restore the appliance makes sure the host holds
+its copy of the tool and of its PowerShell scripts, in a folder named by their
+SHA-256 under `ALTASTOR_HYPERV_WORK_DIR` (by default
+`C:\ProgramData\AltaStor\abr-hyperv`). When that folder is there with every
+file intact, nothing is uploaded; otherwise the files go to a staging folder,
+are checked, and are moved into place. Another build of the appliance gets a
+folder of its own, so several appliances can share a host without replacing
+each other's files. For the rest of the run the scripts are read from that
+folder instead of being sent with every command. `ALTASTOR_VHDX_TOOL_PATH` names
+the appliance's copy of `abr-vhdx-tool.exe` (by default
+`tools/abr-vhdx-tool/abr-vhdx-tool.exe` under the install root). With no copy on
+the appliance, each host must have the tool installed at
+`ALTASTOR_HYPERV_TOOL_PATH` (by default `C:\Program Files\AltaStor\abr-vhdx-tool.exe`).
 
 ## What it needs
 

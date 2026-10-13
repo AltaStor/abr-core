@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright © 2026 Norvitex OÜ
 
+import base64
 import functools
 import ipaddress
 import json
@@ -9,6 +10,7 @@ import re
 import socket
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List
@@ -119,6 +121,11 @@ def load_script(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _bundle_script_block(folder: str, name: str) -> str:
+    path = folder + "\\scripts\\" + name
+    return f"([ScriptBlock]::Create([IO.File]::ReadAllText({_ps_quote(path)})))"
+
+
 def _port_is_open(host: str, port: int, timeout: float = PROBE_TIMEOUT_SECONDS) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -166,6 +173,7 @@ class HyperVNode(Hypervisor):
         self._vm_nodes: Dict[str, str] = {}
         self._vm_states: Dict[str, Dict[str, Any]] = {}
         self._tool_paths: Dict[str, str] = {}
+        self._bundles: Dict[str, str] = {}
         self._lock = threading.Lock()
 
     def connect(self) -> None:
@@ -181,6 +189,9 @@ class HyperVNode(Hypervisor):
 
     def disconnect(self) -> None:
         self._clients.clear()
+        with self._lock:
+            self._bundles.clear()
+            self._tool_paths.clear()
         self._snapshots.clear()
         self._vm_nodes.clear()
         self._vm_states.clear()
@@ -625,9 +636,14 @@ class HyperVNode(Hypervisor):
         node: str | None = None,
         *,
         depth: int = 6,
+        inline: bool = False,
     ) -> List[Dict[str, Any]]:
         payload = json.dumps(args, ensure_ascii=True)
-        body = load_script("common.ps1") + "\n" + load_script(name)
+        folder = None if inline else self._bundle_folder(node)
+        if folder:
+            body = f". {_bundle_script_block(folder, 'common.ps1')}\n. {_bundle_script_block(folder, name)}"
+        else:
+            body = load_script("common.ps1") + "\n" + load_script(name)
         script = f"$AbrArgs = {_ps_quote(payload)} | ConvertFrom-Json\n& {{\n{body}\n}}"
         return self._run_json(script, node, depth=depth)
 
@@ -894,31 +910,82 @@ class HyperVNode(Hypervisor):
 
     # -- abr-vhdx-tool ------------------------------------------------------
 
+    def _bundle_folder(self, node: str | None) -> str | None:
+        with self._lock:
+            return self._bundles.get(str(node or self.host).lower())
+
+    def ensure_host_bundle(self, node: str) -> str:
+        """The folder on a node that holds this appliance's abr-vhdx-tool and
+        Hyper-V scripts, named by their SHA-256; uploaded first when it is
+        missing there or a file in it differs."""
+        key = str(node or self.host).lower()
+        known = self._bundle_folder(node)
+        if known:
+            return known
+        bundle = vhdx_tool.host_bundle(SCRIPT_DIR)
+        folder = bundle.folder(vhdx_tool.remote_work_dir())
+        expected = [{"name": name, "sha256": digest} for name, _path, digest in bundle.files]
+        state = (self._run_script("bundle_check.ps1", {"folder": folder, "expected": expected}, node, inline=True) or [{}])[0]
+        if state.get("complete"):
+            logger.info("Hyper-V node %s already holds this appliance's files in %s", node, folder)
+        else:
+            self._deploy_bundle(node, bundle, folder, expected, state)
+        with self._lock:
+            self._bundles[key] = folder
+        return folder
+
+    def _deploy_bundle(
+        self,
+        node: str,
+        bundle: "vhdx_tool.HostBundle",
+        folder: str,
+        expected: List[Dict[str, str]],
+        state: Dict[str, Any],
+    ) -> None:
+        staging = f"{vhdx_tool.remote_work_dir()}\\.staging-{bundle.bundle_id[:12]}-{uuid.uuid4().hex[:8]}"
+        texts = [
+            {"name": name, "content": base64.b64encode(path.read_bytes()).decode("ascii")}
+            for name, path, _digest in bundle.files
+            if name.startswith("scripts\\")
+        ]
+        logger.info(
+            "Uploading this appliance's files to %s on Hyper-V node %s (%s)",
+            folder,
+            node,
+            "some differ there" if state.get("exists") else "it is not there",
+        )
+        started = time.monotonic()
+        self._run_script("stage_bundle.ps1", {"staging": staging, "files": texts}, node, inline=True)
+        client = self._client_for(node) if node else self._client
+        for name, path, _digest in bundle.files:
+            if not name.startswith("scripts\\"):
+                client.copy(str(path), f"{staging}\\{name}")
+        result = (
+            self._run_script(
+                "finalize_bundle.ps1", {"staging": staging, "folder": folder, "expected": expected}, node, inline=True
+            )
+            or [{}]
+        )[0]
+        logger.info(
+            "Hyper-V node %s: %s %s in %.1fs",
+            node,
+            folder,
+            "was put in place by another run meanwhile" if result.get("status") == "present" else "uploaded",
+            time.monotonic() - started,
+        )
+
     def ensure_disk_tool(self, node: str) -> str:
-        """The path of abr-vhdx-tool.exe on a node, copied there first when it
-        is missing or differs from the appliance's copy."""
+        """The path of abr-vhdx-tool.exe on a node: the copy in this
+        appliance's file folder there, or the one installed on the host when
+        the appliance has none."""
         key = str(node or self.host).lower()
         with self._lock:
             known = self._tool_paths.get(key)
         if known:
             return known
-        remote = vhdx_tool.remote_tool_path()
-        local = vhdx_tool.local_tool_path()
+        folder = self.ensure_host_bundle(node)
+        remote = f"{folder}\\{vhdx_tool.TOOL_NAME}" if vhdx_tool.local_tool_path() is not None else vhdx_tool.remote_tool_path()
         info = (self._run_script("tool_info.ps1", {"path": remote}, node) or [{}])[0]
-        if local is not None:
-            wanted = vhdx_tool.file_sha256(local)
-            if not info.get("exists") or str(info.get("sha256") or "").upper() != wanted:
-                logger.info(
-                    "Copying abr-vhdx-tool from %s to %s on Hyper-V node %s (%s there)",
-                    local,
-                    remote,
-                    node,
-                    "a different build is" if info.get("exists") else "it is not",
-                )
-                self._copy_file(node, local, remote)
-                info = (self._run_script("tool_info.ps1", {"path": remote}, node) or [{}])[0]
-                if str(info.get("sha256") or "").upper() != wanted:
-                    raise HyperVError(f"abr-vhdx-tool could not be copied to {remote} on {node}")
         if not info.get("exists"):
             raise HyperVError(
                 f"abr-vhdx-tool is not installed on {node} at {remote}. Install it there, or set "
@@ -928,12 +995,6 @@ class HyperVNode(Hypervisor):
         with self._lock:
             self._tool_paths[key] = remote
         return remote
-
-    def _copy_file(self, node: str, local: Path, remote: str) -> None:
-        folder = remote.rsplit("\\", 1)[0]
-        self.prepare_folders(node, [folder], [])
-        client = self._client_for(node) if node else self._client
-        client.copy(str(local), remote)
 
     def run_disk_tool(
         self,
@@ -973,7 +1034,14 @@ class HyperVNode(Hypervisor):
         output = _ToolOutput(on_progress)
         with RunspacePool(client.wsman) as pool:
             shell = PowerShell(pool)
-            shell.add_script(load_script("run_tool.ps1"))
+            folder = self._bundle_folder(node)
+            if folder:
+                shell.add_script(
+                    "param([string]$Tool, [string[]]$ToolArgs, [hashtable]$ToolEnv)\n"
+                    f"& {_bundle_script_block(folder, 'run_tool.ps1')} -Tool $Tool -ToolArgs $ToolArgs -ToolEnv $ToolEnv"
+                )
+            else:
+                shell.add_script(load_script("run_tool.ps1"))
             shell.add_parameters({"Tool": tool, "ToolArgs": list(args), "ToolEnv": env})
             shell.begin_invoke()
             seen = 0

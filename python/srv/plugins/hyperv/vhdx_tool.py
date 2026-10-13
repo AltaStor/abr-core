@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -30,6 +31,7 @@ from ...core.storage_tool import APP_ROOT, REPO_ROOT, disk_tool_storage_args, is
 
 TOOL_NAME = "abr-vhdx-tool.exe"
 DEFAULT_REMOTE_TOOL_PATH = r"C:\Program Files\AltaStor\abr-vhdx-tool.exe"
+DEFAULT_REMOTE_WORK_DIR = r"C:\ProgramData\AltaStor\abr-hyperv"
 
 HYPERV_REPOSITORY_MESSAGE = (
     "Hyper-V disks are written and read by abr-vhdx-tool on the Hyper-V host, which reaches S3 "
@@ -87,6 +89,34 @@ def file_sha256(path: Path) -> str:
                 digest.update(block)
         _hashes[key] = digest.hexdigest().upper()
     return _hashes[key]
+
+
+def remote_work_dir() -> str:
+    return (os.environ.get("ALTASTOR_HYPERV_WORK_DIR", "").strip() or DEFAULT_REMOTE_WORK_DIR).rstrip("\\")
+
+
+@dataclass(frozen=True)
+class HostBundle:
+    bundle_id: str
+    files: tuple[tuple[str, Path, str], ...]
+    has_tool: bool
+
+    def folder(self, root: str) -> str:
+        return root.rstrip("\\") + "\\" + self.bundle_id
+
+
+def host_bundle(script_dir: Path) -> HostBundle:
+    files = [(f"scripts\\{path.name}", path, file_sha256(path)) for path in sorted(script_dir.glob("*.ps1"))]
+    tool = local_tool_path()
+    if tool is not None:
+        files.append((TOOL_NAME, tool, file_sha256(tool)))
+    files.sort(key=lambda item: item[0].lower())
+    manifest = "".join(f"{name}\t{digest}\n" for name, _path, digest in files)
+    return HostBundle(
+        bundle_id=hashlib.sha256(manifest.encode("utf-8")).hexdigest(),
+        files=tuple(files),
+        has_tool=tool is not None,
+    )
 
 
 def _is_local_repository(repository: dict[str, Any] | None) -> bool:
