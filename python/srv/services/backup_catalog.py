@@ -24,6 +24,7 @@ from python.srv.core.mongo_db_wrapper import (
     persist_task,
 )
 from python.srv.core.storage_tool import (
+    STORAGE_LAYOUT_BY_ID,
     extract_s3_config,
     hydrate_manifest_via_disk_tool,
     immutability_is_enabled,
@@ -31,6 +32,7 @@ from python.srv.core.storage_tool import (
     join_s3_prefix,
     list_disk_tool_backups,
     remove_disk_tool_backup,
+    repository_cache_root,
     safe_path_component,
 )
 from python.srv.core.utils import utc_now
@@ -253,6 +255,21 @@ def _record_session_warning(
     _append_task_log(task, level="warn", message=message, component=component)
 
 
+def _adopt_id_layout(job: dict[str, Any] | None, result: dict[str, Any]) -> None:
+    if not isinstance(job, dict) or result.get("storage_layout") != STORAGE_LAYOUT_BY_ID:
+        return
+    if job.get("storage_layout") == STORAGE_LAYOUT_BY_ID:
+        return
+    stored = JOBS.get(str(job.get("id") or ""))
+    if not isinstance(stored, dict):
+        return
+    persist_job(normalize_job_record({**stored, "storage_layout": STORAGE_LAYOUT_BY_ID, "updated_at": utc_now()}))
+    logger.info(
+        "Job %s now keeps its backups in folders named by job and VM id; its earlier backups stay where they are.",
+        job.get("id"),
+    )
+
+
 def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] | None:
     if task.get("task_type") != "backup" or task.get("status") != "completed":
         return None
@@ -321,9 +338,13 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
             and str((point.get("placements") or [{}])[0].get("repository_id") if isinstance(point.get("placements"), list) and point.get("placements") else point.get("repository_id") or "") == str(repository_id or "")
         ]
         prior_points.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")))
-        if prior_points:
-            parent_point_id = prior_points[-1].get("id")
-            segment_id = str(prior_points[-1].get("segment_id") or prior_points[-1].get("id") or "")
+        base = next(
+            (point for point in prior_points if point.get("id") and point.get("id") == result.get("parent_point_id")),
+            prior_points[-1] if prior_points else None,
+        )
+        if base is not None:
+            parent_point_id = base.get("id")
+            segment_id = str(base.get("segment_id") or base.get("id") or "")
     if full_backup:
         segment_id = None
         parent_point_id = None
@@ -405,6 +426,7 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
     if not normalized_record.get("segment_id"):
         normalized_record["segment_id"] = normalized_record["id"]
     persist_backup(normalized_record)
+    _adopt_id_layout(normalized_job, result)
     if generation.get("starts_new_generation") and generation.get("expires_at"):
         try:
             report = extend_segment_object_lock(
@@ -578,6 +600,24 @@ def backfill_backup_detail_fields() -> int:
     return updated
 
 
+def _recorded_chain_folder(task: dict[str, Any], repository: dict[str, Any]) -> tuple[str, ...] | None:
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    recorded = Path(str(result.get("backup_root") or "").strip() or ".")
+    if recorded.name != str(task.get("id") or "") or not recorded.parent.name:
+        return None
+    if is_s3_repository(repository):
+        from python.srv.plugins.vcenter.vcenter_backup import _default_backup_root
+
+        root = repository_cache_root(_default_backup_root(), repository)
+    else:
+        root = Path(str(repository.get("path") or "").strip() or ".")
+    try:
+        relative = recorded.parent.resolve().relative_to(root.resolve())
+    except ValueError:
+        return (recorded.parent.name,)
+    return relative.parts if 1 <= len(relative.parts) <= 2 else (recorded.parent.name,)
+
+
 def _interrupted_task_output_location(task: dict[str, Any]) -> tuple[dict[str, Any], str] | None:
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     repository = REPOSITORIES.get(str(parameters.get("repository_id") or ""))
@@ -594,12 +634,13 @@ def _interrupted_task_output_location(task: dict[str, Any]) -> tuple[dict[str, A
                 vm_name = str(point.get("vm_name"))
                 break
     vm_component = safe_path_component(vm_name or task.get("resource_external_id"), fallback="vm")
+    chain_parts = _recorded_chain_folder(task, repository) or (vm_component,)
     if is_s3_repository(repository):
-        return repository, join_s3_prefix(extract_s3_config(repository).get("prefix"), vm_component, task_id)
+        return repository, join_s3_prefix(extract_s3_config(repository).get("prefix"), *chain_parts, task_id)
     root = str(repository.get("path") or "").strip()
     if not root:
         return None
-    return repository, str(Path(root) / vm_component / task_id)
+    return repository, str(Path(root).joinpath(*chain_parts) / task_id)
 
 
 def _task_output_is_registered(task_id: str) -> bool:

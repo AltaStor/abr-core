@@ -15,6 +15,25 @@ from .utils import utc_now
 logger = logging.getLogger(__name__)
 
 
+def _refresh_backup_decision(task: dict[str, object]) -> dict[str, object]:
+    from python.srv.services.abr_v41 import bind_backup_parent, refresh_queued_backup_decision
+
+    try:
+        task = refresh_queued_backup_decision(task)
+    except Exception:
+        logger.exception("Could not re-check the backup type of task '%s' at start; it runs as queued", task.get("id"))
+    try:
+        return bind_backup_parent(task)
+    except Exception:
+        logger.exception(
+            "Could not find the restore point task '%s' continues from; an incremental refuses to guess one", task.get("id")
+        )
+        parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+        parameters.update({"parent_point_id": None, "parent_task_id": None, "parent_manifest_hint": None})
+        task["parameters"] = parameters
+        return task
+
+
 def vm_key_for_task(task: dict[str, object]) -> tuple[str, str] | None:
     """Identity of the live VM a backup reads from, or ``None`` if unknown.
 
@@ -150,6 +169,8 @@ class TaskProcessPool:
             claimed = claim_task(task_id)
             if claimed is None:
                 continue
+            if task_type == "backup":
+                claimed = _refresh_backup_decision(claimed)
             self._submit_claimed_task(claimed)
             available_slots -= 1
             if task_type == "backup":
@@ -229,8 +250,15 @@ class TaskProcessPool:
             raise TaskStopRequested("Session stop requested")
 
     def _complete_task(self, future: Future[dict[str, object]]) -> None:
+        try:
+            self._finish_task(future)
+        finally:
+            with self._futures_lock:
+                self._futures.pop(future, None)
+
+    def _finish_task(self, future: Future[dict[str, object]]) -> None:
         with self._futures_lock:
-            entry = self._futures.pop(future, None)
+            entry = self._futures.get(future)
         if not entry:
             logger.warning("Future completed but no task_id found in tracker.")
             return

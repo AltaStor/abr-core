@@ -36,6 +36,8 @@ from ...core.storage_tool import (
     s3_block_generation_days,
     with_immutability_retention_days,
     safe_path_component,
+    STORAGE_LAYOUT_BY_ID,
+    STORAGE_LAYOUT_BY_NAME,
 )
 from ...core.utils import utc_now
 from ...services.backup_mode import (
@@ -562,25 +564,74 @@ def _stop_message(stranded: list[str], abr_path: str | None, task_root: Path) ->
     )
 
 
+def _vm_backup_manifests(
+    destination_root: Path, vm_external_id: str, pattern: str = "*/*/manifest.json"
+) -> list[tuple[Path, dict[str, Any]]]:
+    found: list[tuple[Path, dict[str, Any]]] = []
+    if not vm_external_id:
+        return found
+    for manifest_path in destination_root.glob(pattern):
+        resolved_path = manifest_path.resolve()
+        try:
+            manifest = _load_manifest(resolved_path)
+        except VCenterBackupError:
+            continue
+        if str(manifest.get("operation") or "") != "vm-backup":
+            continue
+        if str(manifest.get("vm_external_id") or "") != vm_external_id:
+            continue
+        found.append((resolved_path, manifest))
+    return found
+
+
+def _vm_backup_folder(destination_root: Path, vm_name: str, vm_external_id: str | None) -> str:
+    existing = _vm_backup_manifests(destination_root, str(vm_external_id or ""))
+    if existing:
+        newest = max(existing, key=lambda item: _manifest_sort_key(item[0], item[1]))
+        return newest[0].parent.parent.name
+    return safe_path_component(vm_name, fallback="vm")
+
+
+def _job_storage_layout(task: dict[str, Any], *, starts_new_chain: bool) -> str:
+    job = JOBS.get(str(task.get("job_id") or ""))
+    if not isinstance(job, dict):
+        return STORAGE_LAYOUT_BY_NAME
+    if job.get("storage_layout") == STORAGE_LAYOUT_BY_ID or starts_new_chain:
+        return STORAGE_LAYOUT_BY_ID
+    return STORAGE_LAYOUT_BY_NAME
+
+
+def _chain_folder(
+    task: dict[str, Any], destination_root: Path, vm_name: str, vm_external_id: str | None, layout: str
+) -> Path:
+    if layout == STORAGE_LAYOUT_BY_ID and task.get("job_id"):
+        return Path(safe_path_component(task.get("job_id"), fallback="job")) / safe_path_component(
+            vm_external_id or vm_name, fallback="vm"
+        )
+    return Path(_vm_backup_folder(destination_root, vm_name, vm_external_id))
+
+
 def _resolve_backup_storage_layout(
     *,
     task: dict[str, Any],
     vm_name: str,
     parameters: dict[str, Any],
     repository: dict[str, Any] | None,
+    vm_external_id: str | None = None,
+    layout: str = STORAGE_LAYOUT_BY_NAME,
 ) -> tuple[Path, Path, str | None]:
     configured_destination = parameters.get("destination_dir") or parameters.get("backup_root")
-    vm_path_component = safe_path_component(vm_name, fallback="vm")
 
     if is_s3_repository(repository):
         if configured_destination:
             destination_root = Path(str(configured_destination)).expanduser().resolve()
         else:
             destination_root = repository_cache_root(_default_backup_root(), repository).resolve()
-        task_root = destination_root / vm_path_component / str(task["id"])
+        chain_folder = _chain_folder(task, destination_root, vm_name, vm_external_id, layout)
+        task_root = destination_root / chain_folder / str(task["id"])
         abr_path = join_s3_prefix(
             extract_s3_config(repository).get("prefix"),
-            vm_path_component,
+            *chain_folder.parts,
             str(task["id"]),
         )
         return destination_root, task_root, abr_path
@@ -589,7 +640,8 @@ def _resolve_backup_storage_layout(
         destination_root = Path(str(configured_destination)).expanduser().resolve()
     else:
         destination_root = _resolve_repository_backup_root(task) or _default_backup_root()
-    task_root = destination_root / vm_path_component / str(task["id"])
+    chain_folder = _chain_folder(task, destination_root, vm_name, vm_external_id, layout)
+    task_root = destination_root / chain_folder / str(task["id"])
     # Local repositories now use the .abr file backend; the abr path is the
     # per-task filesystem directory the FileBackupManager writes into, and
     # it is passed to the tool as --folder.
@@ -850,53 +902,73 @@ def _resolve_parent_manifest(
     task_root: Path,
     vm_external_id: str,
     differential: bool = False,
+    layout: str = STORAGE_LAYOUT_BY_NAME,
 ) -> tuple[Path, dict[str, Any]]:
     explicit = parameters.get("parent_manifest_path")
     if explicit not in (None, ""):
         manifest_path = Path(str(explicit)).expanduser().resolve()
         return manifest_path, _load_manifest(manifest_path)
 
-    vm_backup_root = destination_root / _sanitize_name(vm_name)
-    if not vm_backup_root.exists():
-        if differential:
-            raise VCenterBackupError(
-                "Differential backup requires parameters.parent_manifest_path or a previous full backup manifest in the VM backup directory"
-            )
-        raise VCenterBackupError(
-            "Incremental backup requires parameters.parent_manifest_path or a previous backup manifest in the VM backup directory"
-        )
-
-    candidates: list[tuple[Path, dict[str, Any]]] = []
     current_manifest = (task_root / "manifest.json").resolve()
-    for manifest_path in vm_backup_root.glob("*/manifest.json"):
-        resolved_path = manifest_path.resolve()
-        if resolved_path == current_manifest:
-            continue
-        try:
-            manifest = _load_manifest(resolved_path)
-        except VCenterBackupError:
-            continue
-        if str(manifest.get("operation") or "") != "vm-backup":
-            continue
-        if str(manifest.get("vm_external_id") or "") != vm_external_id:
-            continue
-        if differential:
-            backup_mode = str(manifest.get("backup_mode") or "").strip().lower()
-            if backup_mode not in {"", "full"}:
-                continue
-        candidates.append((resolved_path, manifest))
+    if layout == STORAGE_LAYOUT_BY_ID:
+        search_root, pattern = task_root.parent, "*/manifest.json"
+    else:
+        search_root, pattern = destination_root, "*/*/manifest.json"
+    if "parent_task_id" in parameters:
+        return _job_parent_manifest(
+            parameters, _vm_backup_manifests(search_root, vm_external_id, pattern), vm_name, vm_external_id
+        )
+    candidates = [
+        (path, manifest)
+        for path, manifest in _vm_backup_manifests(search_root, vm_external_id, pattern)
+        if path != current_manifest
+        and (
+            not differential
+            or str(manifest.get("backup_mode") or "").strip().lower() in {"", "full"}
+        )
+    ]
 
     if not candidates:
-        if differential:
-            raise VCenterBackupError(
-                "Differential backup requires a previous full VM backup manifest. Provide parameters.parent_manifest_path or create a full backup first."
-            )
+        kind = "Differential" if differential else "Incremental"
+        parent = "full backup" if differential else "backup"
         raise VCenterBackupError(
-            "Incremental backup requires a previous VM backup manifest. Provide parameters.parent_manifest_path or create a full backup first."
+            f"{kind} backup of {vm_name} found no previous {parent} manifest of this VM in the repository to "
+            "continue from. Run a full backup of the job (abr job start --full) to start a new chain."
         )
 
     candidates.sort(key=lambda item: _manifest_sort_key(item[0], item[1]), reverse=True)
     return candidates[0]
+
+
+def _job_parent_manifest(
+    parameters: dict[str, Any],
+    found: list[tuple[Path, dict[str, Any]]],
+    vm_name: str,
+    vm_external_id: str,
+) -> tuple[Path, dict[str, Any]]:
+    parent_task_id = str(parameters.get("parent_task_id") or "")
+    parent_point_id = str(parameters.get("parent_point_id") or "")
+    if parent_task_id:
+        for path, manifest in found:
+            if path.parent.name == parent_task_id:
+                return path, manifest
+        hint = str(parameters.get("parent_manifest_hint") or "")
+        if hint:
+            try:
+                manifest = _load_manifest(Path(hint).expanduser().resolve())
+            except VCenterBackupError:
+                manifest = {}
+            if str(manifest.get("vm_external_id") or "") == vm_external_id:
+                return Path(hint).expanduser().resolve(), manifest
+        raise VCenterBackupError(
+            f"Incremental backup of {vm_name} cannot read the manifest of its previous backup, restore point "
+            f"{parent_point_id or '?'} (session {parent_task_id}), so it has nothing of this job's own to continue "
+            "from. Run a full backup of the job (abr job start --full) to start a new chain."
+        )
+    raise VCenterBackupError(
+        f"Incremental backup of {vm_name} found no previous backup manifest of this job to continue from. "
+        "Run a full backup of the job (abr job start --full) to start a new chain."
+    )
 
 
 def _is_cbt_invalid_fault(exc: BaseException) -> bool:
@@ -1108,20 +1180,6 @@ def run_vcenter_backup(
 
     repository = _resolve_repository(task)
     repository_type = str(repository.get("type") or "").strip().lower() if isinstance(repository, dict) else ""
-    destination_root, task_root, repository_abr_path = _resolve_backup_storage_layout(
-        task=task,
-        vm_name=vm_name,
-        parameters=parameters,
-        repository=repository,
-    )
-    ensure_private_directory(task_root)
-    # Every repository now uses the .abr format. When no repository record is
-    # configured, treat it as a local-file repo rooted at the task directory so
-    # the abr command builders have a concrete context to work with.
-    if repository is None:
-        repository = {"type": "local", "id": ""}
-        repository_type = "local"
-
     transport_mode_value = parameters.get("transport_mode")
     if transport_mode_value is None or transport_mode_value == "":
         transport_mode = "nbdssl"
@@ -1168,6 +1226,23 @@ def run_vcenter_backup(
         )
     if incremental_fallback_metadata and query_changed_areas_only:
         raise VCenterBackupError("parameters.incremental_fallback_metadata cannot be combined with parameters.query_changed_areas_only")
+
+    storage_layout = _job_storage_layout(task, starts_new_chain=not changed_block_backup)
+    destination_root, task_root, repository_abr_path = _resolve_backup_storage_layout(
+        task=task,
+        vm_name=vm_name,
+        parameters=parameters,
+        repository=repository,
+        vm_external_id=vm_id,
+        layout=storage_layout,
+    )
+    ensure_private_directory(task_root)
+    # Every repository now uses the .abr format. When no repository record is
+    # configured, treat it as a local-file repo rooted at the task directory so
+    # the abr command builders have a concrete context to work with.
+    if repository is None:
+        repository = {"type": "local", "id": ""}
+        repository_type = "local"
 
     tool_path = Path(str(parameters.get("tool_path") or _default_tool_path())).expanduser()
     logger.debug(
@@ -1491,6 +1566,7 @@ def run_vcenter_backup(
                         task_root=task_root,
                         vm_external_id=str(vm_resource["external_id"]),
                         differential=differential,
+                        layout=storage_layout,
                     )
                 except VCenterBackupError as exc:
                     if not incremental_fallback_full or not _is_missing_parent_manifest_error(str(exc)):
@@ -1762,7 +1838,7 @@ def run_vcenter_backup(
                                 backup_name=disk_backup_name,
                                 repository=repository,
                                 abr_path=repository_abr_path,
-                                datastore_path=datastore_path,
+                                datastore_path=utility_datastore_path,
                                 host=host,
                                 port=port,
                                 username=username,
@@ -1935,7 +2011,7 @@ def run_vcenter_backup(
                                         backup_name=disk_backup_name,
                                         repository=repository,
                                         abr_path=repository_abr_path,
-                                        datastore_path=datastore_path,
+                                        datastore_path=utility_datastore_path,
                                         host=host,
                                         port=port,
                                         username=username,
@@ -2092,7 +2168,13 @@ def run_vcenter_backup(
                     if not datastore_path:
                         raise VCenterBackupError(f"Disk entry is missing datastore_path: {disk}")
                     formatted_vm_moref = _format_vm_spec(vm_moref, service_type)
-                    transfer_datastore_path = datastore_path
+                    uuid = str(payload.get("uuid") or disk.get("uuid") or "")
+                    snapshot_entry = (
+                        change_id_by_uuid.get(uuid)
+                        or change_id_by_datastore_path.get(datastore_path)
+                        or change_id_by_index.get(index)
+                    )
+                    transfer_datastore_path = str((snapshot_entry or {}).get("datastore_path") or "") or datastore_path
                     live_snapshot_datastore_path = live_disk_paths.get(datastore_path, datastore_path)
                     if not is_virtual_center and not formatted_vm_moref:
                         transfer_datastore_path = live_snapshot_datastore_path
@@ -2504,12 +2586,18 @@ def run_vcenter_backup(
             if encryption_rotated and not incremental:
                 resolved_backup_type = "ActiveFull"
                 resolved_backup_reason = "EncryptionKeyChanged"
+            base_point_id = (
+                str(parameters.get("parent_point_id") or "") or None
+                if parent_manifest is not None and resolved_backup_type == "Incremental"
+                else None
+            )
             manifest_payload = {
                 "format_version": 1,
                 "operation": "vm-backup",
                 "backup_mode": backup_mode,
                 "resolved_backup_type": resolved_backup_type,
                 "resolved_backup_reason": resolved_backup_reason,
+                "parent_point_id": base_point_id,
                 "hypervisor_kind": "vcenter",
                 "hypervisor_id": str(task["hypervisor_id"]),
                 "vm_name": vm_name,
@@ -2533,6 +2621,9 @@ def run_vcenter_backup(
                 "snapshot_name": snapshot_name,
                 "snapshot_moref": snapshot_moref,
                 "disks": disk_outputs,
+                "storage_layout": storage_layout,
+                "job_id": str(task.get("job_id") or ""),
+                "job_name": str((JOBS.get(str(task.get("job_id") or "")) or {}).get("name") or ""),
                 "repository_id": str(repository.get("id") or "") if isinstance(repository, dict) else "",
                 "repository_type": repository_type or "local",
                 "storage_mode": "s3" if repository_type == "s3" else "local",
@@ -2615,6 +2706,7 @@ def run_vcenter_backup(
             "backup_mode": backup_mode,
             "resolved_backup_type": resolved_backup_type,
             "resolved_backup_reason": resolved_backup_reason,
+            "parent_point_id": base_point_id,
             "incremental": incremental,
             "differential": differential,
             "query_changed_areas_only": query_changed_areas_only,
@@ -2641,6 +2733,7 @@ def run_vcenter_backup(
             "vm_config": vm_config,
             "disk_count": len(disk_outputs),
             "disks": disk_outputs,
+            "storage_layout": storage_layout,
             "transport_mode": transport_mode,
             "compression_level": compression_level,
             "encryption_enabled": bool(encryption_algorithm),
