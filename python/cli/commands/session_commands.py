@@ -26,11 +26,13 @@ class SessionCommands:
                 '  abr session list --job "Job-SQL-Server"\n'
                 "  abr session list --limit 50\n"
                 "  abr session list --limit 50 --offset 50\n"
-                "  abr session list --since 2026-01-01"
+                "  abr session list --since 2026-01-01\n"
+                "  abr session list --run <run-id>"
             ),
             formatter_class=CompactHelpFormatter,
         )
         list_parser.add_argument("--job", help="Filter by job name")
+        list_parser.add_argument("--run", help="Only the sessions of one job run, by the run id job info shows as last_run_id")
         list_parser.add_argument("--limit", type=int, help="Return at most this many sessions (server caps at 500)")
         list_parser.add_argument("--offset", type=int, help="Skip this many sessions first; page with --limit")
         # Narrows what is being paged, rather than paging through everything to
@@ -83,6 +85,7 @@ class SessionCommands:
         deps = CommandDependencies(args)
         supplied = (
             ("job", args.job),
+            ("run_id", getattr(args, "run", None)),
             ("limit", getattr(args, "limit", None)),
             ("offset", getattr(args, "offset", None)),
             ("since", getattr(args, "since", None)),

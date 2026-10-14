@@ -186,6 +186,30 @@ class SessionTypeFilterTests(_Api):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual({item["id"] for item in response.json()["items"]}, expected)
 
+    def test_the_type_and_run_filters_apply_together_and_survive_paging(self) -> None:
+        for session_id in ("s0", "s1", "s4"):
+            TASKS[session_id]["run_id"] = "run-1"
+        TASKS["s2"]["run_id"] = "run-2"
+
+        for params, expected in (
+            ({"type": "backup", "run_id": "run-1"}, {"s0", "s4"}),
+            ({"type": "restore", "run_id": "run-1"}, {"s1"}),
+            ({"type": "verify", "run_id": "run-1"}, set()),
+            ({"run_id": "run-1"}, {"s0", "s1", "s4"}),
+            ({"type": "backup"}, {"s0", "s4"}),
+        ):
+            with self.subTest(**params):
+                response = self.client.get("/api/v1/sessions", params=params)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual({item["id"] for item in response.json()["items"]}, expected)
+
+        first = self.client.get("/api/v1/sessions", params={"type": "backup", "run_id": "run-1", "limit": 1}).json()
+        self.assertEqual(first["total"], 2)
+        self.assertIn("type=backup", first["next"])
+        self.assertIn("run_id=run-1", first["next"])
+        second = self.client.get(first["next"]).json()
+        self.assertEqual({item["id"] for item in first["items"] + second["items"]}, {"s0", "s4"})
+
     def test_an_unknown_type_is_refused_instead_of_ignored(self) -> None:
         response = self.client.get("/api/v1/sessions", params={"type": "garbage"})
         self.assertEqual(response.status_code, 422, response.text)

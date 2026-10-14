@@ -97,7 +97,6 @@ from python.srv.core.storage_tool import (
 from python.srv.core.utils import utc_now
 from python.srv.services.inventory_management import (
     INVENTORY_KIND_BY_TYPE,
-    EsxDirectConnectionUnsupported,
     EsxHostInClusterError,
     InventoryProviderRegistry,
     apply_inventory_updates,
@@ -107,7 +106,6 @@ from python.srv.services.inventory_management import (
     default_port_for_type,
     extract_host,
     inventory_references,
-    is_direct_esxi_connection,
     inventory_type_from_record,
     normalize_inventory_type,
 )
@@ -1547,8 +1545,6 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             str(exc),
             cluster=exc.cluster_name,
         ) from exc
-    except EsxDirectConnectionUnsupported as exc:
-        raise api_error(409, "esx_direct_connection_unsupported", str(exc)) from exc
     except InventoryUnreachableError as exc:
         raise api_error(
             422,
@@ -2446,11 +2442,7 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         )
         if registration_check is not None:
             updated["last_verify"] = registration_check
-    if (
-        next_s3_config is not None
-        and next_immutability != previous_immutability
-        and immutability_is_enabled(next_immutability)
-    ):
+    if next_s3_config is not None and immutability_is_enabled(next_immutability):
         mode_changed = previous_immutability.get("mode") != next_immutability.get("mode")
         connection_changed = registration_check is not None
         # Only when the answer can have changed. The bucket probe reads the
@@ -2504,7 +2496,7 @@ def _repository_storage_location_mismatch(repository: dict[str, Any]) -> str | N
     )
 
 
-def _verify_local_repository(repository: dict[str, Any]) -> dict[str, Any]:
+def _verify_local_repository(repository: dict[str, Any], *, whole_chains: bool = False) -> dict[str, Any]:
     path = Path(str(repository.get("path") or ""))
     checks: list[dict[str, Any]] = []
     exists, is_dir, access_error = _stat_operator_path(path)
@@ -2556,7 +2548,7 @@ def _verify_local_repository(repository: dict[str, Any]) -> dict[str, Any]:
     if location_mismatch:
         return {"status": "error", "checks": checks, "message": location_mismatch}
 
-    backup_health = _verify_repository_backup_health(str(repository.get("id") or ""))
+    backup_health = _verify_repository_backup_health(str(repository.get("id") or ""), whole_chains=whole_chains)
     checks.append(
         {
             "name": "block_consistency",
@@ -2683,7 +2675,7 @@ def _s3_connectivity_checks(
     return checks, None
 
 
-def _verify_s3_repository(repository: dict[str, Any]) -> dict[str, Any]:
+def _verify_s3_repository(repository: dict[str, Any], *, whole_chains: bool = False) -> dict[str, Any]:
     config = extract_s3_config(repository)
     checks, error = _s3_connectivity_checks(config)
     if error is not None:
@@ -2709,7 +2701,7 @@ def _verify_s3_repository(repository: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    backup_health = _verify_repository_backup_health(str(repository.get("id") or ""))
+    backup_health = _verify_repository_backup_health(str(repository.get("id") or ""), whole_chains=whole_chains)
     checks.append(
         {
             "name": "block_consistency",
@@ -3293,9 +3285,9 @@ def test_s3_connection(payload: dict[str, Any]) -> dict[str, Any]:
 def _repository_verification_result(repository: dict[str, Any]) -> dict[str, Any]:
     repo_type = str(repository.get("type") or "")
     if repo_type == "local":
-        return _verify_local_repository(repository)
+        return _verify_local_repository(repository, whole_chains=True)
     if repo_type == "s3":
-        return _verify_s3_repository(repository)
+        return _verify_s3_repository(repository, whole_chains=True)
     return _verify_remote_repository(repository)
 
 
@@ -3938,10 +3930,78 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "last_run_at": normalized.get("last_run_at"),
         "clock_anomalies": job_clock_anomalies(normalized),
         "last_session_id": normalized.get("last_session_id"),
+        "last_run": job_run_summary(normalized),
         "active_sessions": active_sessions,
         "active_session_count": len(active_sessions),
         "can_delete": not active_sessions,
         "delete_disabled_reason": "Job has queued or running sessions" if active_sessions else None,
+    }
+
+
+def job_run_record(run_id: str, *, trigger: str, started_at: str, session_ids: list[str]) -> dict[str, Any] | None:
+    if not session_ids:
+        return None
+    return {"id": run_id, "trigger": trigger, "started_at": started_at, "session_ids": list(session_ids)}
+
+
+RUN_RESULTS_WORST_FIRST = ("running", "failed", "stopped", "warning", "success")
+
+
+def _session_run_result(task: dict[str, Any]) -> str:
+    state = _session_state(task)
+    if state == "failed":
+        return "failed"
+    if state in {"stopped", "canceled"}:
+        return "stopped"
+    if state == "completed":
+        return "warning" if task.get("warnings") else "success"
+    return "running"
+
+
+def _worse(first: str, second: str) -> str:
+    return min(first, second, key=RUN_RESULTS_WORST_FIRST.index)
+
+
+def job_run_summary(job: dict[str, Any]) -> dict[str, Any] | None:
+    run = job.get("last_run")
+    if not isinstance(run, dict) or not run.get("id"):
+        return None
+    vms: dict[str, dict[str, Any]] = {}
+    finished: list[str] = []
+    for session_id in run.get("session_ids") or []:
+        task = TASKS.get(str(session_id))
+        if not isinstance(task, dict):
+            continue
+        session = session_to_dto(task, include_logs=False)
+        result = _session_run_result(task)
+        vm_key = str(task.get("resource_external_id") or session_id)
+        entry = vms.setdefault(
+            vm_key,
+            {"vm_id": session.get("vm_id"), "vm_name": session.get("vm_name"), "result": result, "session_ids": [], "message": None},
+        )
+        entry["session_ids"].append(str(session_id))
+        entry["result"] = _worse(entry["result"], result)
+        if result in {"failed", "stopped"} and not entry["message"]:
+            errors = session.get("errors") or []
+            entry["message"] = session.get("message") or (errors[0].get("message") if errors and isinstance(errors[0], dict) else None)
+        if session.get("finished_at"):
+            finished.append(str(session["finished_at"]))
+    if not vms:
+        return None
+    counts = {name: sum(1 for vm in vms.values() if vm["result"] == name) for name in RUN_RESULTS_WORST_FIRST}
+    result = "success"
+    for vm in vms.values():
+        result = _worse(result, vm["result"])
+    return {
+        "id": run["id"],
+        "trigger": run.get("trigger"),
+        "started_at": run.get("started_at"),
+        "finished_at": max(finished) if result != "running" and finished else None,
+        "result": result,
+        "vm_count": len(vms),
+        "succeeded": counts["success"] + counts["warning"],
+        **{name: counts[name] for name in ("warning", "failed", "stopped", "running")},
+        "vms": list(vms.values()),
     }
 
 
@@ -5361,6 +5421,7 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
         # other path (Run now/Run full backup, restores, backup-copy) is a
         # human clicking a button, so default to "manual" when unset.
         "triggered_by": task.get("trigger") or "manual",
+        "run_id": task.get("run_id"),
         "progress": result.get("progress"),
         "message": message,
         # Best-effort byte counters (see run_vcenter_backup) -- absent/0 for
@@ -5394,7 +5455,11 @@ SESSION_TYPES = ("backup", "restore", "verify", "delete")
 
 
 def list_sessions(
-    *, job_name: str | None = None, session_type: str | None = None, include_logs: bool = True
+    *,
+    job_name: str | None = None,
+    session_type: str | None = None,
+    run_id: str | None = None,
+    include_logs: bool = True,
 ) -> list[dict[str, Any]]:
     tasks = catalog_records(TASKS)
     if session_type:
@@ -5406,6 +5471,8 @@ def list_sessions(
             type=session_type,
         )
         tasks = [task for task in tasks if str(task.get("task_type") or "") == session_type]
+    if run_id:
+        tasks = [task for task in tasks if str(task.get("run_id") or "") == run_id]
     sessions = [session_to_dto(task, include_logs=include_logs) for task in tasks]
     if job_name:
         lowered = job_name.lower()
@@ -5446,6 +5513,7 @@ def list_sessions_page(
     *,
     job_name: str | None = None,
     session_type: str | None = None,
+    run_id: str | None = None,
     limit: int | None = None,
     offset: int = 0,
     since: str | None = None,
@@ -5464,7 +5532,7 @@ def list_sessions_page(
     match set itself -- the console asks for the window it actually renders
     instead of paging back through years of runs to build a 14-day chart.
     """
-    sessions = list_sessions(job_name=job_name, session_type=session_type, include_logs=False)
+    sessions = list_sessions(job_name=job_name, session_type=session_type, run_id=run_id, include_logs=False)
     if since:
         cutoff = _parse_dt(since)
         sessions = [session for session in sessions if _started_after(session, cutoff)]
@@ -5481,7 +5549,7 @@ def list_sessions_page(
     has_next = start + len(items) < total
     has_prev = start > 0
 
-    link_params = {"job": job_name, "type": session_type, "since": since}
+    link_params = {"job": job_name, "type": session_type, "run_id": run_id, "since": since}
     return {
         "items": items,
         "total": total,
@@ -8154,7 +8222,7 @@ def restore_point_list(vm_id: str) -> list[dict[str, Any]]:
     return [restore_point_to_dto(point) for point in points]
 
 
-def _create_completed_copy_session(job: dict[str, Any]) -> dict[str, Any]:
+def _create_completed_copy_session(job: dict[str, Any], *, run_id: str | None = None) -> dict[str, Any]:
     source_job_id = str(job.get("source_job_id") or "")
     source_points = [point for point in normalized_backup_points() if str(point.get("job_id") or "") == source_job_id]
     session = {
@@ -8166,6 +8234,7 @@ def _create_completed_copy_session(job: dict[str, Any]) -> dict[str, Any]:
         "resource_external_id": source_points[-1]["vm_id"] if source_points else source_job_id,
         "status": "completed",
         "trigger": "manual",
+        "run_id": run_id,
         "parameters": {
             "copy_job": True,
             "target_repository_id": job.get("repo_id"),
@@ -8195,6 +8264,7 @@ def _create_backup_session(
     execution_type: str,
     execution_reason: str,
     target_repository: dict[str, Any] | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     task_parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else {}
     parameters = dict(task_parameters)
@@ -8221,6 +8291,7 @@ def _create_backup_session(
         "resource_external_id": vm_id,
         "status": "queued",
         "trigger": "manual",
+        "run_id": run_id,
         "parameters": parameters,
         "result": {
             "progress": 0,
@@ -8313,8 +8384,10 @@ def start_job_record(
     if force_synthetic and job["job_type"] != "backup-copy":
         _ensure_chain_can_be_merged(job)
     sessions = []
+    run_id = str(uuid4())
+    run_started_at = utc_now()
     if job["job_type"] == "backup-copy":
-        sessions.append(_create_completed_copy_session(job))
+        sessions.append(_create_completed_copy_session(job, run_id=run_id))
     else:
         for vm_id, vm_name in zip(job.get("vm_ids") or [], _job_vm_current_names(job)):
             execution_type, execution_reason = resolve_job_execution(
@@ -8328,6 +8401,7 @@ def start_job_record(
                     execution_type=execution_type,
                     execution_reason=execution_reason,
                     target_repository=target_repository,
+                    run_id=run_id,
                 )
             )
     schedule = job.get("schedule")
@@ -8348,6 +8422,7 @@ def start_job_record(
             **job,
             "last_run_at": utc_now(),
             "last_session_id": sessions[-1]["id"] if sessions else None,
+            "last_run": job_run_record(run_id, trigger="manual", started_at=run_started_at, session_ids=[s["id"] for s in sessions]),
             "next_incremental_run_at": next_incremental_run_at,
             "updated_at": utc_now(),
         }
@@ -8680,13 +8755,6 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         "explicit encryption key.",
         point_id=point_id,
     )
-    if is_direct_esxi_connection(_inventory_record_for_update(str(target_inventory["id"]))):
-        raise api_error(
-            409,
-            "esx_direct_connection_unsupported",
-            str(EsxDirectConnectionUnsupported()),
-            inventory_id=target_inventory["id"],
-        )
     task = {
         "id": str(uuid4()),
         "job_id": None,
@@ -9103,11 +9171,26 @@ def _repository_latest_points(repository_id: str) -> list[dict[str, Any]]:
     return latest_points
 
 
-def _verify_repository_backup_health(repository_id: str) -> dict[str, Any]:
-    latest_points = _repository_latest_points(repository_id)
+def _repository_chain_points(repository_id: str) -> list[list[dict[str, Any]]]:
+    chains: list[list[dict[str, Any]]] = []
+    for points in grouped_backup_points().values():
+        held = [point for point in points if str(point.get("repository_id") or "") == repository_id]
+        if held:
+            chains.append(held)
+    return chains
+
+
+def _verify_repository_backup_health(repository_id: str, *, whole_chains: bool = False) -> dict[str, Any]:
+    if whole_chains:
+        chains = _repository_chain_points(repository_id)
+        checked_points = [point for chain in chains for point in chain]
+        chain_count = len(chains)
+    else:
+        checked_points = _repository_latest_points(repository_id)
+        chain_count = len(checked_points)
     work_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
-    for point in latest_points:
+    for point in checked_points:
         artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
 
         for disk in artifact.get("disks", []):
@@ -9117,7 +9200,8 @@ def _verify_repository_backup_health(repository_id: str) -> dict[str, Any]:
     if not work_items:
         return {
             "status": "skipped",
-            "checked_chains": len(latest_points),
+            "checked_chains": chain_count,
+            "checked_restore_points": len(checked_points),
             "checked_artifacts": 0,
             "errors": [],
             "message": "No backup artifacts to verify",
@@ -9147,14 +9231,18 @@ def _verify_repository_backup_health(repository_id: str) -> dict[str, Any]:
                 )
 
     status = "failed" if errors else "ok"
+    covered = f"{len(checked_points)} restore point(s) across {chain_count} chain(s)"
+    if not whole_chains:
+        covered = f"the newest restore point of each of {chain_count} chain(s)"
     message = (
-        f"{len(errors)} of {len(work_items)} backup artifact(s) failed verification"
+        f"{len(errors)} of {len(work_items)} backup artifact(s) of {covered} failed verification"
         if errors
-        else f"Verified {len(work_items)} backup artifact(s) across {len(latest_points)} chain(s)"
+        else f"Verified {len(work_items)} backup artifact(s) of {covered}"
     )
     return {
         "status": status,
-        "checked_chains": len(latest_points),
+        "checked_chains": chain_count,
+        "checked_restore_points": len(checked_points),
         "checked_artifacts": len(work_items),
         "errors": errors,
         "message": message,

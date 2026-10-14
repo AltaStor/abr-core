@@ -546,12 +546,20 @@ class RepositoryCommands:
                 payload["s3"] = s3_payload
             if getattr(args, "create_bucket", None):
                 payload["create_bucket"] = True
-        if _configures_immutability(args):
+        changes_connection = any(key != "description" for key in payload.get("s3") or {})
+        if _configures_immutability(args) or (changes_connection and _current_immutability(current)[0] != "none"):
             result = run_with_elapsed_indicator(
                 lambda: deps.context.api_client.patch(
                     f"api/v1/repositories/{repo_id}", json=payload, timeout=IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS
                 ),
                 label="Validating repository immutability",
+            )
+        elif changes_connection:
+            result = run_with_elapsed_indicator(
+                lambda: deps.context.api_client.patch(
+                    f"api/v1/repositories/{repo_id}", json=payload, timeout=STORAGE_VALIDATION_TIMEOUT_SECONDS
+                ),
+                label="Validating repository storage",
             )
         else:
             result = deps.context.api_client.patch(f"api/v1/repositories/{repo_id}", json=payload)

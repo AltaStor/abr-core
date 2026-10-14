@@ -229,6 +229,29 @@ class SessionErrorDTO(_LenientModel):
     message: DocStr = None
 
 
+class JobRunVmDTO(_LenientModel):
+    vm_id: DocStr = None
+    vm_name: DocStr = None
+    result: DocStr = None
+    session_ids: DocStrArray = None
+    message: DocStr = None
+
+
+class JobRunDTO(_LenientModel):
+    id: DocStr = None
+    trigger: DocStr = None
+    started_at: DocStr = None
+    finished_at: DocStr = None
+    result: DocStr = None
+    vm_count: DocInt = None
+    succeeded: DocInt = None
+    warning: DocInt = None
+    failed: DocInt = None
+    stopped: DocInt = None
+    running: DocInt = None
+    vms: list[JobRunVmDTO] | None = None
+
+
 class JobDTO(_LenientModel):
     id: str
     name: str
@@ -266,6 +289,7 @@ class JobDTO(_LenientModel):
     last_run_at: str | None = None
     clock_anomalies: DocObjectArray = None
     last_session_id: str | None = None
+    last_run: JobRunDTO | None = None
     active_sessions: DocObjectArray = None
     active_session_count: int = 0
     can_delete: bool = True
@@ -514,6 +538,7 @@ class SessionDTO(_LenientModel):
     warnings: DocObjectArray = None
     message: DocStr = None
     triggered_by: DocStr = None
+    run_id: DocStr = None
     vm_name: DocStr = None
     source_vm_name: DocStr = None
     backup_id: DocStr = None

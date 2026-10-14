@@ -36,6 +36,31 @@ def _clock_anomalies(job: object) -> list[dict[str, Any]]:
     return [anomaly for anomaly in anomalies if isinstance(anomaly, dict)] if isinstance(anomalies, list) else []
 
 
+def _last_run_text(run: object) -> str:
+    if not isinstance(run, dict) or not run.get("result"):
+        return ""
+    result = str(run["result"])
+    total = int(run.get("vm_count") or 0)
+    if result == "running":
+        return f"Running ({total - int(run.get('running') or 0)}/{total} VMs done)"
+    if result == "success":
+        return "Success" if total == 1 else f"Success ({total} VMs)"
+    if result == "warning":
+        return f"Warning ({int(run.get('warning') or 0)} of {total} VMs with warnings)"
+    return f"{result.capitalize()} ({int(run.get(result) or 0)} of {total} VMs {result})"
+
+
+def _last_run_issues(run: dict[str, Any]) -> str:
+    issues = []
+    for vm in run.get("vms") or []:
+        if not isinstance(vm, dict) or vm.get("result") not in {"failed", "stopped", "warning"}:
+            continue
+        sessions = ", ".join(str(session_id) for session_id in vm.get("session_ids") or [])
+        detail = vm.get("message") or ("completed with warnings" if vm.get("result") == "warning" else vm.get("result"))
+        issues.append(f"{vm.get('vm_name')}: {detail} (session {sessions})")
+    return "; ".join(issues)
+
+
 class JobCommands:
     def register(self, registry) -> None:
         job_group = registry.add_parser("job", help="Job management", description="Job commands", formatter_class=CompactHelpFormatter)
@@ -352,6 +377,7 @@ class JobCommands:
         decorated.setdefault("schedule_state", "enabled" if isinstance(schedule, dict) and bool(schedule.get("enabled", True)) else "disabled" if isinstance(schedule, dict) else "manual")
         if not decorated.get("schedule_summary"):
             decorated["schedule_summary"] = "Manual only"
+        decorated["last_result"] = _last_run_text(decorated.get("last_run"))
         return decorated
 
     @classmethod
@@ -367,6 +393,7 @@ class JobCommands:
             ("schedule_summary", "SCHEDULE"),
             ("schedule_state", "STATE"),
             ("last_run_at", "LAST RUN"),
+            ("last_result", "LAST RESULT"),
             ("next_run_at", "NEXT RUN"),
         ]
 
@@ -420,11 +447,16 @@ class JobCommands:
         payload = self._decorate_job(deps.context.api_client.get(f"api/v1/jobs/{self._resolve_id(deps, args)}"))
         anomalies = _clock_anomalies(payload)
         warnings = [str(anomaly.get("message") or anomaly.get("kind")) for anomaly in anomalies]
-        if deps.context.output == "table" and warnings:
+        if deps.context.output == "table":
             shown: dict[str, Any] = {}
             for key, value in payload.items():
-                if key == "clock_anomalies":
+                if key == "clock_anomalies" and warnings:
                     shown["clock_warning"] = " ".join(warnings)
+                elif key == "last_run" and isinstance(value, dict):
+                    shown["last_run_id"] = value.get("id")
+                    issues = _last_run_issues(value)
+                    if issues:
+                        shown["last_run_issues"] = issues
                 else:
                     shown[key] = value
             payload = shown

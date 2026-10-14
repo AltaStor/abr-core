@@ -18,6 +18,7 @@ from python.cli.api.client import AltaStorApiClient
 from python.cli.cli_context import TOKEN_ENV_VAR, resolve_token
 from python.cli.commands.auth_commands import PASSWORD_ENV_VAR, USERNAME_ENV_VAR, AuthCommands
 from python.cli.commands.user_commands import UserCommands
+from python.cli.errors import CliStructuredError
 from python.cli.parsing.parser_builder import AltaStorParserBuilder
 
 
@@ -209,6 +210,50 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
             with redirect_stdout(io.StringIO()):
                 AuthCommands().login(args)
         self.assertEqual(request_mock.call_args.kwargs["json"]["name"], "admin")
+
+    @patch("python.cli.api.client.requests.request")
+    @patch("python.cli.commands.auth_commands.getpass.getpass", side_effect=EOFError)
+    def test_login_without_a_terminal_or_the_password_variable_is_a_usage_error(self, _getpass, request_mock) -> None:
+        os.environ.pop(PASSWORD_ENV_VAR, None)
+
+        with self.assertRaises(CliStructuredError) as raised:
+            AuthCommands().login(_args(name="admin"))
+
+        self.assertEqual(raised.exception.exit_code, 2)
+        self.assertEqual(raised.exception.code, "invalid_argument")
+        self.assertEqual(str(raised.exception), "No password provided; set ABR_PASSWORD or run interactively")
+        request_mock.assert_not_called()
+
+    @patch("python.cli.api.client.requests.request")
+    @patch("builtins.input", side_effect=EOFError)
+    def test_login_without_a_terminal_or_a_user_name_is_a_usage_error(self, _input, request_mock) -> None:
+        os.environ.pop(USERNAME_ENV_VAR, None)
+
+        with self.assertRaises(CliStructuredError) as raised:
+            AuthCommands().login(_args(name=None))
+
+        self.assertEqual(raised.exception.exit_code, 2)
+        self.assertEqual(
+            str(raised.exception), "No user name provided; pass --name, set ABR_USERNAME or run interactively"
+        )
+        request_mock.assert_not_called()
+
+    @patch("python.cli.commands.auth_commands.getpass.getpass", side_effect=EOFError)
+    def test_the_cli_answers_a_missing_password_with_one_json_error_and_exit_2(self, _getpass) -> None:
+        from python.cli import abr_cli
+
+        os.environ.pop(PASSWORD_ENV_VAR, None)
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {USERNAME_ENV_VAR: "admin"}), redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as exited:
+                abr_cli.main(["--base-url", "http://example.test", "--output", "json", "auth", "login"])
+
+        self.assertEqual(exited.exception.code, 2)
+        error = json.loads(err.getvalue()[err.getvalue().index("{"):])["error"]
+        self.assertEqual(error["code"], "invalid_argument")
+        self.assertEqual(error["message"], "No password provided; set ABR_PASSWORD or run interactively")
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn("EOFError", out.getvalue() + err.getvalue())
 
     @patch("python.cli.api.client.requests.request")
     def test_print_token_flag_writes_only_the_token_to_stdout(self, request_mock) -> None:

@@ -578,10 +578,10 @@ class S3RepositorySupportTests(unittest.TestCase):
         self.assertEqual(block_check["status"], "skipped")
 
     @patch("python.srv.core.storage_tool.run_disk_tool")
-    def test_repo_verify_local_checks_only_latest_point_per_chain(
+    def test_repo_verify_local_checks_every_point_a_restore_depends_on(
         self, run_disk_tool_mock: object
     ) -> None:
-        run_disk_tool_mock.side_effect = _disk_tool_stub("new-inc.vmdk")
+        run_disk_tool_mock.side_effect = _disk_tool_stub("old-full.vmdk", "new-inc.vmdk")
         with tempfile.TemporaryDirectory() as tmpdir:
             repository = abr_v41.create_repository_record(
                 {"name": "LocalRepo4", "type": "local", "path": tmpdir}
@@ -639,19 +639,98 @@ class S3RepositorySupportTests(unittest.TestCase):
 
         self.assertEqual(payload["status"], "success")
 
-        # One list existence pre-check plus one verify, both against the latest
-        # point's disk only.
-        self.assertEqual(run_disk_tool_mock.call_count, 2)
-        command = run_disk_tool_mock.call_args.args[0]
-
-        self.assertIn("new-inc.vmdk", command)
-        self.assertNotIn("old-full.vmdk", command)
+        verified = sorted(
+            call.args[0][2] for call in run_disk_tool_mock.call_args_list if call.args[0][0] == "verify"
+        )
+        self.assertEqual(verified, ["new-inc.vmdk", "old-full.vmdk"])
 
         block_check = next(
             check for check in payload["checks"] if check["name"] == "block_consistency"
         )
         self.assertEqual(block_check["status"], "ok")
-        self.assertIn("1 backup artifact", block_check["message"])
+        self.assertEqual(
+            block_check["message"], "Verified 2 backup artifact(s) of 2 restore point(s) across 1 chain(s)"
+        )
+
+    def _chain_point(self, repository: dict, point_id: str, created_at: str, backup_name: str, *, parent: str | None = None) -> None:
+        abr_v41.persist_backup(
+            abr_v41.normalize_backup_point(
+                {
+                    "id": point_id,
+                    "job_id": "job-1",
+                    "vm_id": "vm-1",
+                    "vm_name": "VM-1",
+                    "repository_id": repository["id"],
+                    "repository_name": repository["name"],
+                    "repository_type": repository["type"],
+                    "execution_type": "Incremental" if parent else "ActiveFull",
+                    **({"parent_point_id": parent} if parent else {}),
+                    "created_at": created_at,
+                    "artifact": {"disks": [{"disk_key": "disk-1", "abr_path": "vm-1/task-1", "abr_backup_name": backup_name}]},
+                }
+            )
+        )
+
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_repo_verify_fails_on_a_corrupted_full_beneath_the_newest_point(self, run_disk_tool_mock: object) -> None:
+        listing = _disk_tool_stub("full.vmdk", "inc-1.vmdk", "inc-2.vmdk")
+
+        def tool(command: list[str], **kwargs: object) -> CompletedProcess:
+            if command[0] == "verify" and command[2] == "full.vmdk":
+                raise StorageToolError("CRC32C mismatch for restored chunk 2! full.vmdk is CORRUPT")
+            return listing(command, **kwargs)
+
+        run_disk_tool_mock.side_effect = tool
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repository = abr_v41.create_repository_record({"name": "LocalRepoB", "type": "local", "path": tmpdir})
+            self._chain_point(repository, "b-full", "2026-01-01T00:00:00+00:00", "full.vmdk")
+            self._chain_point(repository, "b-inc-1", "2026-01-02T00:00:00+00:00", "inc-1.vmdk", parent="b-full")
+            self._chain_point(repository, "b-inc-2", "2026-01-03T00:00:00+00:00", "inc-2.vmdk", parent="b-inc-1")
+
+            payload = abr_v41.verify_repository(repository["id"])
+
+        self.assertEqual(payload["status"], "error")
+        block_check = next(check for check in payload["checks"] if check["name"] == "block_consistency")
+        self.assertEqual(block_check["status"], "failed")
+        self.assertEqual(
+            block_check["message"], "1 of 3 backup artifact(s) of 3 restore point(s) across 1 chain(s) failed verification"
+        )
+        self.assertEqual([error["point_id"] for error in block_check["errors"]], ["b-full"])
+        self.assertTrue(block_check["errors"][0]["chain_id"].startswith("backup::job-1::vm-1::"))
+        self.assertEqual(payload["last_verify"]["status"], "error")
+
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_registering_or_editing_a_repository_still_reads_only_the_newest_points_and_says_so(
+        self, run_disk_tool_mock: object
+    ) -> None:
+        run_disk_tool_mock.side_effect = _disk_tool_stub("full.vmdk", "inc-1.vmdk")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repository = abr_v41.create_repository_record({"name": "LocalRepoC", "type": "local", "path": tmpdir})
+            self._chain_point(repository, "c-full", "2026-01-01T00:00:00+00:00", "full.vmdk")
+            self._chain_point(repository, "c-inc-1", "2026-01-02T00:00:00+00:00", "inc-1.vmdk", parent="c-full")
+
+            result = abr_v41._repository_registration_checks(dict(REPOSITORIES[repository["id"]]))
+
+        verified = [call.args[0][2] for call in run_disk_tool_mock.call_args_list if call.args[0][0] == "verify"]
+        self.assertEqual(verified, ["inc-1.vmdk"])
+        block_check = next(check for check in result["checks"] if check["name"] == "block_consistency")
+        self.assertEqual(
+            block_check["message"], "Verified 1 backup artifact(s) of the newest restore point of each of 1 chain(s)"
+        )
+
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_repo_verify_reads_only_the_points_this_repository_holds(self, run_disk_tool_mock: object) -> None:
+        run_disk_tool_mock.side_effect = _disk_tool_stub("mine.vmdk", "theirs.vmdk")
+        with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as other_dir:
+            mine = abr_v41.create_repository_record({"name": "LocalRepoD", "type": "local", "path": tmpdir})
+            other = abr_v41.create_repository_record({"name": "LocalRepoE", "type": "local", "path": other_dir})
+            self._chain_point(mine, "d-full", "2026-01-01T00:00:00+00:00", "mine.vmdk")
+            self._chain_point(other, "e-full", "2026-01-01T00:00:00+00:00", "theirs.vmdk")
+
+            abr_v41.verify_repository(mine["id"])
+
+        verified = [call.args[0][2] for call in run_disk_tool_mock.call_args_list if call.args[0][0] == "verify"]
+        self.assertEqual(verified, ["mine.vmdk"])
 
     @patch("python.srv.core.storage_tool.run_disk_tool")
     def test_repo_verify_local_fails_when_backup_corrupted(

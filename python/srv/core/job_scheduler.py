@@ -17,6 +17,7 @@ from .server_defaults import env_int
 from .utils import utc_now
 from python.srv.services.abr_v41 import (
     job_clock_anomalies,
+    job_run_record,
     normalize_job_record,
     resolve_job_execution,
     schedule_next_run,
@@ -130,7 +131,8 @@ class JobScheduler:
             if not due_slots:
                 continue
 
-            tasks = self._create_scheduled_tasks(normalized_job, scheduled_type=due_slots[0][1])
+            run_id = str(uuid4())
+            tasks = self._create_scheduled_tasks(normalized_job, scheduled_type=due_slots[0][1], run_id=run_id)
             if not tasks:
                 continue
             self._advance_due_slots(job, due_slots)
@@ -140,6 +142,9 @@ class JobScheduler:
             job["last_session_id"] = tasks[-1]["id"]
             job["last_scheduled_at"] = tasks[-1]["created_at"]
             job["last_run_at"] = tasks[-1]["created_at"]
+            job["last_run"] = job_run_record(
+                run_id, trigger="schedule", started_at=tasks[0]["created_at"], session_ids=[task["id"] for task in tasks]
+            )
             job["updated_at"] = tasks[-1]["created_at"]
             job["last_scheduler_error"] = None
             persist_job(dict(job))
@@ -527,7 +532,7 @@ class JobScheduler:
         return parameters
 
     def _create_scheduled_tasks(
-        self, job: dict[str, Any], *, scheduled_type: str = ""
+        self, job: dict[str, Any], *, scheduled_type: str = "", run_id: str | None = None
     ) -> list[dict[str, Any]]:
         resolved_targets = self._resolve_task_targets(job)
         if not resolved_targets:
@@ -554,6 +559,7 @@ class JobScheduler:
                     "resource_external_id": resource_external_id,
                     "status": "queued",
                     "trigger": "schedule",
+                    "run_id": run_id,
                     "parameters": self._build_task_parameters(
                         job,
                         vm_name=vm_name,
