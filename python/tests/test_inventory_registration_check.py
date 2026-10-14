@@ -179,18 +179,11 @@ class DirectEsxiRegistrationTests(unittest.TestCase):
         module = types.SimpleNamespace(VCenterNode=endpoint.node)
         return patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": module})
 
-    def test_a_standalone_esxi_host_is_refused_with_the_reason_and_nothing_is_registered(self) -> None:
+    def test_a_standalone_esxi_host_is_registered(self) -> None:
         with self._connect_to(_Endpoint("HostAgent")):
-            with self.assertRaises(ApiError) as caught:
-                abr_v41.create_inventory_record(dict(PAYLOAD))
+            created = abr_v41.create_inventory_record(dict(PAYLOAD))
 
-        self.assertEqual(caught.exception.status_code, 409)
-        self.assertEqual(caught.exception.code, "esx_direct_connection_unsupported")
-        self.assertEqual(
-            caught.exception.message,
-            "A direct ESXi connection is not supported. Register the vCenter Server that manages this host instead.",
-        )
-        self.assertEqual(list(HYPERVISORS), [])
+        self.assertIn(created["id"], HYPERVISORS)
 
     def test_an_esxi_host_in_a_cluster_keeps_its_own_code(self) -> None:
         with self._connect_to(_Endpoint("HostAgent", cluster="cluster-1")):
@@ -206,36 +199,7 @@ class DirectEsxiRegistrationTests(unittest.TestCase):
 
         self.assertIn(created["id"], HYPERVISORS)
 
-    def test_the_restore_check_tells_a_direct_esxi_host_from_a_vcenter(self) -> None:
-        for label, endpoint, expected in (
-            ("standalone ESXi", _Endpoint("HostAgent"), True),
-            ("ESXi in a cluster", _Endpoint("HostAgent", cluster="cluster-1"), True),
-            ("vCenter", _Endpoint("VirtualCenter"), False),
-        ):
-            with self.subTest(label), self._connect_to(endpoint):
-                self.assertIs(inventory_management.is_direct_esxi_connection(_record()), expected)
-
-    def test_the_restore_check_lets_the_restore_go_on_when_it_cannot_tell(self) -> None:
-        def broken(*args, **kwargs):
-            raise RuntimeError("the server closed the connection")
-
-        with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": types.SimpleNamespace(VCenterNode=broken)}):
-            self.assertFalse(inventory_management.is_direct_esxi_connection(_record()))
-
-        with patch.object(inventory_management, "_endpoint_reachable", return_value=False), patch.object(
-            inventory_management.VsphereInventoryProvider, "test_connection"
-        ) as connect:
-            self.assertFalse(inventory_management.is_direct_esxi_connection(_record()))
-        connect.assert_not_called()
-
-        record = _record()
-        record["type"] = "hyper-v"
-        record["kind"] = "hyperv"
-        with patch.object(inventory_management.VsphereInventoryProvider, "test_connection") as connect:
-            self.assertFalse(inventory_management.is_direct_esxi_connection(record))
-        connect.assert_not_called()
-
-    def test_an_esxi_inventory_registered_earlier_still_tests_as_connected(self) -> None:
+    def test_an_esxi_inventory_tests_as_connected(self) -> None:
         HYPERVISORS["inv-1"] = _record()
         with self._connect_to(_Endpoint("HostAgent")):
             result = abr_v41.test_inventory("inv-1")

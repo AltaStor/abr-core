@@ -97,7 +97,6 @@ from python.srv.core.storage_tool import (
 from python.srv.core.utils import utc_now
 from python.srv.services.inventory_management import (
     INVENTORY_KIND_BY_TYPE,
-    EsxDirectConnectionUnsupported,
     EsxHostInClusterError,
     InventoryProviderRegistry,
     apply_inventory_updates,
@@ -107,7 +106,6 @@ from python.srv.services.inventory_management import (
     default_port_for_type,
     extract_host,
     inventory_references,
-    is_direct_esxi_connection,
     inventory_type_from_record,
     normalize_inventory_type,
 )
@@ -1547,8 +1545,6 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             str(exc),
             cluster=exc.cluster_name,
         ) from exc
-    except EsxDirectConnectionUnsupported as exc:
-        raise api_error(409, "esx_direct_connection_unsupported", str(exc)) from exc
     except InventoryUnreachableError as exc:
         raise api_error(
             422,
@@ -8759,13 +8755,6 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         "explicit encryption key.",
         point_id=point_id,
     )
-    if is_direct_esxi_connection(_inventory_record_for_update(str(target_inventory["id"]))):
-        raise api_error(
-            409,
-            "esx_direct_connection_unsupported",
-            str(EsxDirectConnectionUnsupported()),
-            inventory_id=target_inventory["id"],
-        )
     task = {
         "id": str(uuid4()),
         "job_id": None,

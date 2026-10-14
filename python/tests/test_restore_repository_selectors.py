@@ -29,9 +29,6 @@ class RestoreRepositorySelectorTests(unittest.TestCase):
         )
         reachable.start()
         self.addCleanup(reachable.stop)
-        not_direct_esxi = patch("python.srv.services.abr_v41.is_direct_esxi_connection", return_value=False)
-        not_direct_esxi.start()
-        self.addCleanup(not_direct_esxi.stop)
         for catalog in (BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS):
             catalog.clear()
         self.inventory = abr_v41.create_inventory_record(
@@ -188,22 +185,6 @@ class RestoreRepositorySelectorTests(unittest.TestCase):
         started = self._restore_into(target_host="192.168.12.37", target_datastore="tstds")
 
         self.assertEqual(TASKS[started["restore_session_id"]]["hypervisor_id"], self.inventory["id"])
-
-    def test_a_restore_onto_a_direct_esxi_inventory_is_refused_before_anything_is_created(self) -> None:
-        self._seed_point()
-        with patch.object(abr_v41, "is_direct_esxi_connection", return_value=True) as check:
-            error = self._failure()
-
-        self.assertEqual(error.status_code, 409)
-        self.assertEqual(error.code, "esx_direct_connection_unsupported")
-        self.assertEqual(
-            error.message,
-            "A direct ESXi connection is not supported. Register the vCenter Server that manages this host instead.",
-        )
-        self.assertEqual(list(TASKS), [])
-        stored = check.call_args.args[0]
-        self.assertEqual(stored["id"], self.inventory["id"])
-        self.assertEqual(stored["metadata"]["credentials"]["password"], "secret")
 
     def test_an_id_that_resolves_to_nothing_answers_repository_not_found(self) -> None:
         self._seed_point()
