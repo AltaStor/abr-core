@@ -415,13 +415,13 @@ abr job create-copy --name "Copied Job" --source "Existing Job"
 
 abr job list 
 
-Description: Show all configured jobs, including inventory, repository, VM count, schedule summary, schedule state, and run timestamps when available. 
+Description: Show all configured jobs, including inventory, repository, VM count, schedule summary, schedule state, and run timestamps when available. LAST RESULT is how the job's last run went over all of its VMs: Success, Warning, Stopped or Failed, with the number of VMs affected, or Running while any VM is still being backed up. It is empty for a job that has not run since the server was upgraded to report it. 
 
 abr job list [--output json] 
 
 abr job info 
 
-Description: Display detailed job bindings, tracked virtual machines, schedule configuration, schedule state, execution policy references, and timestamps. 
+Description: Display detailed job bindings, tracked virtual machines, schedule configuration, schedule state, execution policy references, and timestamps. last_result summarises the last run, last_run_issues names each VM that failed, stopped or finished with warnings together with the reason and its session, and last_run_id lists that run's sessions with abr session list --run. With --output json the run is in last_run, with the result of every VM. 
 
 abr job info --name <name> [--id <id>] 
 
@@ -461,7 +461,7 @@ abr session list
 
 Description: Show active and historical sessions. 
 
-abr session list [--job <name>] [--output json] 
+abr session list [--job <name>] [--run <run-id>] [--since <ISO timestamp>] [--output json] 
 
 abr session info 
 

@@ -3934,10 +3934,78 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "last_run_at": normalized.get("last_run_at"),
         "clock_anomalies": job_clock_anomalies(normalized),
         "last_session_id": normalized.get("last_session_id"),
+        "last_run": job_run_summary(normalized),
         "active_sessions": active_sessions,
         "active_session_count": len(active_sessions),
         "can_delete": not active_sessions,
         "delete_disabled_reason": "Job has queued or running sessions" if active_sessions else None,
+    }
+
+
+def job_run_record(run_id: str, *, trigger: str, started_at: str, session_ids: list[str]) -> dict[str, Any] | None:
+    if not session_ids:
+        return None
+    return {"id": run_id, "trigger": trigger, "started_at": started_at, "session_ids": list(session_ids)}
+
+
+RUN_RESULTS_WORST_FIRST = ("running", "failed", "stopped", "warning", "success")
+
+
+def _session_run_result(task: dict[str, Any]) -> str:
+    state = _session_state(task)
+    if state == "failed":
+        return "failed"
+    if state in {"stopped", "canceled"}:
+        return "stopped"
+    if state == "completed":
+        return "warning" if task.get("warnings") else "success"
+    return "running"
+
+
+def _worse(first: str, second: str) -> str:
+    return min(first, second, key=RUN_RESULTS_WORST_FIRST.index)
+
+
+def job_run_summary(job: dict[str, Any]) -> dict[str, Any] | None:
+    run = job.get("last_run")
+    if not isinstance(run, dict) or not run.get("id"):
+        return None
+    vms: dict[str, dict[str, Any]] = {}
+    finished: list[str] = []
+    for session_id in run.get("session_ids") or []:
+        task = TASKS.get(str(session_id))
+        if not isinstance(task, dict):
+            continue
+        session = session_to_dto(task, include_logs=False)
+        result = _session_run_result(task)
+        vm_key = str(task.get("resource_external_id") or session_id)
+        entry = vms.setdefault(
+            vm_key,
+            {"vm_id": session.get("vm_id"), "vm_name": session.get("vm_name"), "result": result, "session_ids": [], "message": None},
+        )
+        entry["session_ids"].append(str(session_id))
+        entry["result"] = _worse(entry["result"], result)
+        if result in {"failed", "stopped"} and not entry["message"]:
+            errors = session.get("errors") or []
+            entry["message"] = session.get("message") or (errors[0].get("message") if errors and isinstance(errors[0], dict) else None)
+        if session.get("finished_at"):
+            finished.append(str(session["finished_at"]))
+    if not vms:
+        return None
+    counts = {name: sum(1 for vm in vms.values() if vm["result"] == name) for name in RUN_RESULTS_WORST_FIRST}
+    result = "success"
+    for vm in vms.values():
+        result = _worse(result, vm["result"])
+    return {
+        "id": run["id"],
+        "trigger": run.get("trigger"),
+        "started_at": run.get("started_at"),
+        "finished_at": max(finished) if result != "running" and finished else None,
+        "result": result,
+        "vm_count": len(vms),
+        "succeeded": counts["success"] + counts["warning"],
+        **{name: counts[name] for name in ("warning", "failed", "stopped", "running")},
+        "vms": list(vms.values()),
     }
 
 
@@ -5357,6 +5425,7 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
         # other path (Run now/Run full backup, restores, backup-copy) is a
         # human clicking a button, so default to "manual" when unset.
         "triggered_by": task.get("trigger") or "manual",
+        "run_id": task.get("run_id"),
         "progress": result.get("progress"),
         "message": message,
         # Best-effort byte counters (see run_vcenter_backup) -- absent/0 for
@@ -5390,7 +5459,11 @@ SESSION_TYPES = ("backup", "restore", "verify", "delete")
 
 
 def list_sessions(
-    *, job_name: str | None = None, session_type: str | None = None, include_logs: bool = True
+    *,
+    job_name: str | None = None,
+    session_type: str | None = None,
+    run_id: str | None = None,
+    include_logs: bool = True,
 ) -> list[dict[str, Any]]:
     tasks = catalog_records(TASKS)
     if session_type:
@@ -5402,6 +5475,8 @@ def list_sessions(
             type=session_type,
         )
         tasks = [task for task in tasks if str(task.get("task_type") or "") == session_type]
+    if run_id:
+        tasks = [task for task in tasks if str(task.get("run_id") or "") == run_id]
     sessions = [session_to_dto(task, include_logs=include_logs) for task in tasks]
     if job_name:
         lowered = job_name.lower()
@@ -5442,6 +5517,7 @@ def list_sessions_page(
     *,
     job_name: str | None = None,
     session_type: str | None = None,
+    run_id: str | None = None,
     limit: int | None = None,
     offset: int = 0,
     since: str | None = None,
@@ -5460,7 +5536,7 @@ def list_sessions_page(
     match set itself -- the console asks for the window it actually renders
     instead of paging back through years of runs to build a 14-day chart.
     """
-    sessions = list_sessions(job_name=job_name, session_type=session_type, include_logs=False)
+    sessions = list_sessions(job_name=job_name, session_type=session_type, run_id=run_id, include_logs=False)
     if since:
         cutoff = _parse_dt(since)
         sessions = [session for session in sessions if _started_after(session, cutoff)]
@@ -5477,7 +5553,7 @@ def list_sessions_page(
     has_next = start + len(items) < total
     has_prev = start > 0
 
-    link_params = {"job": job_name, "type": session_type, "since": since}
+    link_params = {"job": job_name, "type": session_type, "run_id": run_id, "since": since}
     return {
         "items": items,
         "total": total,
@@ -8150,7 +8226,7 @@ def restore_point_list(vm_id: str) -> list[dict[str, Any]]:
     return [restore_point_to_dto(point) for point in points]
 
 
-def _create_completed_copy_session(job: dict[str, Any]) -> dict[str, Any]:
+def _create_completed_copy_session(job: dict[str, Any], *, run_id: str | None = None) -> dict[str, Any]:
     source_job_id = str(job.get("source_job_id") or "")
     source_points = [point for point in normalized_backup_points() if str(point.get("job_id") or "") == source_job_id]
     session = {
@@ -8162,6 +8238,7 @@ def _create_completed_copy_session(job: dict[str, Any]) -> dict[str, Any]:
         "resource_external_id": source_points[-1]["vm_id"] if source_points else source_job_id,
         "status": "completed",
         "trigger": "manual",
+        "run_id": run_id,
         "parameters": {
             "copy_job": True,
             "target_repository_id": job.get("repo_id"),
@@ -8191,6 +8268,7 @@ def _create_backup_session(
     execution_type: str,
     execution_reason: str,
     target_repository: dict[str, Any] | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     task_parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else {}
     parameters = dict(task_parameters)
@@ -8217,6 +8295,7 @@ def _create_backup_session(
         "resource_external_id": vm_id,
         "status": "queued",
         "trigger": "manual",
+        "run_id": run_id,
         "parameters": parameters,
         "result": {
             "progress": 0,
@@ -8309,8 +8388,10 @@ def start_job_record(
     if force_synthetic and job["job_type"] != "backup-copy":
         _ensure_chain_can_be_merged(job)
     sessions = []
+    run_id = str(uuid4())
+    run_started_at = utc_now()
     if job["job_type"] == "backup-copy":
-        sessions.append(_create_completed_copy_session(job))
+        sessions.append(_create_completed_copy_session(job, run_id=run_id))
     else:
         for vm_id, vm_name in zip(job.get("vm_ids") or [], _job_vm_current_names(job)):
             execution_type, execution_reason = resolve_job_execution(
@@ -8324,6 +8405,7 @@ def start_job_record(
                     execution_type=execution_type,
                     execution_reason=execution_reason,
                     target_repository=target_repository,
+                    run_id=run_id,
                 )
             )
     schedule = job.get("schedule")
@@ -8344,6 +8426,7 @@ def start_job_record(
             **job,
             "last_run_at": utc_now(),
             "last_session_id": sessions[-1]["id"] if sessions else None,
+            "last_run": job_run_record(run_id, trigger="manual", started_at=run_started_at, session_ids=[s["id"] for s in sessions]),
             "next_incremental_run_at": next_incremental_run_at,
             "updated_at": utc_now(),
         }
