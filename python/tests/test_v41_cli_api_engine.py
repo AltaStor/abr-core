@@ -392,6 +392,48 @@ class AbrV41RepositoryCommandTests(unittest.TestCase):
         self.assertEqual(request_mock.call_args_list[1].args, ("PATCH", "http://example.test/api/v1/repositories/repo-1"))
         self.assertEqual(request_mock.call_args_list[1].kwargs["json"], {"name": "New"})
 
+    def _edit_s3_repository(self, request_mock: object, mode: str, *flags: str) -> dict[str, object]:
+        from python.cli.commands import repository_commands
+        from python.cli.parsing.parser_builder import build_parser
+
+        current = {
+            "id": "repo-1",
+            "name": "S3-WORM",
+            "type": "s3",
+            "immutability": {"mode": mode, "retention_days": 1 if mode != "none" else 0},
+        }
+        request_mock.side_effect = [_FakeCliResponse(current), _FakeCliResponse(dict(current, status="available"))]
+        args = build_parser().parse_args(["repo", "edit", "--id", "repo-1", *flags])
+        args.base_url = "http://example.test"
+        args.output = "json"
+
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(RepositoryCommands().edit(args), 0)
+
+        self.assertEqual(request_mock.call_args_list[1].args, ("PATCH", "http://example.test/api/v1/repositories/repo-1"))
+        self.repository_commands = repository_commands
+        return request_mock.call_args_list[1].kwargs
+
+    @patch("python.cli.api.client.requests.request")
+    def test_repo_edit_waits_for_the_lock_probe_when_new_keys_reach_an_immutable_repository(self, request_mock: object) -> None:
+        sent = self._edit_s3_repository(request_mock, "governance", "--access-key", "AKIAROTATED")
+
+        self.assertEqual(sent["json"], {"s3": {"access_key": "AKIAROTATED"}})
+        self.assertEqual(sent["timeout"], self.repository_commands.IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS)
+
+    @patch("python.cli.api.client.requests.request")
+    def test_repo_edit_waits_for_the_storage_check_when_new_keys_reach_a_repository_without_a_lock(self, request_mock: object) -> None:
+        sent = self._edit_s3_repository(request_mock, "none", "--access-key", "AKIAROTATED")
+
+        self.assertEqual(sent["timeout"], self.repository_commands.STORAGE_VALIDATION_TIMEOUT_SECONDS)
+
+    @patch("python.cli.api.client.requests.request")
+    def test_repo_edit_of_the_description_alone_keeps_the_usual_timeout(self, request_mock: object) -> None:
+        sent = self._edit_s3_repository(request_mock, "governance", "--description", "Offsite copy")
+
+        self.assertEqual(sent["json"], {"description": "Offsite copy", "s3": {"description": "Offsite copy"}})
+        self.assertEqual(sent["timeout"], 30)
+
     @patch("python.cli.api.client.requests.request")
     def test_repo_verify_posts_and_prints_result(self, request_mock: object) -> None:
         request_mock.return_value = _FakeCliResponse(

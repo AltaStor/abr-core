@@ -725,6 +725,58 @@ class S3ImmutabilityChangeReportingTests(unittest.TestCase):
 
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_new_credentials_on_an_immutable_repository_write_a_probe(self, run_mock, _connect) -> None:
+        run_mock.side_effect = _disk_tool_stub()
+        repository = abr_v41.create_repository_record(
+            {"name": "ObjectRepo", "type": "s3", "s3": {**S3_SETTINGS,
+             "immutability": {"mode": "governance", "retention_days": 1}}}
+        )
+
+        with patch.object(
+            abr_v41, "validate_s3_immutability_config", wraps=abr_v41.validate_s3_immutability_config
+        ) as validate:
+            abr_v41.edit_repository_record(
+                repository["id"], {"s3": {"access_key": "AKIAROTATED", "secret_key": "rotated"}}
+            )
+
+        self.assertEqual(validate.call_args.kwargs["write_probe"], True)
+
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_credentials_that_cannot_set_a_lock_are_refused_and_the_stored_ones_kept(self, run_mock, _connect) -> None:
+        run_mock.side_effect = _disk_tool_stub()
+        repository = abr_v41.create_repository_record(
+            {"name": "ObjectRepo", "type": "s3", "s3": {**S3_SETTINGS,
+             "immutability": {"mode": "governance", "retention_days": 1}}}
+        )
+        run_mock.side_effect = _disk_tool_stub(
+            immutable_backup_error="Error creating multipart upload: 'lab/.abr-immutability-probe/p.abrd': Access Denied."
+        )
+
+        with self.assertRaises(ApiError) as error:
+            abr_v41.edit_repository_record(repository["id"], {"s3": {"access_key": "AKIAWEAK", "secret_key": "weak"}})
+
+        self.assertIn("rejected a test backup written under governance Object Lock", error.exception.message)
+        self.assertIn("Access Denied", error.exception.message)
+        stored = abr_v41.extract_s3_config(REPOSITORIES[repository["id"]])
+        self.assertEqual((stored["access_key"], stored["secret_key"]), ("AKIAEXAMPLE", "secret"))
+
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
+    def test_new_credentials_on_a_repository_without_a_lock_write_no_probe(self, run_mock, _connect) -> None:
+        run_mock.side_effect = _disk_tool_stub()
+        repository = abr_v41.create_repository_record({"name": "PlainRepo", "type": "s3", "s3": dict(S3_SETTINGS)})
+
+        with patch.object(abr_v41, "validate_s3_immutability_config") as validate:
+            result = abr_v41.edit_repository_record(
+                repository["id"], {"s3": {"access_key": "AKIAROTATED", "secret_key": "rotated"}}
+            )
+
+        validate.assert_not_called()
+        self.assertEqual(abr_v41.extract_s3_config(REPOSITORIES[result["id"]])["access_key"], "AKIAROTATED")
+
+    @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
+    @patch("python.srv.core.storage_tool.run_disk_tool")
     def test_shorter_job_retention_than_the_lock_is_warned_about(self, run_mock, _connect) -> None:
         run_mock.side_effect = _disk_tool_stub()
         repository = abr_v41.create_repository_record({"name": "ObjectRepo", "type": "s3", "s3": dict(S3_SETTINGS)})

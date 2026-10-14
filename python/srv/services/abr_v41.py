@@ -2446,11 +2446,7 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         )
         if registration_check is not None:
             updated["last_verify"] = registration_check
-    if (
-        next_s3_config is not None
-        and next_immutability != previous_immutability
-        and immutability_is_enabled(next_immutability)
-    ):
+    if next_s3_config is not None and immutability_is_enabled(next_immutability):
         mode_changed = previous_immutability.get("mode") != next_immutability.get("mode")
         connection_changed = registration_check is not None
         # Only when the answer can have changed. The bucket probe reads the
