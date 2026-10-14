@@ -564,11 +564,16 @@ def run_hyperv_restore(
                 )
 
             # ---- build or update the VM -------------------------------------
+            # A generation 2 "Drive" boot entry is a DVD drive as often as a
+            # hard disk; only a disk this restore wrote can be booted from.
+            restored_slots = {str(item["slot"]).upper(): str(item["slot"]) for item in plan}
             boot_slot = next(
                 (
-                    str(entry.get("device") or "")
+                    restored_slots[str(entry.get("device") or "").upper()]
                     for entry in vm_config.get("boot_order") or []
-                    if isinstance(entry, dict) and entry.get("boot_type") == "Drive" and entry.get("device")
+                    if isinstance(entry, dict)
+                    and entry.get("boot_type") == "Drive"
+                    and str(entry.get("device") or "").upper() in restored_slots
                 ),
                 plan[0]["slot"],
             )
