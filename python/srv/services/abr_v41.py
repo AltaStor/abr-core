@@ -83,6 +83,7 @@ from python.srv.core.storage_tool import (
     normalize_s3_prefix,
     probe_repository_access,
     probe_repository_immutability,
+    read_storage_backup_info,
     read_storage_folder_info,
     remove_disk_tool_backup,
     s3_block_generation_days,
@@ -4667,6 +4668,41 @@ def _segment_points(points: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return segments
 
 
+_RETENTION_LOCK_REPORTED: set[str] = set()
+
+
+def _point_object_lock(point: dict[str, Any]) -> str:
+    repository = REPOSITORIES.get(str(point.get("repository_id") or ""))
+    if not isinstance(repository, dict) or not is_s3_repository(repository):
+        return ""
+    artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+    disk = next(
+        (
+            item
+            for item in artifact.get("disks") or []
+            if isinstance(item, dict) and item.get("abr_path") and item.get("abr_backup_name")
+        ),
+        None,
+    )
+    if disk is not None:
+        try:
+            info = read_storage_backup_info(repository, str(disk["abr_path"]), str(disk["abr_backup_name"]), timeout=60)
+        except StorageToolError:
+            LOGGER.debug("Could not read the Object Lock of restore point %s before retention", point.get("id"), exc_info=True)
+        else:
+            days_left = int(info.get("retention_days") or 0) if isinstance(info, dict) else 0
+            if isinstance(info, dict) and str(info.get("immutability") or "none") != "none" and days_left > 0:
+                return f"for {days_left} more day(s)"
+            return ""
+    stored_expiry = str(point.get("immutability_expires_at") or "").strip()
+    try:
+        if stored_expiry and _parse_dt(stored_expiry) > _now_utc():
+            return f"until {stored_expiry}"
+    except ValueError:
+        pass
+    return ""
+
+
 def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: str | None) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
     points = _points_for_job_vm_repo(str(job["id"]), vm_id, repository_id)
@@ -4703,8 +4739,24 @@ def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: 
             if blocked:
                 persist_backup(point)
                 continue
+            held = _point_object_lock(point)
+            if held:
+                point_id = str(point.get("id") or "")
+                if point_id not in _RETENTION_LOCK_REPORTED:
+                    _RETENTION_LOCK_REPORTED.add(point_id)
+                    LOGGER.info(
+                        "Retention keeps expired restore point %s of job %s while Object Lock holds it %s; "
+                        "it is removed on the first pass after the lock expires",
+                        point_id,
+                        job.get("id"),
+                        held,
+                    )
+                persist_backup(point)
+                blocked = True
+                continue
             if _delete_backup_artifacts_from_point(point):
                 delete_backup(point["id"])
+                _RETENTION_LOCK_REPORTED.discard(str(point.get("id") or ""))
             else:
                 LOGGER.error(
                     "Retention failed to delete backup artifacts; keeping catalog entry for retry: "
