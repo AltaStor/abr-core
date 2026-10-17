@@ -285,6 +285,16 @@ class JobCommands:
                 type=parse_compression_level,
                 help="Backup compression level: 0 disables compression, 1-9 select Zstd levels (higher compresses smaller but slower). Default: 3.",
             )
+            parser.add_argument(
+                "--on-quiesce-failure",
+                dest="on_quiesce_failure",
+                choices=("fail", "crash-consistent"),
+                help=(
+                    "What a backup of a VMware VM does when VMware Tools cannot quiesce the guest, for example because "
+                    "a pre-freeze script or a VSS writer fails: fail (the default) ends that VM's session as failed; "
+                    "crash-consistent takes the snapshot again without quiescing and completes with a warning."
+                ),
+            )
             encryption_state = parser.add_mutually_exclusive_group()
             encryption_state.add_argument(
                 "--set-encryption",

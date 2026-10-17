@@ -112,6 +112,9 @@ class JobService:
         guest_consistency = getattr(args, "guest_consistency", None)
         if guest_consistency is not None:
             updates["hyperv_consistency"] = str(guest_consistency)
+        on_quiesce_failure = getattr(args, "on_quiesce_failure", None)
+        if on_quiesce_failure is not None:
+            updates["on_quiesce_failure"] = str(on_quiesce_failure).replace("-", "_")
 
         if set_encryption:
             updates["encryption_enabled"] = True

@@ -113,7 +113,7 @@ from python.srv.services.inventory_management import (
     normalize_inventory_type,
 )
 from python.srv.services.backup_mode import object_lock_actual_retention_days
-from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL
+from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
 
 from .api_errors import ApiError, api_error
 from .auth_service import MIN_PASSWORD_LENGTH
@@ -4056,6 +4056,16 @@ def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] |
         )
         result["compression_level"] = level
 
+    if "on_quiesce_failure" in result and result["on_quiesce_failure"] is not None:
+        action = str(result["on_quiesce_failure"]).strip().lower().replace("-", "_")
+        _ensure(
+            action in QUIESCE_FAILURE_ACTIONS,
+            422,
+            "invalid_job",
+            f"task_parameters.on_quiesce_failure must be one of: {', '.join(QUIESCE_FAILURE_ACTIONS)}",
+        )
+        result["on_quiesce_failure"] = action
+
     if result.get("encryption_enabled"):
         key = result.get("encryption_key")
         known = _normalized_encryption_keys(
@@ -4186,6 +4196,7 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "active_full_next_run_at": normalized.get("active_full_next_run_at"),
         "synthetic_full_next_run_at": normalized.get("synthetic_full_next_run_at"),
         "compression_level": compression_level,
+        "on_quiesce_failure": str(task_parameters.get("on_quiesce_failure") or "fail"),
         "encryption": {
             "enabled": encryption_enabled,
             "key_set": has_encryption_key,
@@ -5839,6 +5850,8 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
         "finished_at": finished_at,
         "resolved_backup_type": result.get("resolved_backup_type"),
         "resolved_backup_reason": result.get("resolved_backup_reason"),
+        "consistency": result.get("consistency"),
+        "consistency_reason": result.get("consistency_reason"),
         # "schedule" only for tasks the JobScheduler enqueued on its own; every
         # other path (Run now/Run full backup, restores, backup-copy) is a
         # human clicking a button, so default to "manual" when unset.
@@ -6090,6 +6103,8 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "compression_ratio": point.get("compression_ratio"),
             "compression_level": point.get("compression_level"),
             "encryption_enabled": point.get("encryption_enabled"),
+            "consistency": point.get("consistency"),
+            "consistency_reason": point.get("consistency_reason"),
             "skipped_disks": _restore_point_artifact(point).get("skipped_disks") or [],
         }
         for point in points
@@ -7063,6 +7078,8 @@ def import_backup_chain(*, path_value: str, repo_name: str | None = None, repo_i
             "full_backup": True,
             "compression_level": compression_level,
             "encryption_enabled": bool(payload.get("encryption_enabled")),
+            "consistency": payload.get("consistency"),
+            "consistency_reason": payload.get("consistency_reason"),
             "logical_size_bytes": resolve_logical_size_bytes(payload),
             "compression_ratio": resolve_compression_ratio(payload),
             "created_at": utc_now(),
@@ -7300,7 +7317,9 @@ def restore_point_to_dto(point: dict[str, Any]) -> dict[str, Any]:
         "execution_type": point.get("execution_type"),
         "execution_reason": point.get("execution_reason"),
         "size_bytes": _restore_point_size_bytes(point),
-        "consistency_state": point.get("consistency_state"),
+        "consistency_state": point.get("consistency_state") or point.get("consistency"),
+        "consistency": point.get("consistency"),
+        "consistency_reason": point.get("consistency_reason"),
         "status": point.get("status"),
         "available": _restore_point_is_available(point),
         "gfs_marks": point.get("gfs_marks"),
