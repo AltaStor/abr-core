@@ -7,6 +7,20 @@ from typing import Any, Callable, Dict, List
 
 ProgressCallback = Callable[[dict[str, Any]], None] | None
 
+
+class QuiesceFailedError(RuntimeError):
+    def __init__(self, vm_name: str, reason: str | None) -> None:
+        self.vm_name = vm_name
+        self.reason = reason
+        super().__init__(
+            f"VMware Tools could not quiesce VM '{vm_name}' for the backup snapshot"
+            f"{': ' + reason.rstrip(' .') if reason else ''}. "
+            "The usual cause is a pre-freeze script under /etc/vmware-tools/backupScripts.d/ that exits with an error "
+            "(Linux) or a failing VSS writer, listed by 'vssadmin list writers' (Windows). Fix it in the guest, "
+            "or let the job take a crash-consistent backup when quiescing fails."
+        )
+
+
 class Hypervisor(ABC):
     """Abstract class for all hypervisor plugins"""
 
@@ -42,7 +56,7 @@ class Hypervisor(ABC):
         pass
 
     @abstractmethod
-    def create_backup_snapshot(self, vm_name: str) -> str:
+    def create_backup_snapshot(self, vm_name: str, *, quiesce: bool = True) -> str:
         """Creating backup snapshot and return its id."""
         pass
 

@@ -569,6 +569,151 @@ class VCenterNodeCbtResetTests(unittest.TestCase):
         self.assertEqual(len(backup_attempts), 2)
 
 
+_QUIESCE_FAULT_TEXT = (
+    "vCenter task failed: An error occurred while quiescing the virtual machine. "
+    "See the virtual machine's event log for details."
+)
+_GUEST_REASON = (
+    "The guest OS has reported an error during quiescing. The error code was: 2 "
+    "The error message was: Custom quiesce script failed."
+)
+
+
+class _FailingSnapshotTask:
+    def __init__(self, error: object) -> None:
+        self.info = types.SimpleNamespace(error=error, startTime=datetime(2026, 10, 14, tzinfo=timezone.utc))
+
+
+class _QuiesceSnapshotVm(_FakeSnapshotVm):
+    def __init__(self, error: object | None) -> None:
+        super().__init__()
+        self.error = error
+        self.quiesce_requests: list[bool] = []
+        self.snapshot = None
+        self.guest = types.SimpleNamespace(toolsStatus="toolsOk")
+
+    def CreateSnapshot_Task(self, *, name: str, description: str, memory: bool, quiesce: bool) -> object:
+        self.created_snapshots.append(name)
+        self.quiesce_requests.append(quiesce)
+        return _FailingSnapshotTask(self.error if quiesce else None)
+
+
+def _event_source(events: list[object], *, visible_from_query: int = 1) -> object:
+    queries: list[object] = []
+
+    def query(spec: object) -> list[object]:
+        queries.append(spec)
+        return list(events) if len(queries) >= visible_from_query else []
+
+    manager = types.SimpleNamespace(QueryEvents=query, queries=queries)
+    return types.SimpleNamespace(RetrieveContent=lambda: types.SimpleNamespace(eventManager=manager), manager=manager)
+
+
+class VCenterNodeQuiesceTests(unittest.TestCase):
+    def _node(self, vm: object, fails: bool) -> VCenterNode:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        node._get_vm = lambda vm_name: vm if vm_name == "demo-vm" else None  # type: ignore[method-assign]
+
+        def wait(task: object) -> None:
+            if fails and task.info.error is not None:
+                raise RuntimeError(_QUIESCE_FAULT_TEXT)
+
+        node._wait_for_task = wait  # type: ignore[method-assign]
+        return node
+
+    def test_a_failed_quiesce_names_the_guest_reason_and_where_to_look(self) -> None:
+        from python.srv.plugins.hypervisor import QuiesceFailedError
+
+        vm = _QuiesceSnapshotVm(vim.fault.ApplicationQuiesceFault(msg="An error occurred while quiescing"))
+        node = self._node(vm, fails=True)
+        node._quiesce_failure_reason = lambda vm, since: _GUEST_REASON  # type: ignore[method-assign]
+
+        with self.assertRaises(QuiesceFailedError) as caught:
+            node.create_backup_snapshot("demo-vm")
+
+        self.assertEqual(caught.exception.reason, _GUEST_REASON)
+        self.assertIn("Custom quiesce script failed", str(caught.exception))
+        self.assertIn("/etc/vmware-tools/backupScripts.d/", str(caught.exception))
+        self.assertIn("vssadmin list writers", str(caught.exception))
+        self.assertNotIn("event log", str(caught.exception))
+        self.assertEqual(vm.quiesce_requests, [True])
+
+    def test_any_other_snapshot_failure_is_raised_as_before(self) -> None:
+        from python.srv.plugins.hypervisor import QuiesceFailedError
+
+        vm = _QuiesceSnapshotVm(vim.fault.GenericVmConfigFault(msg="Exceeded the maximum number of permitted snapshots."))
+        node = self._node(vm, fails=True)
+
+        with self.assertRaises(RuntimeError) as caught:
+            node.create_backup_snapshot("demo-vm")
+
+        self.assertNotIsInstance(caught.exception, QuiesceFailedError)
+        self.assertEqual(str(caught.exception), _QUIESCE_FAULT_TEXT)
+
+    def test_a_snapshot_can_be_taken_without_quiescing(self) -> None:
+        vm = _QuiesceSnapshotVm(vim.fault.ApplicationQuiesceFault(msg="never raised"))
+        node = self._node(vm, fails=True)
+
+        snapshot_name = node.create_backup_snapshot("demo-vm", quiesce=False)
+
+        self.assertTrue(snapshot_name.startswith("FullBackup_"))
+        self.assertEqual(vm.quiesce_requests, [False])
+
+    def test_the_reason_is_read_from_the_vms_quiesce_event(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        events = [
+            types.SimpleNamespace(key=10, message="Some other warning"),
+            types.SimpleNamespace(key=12, message=_GUEST_REASON + "  "),
+        ]
+        node.si = _event_source(events)
+
+        reason = node._quiesce_failure_reason(vim.VirtualMachine("vm-301"), datetime(2026, 10, 14, tzinfo=timezone.utc))
+
+        self.assertEqual(reason, _GUEST_REASON)
+        self.assertEqual(len(node.si.manager.queries), 1)
+
+    def test_the_reason_is_waited_for_until_vcenter_lists_the_event(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        node.si = _event_source([types.SimpleNamespace(key=12, message=_GUEST_REASON)], visible_from_query=6)
+
+        with patch("python.srv.plugins.vcenter.vcenter.time.sleep"), patch.dict(
+            "os.environ", {"BACKUPSERVER_QUIESCE_REASON_WAIT_SECONDS": "15"}
+        ), patch("python.srv.plugins.vcenter.vcenter.time.monotonic", side_effect=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]):
+            reason = node._quiesce_failure_reason(vim.VirtualMachine("vm-301"), None)
+
+        self.assertEqual(reason, _GUEST_REASON)
+        self.assertEqual(len(node.si.manager.queries), 6)
+
+    def test_without_a_quiesce_event_the_reason_stays_unknown_once_the_wait_is_over(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        node.si = _event_source([types.SimpleNamespace(key=1, message="Some other warning")])
+
+        with patch("python.srv.plugins.vcenter.vcenter.time.sleep"), patch.dict(
+            "os.environ", {"BACKUPSERVER_QUIESCE_REASON_WAIT_SECONDS": "3"}
+        ), patch("python.srv.plugins.vcenter.vcenter.time.monotonic", side_effect=[0.0, 1.0, 2.0, 3.0]):
+            reason = node._quiesce_failure_reason(vim.VirtualMachine("vm-301"), None)
+
+        self.assertIsNone(reason)
+        self.assertEqual(len(node.si.manager.queries), 3)
+
+    def test_the_consistency_comes_from_the_snapshot_itself(self) -> None:
+        for quiesced, tools, expected in (
+            (True, "toolsOk", "quiesced"),
+            (False, "toolsNotRunning", "crash_consistent"),
+            (False, "toolsNotInstalled", "crash_consistent"),
+        ):
+            with self.subTest(tools=tools):
+                vm = _QuiesceSnapshotVm(None)
+                vm.guest = types.SimpleNamespace(toolsStatus=tools)
+                node_entry = types.SimpleNamespace(name="FullBackup_1", quiesced=quiesced, childSnapshotList=[])
+                vm.snapshot = types.SimpleNamespace(rootSnapshotList=[node_entry])
+                node = self._node(vm, fails=False)
+
+                state = node.snapshot_consistency("demo-vm", "FullBackup_1")
+
+                self.assertEqual(state, {"consistency": expected, "tools_status": tools})
+
+
 class VCenterNodeFirmwareTests(unittest.TestCase):
     def test_get_vm_restore_metadata_captures_efi_firmware(self) -> None:
         node = VCenterNode("vc.local", "administrator", "secret")

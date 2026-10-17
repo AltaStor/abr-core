@@ -630,6 +630,8 @@ def run_synthetic_full(
         "disks": disk_outputs,
         "compression_level": compression_level,
         "encryption_enabled": bool(encryption_key),
+        "consistency": manifest_payload.get("consistency"),
+        "consistency_reason": manifest_payload.get("consistency_reason"),
         "logical_bytes": logical_total,
         "transferred_bytes": stored_total,
         "processed_bytes": logical_total,

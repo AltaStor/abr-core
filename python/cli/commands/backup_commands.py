@@ -30,6 +30,7 @@ RESTORE_POINT_COLUMNS = [
     ("encryption_enabled", "ENCRYPTED"),
     ("gfs", "GFS"),
     ("immutability_expires_at", "IMMUTABLE UNTIL"),
+    ("consistency", "CONSISTENCY"),
 ]
 
 

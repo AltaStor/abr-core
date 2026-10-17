@@ -28,7 +28,7 @@ class MockHypervisor(Hypervisor):
     def get_backup_parameters(self, vm_name: str, snapshot_name: str) -> Dict[str, str]:
         raise NotImplementedError("MockHypervisor does not provide VMware backup parameters")
 
-    def create_backup_snapshot(self, vm_name: str) -> str:
+    def create_backup_snapshot(self, vm_name: str, *, quiesce: bool = True) -> str:
         raise NotImplementedError("MockHypervisor does not support snapshots")
 
     def ensure_cbt_enabled(self, vm_name: str) -> bool:

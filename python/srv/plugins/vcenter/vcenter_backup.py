@@ -44,6 +44,7 @@ from ...core.storage_tool import (
     write_file_durably,
 )
 from ...core.utils import utc_now
+from ..hypervisor import QuiesceFailedError
 from ...services.backup_mode import (
     encryption_changed_since_last_backup,
     object_lock_actual_retention_days,
@@ -311,6 +312,66 @@ def _emit_progress(
     }
     payload.update(extra)
     progress_callback(payload)
+
+
+QUIESCE_FAILURE_ACTIONS = ("fail", "crash_consistent")
+
+_CRASH_CONSISTENT_CAUSES = {
+    "toolsNotInstalled": ("tools_not_installed", "VMware Tools is not installed"),
+    "toolsNotRunning": ("tools_not_running", "VMware Tools is not running"),
+}
+
+
+def _take_backup_snapshot(
+    node: Any,
+    task: dict[str, Any],
+    vm_name: str,
+    progress_callback: ProgressCallback,
+) -> tuple[str, dict[str, str | None]]:
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    try:
+        snapshot_name = node.create_backup_snapshot(vm_name)
+    except QuiesceFailedError as exc:
+        if str(parameters.get("on_quiesce_failure") or "fail") != "crash_consistent":
+            raise VCenterBackupError(str(exc)) from exc
+        message = (
+            f"VMware Tools could not quiesce VM {vm_name}{': ' + exc.reason.rstrip(' .') if exc.reason else ''}. "
+            "The job is set to take a crash-consistent backup when quiescing fails, so this backup is crash-consistent."
+        )
+        logger.warning("%s (task %s)", message, task.get("id"))
+        _emit_progress(
+            progress_callback,
+            "snapshot",
+            15,
+            message,
+            worker_mode="vcenter-abr-vmdk-tool",
+            vm_name=vm_name,
+            warning={"code": "quiesce_failed", "message": message, "vm_name": vm_name},
+        )
+        snapshot_name = node.create_backup_snapshot(vm_name, quiesce=False)
+        return snapshot_name, {"consistency": "crash_consistent", "consistency_reason": "quiesce_failed"}
+    try:
+        state = node.snapshot_consistency(vm_name, snapshot_name)
+    except Exception:
+        logger.warning("Could not read whether the snapshot of VM %s was quiesced", vm_name, exc_info=True)
+        return snapshot_name, {"consistency": None, "consistency_reason": None}
+    if state.get("consistency") != "crash_consistent":
+        return snapshot_name, {"consistency": state.get("consistency"), "consistency_reason": None}
+    reason, cause = _CRASH_CONSISTENT_CAUSES.get(
+        str(state.get("tools_status") or ""), ("not_quiesced", "VMware Tools did not quiesce the guest")
+    )
+    message = f"{cause} in VM {vm_name}: the backup is crash-consistent"
+    logger.warning("%s (task %s)", message, task.get("id"))
+    _emit_progress(
+        progress_callback,
+        "snapshot",
+        15,
+        message,
+        worker_mode="vcenter-abr-vmdk-tool",
+        vm_name=vm_name,
+        warning={"code": "crash_consistent", "message": message, "vm_name": vm_name},
+    )
+    return snapshot_name, {"consistency": "crash_consistent", "consistency_reason": reason}
 
 
 def _record_backup_snapshot(
@@ -1639,6 +1700,7 @@ def run_vcenter_backup(
     )
 
     snapshot_name: str | None = None
+    snapshot_consistency: dict[str, str | None] = {"consistency": None, "consistency_reason": None}
     snapshot_moref: str | None = None
     vm_moref: str | None = None
     thumbprint = ""
@@ -1724,7 +1786,7 @@ def run_vcenter_backup(
                 watch_since = node.server_time()
             except Exception:
                 logger.debug("Could not read the vCenter time at the start of backup %s", task.get("id"), exc_info=True)
-            snapshot_name = node.create_backup_snapshot(vm_name)
+            snapshot_name, snapshot_consistency = _take_backup_snapshot(node, task, vm_name, progress_callback)
             _record_backup_snapshot(progress_callback, vm_name, snapshot_name)
             backup_params = node.get_backup_parameters(vm_name, snapshot_name)
             vm_moref = str(backup_params.get("vm_moref") or "")
@@ -3093,6 +3155,8 @@ def run_vcenter_backup(
                 "vm_config_changed_full_required": vm_config_changed_full_required,
                 "vm_config_change_reason": vm_config_change_reason,
                 "cbt_enabled": cbt_enabled,
+                "consistency": snapshot_consistency["consistency"],
+                "consistency_reason": snapshot_consistency["consistency_reason"],
                 "snapshot_name": snapshot_name,
                 "snapshot_moref": snapshot_moref,
                 "disks": disk_outputs,
@@ -3200,6 +3264,8 @@ def run_vcenter_backup(
             "vm_config_changed_full_required": vm_config_changed_full_required,
             "vm_config_change_reason": vm_config_change_reason,
             "cbt_enabled": cbt_enabled,
+            "consistency": snapshot_consistency["consistency"],
+            "consistency_reason": snapshot_consistency["consistency_reason"],
             "snapshot_removed": True,
             "stop_requested_after_completion": stop_requested_after_completion,
             "backup_root": str(task_root),

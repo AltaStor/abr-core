@@ -303,6 +303,19 @@ class SyntheticFullRunTests(unittest.TestCase):
         self.assertIsNone(manifest["parent_point_id"])
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_merge_keeps_the_consistency_of_the_newest_point_it_merges(self, copy_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1024, "stored_data_size": 512, "merged_from": 3}
+        newest = {"format_version": 1, "vm_config": {}, "consistency": "crash_consistent", "consistency_reason": "tools_not_running"}
+
+        with patch("python.srv.services.synthetic_full._source_manifest", return_value=newest):
+            result = synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(result["consistency"], "crash_consistent")
+        self.assertEqual(result["consistency_reason"], "tools_not_running")
+        manifest = json.loads(open(result["manifest_path"], encoding="utf-8").read())
+        self.assertEqual(manifest["consistency"], "crash_consistent")
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_a_merge_is_flushed_to_stable_storage_before_it_is_reported(self, copy_mock) -> None:
         copy_mock.return_value = {"raw_data_size": 1024, "stored_data_size": 512, "merged_from": 3}
 

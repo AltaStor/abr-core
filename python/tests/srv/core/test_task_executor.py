@@ -95,6 +95,10 @@ class FakeVCenterNode:
     vm_firmware: str | None = "bios"
     cbt_enable_calls: list[str] = []
     cbt_enabled_result: bool = True
+    snapshot_quiesce_requests: list[bool] = []
+    quiesce_failure: Exception | None = None
+    snapshot_quiesced: bool = True
+    tools_status: str = "toolsOk"
     raise_on_query_changed_disk_areas: Exception | None = None
     created_vm_firmware: str | None = None
     host_connected: bool = True
@@ -157,10 +161,17 @@ class FakeVCenterNode:
 
         return run_vcenter_restore(task, progress_callback=progress_callback)
 
-    def create_backup_snapshot(self, vm_name: str) -> str:
+    def create_backup_snapshot(self, vm_name: str, *, quiesce: bool = True) -> str:
+        self.snapshot_quiesce_requests.append(quiesce)
+        if quiesce and self.quiesce_failure is not None:
+            raise self.quiesce_failure
         name = f"{vm_name}-snapshot"
         self.snapshots_created.append(name)
         return name
+
+    def snapshot_consistency(self, vm_name: str, snapshot_name: str) -> dict[str, str | None]:
+        quiesced = self.snapshot_quiesced and self.snapshot_quiesce_requests[-1:] == [True]
+        return {"consistency": "quiesced" if quiesced else "crash_consistent", "tools_status": self.tools_status}
 
     def get_backup_parameters(self, vm_name: str, snapshot_name: str) -> dict[str, str]:
         return {"vm_moref": "vm-123", "snapshot_moref": "snapshot-456"}
@@ -436,6 +447,10 @@ class TaskExecutorTests(unittest.TestCase):
         FakeVCenterNode.vm_firmware = "bios"
         FakeVCenterNode.cbt_enable_calls.clear()
         FakeVCenterNode.cbt_enabled_result = True
+        FakeVCenterNode.snapshot_quiesce_requests.clear()
+        FakeVCenterNode.quiesce_failure = None
+        FakeVCenterNode.snapshot_quiesced = True
+        FakeVCenterNode.tools_status = "toolsOk"
         FakeVCenterNode.raise_on_query_changed_disk_areas = None
         FakeVCenterNode.created_vm_firmware = None
         FakeVCenterNode.host_connected = True
@@ -7113,6 +7128,112 @@ class TaskExecutorTests(unittest.TestCase):
             }
             for index, disk in enumerate(live_disks, start=1)
         ]
+
+    def _run_demo_vcenter_backup(self, **parameters: object) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object] | None]:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+        progress_updates: list[dict[str, object]] = []
+        manifest: dict[str, object] | None = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "task-quiesce",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {"destination_dir": temp_dir, "tool_path": EXISTING_TOOL_PATH, **parameters},
+            }
+            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": types.SimpleNamespace(VCenterNode=FakeVCenterNode)}):
+                with patch(
+                    "python.srv.plugins.vcenter.vcenter_backup.run_capped",
+                    side_effect=lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok"),
+                ):
+                    result = run_task(task, progress_callback=progress_updates.append)
+            manifest_path = (result.get("result") or {}).get("manifest_path")
+            if manifest_path:
+                manifest = json.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
+        return result, [update["warning"] for update in progress_updates if isinstance(update.get("warning"), dict)], manifest
+
+    def test_a_quiesced_backup_is_recorded_as_such_without_a_warning(self) -> None:
+        result, warnings, manifest = self._run_demo_vcenter_backup()
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["result"]["consistency"], "quiesced")
+        self.assertIsNone(result["result"]["consistency_reason"])
+        self.assertEqual(manifest["consistency"], "quiesced")
+        self.assertEqual(warnings, [])
+        self.assertEqual(FakeVCenterNode.snapshot_quiesce_requests, [True])
+
+    def test_a_crash_consistent_backup_says_why_in_a_warning(self) -> None:
+        for tools, reason, cause in (
+            ("toolsNotRunning", "tools_not_running", "VMware Tools is not running"),
+            ("toolsNotInstalled", "tools_not_installed", "VMware Tools is not installed"),
+        ):
+            with self.subTest(tools=tools):
+                FakeVCenterNode.snapshot_quiesce_requests.clear()
+                FakeVCenterNode.snapshot_quiesced = False
+                FakeVCenterNode.tools_status = tools
+
+                result, warnings, manifest = self._run_demo_vcenter_backup()
+
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["result"]["consistency"], "crash_consistent")
+                self.assertEqual(result["result"]["consistency_reason"], reason)
+                self.assertEqual(manifest["consistency_reason"], reason)
+                self.assertEqual(
+                    warnings,
+                    [{"code": "crash_consistent", "message": f"{cause} in VM demo-vm: the backup is crash-consistent", "vm_name": "demo-vm"}],
+                )
+
+    def test_a_failed_quiesce_fails_the_session_by_default_and_says_what_to_fix(self) -> None:
+        from python.srv.plugins.hypervisor import QuiesceFailedError
+
+        FakeVCenterNode.quiesce_failure = QuiesceFailedError("demo-vm", "Custom quiesce script failed.")
+
+        result, warnings, _manifest = self._run_demo_vcenter_backup()
+
+        self.assertEqual(result["status"], "failed")
+        message = str(result["error"]) if result.get("error") else str((result.get("result") or {}).get("message"))
+        self.assertIn("for the backup snapshot: Custom quiesce script failed. The usual cause", message)
+        self.assertIn("/etc/vmware-tools/backupScripts.d/", message)
+        self.assertEqual(FakeVCenterNode.snapshot_quiesce_requests, [True])
+        self.assertEqual(FakeVCenterNode.snapshots_created, [])
+        self.assertEqual(warnings, [])
+
+    def test_a_failed_quiesce_falls_back_to_a_crash_consistent_backup_when_the_job_allows_it(self) -> None:
+        from python.srv.plugins.hypervisor import QuiesceFailedError
+
+        FakeVCenterNode.quiesce_failure = QuiesceFailedError("demo-vm", "Custom quiesce script failed.")
+
+        result, warnings, manifest = self._run_demo_vcenter_backup(on_quiesce_failure="crash_consistent")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(FakeVCenterNode.snapshot_quiesce_requests, [True, False])
+        self.assertEqual(FakeVCenterNode.snapshots_created, ["demo-vm-snapshot"])
+        self.assertEqual(FakeVCenterNode.snapshots_removed, ["demo-vm-snapshot"])
+        self.assertEqual(result["result"]["consistency"], "crash_consistent")
+        self.assertEqual(result["result"]["consistency_reason"], "quiesce_failed")
+        self.assertEqual(manifest["consistency"], "crash_consistent")
+        self.assertEqual([warning["code"] for warning in warnings], ["quiesce_failed"])
+        self.assertIn("demo-vm: Custom quiesce script failed. The job", warnings[0]["message"])
+        self.assertIn("crash-consistent", warnings[0]["message"])
 
     def test_an_independent_disk_is_skipped_with_a_warning_and_the_other_disks_are_backed_up(self) -> None:
         live_disks = [

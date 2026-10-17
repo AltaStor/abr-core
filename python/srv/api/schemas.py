@@ -63,6 +63,7 @@ class JobEncryptionDTO(_LenientModel):
 
 class TaskParametersDTO(_LenientModel):
     compression_level: DocInt = None
+    on_quiesce_failure: DocStr = None
     encryption_enabled: DocBool = None
     encryption_key: DocStr = None
     encryption_key_id: DocStr = None
@@ -309,6 +310,7 @@ class JobDTO(_LenientModel):
     active_full_next_run_at: str | None = None
     synthetic_full_next_run_at: str | None = None
     compression_level: int | None = None
+    on_quiesce_failure: str | None = None
     encryption: JobEncryptionDTO | DocObject = None
     task_parameters: TaskParametersDTO | DocObject = {}
     backup_options: TaskParametersDTO | DocObject = {}
@@ -495,6 +497,8 @@ class RestorePointDTO(_LenientModel):
     compression_level: int | None = None
     encryption_enabled: bool | None = None
     immutability_expires_at: str | None = None
+    consistency: DocStr = None
+    consistency_reason: DocStr = None
     restore_point_id: DocStr = None
     backup_id: DocStr = None
     point_type: DocStr = None
@@ -566,6 +570,8 @@ class SessionDTO(_LenientModel):
     finished_at: str | None = None
     resolved_backup_type: str | None = None
     resolved_backup_reason: str | None = None
+    consistency: DocStr = None
+    consistency_reason: DocStr = None
     progress: int | None = None
     processed_bytes: int | None = None
     transferred_bytes: int | None = None
@@ -674,6 +680,7 @@ class GfsRequest(_LenientModel):
 
 class TaskParametersRequest(_LenientModel):
     compression_level: LaxInt = None
+    on_quiesce_failure: LaxStr | None = None
     encryption_enabled: LaxBool | None = None
     encryption_key: LaxStr | None = None
     encryption_key_id: LaxStr | None = None

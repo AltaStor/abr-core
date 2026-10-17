@@ -18,7 +18,7 @@ from pyVim.connect import Disconnect, SmartConnect
 from pyVmomi import vim, vmodl
 from ...core.credential_encryption import StoredCredentialUnreadable, is_encrypted, unreadable_credential_message
 from ...core.server_defaults import env_int
-from ..hypervisor import Hypervisor
+from ..hypervisor import Hypervisor, QuiesceFailedError
 from .vcenter_disk_types import (
     VddkDiskType,
     classify_vmware_disk_eager_zeroed,
@@ -195,6 +195,7 @@ def _fault_message(error: Any) -> str:
         or getattr(error, "msg", None)
         or error
     )
+
 
 
 class VCenterNode(Hypervisor):
@@ -644,13 +645,13 @@ class VCenterNode(Hypervisor):
         except Exception:
             return None
 
-    def create_backup_snapshot(self, vm_name: str) -> str:
+    def create_backup_snapshot(self, vm_name: str, *, quiesce: bool = True) -> str:
         vm = self._get_vm(vm_name)
         if not vm:
             raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
 
         try:
-            return self._create_snapshot(vm, vm_name)
+            return self._create_snapshot(vm, vm_name, quiesce=quiesce)
         except RuntimeError as exc:
             if self._CBT_CORRUPTION_FAULT not in str(exc):
                 raise
@@ -662,7 +663,7 @@ class VCenterNode(Hypervisor):
             )
             self._reset_change_tracking(vm, vm_name)
             try:
-                return self._create_snapshot(vm, vm_name)
+                return self._create_snapshot(vm, vm_name, quiesce=quiesce)
             except RuntimeError as retry_exc:
                 if self._CBT_CORRUPTION_FAULT not in str(retry_exc):
                     raise
@@ -674,19 +675,64 @@ class VCenterNode(Hypervisor):
                     f"backups can succeed again. Original error: {retry_exc}"
                 ) from retry_exc
 
-    def _create_snapshot(self, vm: Any, vm_name: str) -> str:
+    def _create_snapshot(self, vm: Any, vm_name: str, *, quiesce: bool = True) -> str:
         snapshot_name = f"FullBackup_{int(time.time())}"
-        logger.info("Creating snapshot '%s' for VM '%s'...", snapshot_name, vm_name)
+        logger.info(
+            "Creating %s snapshot '%s' for VM '%s'...",
+            "quiesced" if quiesce else "non-quiesced",
+            snapshot_name,
+            vm_name,
+        )
 
         task = vm.CreateSnapshot_Task(
             name=snapshot_name,
             description="Snapshot for full backup.",
             memory=False,
-            quiesce=True,
+            quiesce=quiesce,
         )
-        self._wait_for_task(task)
+        try:
+            self._wait_for_task(task)
+        except RuntimeError as exc:
+            info = getattr(task, "info", None)
+            if quiesce and isinstance(getattr(info, "error", None), vim.fault.ApplicationQuiesceFault):
+                raise QuiesceFailedError(vm_name, self._quiesce_failure_reason(vm, getattr(info, "startTime", None))) from exc
+            raise
         logger.info("Snapshot '%s' created.", snapshot_name)
         return snapshot_name
+
+    def _quiesce_failure_reason(self, vm: Any, since: Any) -> str | None:
+        deadline = time.monotonic() + env_int("BACKUPSERVER_QUIESCE_REASON_WAIT_SECONDS")
+        while True:
+            try:
+                spec = vim.event.EventFilterSpec(
+                    entity=vim.event.EventFilterSpec.ByEntity(entity=vm, recursion="self"),
+                    time=vim.event.EventFilterSpec.ByTime(beginTime=since) if since else None,
+                    type=[vim.event.VmMessageEvent, vim.event.VmMessageWarningEvent, vim.event.VmMessageErrorEvent],
+                )
+                events = list(self.si.RetrieveContent().eventManager.QueryEvents(spec) or [])
+            except Exception:
+                logger.debug("Could not read the events that explain a failed quiesce", exc_info=True)
+                return None
+            for event in sorted(events, key=lambda item: getattr(item, "key", 0), reverse=True):
+                message = " ".join(str(getattr(event, "message", "") or "").split())
+                if "quiesc" in message.lower():
+                    return message
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(1)
+
+    def snapshot_consistency(self, vm_name: str, snapshot_name: str) -> dict[str, str | None]:
+        vm = self._get_vm(vm_name)
+        if not vm:
+            raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
+        tools_status = str(getattr(getattr(vm, "guest", None), "toolsStatus", "") or "") or None
+        node = self._find_snapshot(vm.snapshot.rootSnapshotList if vm.snapshot else [], snapshot_name)
+        if node is None:
+            return {"consistency": None, "tools_status": tools_status}
+        return {
+            "consistency": "quiesced" if bool(getattr(node, "quiesced", False)) else "crash_consistent",
+            "tools_status": tools_status,
+        }
 
     def _reset_change_tracking(self, vm: Any, vm_name: str) -> None:
         """Recover from a corrupted CBT state without powering off the VM.

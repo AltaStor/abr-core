@@ -391,6 +391,8 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
         "compression_ratio": resolve_compression_ratio(result),
         "compression_level": _resolve_compression_level(result),
         "encryption_enabled": bool(result.get("encryption_enabled")),
+        "consistency": result.get("consistency"),
+        "consistency_reason": result.get("consistency_reason"),
         "encryption_key": point_encryption_key,
         "encryption_key_id": _resolve_point_encryption_key_id(normalized_job, point_encryption_key),
         "execution_type": execution_type,

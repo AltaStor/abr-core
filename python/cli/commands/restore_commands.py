@@ -165,6 +165,7 @@ class RestoreCommands:
             ("repository_name", "REPOSITORY"),
             ("created_at", "CREATED"),
             ("point_type", "TYPE"),
+            ("consistency", "CONSISTENCY"),
             ("status", "STATUS"),
         ]
 
