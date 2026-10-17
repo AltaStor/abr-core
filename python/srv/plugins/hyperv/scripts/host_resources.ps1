@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # What a restore can use on this node: where VM files can go (volumes with a
 # drive letter, Cluster Shared Volumes) and how much room each has, the
 # virtual switches adapters can connect to, and the VMs already here.

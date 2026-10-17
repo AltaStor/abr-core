@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 $cluster = ''
 if (Get-Command Get-Cluster -ErrorAction SilentlyContinue) {
     try { $cluster = [string](Get-Cluster -ErrorAction SilentlyContinue).Name } catch { }

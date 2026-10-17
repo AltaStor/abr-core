@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 $local = @(Get-Volume -ErrorAction SilentlyContinue |
     ? { $_.DriveLetter -and $_.DriveType -eq 'Fixed' } | % {
     [pscustomobject]@{

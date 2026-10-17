@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # Point each drive at another file; report what it pointed at before, so the
 # caller can put it back.
 $vm = Get-AbrVm $AbrArgs.vm_id

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # Turns the backup's recovery checkpoint into a reference point: Hyper-V merges
 # the checkpoint back into the VM's disks and keeps the resilient change
 # tracking position it marked, which the next incremental backup reads from.

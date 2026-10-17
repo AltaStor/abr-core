@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # Checks a staged host bundle and moves it into place under its SHA-256 name.
 # A complete bundle already there (another run put it there first) is kept and
 # the staging folder dropped; an incomplete one is replaced.

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # Whether a host bundle folder holds every expected file with its SHA-256.
 $folder = [string]$AbrArgs.folder
 $mismatched = @()

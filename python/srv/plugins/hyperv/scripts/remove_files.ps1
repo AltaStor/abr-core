@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 $failed = @()
 foreach ($path in @($AbrArgs.paths)) {
     if (-not $path) { continue }

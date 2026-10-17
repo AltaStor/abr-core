@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # Runs abr-vhdx-tool on this host. Everything that varies arrives as a
 # parameter, never in the script text, so that S3 credentials and encryption
 # keys stay out of PowerShell's script block logging. The S3 keys reach the

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # A recovery checkpoint (snapshot type 32768) is the one Hyper-V makes for
 # backup applications: it freezes the disks like any checkpoint, can be turned
 # into an RCT reference point afterwards, and stays out of the user's

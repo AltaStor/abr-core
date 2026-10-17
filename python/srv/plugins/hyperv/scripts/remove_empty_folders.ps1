@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 $kept = @()
 foreach ($folder in @($AbrArgs.folders)) {
     if (-not $folder -or -not (Test-Path -LiteralPath $folder -PathType Container)) { continue }

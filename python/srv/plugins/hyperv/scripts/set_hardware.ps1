@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # Processor and memory back to what the backup recorded (the VM is off).
 $vm = Get-AbrVm $AbrArgs.vm_id
 if ([int]$AbrArgs.num_cpu -gt 0) { Set-VMProcessor -VM $vm -Count ([int64]$AbrArgs.num_cpu) }

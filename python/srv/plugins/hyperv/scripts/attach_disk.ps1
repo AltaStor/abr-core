@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 $vm = Get-AbrVm $AbrArgs.vm_id
 $type = [string]$AbrArgs.controller_type
 $number = [int]$AbrArgs.controller_number

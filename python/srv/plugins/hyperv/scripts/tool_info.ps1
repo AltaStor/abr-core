@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # Whether abr-vhdx-tool is installed at the given path, and which build it is.
 $path = [string]$AbrArgs.path
 $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # Everything a restore needs to build the VM again: hardware, firmware,
 # network and disk layout. The disks' content is in the backup itself.
 $vm = Get-AbrVm $AbrArgs.vm_id

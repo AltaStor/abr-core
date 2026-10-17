@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # A VM with the hardware the backup recorded and no disks yet; the restore
 # attaches them next. Anything that fails part way removes the VM again.
 $memory = [int64]$AbrArgs.memory_mb * 1MB

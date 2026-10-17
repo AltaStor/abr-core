@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Norvitex OU
+
 # Boot from the disk the VM booted from at backup time.
 $vm = Get-AbrVm $AbrArgs.vm_id
 if ($vm.Generation -ge 2) {
