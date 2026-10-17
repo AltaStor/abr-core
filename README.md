@@ -7,7 +7,7 @@ The Python core of AltaStor Backup & Replication: the BackupServer API and the
 - `doc` - documentation
 - `python/srv` - BackupServer API service
 - `python/cli` - `abr` command-line client
-- `python/tests` - test suite
+- `python/tests` - test suite: `srv/` (server, by area: `api`, `backup`, `hyperv`, `s3`, `vcenter`, ...) and `cli/`; `manual/` holds scripts run by hand against a live server
 - `scripts` - shell scripts for the local development environment
 
 ## Quick start
@@ -74,6 +74,12 @@ there each host must have the tool installed already, at
 
 ```bash
 .venv/bin/python -m unittest discover -s python/tests -t . -p 'test_*.py'
+```
+
+One area only, for example the S3 tests:
+
+```bash
+.venv/bin/python -m unittest discover -s python/tests/srv/s3 -t . -p 'test_*.py'
 ```
 
 The suite is self-contained: it mocks the data mover and runs without MongoDB,
