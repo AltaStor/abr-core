@@ -24,6 +24,12 @@ class _Catalog(unittest.TestCase):
             store.clear()
             self.addCleanup(store.clear)
         REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Repo One", "type": "local", "path": "/tmp/repo-1"}
+        for patcher in (
+            patch.object(abr_v41, "assert_inventory_registrable", return_value={"identity": {}}),
+            patch.object(abr_v41, "AUTO_DISCOVER_ON_INVENTORY_ADD", False),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     @staticmethod
     def _forget_job() -> None:

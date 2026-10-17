@@ -6,6 +6,9 @@ from __future__ import annotations
 import io
 import threading
 import unittest
+from unittest.mock import patch
+
+from python.srv.services.discovery import generate_inventory_discovery
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 
@@ -54,6 +57,22 @@ class CliHelpContractTests(unittest.TestCase):
 
 class InventoryDiscoveryAndJobStartEngineTests(unittest.TestCase):
     def setUp(self) -> None:
+        registrable = patch(
+            "python.srv.services.abr_v41.assert_inventory_registrable", return_value=None
+        )
+        registrable.start()
+        self.addCleanup(registrable.stop)
+        discovery = patch(
+            "python.srv.services.inventory_management.HyperVInventoryProvider.rescan",
+            autospec=True,
+            side_effect=lambda _self, record: generate_inventory_discovery(
+                inventory_type="hyper-v",
+                hypervisor_id=str(record["id"]),
+                hypervisor_name=str(record["name"]),
+            ),
+        )
+        discovery.start()
+        self.addCleanup(discovery.stop)
         BACKUPS.clear()
         HYPERVISORS.clear()
         JOBS.clear()

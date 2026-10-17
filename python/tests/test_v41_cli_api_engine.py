@@ -1434,7 +1434,11 @@ class AbrV41EngineTests(unittest.TestCase):
 
         self.assertEqual(HYPERVISORS[inventory["id"]]["status"], "unknown")
 
-        result = abr_v41.test_inventory(inventory["id"])
+        with patch(
+            "python.srv.services.inventory_management.HyperVInventoryProvider.test_connection",
+            return_value=None,
+        ):
+            result = abr_v41.test_inventory(inventory["id"])
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(HYPERVISORS[inventory["id"]]["status"], "available")
@@ -2966,6 +2970,61 @@ class AbrV41EngineTests(unittest.TestCase):
                 )
 
         self.assertEqual(ctx.exception.code, "datastore_not_found")
+
+    def test_restore_start_names_a_target_host_that_did_not_answer_the_last_scan(self) -> None:
+        inventory = abr_v41.create_inventory_record(
+            {
+                "name": "vc-unavailable-host",
+                "type": "vsphere",
+                "address": "192.168.12.38",
+                "username": "root",
+                "password": "secret",
+            }
+        )
+        RESOURCES_BY_HV[inventory["id"]][("host", "node-02")] = {
+            "resource_type": "host",
+            "external_id": "node-02",
+            "name": "node-02",
+            "payload": {"datastores": ["tstds"], "status": "unavailable"},
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = f"{tmpdir}/manifest.json"
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump({"vm_name": "tstvm", "vm_external_id": "vm-1", "vm_config": {"name": "tstvm"}, "disks": [{"disk_label": "Hard disk 1", "capacity_gb": 40, "datastore_path": "[tstds] tstvm/tstvm.vmdk"}]}, handle)
+            BACKUPS["p-host"] = abr_v41.normalize_backup_point(
+                {
+                    "id": "p-host",
+                    "chain_id": "backup-host",
+                    "vm_id": "vm-1",
+                    "vm_name": "tstvm",
+                    "inventory_id": inventory["id"],
+                    "inventory_name": inventory["name"],
+                    "repository_id": "repo-1",
+                    "repository_name": "Repo",
+                    "execution_type": "ActiveFull",
+                    "status": "available",
+                    "artifact": {"manifest_path": manifest_path, "backup_root": tmpdir},
+                    "placements": [{"repository_id": "repo-1", "repository_name": "Repo", "manifest_path": manifest_path, "backup_root": tmpdir}],
+                }
+            )
+
+            with self.assertRaises(ApiError) as ctx:
+                abr_v41.restore_start(
+                    {
+                        "restore_point_id": "p-host",
+                        "target": {
+                            "inventory_id": inventory["id"],
+                            "host_id": "node-02",
+                            "datastore_id": f"{inventory['id']}::datastore::tstds",
+                            "vm_name": "restoredtstvm",
+                        },
+                    }
+                )
+
+        self.assertEqual(ctx.exception.code, "host_unavailable")
+        self.assertIn("Target host node-02 is unavailable", ctx.exception.message)
 
     def test_restore_start_rejects_unknown_target_network_id(self) -> None:
         inventory = abr_v41.create_inventory_record(

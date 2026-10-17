@@ -8,7 +8,7 @@ import sys
 from typing import Any
 
 from ..compact_help_formatter import CompactHelpFormatter
-from ..exit_codes import INVALID_STATE, VALIDATION_FAILED
+from ..exit_codes import GENERAL_ERROR, INVALID_STATE, VALIDATION_FAILED
 from ..parsing.common_arguments import add_name_or_id_selector
 from ..parsing.secret_arguments import ENCRYPTION_KEY_ENV_VAR, add_secret_argument
 from ..parsing.validators import (
@@ -204,6 +204,29 @@ class JobCommands:
         )
         start.set_defaults(handler=self.start)
 
+        retention = commands.add_parser(
+            "retention",
+            help="Apply the job's retention policy now, or preview what it removes.",
+            description=(
+                "Apply the job's retention policy to every backup chain the job wrote, now.\n\n"
+                "Retention also runs after each backup; this covers all chains at once. A whole\n"
+                "full-plus-incrementals segment goes only when all of it has expired and no point in\n"
+                "it is kept by GFS, so what stays always restores. Points still under S3 Object Lock\n"
+                "are kept and reported as held. Chains with a backup running are skipped.\n\n"
+                "Examples:\n"
+                '  abr job retention --name "Job-SQL-Server" --dry-run\n'
+                '  abr job retention --name "Job-SQL-Server"'
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        add_name_or_id_selector(retention, name_help="Job name", id_help="Job ID")
+        retention.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Show what retention would remove without removing anything",
+        )
+        retention.set_defaults(handler=self.retention)
+
         delete = commands.add_parser(
             "delete",
             help="Delete a job.",
@@ -281,6 +304,15 @@ class JobCommands:
                 "--encryption-key",
                 env_var=ENCRYPTION_KEY_ENV_VAR,
                 help_text="Encryption key/passphrase, used together with --set-encryption",
+            )
+            parser.add_argument(
+                "--guest-consistency",
+                choices=("application", "crash"),
+                help=(
+                    "Hyper-V only: recovery checkpoint consistency. application quiesces a running guest "
+                    "through VSS and falls back to crash-consistent when it cannot (default); crash never "
+                    "involves the guest"
+                ),
             )
         if include_policy_flags:
             parser.add_argument("--gfs-weekly", type=int, default=gfs_default, help="Weekly GFS count")
@@ -489,6 +521,80 @@ class JobCommands:
         if len(matches) > 1:
             raise ValueError(f"Multiple repositories matched name: {name}")
         return str(matches[0]["id"])
+
+    @staticmethod
+    def _retention_columns(dry_run: bool) -> list[tuple[str, str]]:
+        return [
+            ("vm", "VM"),
+            ("repository", "REPOSITORY"),
+            ("points", "POINTS"),
+            ("removed", "WOULD REMOVE" if dry_run else "REMOVED"),
+            ("held", "HELD"),
+            ("failed", "FAILED"),
+            ("note", "NOTE"),
+        ]
+
+    @staticmethod
+    def _retention_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = []
+        for chain in result.get("chains") or []:
+            held = chain.get("held") or []
+            notes = []
+            if chain.get("skipped_reason"):
+                notes.append(f"skipped: {chain['skipped_reason']}")
+            if held:
+                last = max(str(item.get("until") or "") for item in held)
+                notes.append(f"Object Lock until {last}")
+            if chain.get("failed"):
+                notes.append("could not remove " + ", ".join(chain["failed"]))
+            rows.append(
+                {
+                    "vm": chain.get("vm_name") or chain.get("vm_id"),
+                    "repository": chain.get("repository_name") or chain.get("repository_id") or "-",
+                    "points": chain.get("points"),
+                    "removed": len(chain.get("removed") or []),
+                    "held": len(held) + len(chain.get("kept_for_chain") or []),
+                    "failed": len(chain.get("failed") or []),
+                    "note": "; ".join(notes) or "-",
+                }
+            )
+        return rows
+
+    def retention(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        dry_run = bool(getattr(args, "dry_run", False))
+        result = deps.context.api_client.post(
+            f"api/v1/jobs/{self._resolve_id(deps, args)}/retention", json={"dry_run": dry_run}
+        )
+        summary = result.get("summary") if isinstance(result, dict) else {}
+        summary = summary if isinstance(summary, dict) else {}
+        if deps.context.output == "table":
+            gfs = result.get("gfs") if isinstance(result.get("gfs"), dict) else {}
+            gfs_text = ""
+            if gfs.get("enabled") and any(int(gfs.get(key) or 0) for key in ("weekly", "monthly", "yearly")):
+                gfs_text = (
+                    f", GFS {int(gfs.get('weekly') or 0)} weekly / {int(gfs.get('monthly') or 0)} monthly / "
+                    f"{int(gfs.get('yearly') or 0)} yearly"
+                )
+            verb = "would remove" if dry_run else "removed"
+            print(
+                f"Retention of job {result.get('job_name')}: keep {result.get('retention_days')} day(s){gfs_text}. "
+                f"{int(summary.get('removed') or 0)} of {int(summary.get('points') or 0)} restore point(s) {verb}"
+                + (", nothing changed (dry run)" if dry_run else "")
+                + ".",
+                file=sys.stderr,
+            )
+            deps.context.print_output({"items": self._retention_rows(result)}, self._retention_columns(dry_run))
+        else:
+            deps.context.print_output(result)
+        if int(summary.get("failed") or 0):
+            print(
+                f"Error: {int(summary.get('failed'))} expired restore point(s) could not be removed and are kept "
+                "for the next pass; see the server log for the storage error.",
+                file=sys.stderr,
+            )
+            return GENERAL_ERROR
+        return 0
 
     def start(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)

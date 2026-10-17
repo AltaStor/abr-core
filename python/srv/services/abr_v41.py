@@ -98,10 +98,13 @@ from python.srv.core.utils import utc_now
 from python.srv.services.inventory_management import (
     INVENTORY_KIND_BY_TYPE,
     EsxHostInClusterError,
+    HyperVAlreadyRegisteredError,
     InventoryProviderRegistry,
     apply_inventory_updates,
     InventoryUnreachableError,
+    assert_hyperv_identity_is_new,
     assert_inventory_registrable,
+    connection_fields_changed,
     creatable_inventory_types,
     default_port_for_type,
     extract_host,
@@ -229,6 +232,9 @@ EXECUTION_REASONS = (
     "ActiveOverridesSynthetic",
     "RepositorySyntheticUnsupportedEscalatedToActive",
     "StandardIncremental",
+    "EncryptionKeyChanged",
+    "IncrementalFallbackToFull",
+    "VmConfigurationChanged",
 )
 JOB_TYPES = ("backup", "backup-copy")
 TASK_TYPES = ("backup", "restore")
@@ -1067,6 +1073,8 @@ def normalize_inventory_record(record: dict[str, Any]) -> dict[str, Any]:
     item["created_at"] = str(item.get("created_at") or utc_now())
     item["updated_at"] = str(item.get("updated_at") or item["created_at"])
     item["last_scan_at"] = item.get("last_scan_at")
+    item["status_checked_at"] = item.get("status_checked_at")
+    item["status_error"] = item.get("status_error")
     item["discovery"] = {
         "last_scan_at": item.get("last_scan_at"),
         "last_scan_error": item.get("last_scan_error"),
@@ -1269,6 +1277,70 @@ def _resource_label(resource: dict[str, Any] | None, fallback: str | None = None
     return _nullable_str(resource.get("name") or resource.get("external_id")) or fallback
 
 
+def _inventory_is_hyperv(inventory_id: Any) -> bool:
+    record = HYPERVISORS.get(str(inventory_id or ""))
+    return isinstance(record, dict) and inventory_type_from_record(record) == "hyper-v"
+
+
+def _hyperv_vm_parts(
+    resources: list[dict[str, Any]],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    """A Hyper-V inventory's discovered disks and network adapters, by VM id."""
+    disks: dict[str, list[dict[str, Any]]] = {}
+    nics: dict[str, list[dict[str, Any]]] = {}
+    for resource in resources:
+        kind = str(resource.get("resource_type") or "")
+        if kind not in {"disk", "network_adapter"}:
+            continue
+        payload = _resource_payload(resource)
+        target = disks if kind == "disk" else nics
+        target.setdefault(str(payload.get("vm_id") or ""), []).append(
+            {"name": str(resource.get("name") or ""), **payload}
+        )
+    return disks, nics
+
+
+def _hyperv_vm_details(
+    payload: dict[str, Any], disks: list[dict[str, Any]], nics: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """What the console shows of a Hyper-V VM beyond the common fields: its
+    configuration, and each disk and adapter as backup and recovery see them."""
+    return {
+        "generation": _nullable_number(payload.get("generation")),
+        "configuration_version": _nullable_str(payload.get("version")),
+        "firmware": _nullable_str(payload.get("firmware")),
+        "checkpoint_count": int(payload.get("checkpoints") or 0),
+        "clustered": bool(payload.get("clustered")),
+        "owner_node": _nullable_str(payload.get("host_name")),
+        "config_path": _nullable_str(payload.get("config_path")),
+        "disks": sorted(
+            (
+                {
+                    "name": disk["name"],
+                    "controller": _nullable_str(disk.get("controller")),
+                    "path": _nullable_str(disk.get("datastore_path")),
+                    "format": _nullable_str(disk.get("source_disk_type_code")),
+                    "type": _nullable_str(disk.get("source_disk_type_name")),
+                    "capacity_bytes": _capacity_bytes_from_disk_entry(disk),
+                    "file_bytes": _nullable_number(disk.get("file_bytes")),
+                    "has_parent": bool(disk.get("parent_path")),
+                }
+                for disk in disks
+            ),
+            key=lambda disk: str(disk["controller"] or disk["name"]),
+        ),
+        "network_adapters": [
+            {
+                "name": nic["name"],
+                "switch": _nullable_str(nic.get("network")),
+                "mac": _nullable_str(nic.get("mac")),
+                "connected": bool(nic.get("connected")),
+            }
+            for nic in nics
+        ],
+    }
+
+
 def list_inventory_vm_tree() -> list[dict[str, Any]]:
     root = {"children": [], "_child_index": {}}
     inventories = list_inventory_records()
@@ -1290,7 +1362,7 @@ def list_inventory_vm_tree() -> list[dict[str, Any]]:
             if str(resource.get("resource_type") or "") == "host"
         }
         hosts_by_name = {
-            str(resource.get("name") or ""): resource
+            str(resource.get("name") or "").lower(): resource
             for resource in hosts.values()
             if str(resource.get("name") or "")
         }
@@ -1311,6 +1383,7 @@ def list_inventory_vm_tree() -> list[dict[str, Any]]:
             if capacity is None:
                 continue
             disk_capacity_by_vm[disk_vm_id] = disk_capacity_by_vm.get(disk_vm_id, 0) + capacity
+        hyperv_parts = _hyperv_vm_parts(resources) if _inventory_is_hyperv(inventory_id) else None
 
         inventory_node = _ensure_inventory_vm_tree_child(
             root,
@@ -1339,7 +1412,7 @@ def list_inventory_vm_tree() -> list[dict[str, Any]]:
 
             host_id = _nullable_str(payload.get("host_external_id") or payload.get("host_id"))
             host_name = _nullable_str(payload.get("host_name") or payload.get("host"))
-            host_resource = (hosts.get(host_id or "") if host_id else None) or (hosts_by_name.get(host_name or "") if host_name else None)
+            host_resource = (hosts.get(host_id or "") if host_id else None) or (hosts_by_name.get(host_name.lower()) if host_name else None)
             if host_resource is None and host_id is None and host_name is None:
                 host_resource = single_host
             host_payload = _resource_payload(host_resource)
@@ -1440,6 +1513,8 @@ def list_inventory_vm_tree() -> list[dict[str, Any]]:
                 health=power_state,
                 disk_capacity_bytes=disk_capacity_by_vm.get(vm_id),
             )
+            if hyperv_parts is not None:
+                vm_node["hyperv"] = _hyperv_vm_details(payload, *(part.get(vm_id, []) for part in hyperv_parts))
             parent.setdefault("children", []).append(vm_node)
 
     nodes = [_finalize_inventory_vm_tree_node(node) for node in root["children"]]
@@ -1522,12 +1597,15 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
         "created_at": created_at,
         "updated_at": created_at,
         "last_scan_at": None,
+        "status_checked_at": None,
+        "status_error": None,
         "vm_count": 0,
         "host_count": 0,
         "cluster_count": 0,
         "metadata": {
             "host": address.split("/", 1)[0].split(":", 1)[0],
             "port": effective_port,
+            "port_explicit": port is not None,
             "verify_ssl": not insecure,
             "credentials": {
                 "username": username or None,
@@ -1537,7 +1615,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
         },
     }
     try:
-        assert_inventory_registrable(record)
+        proof = _proof_of_connection(assert_inventory_registrable(record))
     except EsxHostInClusterError as exc:
         raise api_error(
             409,
@@ -1554,6 +1632,16 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             port=effective_port,
             reason=exc.reason,
         ) from exc
+    try:
+        record = _apply_inventory_identity(record, proof.get("identity") or {})
+    except HyperVAlreadyRegisteredError as exc:
+        raise _already_registered_error(exc) from exc
+    if proof:
+        checked_at = utc_now()
+        record["status"] = "available"
+        record["status_checked_at"] = checked_at
+        record["status_error"] = None
+        record["updated_at"] = checked_at
     persist_hypervisor(record)
     RESOURCES_BY_HV.setdefault(record["id"], {})
     if AUTO_DISCOVER_ON_INVENTORY_ADD:
@@ -1562,6 +1650,70 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
         # `job create` still covers the case where this has not finished.
         schedule_inventory_discovery(record["id"])
     return normalize_inventory_record(record)
+
+
+def _proof_of_connection(result: Any) -> dict[str, Any]:
+    return result if isinstance(result, dict) else {}
+
+
+def _already_registered_error(exc: HyperVAlreadyRegisteredError) -> ApiError:
+    return api_error(
+        409,
+        "inventory_already_registered",
+        str(exc),
+        scope=exc.scope,
+        subject=exc.subject,
+        existing_id=exc.existing_id,
+        existing_name=exc.existing_name,
+    )
+
+
+def _record_inventory_identity(record: dict[str, Any], identity: Any) -> dict[str, Any]:
+    if not isinstance(identity, dict) or not identity:
+        return record
+    updated = dict(record)
+    metadata = dict(updated.get("metadata") if isinstance(updated.get("metadata"), dict) else {})
+    metadata["cluster_name"] = str(identity.get("cluster") or "") or None
+    metadata["computer_name"] = str(identity.get("computer") or "") or None
+    updated["metadata"] = metadata
+    return updated
+
+
+def _apply_inventory_identity(record: dict[str, Any], identity: Any) -> dict[str, Any]:
+    if not isinstance(identity, dict) or not identity:
+        return record
+    assert_hyperv_identity_is_new(record, identity)
+    return _record_inventory_identity(record, identity)
+
+
+def _recheck_inventory_connection(record: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(record)
+    checked_at = utc_now()
+    try:
+        proof = _proof_of_connection(assert_inventory_registrable(updated))
+    except (EsxHostInClusterError, InventoryUnreachableError) as exc:
+        updated["status"] = "unavailable"
+        updated["status_error"] = str(exc)
+        updated["status_checked_at"] = checked_at
+        updated["updated_at"] = checked_at
+        return updated
+    except Exception as exc:
+        LOGGER.warning(
+            "Could not re-check inventory %s after an edit: %s", record.get("id"), exc
+        )
+        updated["status"] = "unavailable"
+        updated["status_error"] = str(exc)
+        updated["status_checked_at"] = checked_at
+        updated["updated_at"] = checked_at
+        return updated
+    if not proof:
+        return updated
+    updated = _apply_inventory_identity(updated, proof.get("identity") or {})
+    updated["status"] = "available"
+    updated["status_error"] = None
+    updated["status_checked_at"] = checked_at
+    updated["updated_at"] = checked_at
+    return updated
 
 
 def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1589,6 +1741,11 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
             _ensure_ascii_name(new_name, field="Inventory name", code="invalid_inventory")
         normalized = apply_inventory_updates(normalized, updates)
     _ensure(any(key in payload for key in ("name", "address", "port", "username", "password", "description", "token", "insecure")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
+    if connection_fields_changed(payload):
+        try:
+            normalized = _recheck_inventory_connection(normalized)
+        except HyperVAlreadyRegisteredError as exc:
+            raise _already_registered_error(exc) from exc
     persist_hypervisor(normalized)
     return normalize_inventory_record(normalized)
 
@@ -1596,10 +1753,19 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
 def test_inventory(record_id: str) -> dict[str, Any]:
     record = _inventory_record_for_update(record_id)
     provider = InventoryProviderRegistry.resolve(record)
+    checked_at = utc_now()
     try:
-        provider.test_connection(record)
+        identity = provider.test_connection(record)
     except EsxHostInClusterError as exc:
-        update_hypervisor_fields(record["id"], {"status": "unavailable", "updated_at": utc_now()})
+        update_hypervisor_fields(
+            record["id"],
+            {
+                "status": "unavailable",
+                "status_error": str(exc),
+                "status_checked_at": checked_at,
+                "updated_at": checked_at,
+            },
+        )
         return {
             "id": record["id"],
             "name": record.get("name"),
@@ -1611,7 +1777,15 @@ def test_inventory(record_id: str) -> dict[str, Any]:
             "error": str(exc),
         }
     except Exception as exc:
-        update_hypervisor_fields(record["id"], {"status": "unavailable", "updated_at": utc_now()})
+        update_hypervisor_fields(
+            record["id"],
+            {
+                "status": "unavailable",
+                "status_error": str(exc),
+                "status_checked_at": checked_at,
+                "updated_at": checked_at,
+            },
+        )
         return {
             "id": record["id"],
             "name": record.get("name"),
@@ -1620,7 +1794,17 @@ def test_inventory(record_id: str) -> dict[str, Any]:
             "message": "Unable to connect to virtualization environment",
             "error": str(exc),
         }
-    update_hypervisor_fields(record["id"], {"status": "available", "updated_at": utc_now()})
+    learned = _record_inventory_identity(record, identity)
+    update_hypervisor_fields(
+        record["id"],
+        {
+            "status": "available",
+            "status_error": None,
+            "status_checked_at": checked_at,
+            "updated_at": checked_at,
+            "metadata": learned.get("metadata", record.get("metadata")),
+        },
+    )
     return {
         "id": record["id"],
         "name": record.get("name"),
@@ -1679,8 +1863,16 @@ def rescan_inventory(record_id: str) -> dict[str, Any]:
         # response -- a later GET (page reload, background auto-discovery
         # retry) still shows *why* the environment is unavailable instead of
         # just that it is. Cleared below on the next successful rescan.
+        failed_at = utc_now()
         update_hypervisor_fields(
-            record_id, {"status": "unavailable", "last_scan_error": str(exc), "updated_at": utc_now()}
+            record_id,
+            {
+                "status": "unavailable",
+                "last_scan_error": str(exc),
+                "status_error": str(exc),
+                "status_checked_at": failed_at,
+                "updated_at": failed_at,
+            },
         )
         raise api_error(
             502,
@@ -1711,6 +1903,8 @@ def rescan_inventory(record_id: str) -> dict[str, Any]:
     updated["last_scan_at"] = discovered_at
     updated["updated_at"] = discovered_at
     updated["last_scan_error"] = None
+    updated["status_error"] = None
+    updated["status_checked_at"] = discovered_at
     update_hypervisor_fields(
         record_id,
         {
@@ -1719,6 +1913,8 @@ def rescan_inventory(record_id: str) -> dict[str, Any]:
             "last_scan_at": discovered_at,
             "updated_at": discovered_at,
             "last_scan_error": None,
+            "status_error": None,
+            "status_checked_at": discovered_at,
         },
     )
     return {
@@ -2182,6 +2378,24 @@ def resolve_repository(name: str | None = None, record_id: str | None = None) ->
     return normalize_repository_record(resolve_selector(catalog_records(REPOSITORIES), name=name, record_id=record_id, label="Repository"))
 
 
+def _ensure_local_repository_share(server: Any, share: Any, username: Any, password: Any) -> None:
+    """A local repository's server and share name the SMB share Hyper-V hosts
+    reach its folder by (abr-vhdx-tool writes there from the host); its
+    username and password are the account that opens it."""
+    _ensure(
+        bool(str(server or "").strip()) == bool(str(share or "").strip()),
+        422,
+        "invalid_repository",
+        "A local repository's SMB share for Hyper-V hosts needs both --server and --share",
+    )
+    _ensure(
+        not str(username or "").strip() or bool(str(password or "")),
+        422,
+        "invalid_repository",
+        "A local repository's SMB share account needs --password with --username",
+    )
+
+
 def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or "")
     repo_type = str(payload.get("type") or "").strip().lower()
@@ -2208,6 +2422,7 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
         _ensure(exists, 422, "invalid_repository", f"Path does not exist: {local_path}", path=path)
         _ensure(is_dir, 422, "invalid_repository", f"Path is not a directory: {local_path}", path=path)
         _reject_insecure_local_repository_path(local_path)
+        _ensure_local_repository_share(server, share, username, password)
     elif repo_type == "s3":
         s3_config = _normalize_s3_configuration(payload)
         if description and not s3_config.get("description"):
@@ -2353,6 +2568,16 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         _ensure(bool(str(updated.get("path") or "").strip()), 422, "invalid_repository", "local repositories require --path")
         if local_path is not None and local_path != original_path:
             _reject_insecure_local_repository_path(Path(local_path))
+        for field_name in ("server", "share"):
+            if field_name in payload and payload[field_name] is not None:
+                metadata[field_name] = str(payload[field_name]).strip() or None
+                changed = True
+        _ensure_local_repository_share(
+            metadata.get("server"),
+            metadata.get("share"),
+            payload.get("username", metadata.get("username")),
+            payload.get("password", metadata.get("password")),
+        )
     elif repo_type == "s3":
         current_s3 = extract_s3_config(updated)
         next_s3 = _normalize_s3_configuration(payload, existing=current_s3)
@@ -2947,6 +3172,24 @@ def _immutability_summary(immutability: dict[str, Any]) -> str:
 
 
 def validate_s3_immutability_config(config: dict[str, Any], *, write_probe: bool = True) -> dict[str, Any]:
+    """Check a bucket can hold backups under the configured Object Lock, and
+    log the outcome: every repository add, edit and verify comes through here."""
+    result = _validate_s3_immutability_config(config, write_probe=write_probe)
+    immutability = normalize_immutability_config(config.get("immutability"))
+    LOGGER.log(
+        logging.INFO if result.get("status") == "success" else logging.WARNING,
+        "Object Lock validation of S3 bucket %s (endpoint %s, %s, write probe %s): %s - %s",
+        config.get("bucket"),
+        config.get("endpoint_url") or "AWS",
+        _immutability_summary(immutability) if immutability_is_enabled(immutability) else "immutability off",
+        "on" if write_probe else "off",
+        result.get("status"),
+        result.get("message"),
+    )
+    return result
+
+
+def _validate_s3_immutability_config(config: dict[str, Any], *, write_probe: bool = True) -> dict[str, Any]:
     checks, error = _s3_format_checks(config)
     if error is not None:
         return {"status": "error", "checks": checks, "message": error}
@@ -3171,7 +3414,7 @@ def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:
     return f"for {span} (its full-backup cycle plus the longer of the job retention and the {configured} configured)"
 
 
-def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
+def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
     repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
     _assert_repository_supports_immutability(repository)
     config = normalize_immutability_config(extract_s3_config(repository).get("immutability"))
@@ -3245,6 +3488,21 @@ def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
     result["status"] = "success"
     result["message"] = (
         f"{len(updated)} restore point(s) are now held in {config['mode']} mode {period}, counted from now"
+    )
+    return result
+
+
+def apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
+    result = _apply_immutability_to_existing_backups(record_id)
+    LOGGER.log(
+        logging.INFO if result.get("status") == "success" else logging.WARNING,
+        "Object Lock applied to existing backups of repository %s: %s of %s restore point(s) updated, "
+        "%s refused - %s",
+        result.get("name") or record_id,
+        result.get("updated_restore_points"),
+        result.get("restore_point_count"),
+        result.get("failed_restore_points"),
+        result.get("message"),
     )
     return result
 
@@ -3770,8 +4028,24 @@ def _record_encryption_key(keys: list[dict[str, Any]], key: str) -> tuple[list[d
     return [*keys, {"key_id": next_id, "key": key}], next_id
 
 
+TASK_PARAMETER_CHOICES = {
+    "hyperv_consistency": ("application", "crash"),
+}
+
+
 def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] | None = None) -> dict[str, Any]:
     result = dict(params)
+    for key, allowed in TASK_PARAMETER_CHOICES.items():
+        if result.get(key) is None:
+            continue
+        value = str(result[key]).strip().lower()
+        _ensure(
+            value in allowed,
+            422,
+            "invalid_job",
+            f"task_parameters.{key} must be one of: {', '.join(allowed)}",
+        )
+        result[key] = value
     if "compression_level" in result and result["compression_level"] is not None:
         level = _whole_number(result["compression_level"])
         _ensure(
@@ -4921,6 +5195,7 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
     paths = []
     manifest_abr_paths: set[str] = set()
     all_removed = True
+    storage_refused = False
 
     for key in ("backup_root", "manifest_path"):
         value = artifact.get(key)
@@ -4959,6 +5234,7 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
                     )
                 else:
                     all_removed = False
+                    storage_refused = True
                     LOGGER.warning(
                         "Failed to delete remote backup artifact: point=%s path=%s name=%s",
                         point.get("id"),
@@ -4971,6 +5247,9 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
         if isinstance(destination_path, str) and destination_path:
             paths.append(Path(destination_path))
 
+    if storage_refused and is_s3_repository(repository):
+        return False
+
     for abr_path in manifest_abr_paths:
         try:
             remove_disk_tool_backup(repository, abr_path, "manifest", timeout=120)
@@ -4982,6 +5261,25 @@ def _delete_backup_artifacts_from_point(point: dict[str, Any]) -> bool:
                 exc_info=True,
             )
 
+    return _delete_local_point_paths(point, paths, storage_roots) and all_removed
+
+
+def _delete_local_point_cache(point: dict[str, Any]) -> bool:
+    artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+    repository = REPOSITORIES.get(str(point.get("repository_id") or ""))
+    paths = [
+        Path(value)
+        for value in (artifact.get("backup_root"), artifact.get("manifest_path"))
+        if isinstance(value, str) and value
+    ]
+    return _delete_local_point_paths(
+        point, paths, _repository_storage_roots(repository if isinstance(repository, dict) else None)
+    )
+
+
+def _delete_local_point_paths(point: dict[str, Any], paths: list[Path], storage_roots: Any) -> bool:
+    point_repository_id = str(point.get("repository_id") or "")
+    all_removed = True
     for candidate in sorted({path.resolve() for path in paths if path.exists()}, key=lambda item: len(str(item)), reverse=True):
         if not _path_is_within_repository(candidate, storage_roots, point_repository_id):
             all_removed = False
@@ -5210,10 +5508,15 @@ def _segment_points(points: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
 _RETENTION_LOCK_REPORTED: set[str] = set()
 
 
-def _point_object_lock(point: dict[str, Any]) -> str:
+def _point_object_lock(point: dict[str, Any], now: datetime) -> tuple[str, str] | None:
     repository = REPOSITORIES.get(str(point.get("repository_id") or ""))
     if not isinstance(repository, dict) or not is_s3_repository(repository):
-        return ""
+        return None
+    stored_expiry = str(point.get("immutability_expires_at") or "").strip()
+    try:
+        stored_until = _parse_dt(stored_expiry) if stored_expiry else None
+    except (TypeError, ValueError):
+        stored_until = None
     artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
     disk = next(
         (
@@ -5231,28 +5534,67 @@ def _point_object_lock(point: dict[str, Any]) -> str:
         else:
             days_left = int(info.get("retention_days") or 0) if isinstance(info, dict) else 0
             if isinstance(info, dict) and str(info.get("immutability") or "none") != "none" and days_left > 0:
-                return f"for {days_left} more day(s)"
-            return ""
-    stored_expiry = str(point.get("immutability_expires_at") or "").strip()
-    try:
-        if stored_expiry and _parse_dt(stored_expiry) > _now_utc():
-            return f"until {stored_expiry}"
-    except ValueError:
-        pass
-    return ""
+                if stored_until is not None and stored_until > now:
+                    return stored_expiry, f"for {days_left} more day(s)"
+                return (now + timedelta(days=days_left)).replace(microsecond=0).isoformat(), f"for {days_left} more day(s)"
+            return None
+    if stored_until is not None and stored_until > now:
+        return stored_expiry, f"until {stored_expiry}"
+    return None
 
 
-def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: str | None) -> list[dict[str, Any]]:
+def _new_retention_report(job: dict[str, Any], vm_id: str, repository_id: str | None) -> dict[str, Any]:
+    return {
+        "job_id": str(job.get("id") or ""),
+        "vm_id": vm_id,
+        "vm_name": None,
+        "repository_id": repository_id,
+        "points": 0,
+        "removed": [],
+        "held": [],
+        "failed": [],
+        "kept_for_chain": [],
+        "skipped_reason": None,
+    }
+
+
+def apply_retention_to_chain(
+    job: dict[str, Any],
+    *,
+    vm_id: str,
+    repository_id: str | None,
+    report: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> list[dict[str, Any]]:
+    """Remove the restore points of one chain that the job's retention lets go.
+
+    A segment (a full and the incrementals on it) only goes once every point in
+    it has expired and none is kept by GFS, newest point first, so what is left
+    always restores. A point whose data is still under Object Lock is not even
+    tried: it is reported as held, and so are the older points it depends on.
+
+    ``report``, when given, is filled with what happened (or, with
+    ``dry_run``, what would happen) point by point.
+    """
     failures: list[dict[str, Any]] = []
+    if report is None:
+        report = _new_retention_report(job, vm_id, repository_id)
     points = _points_for_job_vm_repo(str(job["id"]), vm_id, repository_id)
+    report["points"] = len(points)
     if not points:
         return failures
+    report["vm_name"] = points[-1].get("vm_name")
     _apply_gfs_marks(points, dict(job.get("gfs") or {}))
-    cutoff = _now_utc() - timedelta(days=int(job.get("retention_days") or 0))
+    now = _now_utc()
+    cutoff = now - timedelta(days=int(job.get("retention_days") or 0))
     retention_dates = _retention_dates(points)
 
     def expired(point: dict[str, Any]) -> bool:
         return retention_dates[str(point.get("id") or "")] < cutoff
+
+    def keep(point: dict[str, Any]) -> None:
+        if not dry_run:
+            persist_backup(point)
 
     to_delete: list[dict[str, Any]] = []
     for segment in _segment_points(points):
@@ -5269,24 +5611,26 @@ def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: 
     to_delete = _keep_points_others_still_need(to_delete, points, job_id=str(job.get("id") or ""))
     if not to_delete:
         for point in points:
-            persist_backup(point)
+            keep(point)
         return failures
     delete_ids = {point["id"] for point in to_delete}
     for segment in _segment_points(points):
         segment_to_delete = [point for point in segment if point["id"] in delete_ids]
         if not segment_to_delete:
             for point in segment:
-                persist_backup(point)
+                keep(point)
             continue
 
         blocked = False
         for point in reversed(segment_to_delete):
+            point_id = str(point.get("id") or "")
             if blocked:
-                persist_backup(point)
+                report["kept_for_chain"].append(point_id)
+                keep(point)
                 continue
-            held = _point_object_lock(point)
+            held = _point_object_lock(point, now)
             if held:
-                point_id = str(point.get("id") or "")
+                until, remaining = held
                 if point_id not in _RETENTION_LOCK_REPORTED:
                     _RETENTION_LOCK_REPORTED.add(point_id)
                     LOGGER.info(
@@ -5294,14 +5638,19 @@ def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: 
                         "it is removed on the first pass after the lock expires",
                         point_id,
                         job.get("id"),
-                        held,
+                        remaining,
                     )
-                persist_backup(point)
+                report["held"].append({"point_id": point_id, "until": until})
+                keep(point)
                 blocked = True
+                continue
+            if dry_run:
+                report["removed"].append(point_id)
                 continue
             if _delete_backup_artifacts_from_point(point):
                 delete_backup(point["id"])
-                _RETENTION_LOCK_REPORTED.discard(str(point.get("id") or ""))
+                _RETENTION_LOCK_REPORTED.discard(point_id)
+                report["removed"].append(point_id)
             else:
                 LOGGER.error(
                     "Retention failed to delete backup artifacts; keeping catalog entry for retry: "
@@ -5313,18 +5662,91 @@ def apply_retention_to_chain(job: dict[str, Any], *, vm_id: str, repository_id: 
                 )
                 failures.append(
                     {
-                        "point_id": str(point.get("id") or ""),
+                        "point_id": point_id,
                         "job_id": str(job.get("id") or ""),
                         "vm_id": vm_id,
                         "repository_id": repository_id,
                     }
                 )
-                persist_backup(point)
+                report["failed"].append(point_id)
+                keep(point)
                 blocked = True
         for point in segment:
             if point["id"] not in delete_ids:
-                persist_backup(point)
+                keep(point)
+    LOGGER.info(
+        "Retention%s for job %s, %s VM %s (%s) in repository %s: %d restore point(s), %s %d, "
+        "held by Object Lock %d, kept for their chain %d, failed %d",
+        " preview" if dry_run else "",
+        job.get("id"),
+        str(points[-1].get("hypervisor_kind") or "unknown") if points else "unknown",
+        report.get("vm_name") or vm_id,
+        vm_id,
+        repository_id,
+        len(points),
+        "would remove" if dry_run else "removed",
+        len(report["removed"]),
+        len(report["held"]),
+        len(report["kept_for_chain"]),
+        len(report["failed"]),
+    )
     return failures
+
+
+def _job_chains(job_id: str) -> list[tuple[str, str | None]]:
+    chains: dict[tuple[str, str | None], None] = {}
+    for point in normalized_backup_points():
+        if str(point.get("job_id") or "") != job_id:
+            continue
+        chains[(str(point.get("vm_id") or ""), point.get("repository_id") or None)] = None
+    return list(chains)
+
+
+def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
+    """Apply (or preview) a backup job's retention to every chain it wrote.
+
+    Retention also runs after each backup, for that backup's own chain; this
+    covers all of them at once, including VMs that have since left the job.
+    A chain with a backup of the same VM in flight is skipped, so that the
+    point the running backup chains onto cannot go from under it.
+    """
+    job = resolve_job(record_id=job_id)
+    _ensure(job.get("job_type") == "backup", 422, "invalid_job", "Retention applies to backup jobs")
+    busy_vms = {
+        str(task.get("resource_external_id") or "")
+        for task in catalog_records(TASKS)
+        if str(task.get("job_id") or "") == str(job["id"])
+        and _session_state(task) in {"queued", "running", "stopping"}
+    }
+    chains = []
+    for vm_id, repository_id in _job_chains(str(job["id"])):
+        report = _new_retention_report(job, vm_id, repository_id)
+        if vm_id in busy_vms:
+            report["skipped_reason"] = "a backup of this VM is running"
+            report["points"] = len(_points_for_job_vm_repo(str(job["id"]), vm_id, repository_id))
+        else:
+            apply_retention_to_chain(job, vm_id=vm_id, repository_id=repository_id, report=report, dry_run=dry_run)
+        report["repository_name"] = _repository_name_for(str(repository_id or "")) if repository_id else None
+        report["kept"] = report["points"] - len(report["removed"])
+        chains.append(report)
+    summary = {
+        "chains": len(chains),
+        "points": sum(item["points"] for item in chains),
+        "removed": sum(len(item["removed"]) for item in chains),
+        "held": sum(len(item["held"]) for item in chains),
+        "failed": sum(len(item["failed"]) for item in chains),
+        "skipped": sum(1 for item in chains if item["skipped_reason"]),
+    }
+    return {
+        "job_id": str(job["id"]),
+        "job_name": str(job.get("name") or ""),
+        "dry_run": bool(dry_run),
+        "retention_days": int(job.get("retention_days") or 0),
+        "gfs": dict(job.get("gfs") or {}),
+        "summary": summary,
+        "chains": chains,
+        "ran_at": utc_now(),
+    }
 
 
 def _append_task_log(task: dict[str, Any], *, level: str, message: str, component: str = "engine", **extra: Any) -> None:
@@ -5652,6 +6074,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "execution_reason": point.get("execution_reason"),
             "gfs_marks": point.get("gfs_marks"),
             "gfs_protected": point.get("gfs_protected"),
+            "immutability_expires_at": point.get("immutability_expires_at"),
             "parent_point_id": point.get("parent_point_id"),
             "status": point.get("status"),
             "vm_id": point.get("vm_id"),
@@ -6521,33 +6944,51 @@ def delete_backup_chain(
         if progress_callback is not None:
             progress_callback({"progress": progress, "message": message})
 
+    kept_for_chain: list[str] = []
     total_points = len(points)
     _emit(0, f"Deleting {total_points} restore point(s)")
-    for position, point in enumerate(points, start=1):
-        _emit(
-            int((position - 1) * 100 / total_points) if total_points else 100,
-            f"Deleting restore point {position}/{total_points}",
-        )
-        if _delete_backup_artifacts_from_point(point):
-            delete_backup(point["id"])
-            continue
-        artifacts_removed = False
-        if _point_repository_holds_immutable_backups(point):
-            LOGGER.error(
-                "Object Lock refused the deletion of backup artifacts; keeping catalog entry for retry: "
-                "point=%s repository=%s",
-                point.get("id"),
-                point.get("repository_id"),
+    position = 0
+    for segment in _segment_points(points):
+        held_point_id: str | None = None
+        for point in reversed(segment):
+            position += 1
+            _emit(
+                int((position - 1) * 100 / total_points) if total_points else 100,
+                f"Deleting restore point {position}/{total_points}",
             )
-            retained_points.append(str(point.get("id") or ""))
-            continue
-        delete_backup(point["id"])
+            point_id = str(point.get("id") or "")
+            if held_point_id is not None:
+                LOGGER.info(
+                    "Keeping restore point %s: restore point %s, which needs it to restore, is still held "
+                    "under Object Lock",
+                    point_id,
+                    held_point_id,
+                )
+                kept_for_chain.append(point_id)
+                continue
+            if _delete_backup_artifacts_from_point(point):
+                delete_backup(point["id"])
+                continue
+            artifacts_removed = False
+            if _point_repository_holds_immutable_backups(point):
+                LOGGER.error(
+                    "Object Lock refused the deletion of backup artifacts; keeping catalog entry for retry: "
+                    "point=%s repository=%s",
+                    point.get("id"),
+                    point.get("repository_id"),
+                )
+                retained_points.append(point_id)
+                held_point_id = point_id
+                continue
+            _delete_local_point_cache(point)
+            delete_backup(point["id"])
 
-    _emit(100, f"Deleted {total_points - len(retained_points)} of {total_points} restore point(s)")
+    kept_points = len(retained_points) + len(kept_for_chain)
+    _emit(100, f"Deleted {total_points - kept_points} of {total_points} restore point(s)")
     immutable_points = len(retained_points)
     result = {
         "id": backup_id,
-        "deleted": not retained_points,
+        "deleted": not kept_points,
         "restore_point_count": len(points),
         "artifacts_removed": artifacts_removed,
     }
@@ -6559,11 +7000,18 @@ def delete_backup_chain(
         if immutable_points:
             result["immutable_restore_points"] = immutable_points
             result["retained_restore_point_ids"] = retained_points
+        if kept_for_chain:
+            result["kept_for_chain_restore_point_ids"] = kept_for_chain
         result["message"] = (
             (
                 f"{immutable_points} restore point(s) are still held under S3 Object Lock and the storage refused "
                 "to delete their data. They are kept in the catalog and retried once the lock expires, so nothing "
                 "is left untracked in the bucket."
+                + (
+                    f" {len(kept_for_chain)} older restore point(s) they need to restore are kept with them."
+                    if kept_for_chain
+                    else ""
+                )
             )
             if immutable_points
             else (
@@ -6857,6 +7305,7 @@ def restore_point_to_dto(point: dict[str, Any]) -> dict[str, Any]:
         "available": _restore_point_is_available(point),
         "gfs_marks": point.get("gfs_marks"),
         "skipped_disks": _restore_point_artifact(point).get("skipped_disks") or [],
+        "immutability_expires_at": point.get("immutability_expires_at"),
     }
 
 
@@ -6921,9 +7370,66 @@ def _capacity_bytes_from_disk_entry(disk: dict[str, Any]) -> int | None:
     return None
 
 
+_PLATFORM_LABELS = {"vsphere": "VMware", "hyper-v": "Hyper-V", "proxmox-ve": "Proxmox", "xcp-ng": "XCP-ng"}
+_POINT_KIND_TO_INVENTORY_TYPE = {"vcenter": "vsphere", "hyper-v": "hyper-v"}
+
+
+def _point_inventory_type(point: dict[str, Any]) -> str | None:
+    kind = str(point.get("hypervisor_kind") or "").strip().lower()
+    return _POINT_KIND_TO_INVENTORY_TYPE.get(kind)
+
+
+def _point_platform_label(point: dict[str, Any]) -> str:
+    return _PLATFORM_LABELS.get(_point_inventory_type(point) or "", "source platform")
+
+
+def _inventory_platform_label(inventory: dict[str, Any]) -> str:
+    return _PLATFORM_LABELS.get(inventory_type_from_record(inventory), str(inventory.get("type") or "another platform"))
+
+
+def _restore_target_kind_matches(point: dict[str, Any], inventory: dict[str, Any]) -> bool:
+    """A restore point goes back to the platform it came from: nothing here
+    converts a VM between hypervisors. Points of unknown origin (imported,
+    mock) keep the old behaviour and may go anywhere except Hyper-V, whose
+    restore needs a Hyper-V manifest."""
+    expected = _point_inventory_type(point)
+    actual = inventory_type_from_record(inventory)
+    if expected:
+        return actual == expected
+    return actual != "hyper-v"
+
+
+_CSV_PATH = re.compile(r"^([A-Za-z]:\\ClusterStorage\\[^\\]+)(?:\\(.*))?$", re.IGNORECASE)
+_DRIVE_PATH = re.compile(r"^([A-Za-z]:)(?:\\(.*))?$")
+_UNC_PATH = re.compile(r"^(\\\\[^\\]+\\[^\\]+)(?:\\(.*))?$")
+
+
+def _parse_windows_storage_path(raw: str) -> tuple[str | None, str | None, str | None]:
+    """A Hyper-V disk path as (datastore, folder, file name): the datastore is
+    the Cluster Shared Volume, drive or share the file lives on, which is
+    what Hyper-V hosts report as their storage."""
+    value = raw.replace("/", "\\")
+    for pattern in (_CSV_PATH, _UNC_PATH, _DRIVE_PATH):
+        match = pattern.match(value)
+        if not match:
+            continue
+        datastore = match.group(1)
+        if pattern is not _UNC_PATH:
+            datastore = datastore[0].upper() + datastore[1:]
+        rest = (match.group(2) or "").strip("\\")
+        if not rest:
+            return datastore, None, None
+        parts = rest.split("\\")
+        folder = "\\".join(parts[:-1]) or None
+        return datastore, folder, parts[-1] or None
+    return None, None, None
+
+
 def _parse_datastore_path_parts(datastore_path: str | None) -> tuple[str | None, str | None, str | None]:
     raw = str(datastore_path or "").strip()
-    if not raw.startswith("[") or "]" not in raw:
+    if not raw.startswith("["):
+        return _parse_windows_storage_path(raw) if raw else (None, None, None)
+    if "]" not in raw:
         return None, None, None
     datastore, relative_path = raw.split("]", 1)
     datastore_name = datastore[1:].strip() or None
@@ -7036,7 +7542,10 @@ def _source_network_fallbacks(manifest_vm_config: dict[str, Any], discovered_nic
                 "id": _source_nic_id(manifest_vm_config.get("instance_uuid") or manifest_vm_config.get("name"), index + 1, manifest_adapter, discovered),
                 "label": str(manifest_adapter.get("label") or (discovered or {}).get("name") or f"Network adapter {index + 1}"),
                 "source_network": str(manifest_adapter.get("network") or payload.get("network") or "").strip() or None,
-                "mac_address": str(manifest_adapter.get("mac_address") or payload.get("mac") or "").strip() or None,
+                "mac_address": str(
+                    manifest_adapter.get("mac_address") or manifest_adapter.get("mac") or payload.get("mac") or ""
+                ).strip()
+                or None,
                 "connected": bool(manifest_adapter.get("connected", payload.get("connected", True))),
             }
         )
@@ -7316,7 +7825,7 @@ def get_restore_context(restore_point_id: str) -> dict[str, Any]:
     point = _resolve_restore_source_point({"point_id": restore_point_id})
     manifest = _load_restore_manifest_record(point)
     source_vm = _build_restore_source_vm(point, manifest)
-    inventories = list_inventory_records()
+    inventories = [item for item in list_inventory_records() if _restore_target_kind_matches(point, item)]
     target_inventories = [
         {
             "id": str(item.get("id") or ""),
@@ -7480,6 +7989,15 @@ def get_restore_context(restore_point_id: str) -> dict[str, Any]:
 def _resolve_restore_target_datastore(inventory_id: str, datastore_identifier: str, *, host: dict[str, Any]) -> dict[str, Any]:
     identifier = str(datastore_identifier or "").strip()
     _ensure(bool(identifier), 422, "invalid_restore", "Restore target datastore is required")
+    host_payload = host.get("payload") if isinstance(host.get("payload"), dict) else {}
+    _ensure(
+        str(host_payload.get("status") or "").strip().lower() != "unavailable",
+        409,
+        "host_unavailable",
+        f"Target host {host.get('name')} is unavailable: it did not answer the last inventory scan. Pick another "
+        "host, or run abr inventory rescan once it is back",
+        host=host.get("name"),
+    )
     for datastore in _build_restore_target_datastores(inventory_id):
         datastore_id = str(datastore.get("id") or "")
         datastore_name = str(datastore.get("name") or "")
@@ -7502,9 +8020,11 @@ def _resolve_restore_target_datastore(inventory_id: str, datastore_identifier: s
     )
 
 
-_THIN_PROVISIONING_REQUESTS = {"thin", "thin-provisioned", "thin_provisioned", "vmfs_thin"}
+# Hyper-V's "dynamic" VHDX (and a differencing chain, restored as one dynamic
+# disk) grows with its data the way a thin VMDK does.
+_THIN_PROVISIONING_REQUESTS = {"thin", "thin-provisioned", "thin_provisioned", "vmfs_thin", "dynamic"}
 
-_THIN_SOURCE_DISK_TYPES = {"vmfs_thin", "vmfs_sparse", "monolithic_sparse", "split_sparse"}
+_THIN_SOURCE_DISK_TYPES = {"vmfs_thin", "vmfs_sparse", "monolithic_sparse", "split_sparse", "dynamic", "differencing"}
 
 _WHOLE_DISK_BACKUP_MODES = {"full", "incremental-full-fallback"}
 
@@ -8303,6 +8823,26 @@ def _create_backup_session(
         "logs": [],
     }
     _append_task_log(task, level="info", message=f"Queued backup session for {vm_name}", component="session")
+    _append_task_log(
+        task,
+        level="info",
+        message=(
+            f"Job {job.get('name')}: {execution_type} ({execution_reason}) of {vm_name} from inventory "
+            f"{job.get('inventory_name')} to repository {parameters.get('repository_name')}"
+        ),
+        component="session",
+    )
+    LOGGER.info(
+        "Backup session %s queued: job %s, VM %s (%s) of inventory %s, %s (%s), repository %s",
+        task["id"],
+        job.get("name"),
+        vm_name,
+        vm_id,
+        job.get("inventory_name"),
+        execution_type,
+        execution_reason,
+        parameters.get("repository_name"),
+    )
     persist_task(task)
     return session_to_dto(task)
 
@@ -8598,6 +9138,14 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         id_option="--target-inventory-id",
     )
     _ensure(
+        _restore_target_kind_matches(point, target_inventory),
+        422,
+        "restore_option_unsupported",
+        f"A {_point_platform_label(point)} restore point can only be restored to a {_point_platform_label(point)} "
+        f"inventory; '{target_inventory.get('name')}' is {_inventory_platform_label(target_inventory)}",
+        inventory_id=target_inventory.get("id"),
+    )
+    _ensure(
         str(target_inventory.get("status") or "unknown").strip().lower() != "unavailable",
         409,
         "target_inventory_unavailable",
@@ -8805,6 +9353,19 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         "logs": [],
     }
     _append_task_log(task, level="info", message=f"Queued restore session for restore point {point_id}", component="session")
+    mode_label = "In-place" if restore_mode == "in_place" else "Out-of-place"
+    placement_text = ", ".join(f"{source} -> {target}" for source, target in sorted((datastore_placement or {}).items()))
+    network_text = ", ".join(f"{source} -> {target}" for source, target in sorted((network_map or {}).items()))
+    restore_summary = (
+        f"{mode_label} recovery of {point.get('vm_name') or point.get('vm_id')} from restore point {point_id} "
+        f"({point.get('created_at')}, {_restore_point_type(point)}) to {target_vm_name} on "
+        f"{target_inventory['name']}/{resolved_target_host_name}, storage {target_datastore_name}"
+        + (f", datastore mapping {placement_text}" if placement_text and restore_mode != "in_place" else "")
+        + (f", network mapping {network_text}" if network_text and restore_mode != "in_place" else "")
+        + (", power on afterwards" if power_on else "")
+    )
+    _append_task_log(task, level="info", message=restore_summary, component="session")
+    LOGGER.info("Restore session %s queued: %s", task["id"], restore_summary)
     persist_task(task)
     session = session_to_dto(task)
     return {

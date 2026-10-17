@@ -43,9 +43,40 @@ All notable changes to this project are documented in this file.
   `--immutability-days` counted from each backup.
 - A job reports how its last run went across all of its VMs, and its soonest
   next run across all of its schedules.
+- `abr job retention [--dry-run]` and `POST /api/v1/jobs/{id}/retention`
+  apply (or preview) a job's retention across all of its chains and report,
+  per chain, what was removed, what Object Lock still holds and what could not
+  be removed.
+- Hyper-V backup and recovery: full and incremental (resilient change
+  tracking) backups of Hyper-V VMs, standalone or clustered, from
+  application-consistent recovery checkpoints with a crash-consistent
+  fallback, kept as reference points between backups; synthetic fulls and
+  retention as for VMware; in-place and out-of-place recovery with target
+  host, storage and virtual switch mapping. Disks are moved by abr-vhdx-tool
+  (the `abr-vhdx-tools` repository) on the Hyper-V host, which the appliance
+  deploys there (`ALTASTOR_VHDX_TOOL_PATH`, `ALTASTOR_HYPERV_TOOL_PATH`);
+  Hyper-V jobs need an S3 repository, or a local one shared to the hosts over
+  SMB (`abr repo edit --server --share`). See `doc/HyperVBackup.md`.
+- Hyper-V job option `--guest-consistency`.
 
 ### Enhanced
 
+- Retention no longer tries to delete a restore point still under S3 Object
+  Lock: it is reported as held, with the older points it depends on, instead of
+  as a failure.
+- A synthetic full records the hypervisor kind of the chain it merged instead
+  of always reporting vCenter.
+- A restore point is only offered, and only accepted, for restore to an
+  inventory of the platform it came from.
+- Logging: storage operations (with their bucket and path, never keys), Object
+  Lock validation and application, Hyper-V connection, authentication and
+  discovery outcomes, per-chain retention results, and a summary of every
+  queued backup and restore session.
+- A Hyper-V backup checks from the host that it can reach the repository
+  before it takes a checkpoint, so an unreachable S3 endpoint, refused keys or
+  a share the host cannot open fail the run without touching the VM. A failed
+  abr-vhdx-tool run on the host reports the tool's own reason, not only its
+  last line.
 - Improved backup and restore reliability with corrected backup and restore
   logic and better handling of storage backends.
 - Expanded CLI and web console capabilities, including support for S3-based

@@ -70,6 +70,7 @@ class TaskParametersDTO(_LenientModel):
     tool_timeout_seconds: DocInt = None
     app_aware: DocBool = None
     dedup: DocBool = None
+    hyperv_consistency: DocStr = None
 
 
 class ExecutionChoiceDTO(_LenientModel):
@@ -166,6 +167,36 @@ class SystemCountsDTO(_LenientModel):
     restore_points: DocInt = None
 
 
+class HyperVDiskDTO(_LenientModel):
+    name: DocStr = None
+    controller: DocStr = None
+    path: DocStr = None
+    format: DocStr = None
+    type: DocStr = None
+    capacity_bytes: DocInt = None
+    file_bytes: DocInt = None
+    has_parent: bool | None = None
+
+
+class HyperVNetworkAdapterDTO(_LenientModel):
+    name: DocStr = None
+    switch: DocStr = None
+    mac: DocStr = None
+    connected: bool | None = None
+
+
+class HyperVVmDetailsDTO(_LenientModel):
+    generation: DocInt = None
+    configuration_version: DocStr = None
+    firmware: DocStr = None
+    checkpoint_count: DocInt = None
+    clustered: bool | None = None
+    owner_node: DocStr = None
+    config_path: DocStr = None
+    disks: list[HyperVDiskDTO] | DocArray = None
+    network_adapters: list[HyperVNetworkAdapterDTO] | DocArray = None
+
+
 class InventoryTreeNodeDTO(_LenientModel):
     id: DocStr = None
     kind: DocStr = None
@@ -189,6 +220,7 @@ class InventoryTreeNodeDTO(_LenientModel):
     cpu_model: DocStr = None
     vm_count: DocInt = None
     health: DocStr = None
+    hyperv: HyperVVmDetailsDTO | DocObject = None
     children: list[InventoryTreeNodeDTO] | DocArray = None
 
 
@@ -325,6 +357,8 @@ class InventoryDTO(_LenientModel):
     updated_at: str
     last_scan_at: str | None = None
     last_scan_error: DocStr = None
+    status_checked_at: DocStr = None
+    status_error: DocStr = None
     kind: DocStr = None
     description: DocStr = None
     address: DocStr = None
@@ -460,6 +494,7 @@ class RestorePointDTO(_LenientModel):
     compression_ratio: float | None = None
     compression_level: int | None = None
     encryption_enabled: bool | None = None
+    immutability_expires_at: str | None = None
     restore_point_id: DocStr = None
     backup_id: DocStr = None
     point_type: DocStr = None
@@ -814,6 +849,10 @@ class StartJobRequest(_LenientModel):
     target_repository_id: LaxStr | None = None
 
 
+class RunRetentionRequest(_LenientModel):
+    dry_run: LaxBool | None = None
+
+
 class StopSessionRequest(_LenientModel):
     force: LaxBool | None = None
 
@@ -1159,6 +1198,46 @@ class RemovedResult(_LenientModel):
 class JobStartResult(_LenientModel):
     job: JobRefDTO | DocObject = None
     items: list[SessionDTO] | DocArray = None
+
+
+class RetentionHoldDTO(_LenientModel):
+    point_id: DocStr = None
+    until: DocStr = None
+
+
+class RetentionChainDTO(_LenientModel):
+    job_id: DocStr = None
+    vm_id: DocStr = None
+    vm_name: DocStrOrNull = None
+    repository_id: DocStrOrNull = None
+    repository_name: DocStrOrNull = None
+    points: DocInt = None
+    kept: DocInt = None
+    removed: DocStrArray = None
+    held: list[RetentionHoldDTO] | DocObjectArray = None
+    failed: DocStrArray = None
+    kept_for_chain: DocStrArray = None
+    skipped_reason: DocStrOrNull = None
+
+
+class RetentionSummaryDTO(_LenientModel):
+    chains: DocInt = None
+    points: DocInt = None
+    removed: DocInt = None
+    held: DocInt = None
+    failed: DocInt = None
+    skipped: DocInt = None
+
+
+class RetentionRunResult(_LenientModel):
+    job_id: DocStr = None
+    job_name: DocStr = None
+    dry_run: DocBool = None
+    retention_days: DocInt = None
+    gfs: GfsDTO | DocObject = None
+    summary: RetentionSummaryDTO | DocObject = None
+    chains: list[RetentionChainDTO] | DocArray = None
+    ran_at: DocStr = None
 
 
 

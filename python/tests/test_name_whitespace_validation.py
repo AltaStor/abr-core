@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 
 from python.srv.core.mongo_db_wrapper import (
@@ -35,6 +36,11 @@ ACCEPTED_NAMES = ["aqajob", "aqa job", "a.b_c-d 1", "9start"]
 
 class NameWhitespaceValidationTests(unittest.TestCase):
     def setUp(self) -> None:
+        registrable = patch(
+            "python.srv.services.abr_v41.assert_inventory_registrable", return_value=None
+        )
+        registrable.start()
+        self.addCleanup(registrable.stop)
         BACKUPS.clear()
         HYPERVISORS.clear()
         JOBS.clear()

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import re
 from typing import Any
 
 from ..compact_help_formatter import CompactHelpFormatter
 from ..exit_codes import INVALID_STATE
+from ..models.views import human_size
 from ..parsing.secret_arguments import ENCRYPTION_KEY_ENV_VAR, add_secret_argument
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
@@ -70,10 +72,18 @@ class RestoreCommands:
             help="Start restore.",
             description=(
                 "Start a full VM restore from a restore point.\n\n"
+                "A restore point goes back to the platform it came from. For Hyper-V, --datastore and\n"
+                "--datastore-map name a volume or Cluster Shared Volume of the target host (D:,\n"
+                "C:\\ClusterStorage\\Volume1) and --network-map maps the source adapters' virtual switches\n"
+                "to switches on the target host; the VM's files go under <volume>\\Hyper-V\\<new name>.\n"
+                "An in-place Hyper-V restore keeps the VM and replaces its disks; it is refused while the\n"
+                "VM has checkpoints.\n\n"
                 "Examples:\n"
                 '  abr restore start --restore-point <point-id> --new-name "sql-01-restored"\n'
                 '  abr restore start --backup <backup-id> --vm "sql-01" --target-inventory "vCenter-Prod" '
                 '--datastore "datastore1" --power-on\n'
+                '  abr restore start --restore-point <point-id> --new-name "web-01-copy" --target-inventory "hv-cluster" '
+                '--target-host "HV-NODE-2" --datastore "D:" --network-map "External=Isolated" --wait\n'
                 "  abr restore start --restore-point <point-id> --in-place --force"
             ),
             formatter_class=CompactHelpFormatter,
@@ -210,6 +220,56 @@ class RestoreCommands:
         ]
 
     @staticmethod
+    def _source_datastore(path: str) -> str:
+        if path.startswith("["):
+            return path.partition("]")[0].lstrip("[").strip()
+        local = re.match(r"^([A-Za-z]:)", path)
+        if local:
+            return local.group(1).upper()
+        share = re.match(r"^(\\\\[^\\]+\\[^\\]+)", path)
+        return share.group(1) if share else ""
+
+    @staticmethod
+    def _target_columns() -> list[tuple[str, str]]:
+        return [
+            ("kind", "TARGET"),
+            ("name", "NAME"),
+            ("status", "STATUS"),
+            ("hosts", "HOSTS"),
+            ("free", "FREE"),
+            ("capacity", "CAPACITY"),
+        ]
+
+    @staticmethod
+    def _target_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        targets = payload.get("targets") if isinstance(payload.get("targets"), dict) else {}
+        rows: list[dict[str, Any]] = []
+        for host in targets.get("hosts", []):
+            if isinstance(host, dict):
+                rows.append({"kind": "host", "name": str(host.get("name") or host.get("id") or ""), "status": str(host.get("status") or "")})
+        for network in targets.get("networks", []):
+            if isinstance(network, dict):
+                rows.append(
+                    {
+                        "kind": "network",
+                        "name": str(network.get("name") or ""),
+                        "hosts": ", ".join(str(item) for item in network.get("host_ids") or []),
+                    }
+                )
+        for datastore in targets.get("datastores", []):
+            if isinstance(datastore, dict):
+                rows.append(
+                    {
+                        "kind": "datastore",
+                        "name": str(datastore.get("name") or ""),
+                        "hosts": ", ".join(str(item) for item in datastore.get("host_ids") or []),
+                        "free": human_size(datastore.get("free_bytes")) if datastore.get("free_bytes") is not None else "",
+                        "capacity": human_size(datastore.get("capacity_bytes")) if datastore.get("capacity_bytes") is not None else "",
+                    }
+                )
+        return rows
+
+    @staticmethod
     def _mappable_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         source_vm = payload.get("source_vm") if isinstance(payload.get("source_vm"), dict) else {}
         targets = payload.get("targets") if isinstance(payload.get("targets"), dict) else {}
@@ -244,7 +304,7 @@ class RestoreCommands:
         for disk in source_vm.get("disks", []):
             if not isinstance(disk, dict):
                 continue
-            source_datastore = str((disk.get("datastore_path") or "").partition("]")[0]).lstrip("[").strip()
+            source_datastore = RestoreCommands._source_datastore(str(disk.get("datastore_path") or ""))
             rows.append(
                 {
                     "kind": "disk",
@@ -286,6 +346,10 @@ class RestoreCommands:
         )
         if str(getattr(args, "output", "table")) == "table":
             deps.context.print_output({"items": self._mappable_rows(payload)}, self._context_columns())
+            targets = self._target_rows(payload)
+            if targets:
+                print()
+                deps.context.print_output({"items": targets}, self._target_columns())
         else:
             deps.context.print_output(payload)
         return 0

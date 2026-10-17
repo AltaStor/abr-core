@@ -34,6 +34,16 @@ def task_status(task_id: str) -> str | None:
         return str(task.get("status") or "") if task else None
 
 
+WORKER_MODES = {
+    "vcenter": "vcenter-abr-vmdk-tool",
+    "hyper-v": "hyperv-abr-vhdx-tool",
+}
+
+
+def worker_mode_for_kind(hypervisor_kind: str) -> str:
+    return WORKER_MODES.get(hypervisor_kind, "mock-backup-emulator")
+
+
 def _task_resolved_execution_field(task: dict[str, Any], field_name: str) -> Any:
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     if field_name in parameters:
@@ -89,13 +99,7 @@ def run_task(
                 "finished_at": utc_now(),
                 "resolved_backup_type": _task_resolved_execution_field(task, "resolved_backup_type"),
                 "resolved_backup_reason": _task_resolved_execution_field(task, "resolved_backup_reason"),
-                "worker_mode": (
-                    "synthetic-full"
-                    if synthetic_full
-                    else "mock-backup-emulator"
-                    if hypervisor_kind != "vcenter"
-                    else "vcenter-abr-vmdk-tool"
-                ),
+                "worker_mode": "synthetic-full" if synthetic_full else worker_mode_for_kind(hypervisor_kind),
             },
             "updated_at": utc_now(),
         }
@@ -112,22 +116,13 @@ def run_task(
                 "finished_at": utc_now(),
                 "resolved_backup_type": _task_resolved_execution_field(task, "resolved_backup_type"),
                 "resolved_backup_reason": _task_resolved_execution_field(task, "resolved_backup_reason"),
-                "worker_mode": (
-                    "synthetic-full"
-                    if synthetic_full
-                    else "mock-backup-emulator"
-                    if hypervisor_kind != "vcenter"
-                    else "vcenter-abr-vmdk-tool"
-                ),
+                "worker_mode": "synthetic-full" if synthetic_full else worker_mode_for_kind(hypervisor_kind),
             },
             "updated_at": utc_now(),
         }
 
     result.setdefault("finished_at", utc_now())
-    result.setdefault(
-        "worker_mode",
-        "mock-backup-emulator" if hypervisor_kind != "vcenter" else "vcenter-abr-vmdk-tool",
-    )
+    result.setdefault("worker_mode", worker_mode_for_kind(hypervisor_kind))
 
     logger.debug("Task '%s' execution completed inside run_task.", task_id)
     

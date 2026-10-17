@@ -109,6 +109,9 @@ class JobService:
         compression_level = getattr(args, "compression_level", None)
         if compression_level is not None:
             updates["compression_level"] = int(compression_level)
+        guest_consistency = getattr(args, "guest_consistency", None)
+        if guest_consistency is not None:
+            updates["hyperv_consistency"] = str(guest_consistency)
 
         if set_encryption:
             updates["encryption_enabled"] = True

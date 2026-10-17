@@ -57,6 +57,19 @@ Without it the server falls back to `tools/abr-vmdk-tool/abr-vmdk-tool.sh` in
 this checkout (`tools/` is git-ignored, so a symlink there works too) and, in a
 packaged install, to `/opt/altastor-backup/tools/abr-vmdk-tool/`.
 
+Hyper-V disks are moved by `abr-vhdx-tool.exe` from the `abr-vhdx-tools`
+repository, on the Hyper-V host itself. Build it there (its README covers the
+cross build on Linux) and point the server at the `.exe`; the server copies it
+to each host the first time it backs up or restores a VM there:
+
+```bash
+export ALTASTOR_VHDX_TOOL_PATH=/path/to/abr-vhdx-tools/build/vhdx-tool/abr-vhdx-tool.exe
+```
+
+Without it the server looks in `tools/abr-vhdx-tool/` as above, and with none
+there each host must have the tool installed already, at
+`ALTASTOR_HYPERV_TOOL_PATH` (`C:\Program Files\AltaStor\abr-vhdx-tool.exe`).
+
 ## Tests
 
 ```bash
@@ -64,7 +77,7 @@ packaged install, to `/opt/altastor-backup/tools/abr-vmdk-tool/`.
 ```
 
 The suite is self-contained: it mocks the data mover and runs without MongoDB,
-VDDK, or a vCenter endpoint.
+VDDK, or a vCenter or Hyper-V endpoint.
 
 ## Documentation
 - [Deployment, build, and ESXi scenario](doc/DeploymentBuildAndScenario.md) -
@@ -77,6 +90,8 @@ VDDK, or a vCenter endpoint.
   end-to-end lab flow.
 - [Server state recovery](doc/ServerStateRecovery.md) - recovering the catalog
   after a server loss.
+- [Hyper-V backup and recovery](doc/HyperVBackup.md) - what Hyper-V backup and
+  recovery need from the host, how they run, and what to check when they fail.
 
 Note: the environment and service setup in the deployment runbook and the ESXi
 sample is current, but their scenario commands still use the pre-v4.1 CLI

@@ -727,6 +727,7 @@ class InventoryListVmsCommandTests(unittest.TestCase):
             columns,
             [
                 ("label", "NAME"),
+                ("host_name", "HOST"),
                 ("power_state", "POWER STATE"),
                 ("guest_os", "GUEST OS"),
                 ("cpu_count", "CPU"),

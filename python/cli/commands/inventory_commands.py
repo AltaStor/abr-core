@@ -13,7 +13,10 @@ from ..parsing.secret_arguments import (
     add_secret_argument,
     resolve_secret,
 )
+from ..progress_watch import run_with_elapsed_indicator
 from .base import CommandDependencies
+
+INVENTORY_SCAN_TIMEOUT_SECONDS = 900
 
 
 class InventoryCommands:
@@ -204,7 +207,14 @@ class InventoryCommands:
 
     def rescan(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
-        deps.context.print_output(deps.context.api_client.post(f"api/v1/inventories/{self._resolve_id(deps, args)}/rescan"), [("id", "ID"), ("name", "NAME"), ("status", "STATUS"), ("last_scan_at", "LAST SCAN")])
+        inventory_id = self._resolve_id(deps, args)
+        result = run_with_elapsed_indicator(
+            lambda: deps.context.api_client.post(
+                f"api/v1/inventories/{inventory_id}/rescan", timeout=INVENTORY_SCAN_TIMEOUT_SECONDS
+            ),
+            label="Discovering inventory objects",
+        )
+        deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("status", "STATUS"), ("last_scan_at", "LAST SCAN")])
         return 0
 
     def test(self, args: argparse.Namespace) -> int:
@@ -253,6 +263,7 @@ class InventoryCommands:
             {"items": virtual_machines},
             [
                 ("label", "NAME"),
+                ("host_name", "HOST"),
                 ("power_state", "POWER STATE"),
                 ("guest_os", "GUEST OS"),
                 ("cpu_count", "CPU"),

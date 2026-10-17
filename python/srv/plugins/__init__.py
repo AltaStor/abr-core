@@ -24,6 +24,26 @@ def build_hypervisor_plugin(record: dict[str, object]) -> Hypervisor:
             verify_ssl=bool(metadata.get("verify_ssl", False)),
         )
 
+    if kind == "hyper-v":
+        metadata = record.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("Hyper-V hypervisor metadata must be a mapping")
+        credentials = metadata.get("credentials", {})
+        if not isinstance(credentials, dict):
+            raise ValueError("Hyper-V hypervisor credentials must be a mapping")
+
+        from .hyperv import HyperVNode
+
+        port = metadata.get("port")
+        port_explicit = bool(metadata.get("port_explicit"))
+        return HyperVNode(
+            host=str(metadata.get("host") or ""),
+            user=str(credentials.get("username") or ""),
+            password=str(credentials.get("password") or ""),
+            port=int(port) if port and port_explicit else None,
+            verify_ssl=bool(metadata.get("verify_ssl", False)),
+        )
+
     if kind == "mock":
         from .mock import MockHypervisor
 
