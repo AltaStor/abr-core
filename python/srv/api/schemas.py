@@ -348,6 +348,7 @@ class InventoryConnectionDTO(_LenientModel):
     username: str | None = None
     token_present: bool = False
     insecure: bool = False
+    protocol: str | None = None
 
 
 class InventoryDTO(_LenientModel):
@@ -719,6 +720,7 @@ class CreateInventoryRequest(_LenientModel):
     type: LaxStr | None = None
     address: LaxStr | None = None
     port: LaxInt = None
+    protocol: LaxStr | None = None
     username: LaxStr | None = None
     password: LaxStr | None = None
     token: LaxStr | None = None
@@ -730,6 +732,7 @@ class UpdateInventoryRequest(_LenientModel):
     name: LaxStr | None = None
     address: LaxStr | None = None
     port: LaxInt = None
+    protocol: LaxStr | None = None
     username: LaxStr | None = None
     password: LaxStr | None = None
     token: LaxStr | None = None

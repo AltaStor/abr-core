@@ -270,9 +270,6 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
     metadata = hv.get("metadata", {})
     credentials = metadata.get("credentials", {})
     host = metadata.get("host")
-    port = metadata.get("port")
-    port_explicit = bool(metadata.get("port_explicit"))
-    verify_ssl = bool(metadata.get("verify_ssl", False))
     username = credentials.get("username")
     password = credentials.get("password")
 
@@ -280,6 +277,7 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
         raise ValueError("Saved Hyper-V registration is missing host or credentials")
 
     from ..plugins.hyperv import HyperVNode
+    from ..plugins.hyperv.hyperv import node_options, protocol_recorder
 
     started = time.monotonic()
     discovery_logger.info("Hyper-V discovery of inventory %s (%s) started", hv.get("name"), host)
@@ -288,8 +286,8 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
             str(host),
             str(username),
             str(password),
-            port=int(port) if port and port_explicit else None,
-            verify_ssl=verify_ssl,
+            on_protocol_detected=protocol_recorder(str(hv.get("id") or "")),
+            **node_options(metadata),
         ) as node:
             inventory = node.get_inventory()
             hosts = node.list_hosts()

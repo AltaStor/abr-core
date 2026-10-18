@@ -15,9 +15,11 @@ from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
 from python.srv.plugins.hyperv import (
     HyperVAuthError,
+    HyperVCertificateError,
     HyperVPermissionError,
     HyperVUnreachableError,
 )
+from python.srv.plugins.hyperv.hyperv import DEFAULT_WINRM_PROTOCOL, WINRM_PORTS, winrm_protocol, with_protocol
 from python.srv.services.discovery import (
     build_hyperv_resources,
     build_vcenter_resources,
@@ -104,13 +106,21 @@ def extract_host(address: str) -> str:
     return parsed.hostname or candidate
 
 
-def _extract_port(address: str, inventory_type: str) -> int:
+def _extract_port(address: str, inventory_type: str, protocol: str | None = None) -> int:
     candidate = str(address or "").strip()
     if candidate and "://" in candidate:
         parsed = urlparse(candidate)
         if parsed.port is not None:
             return parsed.port
-    return default_port_for_type(inventory_type)
+    return WINRM_PORTS[protocol] if protocol else default_port_for_type(inventory_type)
+
+
+def inventory_protocol(inventory_type: str, value: Any) -> str | None:
+    if inventory_type != "hyper-v":
+        if str(value or "").strip():
+            raise ValueError("Only a Hyper-V inventory has a WinRM protocol")
+        return None
+    return winrm_protocol(value) or DEFAULT_WINRM_PROTOCOL
 
 
 def _credentials_from_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -202,24 +212,17 @@ class HyperVInventoryProvider(InventoryProvider):
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         credentials = _credentials_from_record(record)
         host = metadata.get("host") or extract_host(str(record.get("address") or ""))
-        port = metadata.get("port")
-        port_explicit = bool(metadata.get("port_explicit"))
         username = credentials.get("username")
         password = credentials.get("password")
         if not host or not username or not password:
             raise ValueError("Saved Hyper-V inventory is missing host or credentials")
 
         from python.srv.plugins.hyperv import HyperVNode
+        from python.srv.plugins.hyperv.hyperv import node_options
 
-        node = HyperVNode(
-            str(host),
-            str(username),
-            str(password),
-            port=int(port) if port and port_explicit else None,
-            verify_ssl=bool(metadata.get("verify_ssl", False)),
-        )
+        node = HyperVNode(str(host), str(username), str(password), **node_options(metadata))
         with node:
-            return node.identity()
+            return {**node.identity(), "protocol": node.protocol}
 
     def rescan(self, record: dict[str, Any]) -> list[dict[str, Any]]:
         return build_hyperv_resources(record)
@@ -328,8 +331,11 @@ def apply_inventory_updates(record: dict[str, Any], updates: dict[str, Any]) -> 
         updated["address"] = value
         updated["endpoint"] = value
         metadata["host"] = extract_host(value)
-        metadata["port"] = _extract_port(value, inventory_type_from_record(record))
+        metadata["port"] = _extract_port(value, inventory_type_from_record(record), winrm_protocol(metadata.get("protocol")))
         metadata["port_explicit"] = "://" in value
+        changed = True
+    if "protocol" in updates:
+        metadata = with_protocol(metadata, inventory_protocol(inventory_type_from_record(record), updates["protocol"]))
         changed = True
     if "port" in updates:
         try:
@@ -466,6 +472,8 @@ def assert_inventory_registrable(record: dict[str, Any]) -> dict[str, Any]:
             identity = provider.test_connection(record)
         except HyperVAuthError as exc:
             raise InventoryUnreachableError(str(exc), reason="auth") from exc
+        except HyperVCertificateError as exc:
+            raise InventoryUnreachableError(str(exc), reason="certificate") from exc
         except HyperVPermissionError as exc:
             raise InventoryUnreachableError(str(exc), reason="permission") from exc
         except HyperVUnreachableError as exc:
@@ -523,7 +531,7 @@ def assert_hyperv_identity_is_new(record: dict[str, Any], identity: dict[str, An
             )
 
 
-CONNECTION_FIELDS = ("address", "port", "username", "password", "token", "insecure")
+CONNECTION_FIELDS = ("address", "port", "protocol", "username", "password", "token", "insecure")
 
 
 def connection_fields_changed(payload: dict[str, Any]) -> bool:

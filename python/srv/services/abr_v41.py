@@ -108,11 +108,13 @@ from python.srv.services.inventory_management import (
     creatable_inventory_types,
     default_port_for_type,
     extract_host,
+    inventory_protocol,
     inventory_references,
     inventory_type_from_record,
     normalize_inventory_type,
 )
 from python.srv.services.backup_mode import object_lock_actual_retention_days
+from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
 
 from .api_errors import ApiError, api_error
@@ -1089,6 +1091,7 @@ def normalize_inventory_record(record: dict[str, Any]) -> dict[str, Any]:
         "username": credentials.get("username") or item.get("username"),
         "token_present": bool(metadata.get("token")),
         "insecure": not bool(metadata.get("verify_ssl", True)),
+        "protocol": metadata.get("protocol"),
     }
     refs = inventory_references(str(item.get("id") or ""))
     referenced_jobs = refs["jobs"] if isinstance(refs.get("jobs"), list) else []
@@ -1555,6 +1558,10 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
     token = str(payload.get("token") or "").strip()
     insecure = bool(payload.get("insecure", False))
     description = str(payload.get("description") or "")
+    try:
+        protocol = inventory_protocol(inventory_type, payload.get("protocol"))
+    except ValueError as exc:
+        raise api_error(422, "invalid_inventory", str(exc)) from exc
     _ensure(bool(name.strip()), 422, "invalid_inventory", "Inventory name is required")
     _ensure_ascii_name(name, field="Inventory name", code="invalid_inventory")
     _validate_text_fields(payload, INVENTORY_TEXT_FIELDS, code="invalid_inventory")
@@ -1565,7 +1572,12 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         _ensure(bool(token or (username and password)), 422, "invalid_inventory", "Inventory requires either token or username/password")
     created_at = utc_now()
-    effective_port = port if port is not None else default_port_for_type(inventory_type)
+    if port is not None:
+        effective_port = port
+    elif protocol:
+        effective_port = WINRM_PORTS[protocol]
+    else:
+        effective_port = default_port_for_type(inventory_type)
     # Reject both a reused name and a second registration of the same box: the
     # same host under two names yields duplicate snapshots and duplicate jobs
     # racing each other on one vCenter.
@@ -1606,6 +1618,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             "host": address.split("/", 1)[0].split(":", 1)[0],
             "port": effective_port,
             "port_explicit": port is not None,
+            **({"protocol": protocol} if protocol else {}),
             "verify_ssl": not insecure,
             "credentials": {
                 "username": username or None,
@@ -1675,6 +1688,10 @@ def _record_inventory_identity(record: dict[str, Any], identity: Any) -> dict[st
     metadata = dict(updated.get("metadata") if isinstance(updated.get("metadata"), dict) else {})
     metadata["cluster_name"] = str(identity.get("cluster") or "") or None
     metadata["computer_name"] = str(identity.get("computer") or "") or None
+    protocol = str(identity.get("protocol") or "")
+    if protocol and not metadata.get("protocol"):
+        metadata = with_protocol(metadata, protocol)
+        log_detected_protocol(str(updated.get("name") or updated.get("id") or ""), protocol)
     updated["metadata"] = metadata
     return updated
 
@@ -1721,7 +1738,7 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
     _validate_text_fields(payload, INVENTORY_TEXT_FIELDS, code="invalid_inventory")
     normalized = dict(record)
     updates: dict[str, Any] = {}
-    for field_name in ("name", "address", "port", "username", "password", "description"):
+    for field_name in ("name", "address", "port", "protocol", "username", "password", "description"):
         if field_name in payload and payload[field_name] is not None:
             updates[field_name] = payload[field_name]
     if "insecure" in payload and payload["insecure"] is not None:
@@ -1740,7 +1757,7 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
             _ensure(bool(new_name.strip()), 422, "invalid_inventory", "Inventory name must not be empty")
             _ensure_ascii_name(new_name, field="Inventory name", code="invalid_inventory")
         normalized = apply_inventory_updates(normalized, updates)
-    _ensure(any(key in payload for key in ("name", "address", "port", "username", "password", "description", "token", "insecure")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
+    _ensure(any(key in payload for key in ("name", "address", "port", "protocol", "username", "password", "description", "token", "insecure")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
     if connection_fields_changed(payload):
         try:
             normalized = _recheck_inventory_connection(normalized)

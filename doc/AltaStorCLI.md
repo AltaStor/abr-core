@@ -301,7 +301,7 @@ abr inventory add
 
 Description: Register a new virtualization inventory source. 
 
-abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --address <host/ip> [--port <int>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] 
+abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --address <host/ip> [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] 
 
 The password comes from ABR_INVENTORY_PASSWORD and the token from ABR_INVENTORY_TOKEN, or the password is asked for interactively. A value typed after --password or --token is still accepted, but every local user can read it (ps, /proc) while the command runs, and it stays in the shell history. 
 
@@ -312,6 +312,13 @@ Note:
 VM discovery is not required up front. It runs automatically the first time you
 reference VM names in job create, so no manual inventory rescan is needed after
 inventory add.
+
+A hyper-v inventory speaks WinRM over HTTPS on port 5986 unless --protocol
+http is given (port 5985). --port moves the port and keeps the protocol, so
+HTTPS works on any port the host's listener uses. HTTPS is never given up for
+HTTP: a host without an HTTPS listener, or with a certificate the server does
+not trust, is refused with the reason. --insecure accepts a self-signed
+certificate. --protocol applies to hyper-v only.
 
 A vsphere inventory can be a vCenter Server or a standalone ESXi host. When an
 ESXi host is also managed by a vCenter, register the vCenter instead: through a
@@ -344,7 +351,10 @@ abr inventory edit
 
 Description: Update server connection attributes or credentials. 
 
-abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] 
+abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] 
+
+Changing --protocol of a hyper-v inventory moves a standard port along with it
+(5986 for https, 5985 for http); a port of your own stays as it is.
 
 abr inventory remove 
 
