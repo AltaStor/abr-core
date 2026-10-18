@@ -1014,7 +1014,7 @@ class HyperVNode(Hypervisor):
         which ends the tool; it discards what it had written itself, and no
         virtual disk stays attached once it is gone.
         """
-        from pypsrp.complex_objects import PSInvocationState
+        from pypsrp.complex_objects import ObjectMeta, PSInvocationState
         from pypsrp.powershell import PowerShell, RunspacePool
 
         from ...core.storage_tool import redact_disk_tool_command
@@ -1026,10 +1026,9 @@ class HyperVNode(Hypervisor):
             raise HyperVError("Hyper-V connection is not open")
         logger.info("Running abr-vhdx-tool on %s: %s", node, " ".join(redact_disk_tool_command([tool, *args])))
         env = dict(env or {})
+        share_password = env.pop("ABR_SMB_PASSWORD", None)
         if env.get("ABR_SMB_SHARE") and not env.get("ABR_SMB_USER"):
-            # A repository share with no account of its own is opened with
-            # the one this inventory signs in to the hosts with.
-            env["ABR_SMB_USER"], env["ABR_SMB_PASSWORD"] = self.user, self.password
+            env["ABR_SMB_USER"], share_password = self.user, self.password
         started = time.monotonic()
         output = _ToolOutput(on_progress)
         with RunspacePool(client.wsman) as pool:
@@ -1037,12 +1036,16 @@ class HyperVNode(Hypervisor):
             folder = self._bundle_folder(node)
             if folder:
                 shell.add_script(
-                    "param([string]$Tool, [string[]]$ToolArgs, [hashtable]$ToolEnv)\n"
-                    f"& {_bundle_script_block(folder, 'run_tool.ps1')} -Tool $Tool -ToolArgs $ToolArgs -ToolEnv $ToolEnv"
+                    "param([string]$Tool, [string[]]$ToolArgs, [hashtable]$ToolEnv, [securestring]$SharePassword)\n"
+                    f"& {_bundle_script_block(folder, 'run_tool.ps1')} "
+                    "-Tool $Tool -ToolArgs $ToolArgs -ToolEnv $ToolEnv -SharePassword $SharePassword"
                 )
             else:
                 shell.add_script(load_script("run_tool.ps1"))
             shell.add_parameters({"Tool": tool, "ToolArgs": list(args), "ToolEnv": env})
+            if env.get("ABR_SMB_SHARE") and share_password:
+                pool.exchange_keys()
+                shell.add_parameter("SharePassword", pool.serialize(share_password, ObjectMeta("SS")))
             shell.begin_invoke()
             seen = 0
             while shell.state == PSInvocationState.RUNNING:

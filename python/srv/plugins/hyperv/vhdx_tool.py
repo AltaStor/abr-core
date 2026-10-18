@@ -39,10 +39,6 @@ HYPERV_REPOSITORY_MESSAGE = (
     "repository, or give this one the share the hosts reach it by (abr repo edit --server --share)"
 )
 
-# What run_tool.ps1 takes out of the tool's environment to open a repository's
-# share for the run, rather than handing it to the tool.
-SHARE_ENV = ("ABR_SMB_SHARE", "ABR_SMB_USER", "ABR_SMB_PASSWORD")
-
 _PROGRESS_LINE = re.compile(r"^\s*(\d{1,3})%\s*$")
 # What the tool says when it cannot take an incremental against the given RCT
 # id (vhdx_disk.cpp, collectChanges). It refuses before anything is written,
