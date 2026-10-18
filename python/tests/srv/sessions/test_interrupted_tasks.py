@@ -39,6 +39,8 @@ class FakeNode:
         self.lock_releases: list[tuple[str, str | None]] = []
         self.raise_on_release: Exception | None = None
         self.lock_held = True
+        self.consolidations: list[str] = []
+        self.raise_on_consolidate: Exception | None = None
 
     def __enter__(self) -> "FakeNode":
         self.connected += 1
@@ -51,6 +53,12 @@ class FakeNode:
         if self.raise_on_remove is not None:
             raise self.raise_on_remove
         self.removed.append((vm_name, snapshot_name))
+
+    def consolidate_disks(self, vm_name: str) -> bool:
+        self.consolidations.append(vm_name)
+        if self.raise_on_consolidate is not None:
+            raise self.raise_on_consolidate
+        return True
 
     def release_access_lock(self, vm_name: str, vm_moref: str | None = None) -> bool:
         self.lock_releases.append((vm_name, vm_moref))
@@ -240,6 +248,43 @@ class InterruptedBackupSnapshotTests(SweepTestCase):
         self.assertEqual(TASKS["task-s1"]["result"]["failure_kind"], "interrupted")
         self.assertNotIn("backup_snapshot", TASKS["task-s1"]["result"])
         self.assertEqual(remove_mock.call_count, 1)
+
+    @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
+    @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value={"01-disk.vmdk"})
+    def test_removing_an_abandoned_backups_snapshot_consolidates_the_vm(self, list_mock, remove_mock) -> None:
+        TASKS["task-c1"] = self._running_with_snapshot("task-c1")
+        self._output_dir("task-c1")
+
+        backup_catalog.fail_interrupted_tasks()
+
+        self.assertEqual(self.node.consolidations, ["web01"])
+        self.assertNotIn("backup_snapshot", TASKS["task-c1"]["result"])
+
+    @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
+    @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value={"01-disk.vmdk"})
+    def test_a_consolidation_that_fails_at_startup_is_logged_and_the_snapshot_still_counts_as_removed(
+        self, list_mock, remove_mock
+    ) -> None:
+        self.node.raise_on_consolidate = RuntimeError("Unable to access file since it is locked")
+        TASKS["task-c2"] = self._running_with_snapshot("task-c2")
+        self._output_dir("task-c2")
+
+        with self.assertLogs("python.srv.services.backup_catalog", level="WARNING") as logs:
+            backup_catalog.fail_interrupted_tasks()
+
+        self.assertIn("needs disk consolidation", "\n".join(logs.output))
+        self.assertNotIn("backup_snapshot", TASKS["task-c2"]["result"])
+
+    @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
+    @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value={"01-disk.vmdk"})
+    def test_a_snapshot_that_could_not_be_removed_is_not_consolidated(self, list_mock, remove_mock) -> None:
+        self.node.raise_on_remove = RuntimeError("vCenter is still booting")
+        TASKS["task-c3"] = self._running_with_snapshot("task-c3")
+        self._output_dir("task-c3")
+
+        backup_catalog.fail_interrupted_tasks()
+
+        self.assertEqual(self.node.consolidations, [])
 
     @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
     @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value={"01-disk.vmdk"})

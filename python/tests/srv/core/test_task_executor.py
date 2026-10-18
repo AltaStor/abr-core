@@ -106,6 +106,9 @@ class FakeVCenterNode:
     access_lock_held: bool = False
     access_lock_releases: list[dict[str, object]] = []
     raise_on_release_access_lock: Exception | None = None
+    consolidation_needed: bool = False
+    raise_on_consolidate: Exception | None = None
+    consolidations: list[str] = []
     snapshot_change_ids: list[dict[str, object]] = [
         {
             "disk_label": "Hard disk 1",
@@ -258,6 +261,14 @@ class FakeVCenterNode:
 
     def remove_snapshot(self, vm_name: str, snapshot_name: str) -> None:
         self.snapshots_removed.append(snapshot_name)
+
+    def consolidate_disks(self, vm_name: str) -> bool:
+        FakeVCenterNode.consolidations.append(vm_name)
+        if FakeVCenterNode.raise_on_consolidate is not None:
+            raise FakeVCenterNode.raise_on_consolidate
+        needed = FakeVCenterNode.consolidation_needed
+        FakeVCenterNode.consolidation_needed = False
+        return needed
 
     def release_access_lock(self, vm_name: str, vm_moref: str | None = None) -> bool:
         FakeVCenterNode.access_lock_releases.append({"vm_name": vm_name, "vm_moref": vm_moref})
@@ -457,6 +468,9 @@ class TaskExecutorTests(unittest.TestCase):
         FakeVCenterNode.access_lock_held = False
         FakeVCenterNode.access_lock_releases.clear()
         FakeVCenterNode.raise_on_release_access_lock = None
+        FakeVCenterNode.consolidation_needed = False
+        FakeVCenterNode.raise_on_consolidate = None
+        FakeVCenterNode.consolidations.clear()
         FakeVCenterNode.snapshot_change_ids = [
             {
                 "disk_label": "Hard disk 1",
@@ -929,6 +943,62 @@ class TaskExecutorTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertTrue(self._access_lock_records(progress_updates)[-1]["retry_noted"])
+
+    def test_a_backup_that_fails_mid_transfer_consolidates_the_disks_its_snapshot_left(self) -> None:
+        FakeVCenterNode.consolidation_needed = True
+
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            return FakeCompletedProcess(returncode=1, stderr="Error: failed to read disk data: The server refused connection")
+
+        result, progress_updates = self._run_backup_for_access_lock(fake_run)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(FakeVCenterNode.consolidations, ["demo-vm"])
+        self.assertIn("Consolidated the disks of VM demo-vm", self._progress_messages(progress_updates))
+        self.assertFalse(any(update.get("warning") for update in progress_updates))
+
+    def test_a_consolidation_that_fails_after_a_lost_transfer_is_a_session_warning(self) -> None:
+        FakeVCenterNode.raise_on_consolidate = RuntimeError("Unable to access file since it is locked")
+
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            return FakeCompletedProcess(returncode=1, stderr="Error: failed to read disk data")
+
+        result, progress_updates = self._run_backup_for_access_lock(fake_run)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Disk backup failed", result["result"]["message"])
+        warnings = [update["warning"] for update in progress_updates if update.get("warning")]
+        self.assertEqual([warning["code"] for warning in warnings], ["consolidation_needed"])
+        self.assertIn("VM demo-vm needs disk consolidation", warnings[0]["message"])
+        self.assertIn("Unable to access file since it is locked", warnings[0]["message"])
+
+    def test_a_successful_backup_consolidates_a_vm_its_snapshot_left_on_delta_disks(self) -> None:
+        FakeVCenterNode.consolidation_needed = True
+
+        result, progress_updates = self._run_backup_for_access_lock(
+            lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok")
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(FakeVCenterNode.consolidations, ["demo-vm"])
+        self.assertIn("Consolidated the disks of VM demo-vm", self._progress_messages(progress_updates))
+
+    def test_a_vm_that_needs_no_consolidation_is_checked_once_and_says_nothing(self) -> None:
+        result, progress_updates = self._run_backup_for_access_lock(
+            lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok")
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(FakeVCenterNode.consolidations, ["demo-vm"])
+        self.assertNotIn("Consolidated", self._progress_messages(progress_updates))
+        self.assertFalse(any(update.get("warning") for update in progress_updates))
+
+    def test_a_backup_refused_before_its_snapshot_never_consolidates(self) -> None:
+        FakeVCenterNode.host_connected = False
+
+        self._run_backup_for_access_lock(lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok"))
+
+        self.assertEqual(FakeVCenterNode.consolidations, [])
 
     def test_a_backup_refused_before_its_snapshot_never_touches_the_block(self) -> None:
         FakeVCenterNode.host_connected = False
