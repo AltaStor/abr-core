@@ -4992,6 +4992,15 @@ def resolve_job_execution(
     return "Incremental", "StandardIncremental"
 
 
+def execution_phases(execution_type: str, execution_reason: str) -> list[tuple[str, str]]:
+    if execution_type != "SyntheticFull" or execution_reason == "ForceSynthetic":
+        return [(execution_type, execution_reason)]
+    return [
+        ("Incremental", "SyntheticFullSourceIncrement"),
+        (execution_type, execution_reason),
+    ]
+
+
 def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
     if str(task.get("task_type") or "") != "backup":
         return task
@@ -8821,6 +8830,7 @@ def _create_backup_session(
     execution_reason: str,
     target_repository: dict[str, Any] | None = None,
     run_id: str | None = None,
+    requires_task_id: str | None = None,
 ) -> dict[str, Any]:
     task_parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else {}
     parameters = dict(task_parameters)
@@ -8838,6 +8848,8 @@ def _create_backup_session(
             "active_full": execution_type == "ActiveFull",
         }
     )
+    if requires_task_id:
+        parameters["requires_task_id"] = requires_task_id
     task = {
         "id": str(uuid4()),
         "job_id": job["id"],
@@ -8969,17 +8981,20 @@ def start_job_record(
             execution_type, execution_reason = resolve_job_execution(
                 job, vm_id=vm_id, force_full=force_full, force_synthetic=force_synthetic
             )
-            sessions.append(
-                _create_backup_session(
+            requires_task_id = None
+            for phase_type, phase_reason in execution_phases(execution_type, execution_reason):
+                session = _create_backup_session(
                     job,
                     vm_id=vm_id,
                     vm_name=vm_name,
-                    execution_type=execution_type,
-                    execution_reason=execution_reason,
+                    execution_type=phase_type,
+                    execution_reason=phase_reason,
                     target_repository=target_repository,
                     run_id=run_id,
+                    requires_task_id=requires_task_id,
                 )
-            )
+                sessions.append(session)
+                requires_task_id = session["id"]
     schedule = job.get("schedule")
     # A manual "Run now"/"Run full backup" must push next_incremental_run_at forward the
     # same way the scheduler does after its own dispatch (_dispatch_due_jobs

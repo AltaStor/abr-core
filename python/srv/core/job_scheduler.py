@@ -16,6 +16,7 @@ from .mongo_db_wrapper import HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, catalog
 from .server_defaults import env_int
 from .utils import utc_now
 from python.srv.services.abr_v41 import (
+    execution_phases,
     job_clock_anomalies,
     job_run_record,
     normalize_job_record,
@@ -548,7 +549,7 @@ class JobScheduler:
             )
             vm_name = str(resource.get("name") or resource_external_id)
             requires_task_id: str | None = None
-            for phase_type, phase_reason in self._execution_phases(execution_type, execution_reason):
+            for phase_type, phase_reason in execution_phases(execution_type, execution_reason):
                 now = utc_now()
                 task = {
                     "id": str(uuid4()),
@@ -583,12 +584,3 @@ class JobScheduler:
                 tasks.append(task)
                 requires_task_id = task["id"]
         return tasks
-
-    @staticmethod
-    def _execution_phases(execution_type: str, execution_reason: str) -> list[tuple[str, str]]:
-        if execution_type != "SyntheticFull":
-            return [(execution_type, execution_reason)]
-        return [
-            ("Incremental", "SyntheticFullSourceIncrement"),
-            (execution_type, execution_reason),
-        ]

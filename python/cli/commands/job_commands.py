@@ -620,7 +620,14 @@ class JobCommands:
         )
         sessions = result.get("items") if isinstance(result, dict) else None
         if getattr(args, "wait", False) and isinstance(sessions, list) and sessions:
-            if len(sessions) > 1:
+            if len(sessions) == 1:
+                watched = watch_session(deps.context.api_client, str(sessions[0]["id"]))
+                deps.context.print_output(watched)
+                if not session_watch_succeeded(watched):
+                    return _session_failure_exit_code(watched)
+            elif self._one_vm(sessions):
+                return self._watch_in_order(deps, result, sessions)
+            else:
                 print(
                     "Job started " + str(len(sessions)) + " sessions; "
                     "--wait only follows one at a time. Not watching -- use "
@@ -629,11 +636,22 @@ class JobCommands:
                     file=sys.stderr,
                 )
                 deps.context.print_output(result, self._start_columns())
-            else:
-                watched = watch_session(deps.context.api_client, str(sessions[0]["id"]))
-                deps.context.print_output(watched)
-                if not session_watch_succeeded(watched):
-                    return _session_failure_exit_code(watched)
         else:
             deps.context.print_output(result, self._start_columns())
+        return 0
+
+    @staticmethod
+    def _one_vm(sessions: list[dict[str, Any]]) -> bool:
+        vm_ids = {str(session.get("vm_id") or "") for session in sessions}
+        return len(vm_ids) == 1 and "" not in vm_ids
+
+    def _watch_in_order(self, deps: CommandDependencies, result: dict[str, Any], sessions: list[dict[str, Any]]) -> int:
+        watched: list[dict[str, Any]] = []
+        for session in sessions:
+            current = watch_session(deps.context.api_client, str(session["id"]))
+            watched.append(current)
+            if not session_watch_succeeded(current):
+                deps.context.print_output({**result, "items": watched}, self._start_columns())
+                return _session_failure_exit_code(current)
+        deps.context.print_output({**result, "items": watched}, self._start_columns())
         return 0
