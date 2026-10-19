@@ -272,7 +272,7 @@ class UnhandledErrorReportingTests(unittest.TestCase):
 
         self.app = app
         self.app.dependency_overrides[require_session] = lambda: {
-            "token": "test", "user_id": "test", "user_name": "test"
+            "token": "test", "user_id": "test", "user_name": "test", "role": "administrator"
         }
         self.addCleanup(self.app.dependency_overrides.clear)
 

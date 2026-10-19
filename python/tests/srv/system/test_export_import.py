@@ -94,7 +94,7 @@ class SecureArchiveTests(unittest.TestCase):
 class SystemCatalogSnapshotApiTests(unittest.TestCase):
     def setUp(self) -> None:
         _reset_catalog()
-        app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user"}
+        app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user", "role": "administrator"}
         self.client_cm = TestClient(app)
         self.client = self.client_cm.__enter__()
 

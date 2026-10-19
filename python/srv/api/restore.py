@@ -45,9 +45,9 @@ def start_restore(payload: StartRestoreRequest = Body(default_factory=StartResto
 
 
 register(router, [
-    ("/vms", list_restore_vms, ["GET"]),
-    ("/points", list_restore_point_catalog, ["GET"]),
-    ("/vms/{vm_id}/points", list_restore_points, ["GET"]),
-    ("/context", get_restore_context, ["GET"]),
-    ("/start", start_restore, ["POST"]),
+    ("/vms", list_restore_vms, ["GET"], "restore.view"),
+    ("/points", list_restore_point_catalog, ["GET"], "restore.view"),
+    ("/vms/{vm_id}/points", list_restore_points, ["GET"], "restore.view"),
+    ("/context", get_restore_context, ["GET"], "restore.view"),
+    ("/start", start_restore, ["POST"], "restore.start"),
 ])

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 from functools import wraps
 
-from pymongo import ASCENDING, MongoClient, ReturnDocument
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import (
     ConnectionFailure,
     ExecutionTimeout,
@@ -145,6 +145,8 @@ class Database:
         self._db["disks"].create_index("vm_id")
         self._db["resources"].create_index("hypervisor_id")
         self._db["resources"].create_index([("hypervisor_id", ASCENDING), ("resource_type", ASCENDING)])
+        self._db["audit"].create_index([("id", ASCENDING)], unique=True, name="uq_id")
+        self._db["audit"].create_index([("timestamp", DESCENDING)], name="ix_timestamp")
         logger.debug("Indexes verified for %d collections.", len(specs))
 
     @_retry()
@@ -183,6 +185,19 @@ class Database:
             sessions.update_one({"_id": document["_id"]}, {"$set": {"token": digest(token)}})
             rehashed += 1
         return rehashed
+
+    @_retry()
+    def insert(self, collection: str, document: dict[str, Any]) -> None:
+        self._db[collection].insert_one(copy.deepcopy(document))
+
+    @_retry()
+    def find_page(
+        self, collection: str, query: dict[str, Any], *, sort_field: str, skip: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int]:
+        cursor = (
+            self._db[collection].find(query, {"_id": 0}).sort(sort_field, DESCENDING).skip(skip).limit(limit)
+        )
+        return list(cursor), self._db[collection].count_documents(query)
 
     @_retry()
     def delete(self, collection: str, id_field: str, doc_id: str) -> bool:

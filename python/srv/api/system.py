@@ -130,14 +130,14 @@ def revert_tls_certificate(request: Request) -> TlsCertificateChangeDTO:
 
 
 register(router, [
-    ("/version", system_version, ["GET"]),
-    ("/info", system_info, ["GET"]),
-    ("/health", system_health, ["GET"]),
-    ("/logs", system_logs, ["GET"]),
-    ("/catalog-snapshot", export_catalog_snapshot, ["POST"]),
-    ("/catalog-restore", import_catalog_snapshot, ["POST"]),
-    ("/support-bundle", get_support_bundle, ["POST"]),
-    ("/tls-certificate", get_tls_certificate, ["GET"]),
-    ("/tls-certificate", install_tls_certificate, ["PUT"]),
-    ("/tls-certificate", revert_tls_certificate, ["DELETE"]),
+    ("/version", system_version, ["GET"], "system.view"),
+    ("/info", system_info, ["GET"], "system.view"),
+    ("/health", system_health, ["GET"], "system.view"),
+    ("/logs", system_logs, ["GET"], "system.logs"),
+    ("/catalog-snapshot", export_catalog_snapshot, ["POST"], "system.export"),
+    ("/catalog-restore", import_catalog_snapshot, ["POST"], "system.import"),
+    ("/support-bundle", get_support_bundle, ["POST"], "system.support_bundle"),
+    ("/tls-certificate", get_tls_certificate, ["GET"], "tls.view"),
+    ("/tls-certificate", install_tls_certificate, ["PUT"], "tls.edit"),
+    ("/tls-certificate", revert_tls_certificate, ["DELETE"], "tls.edit"),
 ])

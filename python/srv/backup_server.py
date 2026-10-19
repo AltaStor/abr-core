@@ -38,12 +38,14 @@ API_VERSION_HEADER = "X-ABR-API-Version"
 
 import uvicorn
 
+from .api import audit as audit_api
 from .api import auth as auth_api
 from .api import backups as backups_api
 from .api import inventories as inventories_api
 from .api import jobs as jobs_api
 from .api import repositories as repositories_api
 from .api import restore as restore_api
+from .api import roles as roles_api
 from .api import sessions as sessions_api
 from .api import system as system_api
 from .api import users as users_api
@@ -268,6 +270,12 @@ async def lifespan(_: FastAPI):
         RESOURCES_BY_HV.update(load_resources())
         USERS.clear()
         USERS.update(load_users())
+        try:
+            roled = auth_service.backfill_user_roles()
+            if roled:
+                logger.info("Gave %d user(s) from before roles existed the Administrator role.", roled)
+        except Exception:
+            logger.exception("User role backfill failed; continuing startup without it.")
         SESSIONS.clear()
         SESSIONS.update(load_sessions())
 
@@ -477,6 +485,8 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
 for domain in (
     auth_api,
     users_api,
+    roles_api,
+    audit_api,
     repositories_api,
     inventories_api,
     jobs_api,

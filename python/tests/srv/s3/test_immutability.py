@@ -1258,7 +1258,7 @@ class S3ImmutabilityApiTests(unittest.TestCase):
 
         for store in (BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS):
             store.clear()
-        app.dependency_overrides[require_session] = lambda: {"user_id": "test", "user_name": "test"}
+        app.dependency_overrides[require_session] = lambda: {"user_id": "test", "user_name": "test", "role": "administrator"}
         self._app = app
         self._require_session = require_session
         self._client_cm = TestClient(app)

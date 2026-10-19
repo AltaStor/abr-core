@@ -10,7 +10,7 @@ from python.srv.services import auth_service
 
 from ._routing import build_router, register
 from .auth_guard import require_session
-from .schemas import ExtendSessionResult, LoginResult, LogoutResult, UserResult
+from .schemas import ExtendSessionResult, LoginResult, LogoutResult, UserResult, WhoAmIResult
 
 router = build_router("/auth", tag="auth", protected=False)
 
@@ -52,9 +52,15 @@ def extend_session(payload: ExtendSessionRequest, session: dict = Depends(requir
     return auth_service.extend_session(session["token"], payload.duration_seconds)
 
 
+def whoami(session: dict = Depends(require_session)) -> WhoAmIResult:
+    """The signed-in user, their role, and the function IDs that role allows."""
+    return auth_service.whoami(session["user_id"])
+
+
 register(router, [
-    ("/login", login, ["POST"]),
-    ("/logout", logout, ["POST"]),
-    ("/change-password", change_password, ["POST"]),
-    ("/session/duration", extend_session, ["PUT"]),
+    ("/login", login, ["POST"], "auth.login"),
+    ("/logout", logout, ["POST"], "auth.logout"),
+    ("/change-password", change_password, ["POST"], "auth.change_password"),
+    ("/session/duration", extend_session, ["PUT"], "auth.extend_session"),
+    ("/me", whoami, ["GET"], "auth.whoami"),
 ])

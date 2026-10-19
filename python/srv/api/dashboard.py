@@ -7,9 +7,15 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from ..core.mongo_db_wrapper import BACKUPS, JOBS, REPOSITORIES, TASKS, catalog_entries, catalog_records
-from .auth_guard import require_session
+from ._routing import FUNCTION_ID_KEY, AuditedRoute
+from .auth_guard import authorize, require_session
 
-router = APIRouter(prefix="/api/v1/dashboard", tags=["Dashboard"], dependencies=[Depends(require_session)])
+router = APIRouter(
+    prefix="/api/v1/dashboard",
+    tags=["Dashboard"],
+    dependencies=[Depends(require_session)],
+    route_class=AuditedRoute,
+)
 
 
 SESSION_TYPE_LABELS = {"backup": "Backup", "restore": "Restore", "verify": "Verify", "delete": "Delete"}
@@ -143,7 +149,13 @@ def _backup_protected_vm_key(backup: dict) -> tuple[str, str] | None:
     return inventory_id, vm_text.lower()
 
 
-@router.get("/summary", response_model=DashboardSummary)
+@router.get(
+    "/summary",
+    response_model=DashboardSummary,
+    dependencies=[Depends(authorize("dashboard.view"))],
+    openapi_extra={FUNCTION_ID_KEY: "dashboard.view"},
+    description="Function `dashboard.view`: View the dashboard summary.",
+)
 def get_dashboard_summary():
     from ..services.abr_v41 import session_to_dto
 

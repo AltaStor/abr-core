@@ -66,8 +66,8 @@ def stop_session(
 
 
 register(router, [
-    ("", list_sessions, ["GET"]),
-    ("/{session_id}", get_session, ["GET"]),
-    ("/{session_id}/log", get_session_log, ["GET"]),
-    ("/{session_id}/stop", stop_session, ["POST"]),
+    ("", list_sessions, ["GET"], "session.view"),
+    ("/{session_id}", get_session, ["GET"], "session.view"),
+    ("/{session_id}/log", get_session_log, ["GET"], "session.view"),
+    ("/{session_id}/stop", stop_session, ["POST"], "session.stop"),
 ])

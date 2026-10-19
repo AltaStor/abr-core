@@ -118,6 +118,7 @@ from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol,
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
 
 from .api_errors import ApiError, api_error
+from . import auth_service
 from .auth_service import MIN_PASSWORD_LENGTH
 
 LOGGER = logging.getLogger(__name__)
@@ -9702,7 +9703,9 @@ def import_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(configuration, dict):
         configuration = {}
 
-    replaced_users = sorted(str(user.get("name") or "") for user in users_replaced_by_import(catalog))
+    replaced = users_replaced_by_import(catalog)
+    auth_service.ensure_import_keeps_an_administrator(catalog, replaced)
+    replaced_users = sorted(str(user.get("name") or "") for user in replaced)
     counts = restore_catalog(catalog)
     return {
         "manifest": manifest,

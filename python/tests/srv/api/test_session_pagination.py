@@ -56,7 +56,7 @@ def _task(index: int) -> dict[str, Any]:
 
 class SessionPaginationTests(unittest.TestCase):
     def setUp(self) -> None:
-        app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user"}
+        app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user", "role": "administrator"}
         self.client_cm = TestClient(app)
         self.client = self.client_cm.__enter__()
         self._saved_tasks = dict(TASKS)

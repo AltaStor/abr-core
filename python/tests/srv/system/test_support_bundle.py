@@ -974,7 +974,7 @@ class CatalogCollectionTests(unittest.TestCase):
 
 class SupportBundleApiTests(unittest.TestCase):
     def setUp(self) -> None:
-        app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user"}
+        app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user", "role": "administrator"}
         self.client_cm = TestClient(app)
         self.client = self.client_cm.__enter__()
 
@@ -997,7 +997,7 @@ class SupportBundleApiTests(unittest.TestCase):
             response = self.client.post("/api/v1/system/support-bundle")
             self.assertEqual(response.status_code, 401)
         finally:
-            app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user"}
+            app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user", "role": "administrator"}
 
 
 if __name__ == "__main__":

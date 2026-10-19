@@ -614,6 +614,8 @@ class PublicUserDTO(_LenientModel):
     id: str
     name: str
     fullName: str = ""
+    role: str | None = Field(default=None, description="The user's one role, by role ID")
+    enabled: bool = True
     created_at: str | None = None
     passwordPolicyExempt: bool = False
 
@@ -877,6 +879,13 @@ class CreateUserRequest(_LenientModel):
     name: LaxStr | None = None
     password: LaxStr | None = None
     fullName: LaxStr | None = None
+    role: LaxStr | None = None
+
+
+class UpdateUserRequest(_LenientModel):
+    fullName: LaxStr | None = None
+    role: LaxStr | None = None
+    enabled: SkipValidation[bool] | None = None
 
 
 
@@ -885,6 +894,8 @@ class UserResult(_LenientModel):
     id: DocStr = None
     name: DocStr = None
     fullName: DocStr = None
+    role: DocStr = None
+    enabled: DocBool = None
     created_at: DocStr = None
     passwordPolicyExempt: DocBool = None
 
@@ -1403,6 +1414,78 @@ class LoginResult(_LenientModel):
     token: DocStr = None
     expires_at: DocStr = None
     user: PublicUserDTO | DocObject = None
+    permissions: DocStrArray = None
+
+
+class RoleSummaryDTO(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+    description: DocStr = None
+    built_in: DocBool = None
+
+
+class WhoAmIResult(_LenientModel):
+    user: PublicUserDTO | DocObject = None
+    role: RoleSummaryDTO | None = None
+    permissions: DocStrArray = None
+
+
+class RolePermissionDTO(_LenientModel):
+    function_id: DocStr = None
+    allowed: DocBool = None
+
+
+class RoleDTO(RoleSummaryDTO):
+    permissions: list[RolePermissionDTO] | DocArray = None
+    allowed_functions: DocStrArray = None
+
+
+class RoleList(_LenientModel):
+    items: list[RoleDTO]
+
+
+class FunctionDTO(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+    category: DocStr = None
+    starts_session: DocBool = None
+
+
+class FunctionList(_LenientModel):
+    items: list[FunctionDTO]
+
+
+class AuditTargetDTO(_LenientModel):
+    type: DocStr = None
+    id: DocStr = None
+    name: DocStr = None
+
+
+class AuditRecordDTO(_LenientModel):
+    id: DocStr = None
+    timestamp: DocStr = Field(default=None, description="UTC")
+    user: DocStr = None
+    user_id: DocStr = None
+    role: DocStr = Field(default=None, description="The role the user held at the time")
+    function_id: DocStr = None
+    target: AuditTargetDTO | None = None
+    result: DocStr = Field(default=None, description="allowed, denied or failed")
+    session_id: DocStr = Field(default=None, description="The session the command started, if any")
+    auth_session_id: DocStr = Field(default=None, description="A reference to the sign-in session")
+    interface: DocStr = Field(default=None, description="web, cli or api")
+    command: DocStr = Field(default=None, description="The CLI command, when it came from the CLI")
+    client: DocStr = None
+    status: DocInt = None
+    error: DocObject = None
+    parameters: DocObject = Field(default=None, description="The request, with credentials masked")
+    details: DocObject = None
+
+
+class AuditList(_LenientModel):
+    items: list[AuditRecordDTO]
+    total: DocInt = None
+    limit: DocInt = None
+    offset: DocInt = None
 
 
 class LogoutResult(_LenientModel):
