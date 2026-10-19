@@ -36,6 +36,7 @@ from ...core.storage_tool import (
     remove_disk_tool_backup,
     repository_cache_root,
     run_disk_tool,
+    run_disk_tool_process,
     s3_block_generation_days,
     with_immutability_retention_days,
     safe_path_component,
@@ -452,6 +453,33 @@ def _access_lock_not_released(
     _record_access_lock(progress_callback, vm_name, vm_moref, retry_noted=True)
 
 
+def _consolidate_disks(
+    node: Any,
+    task: dict[str, Any],
+    progress_callback: ProgressCallback,
+    vm_name: str,
+) -> None:
+    try:
+        consolidated = node.consolidate_disks(vm_name)
+    except Exception as exc:
+        message = (
+            f"VM {vm_name} needs disk consolidation, which failed after the backup snapshot was removed: {exc}. "
+            "Consolidate it in vSphere (Snapshots > Consolidate); until then it runs on delta disks."
+        )
+        logger.warning("%s (task %s)", message, task.get("id"))
+        _report_access_lock(
+            progress_callback,
+            message,
+            warning={"code": "consolidation_needed", "message": message, "vm_name": vm_name},
+        )
+        return
+    if consolidated:
+        _report_access_lock(
+            progress_callback,
+            f"Consolidated the disks of VM {vm_name}, which removing the backup snapshot left on delta disks",
+        )
+
+
 def _release_access_lock(
     node: Any,
     task: dict[str, Any],
@@ -519,6 +547,7 @@ def _remove_stranded_backup_snapshots(
                 exc,
             )
             continue
+        _consolidate_disks(node, task, progress_callback, vm_name)
         forget_task_backup_snapshot(task_id)
         logger.info(
             "Removed the snapshot %s that interrupted task %s left on VM %s.",
@@ -1326,7 +1355,7 @@ def _run_watched_disk_tool(
         )
 
     try:
-        return run_capped(command, stall_seconds=limit, on_stall=on_stall, **kwargs)
+        return run_disk_tool_process(run_capped, command, stall_seconds=limit, on_stall=on_stall, **kwargs)
     except DataPathStalled as exc:
         logger.error(
             "Data path to %s lost while backing up %s (%s): no data for %ds; stopped the data mover. %s",
@@ -3228,6 +3257,7 @@ def run_vcenter_backup(
             _record_backup_snapshot(progress_callback, vm_name, None)
             _release_access_lock(node, task, progress_callback, vm_name, access_lock_moref)
             access_lock_moref = None
+            _consolidate_disks(node, task, progress_callback, vm_name)
 
         if not stop_requested_after_completion and cancel_requested(task_id):
             stop_requested_after_completion = True
@@ -3337,6 +3367,7 @@ def run_vcenter_backup(
                     pass
                 with VCenterNode(host, username, password, port=port, verify_ssl=verify_ssl) as node:
                     node.remove_snapshot(vm_name, snapshot_name)
+                    _consolidate_disks(node, task, progress_callback, vm_name)
                 logger.info(
                     "Backup snapshot %s removed for VM %s",
                     snapshot_name,

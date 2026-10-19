@@ -322,7 +322,7 @@ class UnreadableHyperVPasswordIsNeverSentTests(_KeyFileTestCase):
         node = hyperv.HyperVNode("hv.local", "CORP\\backupsvc", credential_encryption.decrypt_secret(stored))
 
         with patch("pypsrp.client.Client") as client:
-            node._build_client("hv.local", hyperv.HTTPS_PORT)
+            node._build_client("hv.local", hyperv.HTTPS_PORT, "https")
 
         self.assertEqual(client.call_args.kwargs["password"], "hyperv-secret")
 

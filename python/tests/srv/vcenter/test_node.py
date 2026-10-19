@@ -1905,3 +1905,73 @@ class ReleaseAccessLockTests(unittest.TestCase):
         self.assertTrue(connection.closed)
         self.assertEqual(stub.returned, 0)
 
+
+class _ConsolidatingVm:
+    def __init__(self, needed: bool, clears_after: int = 1) -> None:
+        self.runtime = types.SimpleNamespace(consolidationNeeded=needed)
+        self.consolidate_calls = 0
+        self._clears_after = clears_after
+
+    def ConsolidateVMDisks_Task(self) -> str:
+        self.consolidate_calls += 1
+        return f"consolidate-{self.consolidate_calls}"
+
+
+class VCenterNodeConsolidationTests(unittest.TestCase):
+    def _node(self, vm: object, failures: list[Exception] | None = None) -> VCenterNode:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        pending = list(failures or [])
+
+        def wait(task: object) -> None:
+            if pending:
+                raise pending.pop(0)
+            vm.runtime.consolidationNeeded = vm.consolidate_calls < vm._clears_after
+
+        node._get_vm = lambda vm_name: vm  # type: ignore[method-assign]
+        node._wait_for_task = wait  # type: ignore[method-assign]
+        return node
+
+    def _settle(self, seconds: int):
+        return patch("python.srv.plugins.vcenter.vcenter.env_int", return_value=seconds)
+
+    def test_a_vm_that_needs_nothing_is_left_alone(self) -> None:
+        vm = _ConsolidatingVm(needed=False)
+
+        self.assertFalse(self._node(vm).consolidate_disks("demo-vm"))
+        self.assertEqual(vm.consolidate_calls, 0)
+
+    def test_a_vm_left_on_delta_disks_is_consolidated(self) -> None:
+        vm = _ConsolidatingVm(needed=True)
+
+        with self.assertLogs("python.srv.plugins.vcenter.vcenter", level="INFO") as logs:
+            self.assertTrue(self._node(vm).consolidate_disks("demo-vm"))
+
+        self.assertEqual(vm.consolidate_calls, 1)
+        self.assertFalse(vm.runtime.consolidationNeeded)
+        self.assertIn("Consolidated the disks of VM 'demo-vm'", "\n".join(logs.output))
+
+    def test_disks_still_held_open_are_retried_until_they_merge(self) -> None:
+        vm = _ConsolidatingVm(needed=True, clears_after=3)
+        locked = RuntimeError("vCenter task failed: Unable to access file since it is locked")
+
+        with self._settle(60), patch("python.srv.plugins.vcenter.vcenter.time.sleep") as sleep:
+            self.assertTrue(self._node(vm, [locked]).consolidate_disks("demo-vm"))
+
+        self.assertEqual(vm.consolidate_calls, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_a_consolidation_that_keeps_failing_raises_once_the_wait_is_over(self) -> None:
+        vm = _ConsolidatingVm(needed=True)
+        locked = RuntimeError("vCenter task failed: Unable to access file since it is locked")
+
+        with self._settle(0), patch("python.srv.plugins.vcenter.vcenter.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "locked"):
+                self._node(vm, [locked, locked]).consolidate_disks("demo-vm")
+
+        self.assertTrue(vm.runtime.consolidationNeeded)
+
+    def test_a_missing_vm_needs_nothing(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        node._get_vm = lambda vm_name: None  # type: ignore[method-assign]
+
+        self.assertFalse(node.consolidate_disks("gone-vm"))

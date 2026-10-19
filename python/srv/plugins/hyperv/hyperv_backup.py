@@ -70,7 +70,7 @@ from ..vcenter.vcenter_backup import (
     _stop_message,
 )
 from . import vhdx_tool
-from .hyperv import QUIESCABLE_STATES, HyperVError, HyperVNode
+from .hyperv import QUIESCABLE_STATES, HyperVError, HyperVNode, node_options, protocol_recorder
 
 logger = logging.getLogger(__name__)
 
@@ -165,13 +165,12 @@ def connection_settings(hypervisor: dict[str, Any]) -> dict[str, Any]:
     password = str(credentials.get("password") or "")
     if not host or not username or not password:
         raise HyperVBackupError("Saved Hyper-V registration is missing host or credentials")
-    port = metadata.get("port")
     return {
         "host": host,
         "user": username,
         "password": password,
-        "port": int(port) if port and metadata.get("port_explicit") else None,
-        "verify_ssl": bool(metadata.get("verify_ssl", False)),
+        "hypervisor_id": str(hypervisor.get("id") or ""),
+        **node_options(metadata),
     }
 
 
@@ -182,6 +181,8 @@ def open_node(connection: dict[str, Any]) -> HyperVNode:
         connection["password"],
         port=connection["port"],
         verify_ssl=connection["verify_ssl"],
+        protocol=connection.get("protocol"),
+        on_protocol_detected=protocol_recorder(str(connection.get("hypervisor_id") or "")),
     )
 
 

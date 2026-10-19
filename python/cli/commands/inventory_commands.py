@@ -17,6 +17,7 @@ from ..progress_watch import run_with_elapsed_indicator
 from .base import CommandDependencies
 
 INVENTORY_SCAN_TIMEOUT_SECONDS = 900
+WINRM_PROTOCOLS = ("https", "http")
 
 
 class InventoryCommands:
@@ -47,7 +48,11 @@ class InventoryCommands:
                 '  abr inventory add --name "vCenter-Prod" --type vsphere --address vcenter.example.com '
                 "--username administrator@vsphere.local\n"
                 f'  {INVENTORY_PASSWORD_ENV_VAR}=... abr inventory add --name "HyperV-Host1" --type hyper-v '
-                "--address 10.0.0.5 --port 5986 --username Administrator --insecure"
+                "--address 10.0.0.5 --username Administrator --insecure\n"
+                f'  {INVENTORY_PASSWORD_ENV_VAR}=... abr inventory add --name "HyperV-Host2" --type hyper-v '
+                "--address 10.0.0.6 --protocol http --username Administrator\n\n"
+                "A Hyper-V inventory speaks WinRM over HTTPS (port 5986) unless --protocol http "
+                "(port 5985) is given; --port overrides the port, not the protocol."
             ),
             formatter_class=CompactHelpFormatter,
         )
@@ -55,6 +60,7 @@ class InventoryCommands:
         add.add_argument("--type", required=True, choices=("vsphere", "hyper-v", "proxmox-ve", "xcp-ng"), help="Inventory type")
         add.add_argument("--address", required=True, help="Inventory endpoint address")
         add.add_argument("--port", type=int, help="Inventory connection port")
+        add.add_argument("--protocol", choices=WINRM_PROTOCOLS, help="WinRM protocol of a Hyper-V inventory (default: https)")
         add.add_argument("--username", help="Inventory username")
         add_secret_argument(add, "--password", env_var=INVENTORY_PASSWORD_ENV_VAR, help_text="Inventory password")
         add_secret_argument(add, "--token", env_var=INVENTORY_TOKEN_ENV_VAR, help_text="Inventory token")
@@ -122,6 +128,11 @@ class InventoryCommands:
         edit.add_argument("--new-name", help="Updated inventory display name")
         edit.add_argument("--address", help="Updated endpoint address")
         edit.add_argument("--port", type=int, help="Updated connection port")
+        edit.add_argument(
+            "--protocol",
+            choices=WINRM_PROTOCOLS,
+            help="Updated WinRM protocol of a Hyper-V inventory; a standard port (5986/5985) follows it",
+        )
         edit.add_argument("--username", help="Updated username")
         add_secret_argument(edit, "--password", env_var=INVENTORY_PASSWORD_ENV_VAR, help_text="Updated password")
         add_secret_argument(edit, "--token", env_var=INVENTORY_TOKEN_ENV_VAR, help_text="Updated token")
@@ -162,6 +173,7 @@ class InventoryCommands:
             "type": args.type,
             "address": args.address,
             "port": args.port,
+            "protocol": args.protocol,
             "username": args.username,
             "password": password,
             "token": token,
@@ -186,6 +198,7 @@ class InventoryCommands:
             "name": args.new_name,
             "address": args.address,
             "port": args.port,
+            "protocol": args.protocol,
             "username": args.username,
             "password": resolve_secret(args.password, env_var=INVENTORY_PASSWORD_ENV_VAR, prompt="Inventory password"),
             "token": resolve_secret(args.token, env_var=INVENTORY_TOKEN_ENV_VAR, prompt="Inventory token"),

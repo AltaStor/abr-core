@@ -18,6 +18,7 @@ from ...core.storage_tool import (
     disk_tool_storage_args,
     extract_s3_config,
     redact_disk_tool_command,
+    run_disk_tool_process,
 )
 from ...core.utils import utc_now
 
@@ -529,7 +530,7 @@ def _build_abr_restore_command(
 
 def _run_restore_layer(command: list[str], **kwargs: Any):
     try:
-        return run_capped(command, **kwargs)
+        return run_disk_tool_process(run_capped, command, **kwargs)
     except ProcessCancelled as exc:
         raise TaskStopRequested("Session stop requested") from exc
 

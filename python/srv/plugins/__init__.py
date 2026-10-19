@@ -32,16 +32,14 @@ def build_hypervisor_plugin(record: dict[str, object]) -> Hypervisor:
         if not isinstance(credentials, dict):
             raise ValueError("Hyper-V hypervisor credentials must be a mapping")
 
-        from .hyperv import HyperVNode
+        from .hyperv.hyperv import HyperVNode, node_options, protocol_recorder
 
-        port = metadata.get("port")
-        port_explicit = bool(metadata.get("port_explicit"))
         return HyperVNode(
             host=str(metadata.get("host") or ""),
             user=str(credentials.get("username") or ""),
             password=str(credentials.get("password") or ""),
-            port=int(port) if port and port_explicit else None,
-            verify_ssl=bool(metadata.get("verify_ssl", False)),
+            on_protocol_detected=protocol_recorder(str(record.get("id") or "")),
+            **node_options(metadata),
         )
 
     if kind == "mock":

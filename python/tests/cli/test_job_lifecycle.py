@@ -1759,6 +1759,53 @@ class JobStartWaitTests(unittest.TestCase):
         self.assertEqual(exit_code, INVALID_STATE)
 
 
+    @patch("python.cli.api.client.requests.request")
+    def test_start_with_wait_follows_the_sessions_of_one_vm_in_order(self, request_mock: object) -> None:
+        request_mock.return_value = _FakeResponse(
+            {
+                "job": {"id": "job-1", "name": "Nightly"},
+                "items": [
+                    {"id": "sess-inc", "vm_id": "vm-1", "state": "queued"},
+                    {"id": "sess-synth", "vm_id": "vm-1", "state": "queued"},
+                ],
+            }
+        )
+        args = SimpleNamespace(base_url="http://example.test", output="json", name=None, id="job-1", full=False, wait=True)
+
+        with patch("python.cli.commands.job_commands.watch_session") as watch_mock:
+            watch_mock.side_effect = lambda client, session_id: {"id": session_id, "vm_id": "vm-1", "state": "completed"}
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                exit_code = JobCommands().start(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual([call.args[1] for call in watch_mock.call_args_list], ["sess-inc", "sess-synth"])
+        self.assertEqual([item["state"] for item in json.loads(stream.getvalue())["items"]], ["completed", "completed"])
+
+    @patch("python.cli.api.client.requests.request")
+    def test_start_with_wait_stops_at_the_first_failed_session_of_one_vm(self, request_mock: object) -> None:
+        request_mock.return_value = _FakeResponse(
+            {
+                "job": {"id": "job-1", "name": "Nightly"},
+                "items": [
+                    {"id": "sess-inc", "vm_id": "vm-1", "state": "queued"},
+                    {"id": "sess-synth", "vm_id": "vm-1", "state": "queued"},
+                ],
+            }
+        )
+        args = SimpleNamespace(base_url="http://example.test", output="json", name=None, id="job-1", full=False, wait=True)
+
+        with patch("python.cli.commands.job_commands.watch_session") as watch_mock:
+            watch_mock.return_value = {"id": "sess-inc", "vm_id": "vm-1", "state": "failed"}
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                exit_code = JobCommands().start(args)
+
+        self.assertEqual(exit_code, INVALID_STATE)
+        watch_mock.assert_called_once()
+        self.assertEqual([item["id"] for item in json.loads(stream.getvalue())["items"]], ["sess-inc"])
+
+
 class JobCurrentVmNameTests(unittest.TestCase):
     def setUp(self) -> None:
         RESOURCES_BY_HV.clear()

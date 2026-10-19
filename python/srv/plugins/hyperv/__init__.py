@@ -3,6 +3,7 @@
 
 from .hyperv import (
     HyperVAuthError,
+    HyperVCertificateError,
     HyperVCheckpointError,
     HyperVError,
     HyperVNode,
@@ -14,6 +15,7 @@ from .hyperv import (
 
 __all__ = [
     "HyperVAuthError",
+    "HyperVCertificateError",
     "HyperVCheckpointError",
     "HyperVError",
     "HyperVNode",

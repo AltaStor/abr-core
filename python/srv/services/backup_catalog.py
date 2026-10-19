@@ -904,6 +904,7 @@ def _remove_interrupted_task_snapshot(task: dict[str, Any]) -> None:
     try:
         with build_hypervisor_plugin(hypervisor) as node:
             node.remove_snapshot(vm_name, snapshot_name)
+            _consolidate_after_interrupted_task(node, task_id, vm_name)
     except Exception as exc:
         logger.warning(
             "Could not remove the snapshot %r that interrupted task %s left on VM %r (%s); "
@@ -921,6 +922,19 @@ def _remove_interrupted_task_snapshot(task: dict[str, Any]) -> None:
         task_id,
         vm_name,
     )
+
+
+def _consolidate_after_interrupted_task(node: Any, task_id: str, vm_name: str) -> None:
+    try:
+        node.consolidate_disks(vm_name)
+    except Exception as exc:
+        logger.warning(
+            "VM %r needs disk consolidation after the snapshot interrupted task %s left was removed, and "
+            "consolidating it failed (%s).",
+            vm_name,
+            task_id,
+            exc,
+        )
 
 
 def _discard_interrupted_task_output(task: dict[str, Any]) -> None:

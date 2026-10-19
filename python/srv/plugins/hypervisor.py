@@ -114,6 +114,9 @@ class Hypervisor(ABC):
         """Delete snapshot from virtual machine."""
         pass
 
+    def consolidate_disks(self, vm_name: str) -> bool:
+        return False
+
     @abstractmethod
     def attach_existing_disk(
         self,

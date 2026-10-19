@@ -32,10 +32,33 @@ the appliance, each host must have the tool installed at
 
 | From | What | Why |
 | --- | --- | --- |
-| Every Hyper-V host (every node of a cluster) | WinRM, TCP 5986 (HTTPS) or 5985 | Inventory, checkpoints, VM configuration, running abr-vhdx-tool, building and changing VMs on restore |
+| Every Hyper-V host (every node of a cluster) | WinRM over HTTPS, TCP 5986 (or HTTP, TCP 5985, when the inventory is set to HTTP) | Inventory, checkpoints, VM configuration, running abr-vhdx-tool, building and changing VMs on restore |
 | The registered account | Local administrator on every node | Hyper-V WMI, and the elevated token abr-vhdx-tool needs to attach virtual disks |
 | The repository | **S3** (or S3-compatible), reachable from every host and from the backup server; or a **local** repository whose folder is shared over SMB to every host (see below) | The host writes and reads the disks; the server keeps the manifests, merges chains, applies retention and verifies. Both have to reach the same storage |
 | The VM | Configuration version 8.0 or later for incremental backups | Resilient change tracking (RCT) starts with version 8.0; older VMs get a full backup every time |
+
+### WinRM: HTTPS by default
+
+A Hyper-V inventory connects over WinRM HTTPS (port 5986) unless it is set to
+HTTP (`--protocol http`, port 5985; *Protocol* in the web UI). `--port` moves
+the port and keeps the protocol. The server never falls back from HTTPS to
+HTTP: when a host has no HTTPS listener, or offers a certificate the server
+does not trust, adding the inventory is refused and a backup or restore fails
+with that reason. A self-signed certificate is accepted with `--insecure`
+(*Skip TLS verification*). Every node of a cluster is reached the same way.
+
+An inventory registered before the setting existed is checked once: the first
+connection tries HTTPS, then HTTP, and the protocol that answered is saved.
+From then on it is used strictly; an inventory that settled on HTTP logs a
+warning to set up HTTPS and switch it with `abr inventory edit --protocol https`.
+
+A WinRM HTTPS listener with a self-signed certificate, on each node:
+
+```powershell
+$cert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation Cert:\LocalMachine\My
+New-Item -Path WSMan:\localhost\Listener -Transport HTTPS -Address * -CertificateThumbPrint $cert.Thumbprint -Force
+New-NetFirewallRule -DisplayName 'WinRM HTTPS' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow
+```
 
 ### A local repository
 
@@ -61,10 +84,12 @@ The appliance creates every backup folder itself, owned by the user its server
 runs as and writable by nobody else (mode 0750), so the share must write as
 that user (Samba's `force user`), and every node needs TCP 445 to it.
 
-The S3 keys reach the tool as the AWS SDK's environment variables of its
-WinRM session, never on its command line; encryption keys and S3 secrets are
-passed as parameters of the remote command, not in script text, so they stay
-out of PowerShell's script block logging.
+The encryption keys and the S3 secret key reach the tool on its standard
+input (`--stdin-keys`), never on its command line, where process-creation
+auditing (event 4688) would keep them. They travel to the host as PSRP secure
+strings, parameters of the remote command rather than script text, so they
+also stay out of PowerShell's script block logging. The S3 access key, an
+identifier rather than a secret, stays on the command line.
 
 Supported disks are VHDX, VHD and differencing disks (a VM with checkpoints of
 its own). Pass-through physical disks and shared VHD Sets (`.vhds`) are skipped
@@ -194,6 +219,9 @@ Lock validation. Credentials and encryption keys are never written to either.
 | `reaches S3 repositories, and local repositories only through an SMB share` | Point the job at an S3 repository, or give the local repository its share (`abr repo edit --server --share`) |
 | `cannot reach repository` | The reason that follows it: the S3 endpoint, keys and bucket the repository names, or its share, as seen from that node |
 | `cannot open the repository share` | The share's account (the repository's `--username`, else the inventory's), and that every node reaches the share on TCP 445 |
+| `did not answer WinRM over HTTPS on port ...` | No HTTPS listener on that port of the host: set one up, or set the inventory to HTTP (`abr inventory edit --protocol http`) |
+| `the port answers without TLS` | The port is an HTTP listener: give the HTTPS listener's port, or set the inventory to HTTP |
+| `The TLS certificate of Hyper-V host ... was not trusted` | Give the host a certificate the server trusts, or accept it with `--insecure` (*Skip TLS verification*) |
 | `abr-vhdx-tool is not installed on ...` | Set `ALTASTOR_VHDX_TOOL_PATH` on the appliance, or install the tool on the host at `ALTASTOR_HYPERV_TOOL_PATH` |
 | `needs an elevated (administrator) process` | The registered account is not a local administrator of that node |
 | `is in the OffCritical state` | The host lost the VM's storage or configuration |

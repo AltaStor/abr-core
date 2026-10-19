@@ -32,6 +32,7 @@ _T = TypeVar("_T")
 
 ACCESS_LOCK_METHOD = "RelocateVM_Task"
 ACCESS_LOCK_SOURCE = "abr-vmdk-tool"
+CONSOLIDATION_RETRY_SECONDS = 5
 
 
 def _keepalive_interval_seconds() -> int:
@@ -1425,6 +1426,28 @@ class VCenterNode(Hypervisor):
         task = target.snapshot.RemoveSnapshot_Task(removeChildren=False)
         self._wait_for_task(task)
         logger.info("Snapshot '%s' removed from VM '%s'.", snapshot_name, vm_name)
+
+    @_retry_on_expired_session
+    def consolidate_disks(self, vm_name: str) -> bool:
+        vm = self._get_vm(vm_name)
+        if vm is None or not vm.runtime.consolidationNeeded:
+            return False
+        logger.warning("VM '%s' needs its disks consolidated after a snapshot was removed; consolidating.", vm_name)
+        deadline = time.monotonic() + env_int("BACKUPSERVER_CONSOLIDATION_SETTLE_SECONDS")
+        while True:
+            try:
+                self._wait_for_task(vm.ConsolidateVMDisks_Task())
+            except Exception as exc:
+                if time.monotonic() >= deadline:
+                    raise
+                logger.info("Consolidating the disks of VM '%s' failed, retrying: %s", vm_name, exc)
+            else:
+                if not vm.runtime.consolidationNeeded:
+                    logger.info("Consolidated the disks of VM '%s'.", vm_name)
+                    return True
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("vCenter finished the consolidation but still reports that the VM needs one")
+            time.sleep(CONSOLIDATION_RETRY_SECONDS)
 
     def attach_existing_disk(
         self,

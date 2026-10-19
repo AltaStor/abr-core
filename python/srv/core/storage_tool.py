@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from .server_defaults import env_int
-from .subprocess_util import CompletedProcess, ProcessCancelled, run_capped
+from .subprocess_util import CompletedProcess, DataPathStalled, ProcessCancelled, run_capped
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,15 @@ DISK_TOOL_LAUNCHER = "abr-vmdk-tool.sh"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CREDENTIAL_FIELD_NAMES = frozenset({"password", "token", "encryption_key"})
 SECRET_MASK = "********"
+STDIN_KEYS_FLAG = "--stdin-keys"
+STDIN_SECRET_NAMES = {
+    "--key": "key",
+    "-k": "key",
+    "--secret-key": "secret-key",
+    "--source-key": "source-key",
+    "--source-secret-key": "source-secret-key",
+    "--password": "password",
+}
 _SAFE_PATH_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 VERIFY_PROGRESS_POLL_SECONDS = 0.25
 IMMUTABILITY_MODES = ("none", "governance", "compliance")
@@ -491,7 +500,7 @@ def copy_disk_tool_chain(
 def redact_disk_tool_command(command: list[str]) -> list[str]:
     redacted = list(command)
     for index, value in enumerate(redacted[:-1]):
-        if value in _SECRET_FLAGS:
+        if value in STDIN_SECRET_NAMES:
             redacted[index + 1] = SECRET_MASK
         if value in {"--access-key", "--source-access-key"}:
             redacted[index + 1] = mask_access_key(redacted[index + 1]) or SECRET_MASK
@@ -665,25 +674,79 @@ def parse_disk_tool_json(stdout: str) -> dict[str, Any]:
 
 
 _UNREADABLE_RESULT_TAIL = 2000
-_SECRET_FLAGS = {"--password", "--secret-key", "--key", "-k", "--source-secret-key", "--source-key"}
+
+
+def split_disk_tool_secrets(command: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    argv: list[str] = []
+    secrets: list[tuple[str, str]] = []
+    index = 0
+    while index < len(command):
+        name = STDIN_SECRET_NAMES.get(command[index])
+        value = str(command[index + 1]) if name and index + 1 < len(command) else ""
+        if not value:
+            argv.append(command[index])
+            index += 1
+            continue
+        if "\n" in value or "\r" in value:
+            raise StorageToolError(f"The {name} given to the backup tool must not contain a line break")
+        secrets.append((name, value))
+        index += 2
+    return ([*argv, STDIN_KEYS_FLAG] if secrets else argv), secrets
+
+
+def stdin_keys_text(secrets: list[tuple[str, str]]) -> str | None:
+    if not secrets:
+        return None
+    return "".join(f"{name}={value}\n" for name, value in secrets) + "\n"
+
+
+def mask_secret_values(text: Any, secrets: list[str]) -> str:
+    masked = str(text or "")
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            masked = masked.replace(secret, SECRET_MASK)
+    return masked
+
+
+def _mask_stream(stream: Any, secrets: list[str]) -> Any:
+    if isinstance(stream, bytes):
+        for secret in sorted(set(secrets), key=len, reverse=True):
+            if secret:
+                stream = stream.replace(secret.encode("utf-8"), SECRET_MASK.encode("utf-8"))
+        return stream
+    if isinstance(stream, str):
+        return mask_secret_values(stream, secrets)
+    return stream
+
+
+def run_disk_tool_process(run: Callable[..., CompletedProcess], command: list[str], **kwargs: Any) -> CompletedProcess:
+    argv, pairs = split_disk_tool_secrets(list(command))
+    secrets = [value for _, value in pairs]
+    try:
+        completed = run(argv, stdin_text=stdin_keys_text(pairs), **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        raise subprocess.TimeoutExpired(
+            argv, exc.timeout, output=_mask_stream(exc.output, secrets), stderr=_mask_stream(exc.stderr, secrets)
+        ) from None
+    except DataPathStalled as exc:
+        raise DataPathStalled(
+            exc.idle_seconds, stdout=_mask_stream(exc.stdout, secrets), stderr=_mask_stream(exc.stderr, secrets)
+        ) from None
+    if secrets:
+        completed.stdout = _mask_stream(completed.stdout, secrets)
+        completed.stderr = _mask_stream(completed.stderr, secrets)
+    return completed
 
 
 def _masked_tail(text: Any, secrets: list[str]) -> str:
-    tail = str(text or "")[-_UNREADABLE_RESULT_TAIL:]
-    for secret in secrets:
-        tail = tail.replace(secret, SECRET_MASK)
-    return tail.strip()
+    return mask_secret_values(str(text or "")[-_UNREADABLE_RESULT_TAIL:], secrets).strip()
 
 
 def parse_disk_tool_result(completed: Any, command: list[str]) -> dict[str, Any]:
     try:
         return parse_disk_tool_json(str(getattr(completed, "stdout", "") or ""))
     except StorageToolError as exc:
-        secrets = [
-            command[index + 1]
-            for index, flag in enumerate(command[:-1])
-            if flag in _SECRET_FLAGS and command[index + 1]
-        ]
+        secrets = [value for _, value in split_disk_tool_secrets(list(command))[1]]
         returncode = getattr(completed, "returncode", None)
         stderr_tail = _masked_tail(getattr(completed, "stderr", ""), secrets)
         stdout_tail = _masked_tail(getattr(completed, "stdout", ""), secrets)
@@ -977,7 +1040,8 @@ def run_disk_tool(
                 progress_options["progress_poll_seconds"] = progress_poll_seconds
         if should_cancel is not None:
             progress_options["should_cancel"] = should_cancel
-        completed = run_capped(
+        completed = run_disk_tool_process(
+            run_capped,
             [str(resolved_tool_path), *args],
             check=False,
             capture_output=True,

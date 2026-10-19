@@ -13,9 +13,12 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Dict, List
+from collections.abc import Callable
+from typing import Any, Dict, List, Tuple
 
 from ...core.credential_encryption import StoredCredentialUnreadable, is_encrypted, unreadable_credential_message
+from ...core.mongo_db_wrapper import HYPERVISORS, update_hypervisor_fields
+from ...core.storage_tool import mask_secret_values, redact_disk_tool_command, split_disk_tool_secrets
 from ..hypervisor import Hypervisor, ProgressCallback
 from . import vhdx_tool
 
@@ -23,6 +26,14 @@ logger = logging.getLogger(__name__)
 
 HTTPS_PORT = 5986
 HTTP_PORT = 5985
+TOOL_SECRET_PARAMETERS = {
+    "key": "Key",
+    "secret-key": "SecretKey",
+    "source-key": "SourceKey",
+    "source-secret-key": "SourceSecretKey",
+}
+WINRM_PORTS = {"https": HTTPS_PORT, "http": HTTP_PORT}
+DEFAULT_WINRM_PROTOCOL = "https"
 PROBE_TIMEOUT_SECONDS = 5
 OPERATION_TIMEOUT_SECONDS = 120
 READ_TIMEOUT_SECONDS = 180
@@ -35,14 +46,30 @@ class HyperVError(Exception):
 
 
 class HyperVUnreachableError(HyperVError):
-    def __init__(self, host: str, ports: List[int], detail: str = "") -> None:
+    def __init__(self, host: str, ports: List[int], detail: str = "", protocol: str | None = None) -> None:
         tried = ", ".join(str(port) for port in ports)
-        message = f"Hyper-V host {host} did not answer WinRM on port {tried}"
+        over = f" over {protocol.upper()}" if protocol else ""
+        message = f"Hyper-V host {host} did not answer WinRM{over} on port {tried}"
         if detail:
             message = f"{message}: {detail}"
+        if protocol == "https":
+            message = f"{message}. Check that a WinRM HTTPS listener is set up on that port"
         super().__init__(message)
         self.host = host
         self.ports = list(ports)
+        self.detail = detail
+        self.protocol = protocol
+
+
+class HyperVCertificateError(HyperVError):
+    def __init__(self, host: str, port: int, detail: str = "") -> None:
+        message = f"The TLS certificate of Hyper-V host {host}:{port} was not trusted"
+        if detail:
+            message = f"{message} ({detail})"
+        message = f"{message}. Install a certificate the backup server trusts, or skip TLS verification for this inventory (--insecure in the CLI)"
+        super().__init__(message)
+        self.host = host
+        self.port = port
         self.detail = detail
 
 
@@ -80,6 +107,7 @@ class HyperVPermissionError(HyperVError):
         self.detail = detail
 
 
+_CERTIFICATE_REASON = re.compile(r"certificate verify failed:\s*([^()'\]]+)", re.IGNORECASE)
 _GUID_PATTERN = re.compile(r"^\{?[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\}?$")
 
 # VM states a checkpoint can be taken in. A running VM gets an
@@ -146,6 +174,81 @@ def _is_permission_failure(exc: BaseException) -> bool:
     return "access is denied" in text or "accessdenied" in text or "403" in text
 
 
+def _is_certificate_failure(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "certificate_verify_failed" in text or "certificate verify failed" in text
+
+
+def _certificate_reason(exc: BaseException) -> str:
+    match = _CERTIFICATE_REASON.search(str(exc))
+    return match.group(1).strip().rstrip(".") if match else "certificate verify failed"
+
+
+def _answers_without_tls(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "wrong_version_number" in text or "wrong version number" in text or "record layer failure" in text
+
+
+def winrm_protocol(value: Any) -> str | None:
+    protocol = str(value or "").strip().lower()
+    if not protocol:
+        return None
+    if protocol not in WINRM_PORTS:
+        raise ValueError(f"WinRM protocol must be one of: {', '.join(WINRM_PORTS)}")
+    return protocol
+
+
+def node_options(metadata: dict[str, Any]) -> dict[str, Any]:
+    protocol = winrm_protocol(metadata.get("protocol"))
+    port = metadata.get("port")
+    explicit = protocol is not None or bool(metadata.get("port_explicit"))
+    return {
+        "port": int(port) if port and explicit else None,
+        "verify_ssl": bool(metadata.get("verify_ssl", False)),
+        "protocol": protocol,
+    }
+
+
+def with_protocol(metadata: dict[str, Any], protocol: str) -> dict[str, Any]:
+    updated = dict(metadata)
+    updated["protocol"] = protocol
+    if not updated.get("port_explicit") or updated.get("port") in WINRM_PORTS.values():
+        updated["port"] = WINRM_PORTS[protocol]
+    return updated
+
+
+def protocol_recorder(hypervisor_id: str) -> Callable[[str], None] | None:
+    if not hypervisor_id:
+        return None
+    return lambda protocol: record_detected_protocol(hypervisor_id, protocol)
+
+
+def record_detected_protocol(hypervisor_id: str, protocol: str) -> None:
+    current = HYPERVISORS.get(hypervisor_id)
+    if not isinstance(current, dict):
+        return
+    metadata = current.get("metadata") if isinstance(current.get("metadata"), dict) else {}
+    if metadata.get("protocol"):
+        return
+    try:
+        update_hypervisor_fields(hypervisor_id, {"metadata": with_protocol(metadata, protocol)})
+    except Exception as exc:
+        logger.warning("Could not save the WinRM protocol of Hyper-V inventory %s: %s", current.get("name"), exc)
+        return
+    log_detected_protocol(str(current.get("name") or hypervisor_id), protocol)
+
+
+def log_detected_protocol(name: str, protocol: str) -> None:
+    if protocol == "http":
+        logger.warning(
+            "Hyper-V inventory %s answers WinRM only over HTTP, so it stays on HTTP from now on. "
+            "Set up a WinRM HTTPS listener on the host and switch the inventory to HTTPS",
+            name,
+        )
+        return
+    logger.info("Hyper-V inventory %s answers WinRM over HTTPS and stays on HTTPS from now on", name)
+
+
 class HyperVNode(Hypervisor):
     def __init__(
         self,
@@ -154,12 +257,16 @@ class HyperVNode(Hypervisor):
         password: str,
         port: int | None = None,
         verify_ssl: bool = False,
+        protocol: str | None = None,
+        on_protocol_detected: Callable[[str], None] | None = None,
     ) -> None:
         self.host = str(host or "").strip()
         self.user = str(user or "")
         self.password = str(password or "")
         self.port = int(port) if port else None
         self.verify_ssl = bool(verify_ssl)
+        self.protocol = winrm_protocol(protocol)
+        self._on_protocol_detected = on_protocol_detected
         self._client: Any = None
         self._clients: Dict[str, Any] = {}
         self._resolved_port: int | None = None
@@ -413,12 +520,17 @@ class HyperVNode(Hypervisor):
             "dynamic_mac": bool(raw.get("dynamic_mac")),
         }
 
-    def _candidate_ports(self) -> List[int]:
+    def _candidates(self) -> List[Tuple[int, str]]:
+        if self.protocol:
+            return [(self.port or WINRM_PORTS[self.protocol], self.protocol)]
         if self.port:
-            return [self.port]
-        return [HTTPS_PORT, HTTP_PORT]
+            return [(self.port, "https" if self.port == HTTPS_PORT else "http")]
+        return [(HTTPS_PORT, "https"), (HTTP_PORT, "http")]
 
-    def _build_client(self, host: str, port: int) -> Any:
+    def _candidate_ports(self) -> List[int]:
+        return [port for port, _ in self._candidates()]
+
+    def _build_client(self, host: str, port: int, protocol: str) -> Any:
         if is_encrypted(self.password):
             raise StoredCredentialUnreadable(unreadable_credential_message(f"for Hyper-V host {self.host}"))
         try:
@@ -431,7 +543,7 @@ class HyperVNode(Hypervisor):
             username=self.user,
             password=self.password,
             port=port,
-            ssl=port == HTTPS_PORT,
+            ssl=protocol == "https",
             cert_validation=self.verify_ssl,
             auth="ntlm",
             operation_timeout=OPERATION_TIMEOUT_SECONDS,
@@ -439,19 +551,21 @@ class HyperVNode(Hypervisor):
         )
 
     def _open(self, host: str) -> Any:
-        ports = self._candidate_ports()
-        reachable = [port for port in ports if _port_is_open(host, port)]
+        candidates = self._candidates()
+        configured = self.protocol
+        ports = [port for port, _ in candidates]
+        reachable = [(port, protocol) for port, protocol in candidates if _port_is_open(host, port)]
         if not reachable:
             logger.warning(
                 "Hyper-V host %s does not answer WinRM on port(s) %s",
                 host,
                 ", ".join(str(port) for port in ports),
             )
-            raise HyperVUnreachableError(host, ports)
+            raise HyperVUnreachableError(host, ports, protocol=configured)
 
-        last_error: BaseException | None = None
-        for port in reachable:
-            client = self._build_client(host, port)
+        last_error: str = ""
+        for port, protocol in reachable:
+            client = self._build_client(host, port, protocol)
             try:
                 client.execute_ps("$env:COMPUTERNAME")
             except Exception as exc:
@@ -474,9 +588,20 @@ class HyperVNode(Hypervisor):
                         first_line,
                     )
                     raise HyperVPermissionError(host, self.user, first_line) from exc
+                if configured == "https" and _is_certificate_failure(exc):
+                    logger.warning(
+                        "Hyper-V host %s offered a TLS certificate on WinRM port %d that was not trusted: %s",
+                        host,
+                        port,
+                        first_line,
+                    )
+                    raise HyperVCertificateError(host, port, _certificate_reason(exc)) from exc
 
                 logger.warning("Hyper-V host %s did not accept WinRM on port %d: %s", host, port, exc)
-                last_error = exc
+                if protocol == "https" and _answers_without_tls(exc):
+                    last_error = "the port answers without TLS, the way an HTTP listener does"
+                else:
+                    last_error = str(exc)[:200]
                 continue
 
             self._resolved_port = port
@@ -484,12 +609,16 @@ class HyperVNode(Hypervisor):
                 "Connected to Hyper-V host %s over WinRM port %d (%s) as %s",
                 host,
                 port,
-                "HTTPS" if port == HTTPS_PORT else "HTTP",
+                protocol.upper(),
                 self.user,
             )
+            if not configured:
+                self.protocol = protocol
+                if self._on_protocol_detected is not None:
+                    self._on_protocol_detected(protocol)
             return client
 
-        raise HyperVUnreachableError(host, reachable, str(last_error or "")[:200])
+        raise HyperVUnreachableError(host, [port for port, _ in reachable], last_error, protocol=configured)
 
     def _client_for(self, node: str) -> Any:
         key = str(node or "").lower()
@@ -1014,10 +1143,9 @@ class HyperVNode(Hypervisor):
         which ends the tool; it discards what it had written itself, and no
         virtual disk stays attached once it is gone.
         """
-        from pypsrp.complex_objects import PSInvocationState
+        from pypsrp.complex_objects import ObjectMeta, PSInvocationState
         from pypsrp.powershell import PowerShell, RunspacePool
 
-        from ...core.storage_tool import redact_disk_tool_command
         from ...core.subprocess_util import ProcessCancelled
 
         tool = self.ensure_disk_tool(node)
@@ -1025,24 +1153,38 @@ class HyperVNode(Hypervisor):
         if client is None:
             raise HyperVError("Hyper-V connection is not open")
         logger.info("Running abr-vhdx-tool on %s: %s", node, " ".join(redact_disk_tool_command([tool, *args])))
+        tool_args, secrets = split_disk_tool_secrets(list(args))
+        unknown = [name for name, _ in secrets if name not in TOOL_SECRET_PARAMETERS]
+        if unknown:
+            raise HyperVError(f"abr-vhdx-tool takes no {', '.join(unknown)} on its standard input")
         env = dict(env or {})
+        share_password = env.pop("ABR_SMB_PASSWORD", None)
         if env.get("ABR_SMB_SHARE") and not env.get("ABR_SMB_USER"):
-            # A repository share with no account of its own is opened with
-            # the one this inventory signs in to the hosts with.
-            env["ABR_SMB_USER"], env["ABR_SMB_PASSWORD"] = self.user, self.password
+            env["ABR_SMB_USER"], share_password = self.user, self.password
+        secure = {TOOL_SECRET_PARAMETERS[name]: value for name, value in secrets}
+        if env.get("ABR_SMB_SHARE") and share_password:
+            secure["SharePassword"] = share_password
         started = time.monotonic()
-        output = _ToolOutput(on_progress)
+        output = _ToolOutput(on_progress, [value for _, value in secrets] + ([share_password] if share_password else []))
         with RunspacePool(client.wsman) as pool:
             shell = PowerShell(pool)
             folder = self._bundle_folder(node)
             if folder:
+                names = ["SharePassword", *TOOL_SECRET_PARAMETERS.values()]
                 shell.add_script(
-                    "param([string]$Tool, [string[]]$ToolArgs, [hashtable]$ToolEnv)\n"
-                    f"& {_bundle_script_block(folder, 'run_tool.ps1')} -Tool $Tool -ToolArgs $ToolArgs -ToolEnv $ToolEnv"
+                    "param([string]$Tool, [string[]]$ToolArgs, [hashtable]$ToolEnv, "
+                    + ", ".join(f"[securestring]${name}" for name in names)
+                    + ")\n"
+                    + f"& {_bundle_script_block(folder, 'run_tool.ps1')} -Tool $Tool -ToolArgs $ToolArgs -ToolEnv $ToolEnv "
+                    + " ".join(f"-{name} ${name}" for name in names)
                 )
             else:
                 shell.add_script(load_script("run_tool.ps1"))
-            shell.add_parameters({"Tool": tool, "ToolArgs": list(args), "ToolEnv": env})
+            shell.add_parameters({"Tool": tool, "ToolArgs": tool_args, "ToolEnv": env})
+            if secure:
+                pool.exchange_keys()
+                for name, value in secure.items():
+                    shell.add_parameter(name, pool.serialize(value, ObjectMeta("SS")))
             shell.begin_invoke()
             seen = 0
             while shell.state == PSInvocationState.RUNNING:
@@ -1291,12 +1433,15 @@ class _ToolOutput:
     """Sorts what abr-vhdx-tool prints: ``NN%`` progress lines, the exit code
     the runner script appends, and everything else."""
 
-    def __init__(self, on_progress: Any = None) -> None:
+    def __init__(self, on_progress: Any = None, secrets: List[str] | None = None) -> None:
         self.on_progress = on_progress
         self.lines: List[str] = []
         self.exit_code: int | None = None
+        self._secrets = [secret for secret in secrets or [] if secret]
 
     def feed(self, text: str) -> None:
+        if self._secrets:
+            text = mask_secret_values(text, self._secrets)
         for line in text.splitlines() or [""]:
             if line.startswith("ABR_TOOL_EXIT="):
                 try:
