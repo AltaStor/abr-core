@@ -36,6 +36,7 @@ from ...core.storage_tool import (
     remove_disk_tool_backup,
     repository_cache_root,
     run_disk_tool,
+    run_disk_tool_process,
     s3_block_generation_days,
     with_immutability_retention_days,
     safe_path_component,
@@ -1354,7 +1355,7 @@ def _run_watched_disk_tool(
         )
 
     try:
-        return run_capped(command, stall_seconds=limit, on_stall=on_stall, **kwargs)
+        return run_disk_tool_process(run_capped, command, stall_seconds=limit, on_stall=on_stall, **kwargs)
     except DataPathStalled as exc:
         logger.error(
             "Data path to %s lost while backing up %s (%s): no data for %ds; stopped the data mover. %s",

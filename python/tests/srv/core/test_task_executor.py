@@ -1773,6 +1773,7 @@ class TaskExecutorTests(unittest.TestCase):
         }
 
         recorded_commands: list[list[str]] = []
+        recorded_stdin: list[str | None] = []
         fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1793,6 +1794,7 @@ class TaskExecutorTests(unittest.TestCase):
 
             def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
                 recorded_commands.append(command)
+                recorded_stdin.append(kwargs.get("stdin_text"))
                 return FakeCompletedProcess(returncode=0, stdout="ok")
 
             with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
@@ -1805,8 +1807,12 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(payload["encryption_algorithm"], 1)
         self.assertEqual(len(recorded_commands), 1)
         command = recorded_commands[0]
-        self.assertIn("--key", command)
-        self.assertEqual(command[command.index("--key") + 1], "hunter2")
+        self.assertNotIn("--key", command)
+        self.assertNotIn("hunter2", " ".join(command))
+        self.assertIn("--stdin-keys", command)
+        self.assertIn("key=hunter2\n", recorded_stdin[0])
+        self.assertNotIn("--password", command)
+        self.assertIn("password=secret\n", recorded_stdin[0])
 
     def test_vcenter_backup_task_rejects_encryption_enabled_without_key(self) -> None:
         HYPERVISORS["hv-vc"] = {
@@ -1878,6 +1884,7 @@ class TaskExecutorTests(unittest.TestCase):
 
         fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
         recorded_commands: list[list[str]] = []
+        recorded_stdin: list[str | None] = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             previous_task_root = pathlib.Path(temp_dir) / "demo-vm" / "task-prev"
@@ -1927,6 +1934,7 @@ class TaskExecutorTests(unittest.TestCase):
 
             def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
                 recorded_commands.append(command)
+                recorded_stdin.append(kwargs.get("stdin_text"))
                 return FakeCompletedProcess(returncode=0, stdout="ok")
 
             with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
@@ -1937,8 +1945,10 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(len(recorded_commands), 1)
         command = recorded_commands[0]
         self.assertEqual(command[command.index("--type") + 1], "incremental")
-        self.assertIn("--key", command)
-        self.assertEqual(command[command.index("--key") + 1], "hunter2")
+        self.assertNotIn("--key", command)
+        self.assertNotIn("hunter2", " ".join(command))
+        self.assertIn("--stdin-keys", command)
+        self.assertIn("key=hunter2\n", recorded_stdin[0])
 
     def test_vcenter_disk_backup_task_uses_selected_disk_only(self) -> None:
         HYPERVISORS["hv-vc"] = {
@@ -5568,6 +5578,7 @@ class TaskExecutorTests(unittest.TestCase):
 
         fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
         recorded_commands: list[list[str]] = []
+        recorded_stdin: list[str | None] = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             full_task_root = pathlib.Path(temp_dir) / "task-full"
@@ -5616,6 +5627,7 @@ class TaskExecutorTests(unittest.TestCase):
 
             def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
                 recorded_commands.append(command)
+                recorded_stdin.append(kwargs.get("stdin_text"))
                 return FakeCompletedProcess(returncode=0, stdout="ok")
 
             with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
@@ -5624,8 +5636,10 @@ class TaskExecutorTests(unittest.TestCase):
 
         self.assertEqual(len(recorded_commands), 1)
         command = recorded_commands[0]
-        self.assertIn("--key", command)
-        self.assertEqual(command[command.index("--key") + 1], "hunter2")
+        self.assertNotIn("--key", command)
+        self.assertNotIn("hunter2", " ".join(command))
+        self.assertIn("--stdin-keys", command)
+        self.assertIn("key=hunter2\n", recorded_stdin[0])
 
     def test_restore_disk_replays_full_then_incremental_abr_layers(self) -> None:
         HYPERVISORS["hv-vc"] = {

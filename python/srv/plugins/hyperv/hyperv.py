@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Tuple
 
 from ...core.credential_encryption import StoredCredentialUnreadable, is_encrypted, unreadable_credential_message
 from ...core.mongo_db_wrapper import HYPERVISORS, update_hypervisor_fields
+from ...core.storage_tool import mask_secret_values, redact_disk_tool_command, split_disk_tool_secrets
 from ..hypervisor import Hypervisor, ProgressCallback
 from . import vhdx_tool
 
@@ -25,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 HTTPS_PORT = 5986
 HTTP_PORT = 5985
+TOOL_SECRET_PARAMETERS = {
+    "key": "Key",
+    "secret-key": "SecretKey",
+    "source-key": "SourceKey",
+    "source-secret-key": "SourceSecretKey",
+}
 WINRM_PORTS = {"https": HTTPS_PORT, "http": HTTP_PORT}
 DEFAULT_WINRM_PROTOCOL = "https"
 PROBE_TIMEOUT_SECONDS = 5
@@ -1139,7 +1146,6 @@ class HyperVNode(Hypervisor):
         from pypsrp.complex_objects import ObjectMeta, PSInvocationState
         from pypsrp.powershell import PowerShell, RunspacePool
 
-        from ...core.storage_tool import redact_disk_tool_command
         from ...core.subprocess_util import ProcessCancelled
 
         tool = self.ensure_disk_tool(node)
@@ -1147,27 +1153,38 @@ class HyperVNode(Hypervisor):
         if client is None:
             raise HyperVError("Hyper-V connection is not open")
         logger.info("Running abr-vhdx-tool on %s: %s", node, " ".join(redact_disk_tool_command([tool, *args])))
+        tool_args, secrets = split_disk_tool_secrets(list(args))
+        unknown = [name for name, _ in secrets if name not in TOOL_SECRET_PARAMETERS]
+        if unknown:
+            raise HyperVError(f"abr-vhdx-tool takes no {', '.join(unknown)} on its standard input")
         env = dict(env or {})
         share_password = env.pop("ABR_SMB_PASSWORD", None)
         if env.get("ABR_SMB_SHARE") and not env.get("ABR_SMB_USER"):
             env["ABR_SMB_USER"], share_password = self.user, self.password
+        secure = {TOOL_SECRET_PARAMETERS[name]: value for name, value in secrets}
+        if env.get("ABR_SMB_SHARE") and share_password:
+            secure["SharePassword"] = share_password
         started = time.monotonic()
-        output = _ToolOutput(on_progress)
+        output = _ToolOutput(on_progress, [value for _, value in secrets] + ([share_password] if share_password else []))
         with RunspacePool(client.wsman) as pool:
             shell = PowerShell(pool)
             folder = self._bundle_folder(node)
             if folder:
+                names = ["SharePassword", *TOOL_SECRET_PARAMETERS.values()]
                 shell.add_script(
-                    "param([string]$Tool, [string[]]$ToolArgs, [hashtable]$ToolEnv, [securestring]$SharePassword)\n"
-                    f"& {_bundle_script_block(folder, 'run_tool.ps1')} "
-                    "-Tool $Tool -ToolArgs $ToolArgs -ToolEnv $ToolEnv -SharePassword $SharePassword"
+                    "param([string]$Tool, [string[]]$ToolArgs, [hashtable]$ToolEnv, "
+                    + ", ".join(f"[securestring]${name}" for name in names)
+                    + ")\n"
+                    + f"& {_bundle_script_block(folder, 'run_tool.ps1')} -Tool $Tool -ToolArgs $ToolArgs -ToolEnv $ToolEnv "
+                    + " ".join(f"-{name} ${name}" for name in names)
                 )
             else:
                 shell.add_script(load_script("run_tool.ps1"))
-            shell.add_parameters({"Tool": tool, "ToolArgs": list(args), "ToolEnv": env})
-            if env.get("ABR_SMB_SHARE") and share_password:
+            shell.add_parameters({"Tool": tool, "ToolArgs": tool_args, "ToolEnv": env})
+            if secure:
                 pool.exchange_keys()
-                shell.add_parameter("SharePassword", pool.serialize(share_password, ObjectMeta("SS")))
+                for name, value in secure.items():
+                    shell.add_parameter(name, pool.serialize(value, ObjectMeta("SS")))
             shell.begin_invoke()
             seen = 0
             while shell.state == PSInvocationState.RUNNING:
@@ -1416,12 +1433,15 @@ class _ToolOutput:
     """Sorts what abr-vhdx-tool prints: ``NN%`` progress lines, the exit code
     the runner script appends, and everything else."""
 
-    def __init__(self, on_progress: Any = None) -> None:
+    def __init__(self, on_progress: Any = None, secrets: List[str] | None = None) -> None:
         self.on_progress = on_progress
         self.lines: List[str] = []
         self.exit_code: int | None = None
+        self._secrets = [secret for secret in secrets or [] if secret]
 
     def feed(self, text: str) -> None:
+        if self._secrets:
+            text = mask_secret_values(text, self._secrets)
         for line in text.splitlines() or [""]:
             if line.startswith("ABR_TOOL_EXIT="):
                 try:

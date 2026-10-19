@@ -112,6 +112,12 @@ ln -sfn /path/to/abr-vmdk-tools/vmdk-tool/abr-vmdk-tool.sh \
 Individual backup and restore commands can also override it per call with
 `--tool-path`, which is what the scenario below does.
 
+The server hands the tools their secrets (encryption keys, S3 secret keys and
+the vCenter password) on standard input with `--stdin-keys`, so they never show
+in `ps` or `/proc/<pid>/cmdline`. That needs abr-vmdk-tool and abr-vhdx-tool
+from abr-disk-tools 3ee1dab or later; an older tool refuses the option as
+unknown, so ship the tools together with the server.
+
 ## 5. Start services
 
 Use three terminals. Keep Terminal 1 and Terminal 2 open while running the CLI

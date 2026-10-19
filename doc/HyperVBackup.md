@@ -84,10 +84,12 @@ The appliance creates every backup folder itself, owned by the user its server
 runs as and writable by nobody else (mode 0750), so the share must write as
 that user (Samba's `force user`), and every node needs TCP 445 to it.
 
-The S3 keys reach the tool as the AWS SDK's environment variables of its
-WinRM session, never on its command line; encryption keys and S3 secrets are
-passed as parameters of the remote command, not in script text, so they stay
-out of PowerShell's script block logging.
+The encryption keys and the S3 secret key reach the tool on its standard
+input (`--stdin-keys`), never on its command line, where process-creation
+auditing (event 4688) would keep them. They travel to the host as PSRP secure
+strings, parameters of the remote command rather than script text, so they
+also stay out of PowerShell's script block logging. The S3 access key, an
+identifier rather than a secret, stays on the command line.
 
 Supported disks are VHDX, VHD and differencing disks (a VM with checkpoints of
 its own). Pass-through physical disks and shared VHD Sets (`.vhds`) are skipped

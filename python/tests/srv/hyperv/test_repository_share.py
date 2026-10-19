@@ -71,9 +71,10 @@ class RunToolOpensTheShareTests(unittest.TestCase):
         self.assertIn("[AbrSmbConnection]::Add($share, $account, $SharePassword)", self.script)
 
     def test_no_command_that_puts_the_password_on_a_command_line_or_needs_an_interactive_logon(self) -> None:
-        for command in ("New-SmbMapping", "net use", "New-PSDrive", "CreateProcessWithLogonW", "ConvertTo-PlainText"):
+        for command in ("New-SmbMapping", "net use", "New-PSDrive", "CreateProcessWithLogonW"):
             with self.subTest(command=command):
                 self.assertNotIn(command, self.script)
+        self.assertEqual(self.script.count("$SharePassword"), 3)
 
     def test_the_share_password_never_reaches_the_tools_environment(self) -> None:
         self.assertIn("-notlike 'ABR_SMB_*'", self.script)

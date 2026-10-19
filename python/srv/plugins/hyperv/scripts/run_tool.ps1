@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Norvitex OU
 
-param([string]$Tool, [string[]]$ToolArgs, [hashtable]$ToolEnv, [securestring]$SharePassword)
+param(
+    [string]$Tool, [string[]]$ToolArgs, [hashtable]$ToolEnv, [securestring]$SharePassword,
+    [securestring]$Key, [securestring]$SecretKey, [securestring]$SourceKey, [securestring]$SourceSecretKey
+)
+
+function ConvertTo-PlainText([securestring]$Value) {
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($Value)
+    try { [Runtime.InteropServices.Marshal]::PtrToStringUni($pointer) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($pointer) }
+}
 
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
@@ -68,11 +77,21 @@ public static class AbrSmbConnection {
     }
 }
 
+$secrets = [ordered]@{ 'key' = $Key; 'secret-key' = $SecretKey; 'source-key' = $SourceKey; 'source-secret-key' = $SourceSecretKey }
+$stdin = @($secrets.GetEnumerator() | Where-Object { $_.Value } | ForEach-Object { '{0}={1}' -f $_.Key, (ConvertTo-PlainText $_.Value) })
 foreach ($name in $names) { Set-Item -Path "Env:$name" -Value ([string]$ToolEnv[$name]) }
+$savedEncoding = $global:OutputEncoding
 try {
-    & $Tool @ToolArgs 2>&1 | ForEach-Object { "$_" }
+    if ($stdin.Count) {
+        $global:OutputEncoding = New-Object Text.UTF8Encoding $false
+        ($stdin + '') | & $Tool @ToolArgs 2>&1 | ForEach-Object { "$_" }
+    } else {
+        & $Tool @ToolArgs 2>&1 | ForEach-Object { "$_" }
+    }
     "ABR_TOOL_EXIT=$LASTEXITCODE"
 } finally {
+    $global:OutputEncoding = $savedEncoding
+    $stdin = $null
     foreach ($name in $names) { Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue }
     if ($share) { [AbrSmbConnection]::Remove($share) }
 }

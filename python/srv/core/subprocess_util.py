@@ -262,6 +262,19 @@ class CompletedProcess:
     stderr: str | bytes
 
 
+def _send_stdin(proc: subprocess.Popen, text: str) -> None:
+    try:
+        proc.stdin.write(text.encode("utf-8"))
+        proc.stdin.flush()
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+
+
 def run_capped(
     command: Sequence[str],
     *,
@@ -277,6 +290,7 @@ def run_capped(
     should_cancel: Callable[[], bool] | None = None,
     stall_seconds: float | None = None,
     on_stall: Callable[[float], None] | None = None,
+    stdin_text: str | None = None,
     **_ignored,
 ) -> CompletedProcess:
     """Run ``command`` capturing only a bounded tail of stdout/stderr.
@@ -298,7 +312,11 @@ def run_capped(
         full_cmd = _progress_prefix() + full_cmd
 
     with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
-        proc = subprocess.Popen(full_cmd, stdout=out_f, stderr=err_f)
+        if stdin_text is None:
+            proc = subprocess.Popen(full_cmd, stdout=out_f, stderr=err_f)
+        else:
+            proc = subprocess.Popen(full_cmd, stdin=subprocess.PIPE, stdout=out_f, stderr=err_f)
+            _send_stdin(proc, stdin_text)
         stall_watch = _StallWatch(proc.pid, stall_seconds, on_stall) if stall_seconds else None
         try:
             if on_progress is not None:

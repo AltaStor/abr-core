@@ -46,9 +46,6 @@ _PROGRESS_LINE = re.compile(r"^\s*(\d{1,3})%\s*$")
 _CHANGE_TRACKING_LOST = re.compile(
     r"resilient change tracking|failed to query what changed|start a new chain", re.IGNORECASE
 )
-# The S3 keys go to the tool as the AWS SDK's environment variables rather
-# than on its command line, where every process on the host could read them.
-_CREDENTIAL_FLAGS = {"--access-key": "AWS_ACCESS_KEY_ID", "--secret-key": "AWS_SECRET_ACCESS_KEY"}
 
 
 class VhdxToolError(RuntimeError):
@@ -178,19 +175,7 @@ def storage_invocation(
     ensure_hyperv_repository(repository)
     if not is_s3_repository(repository):
         return _share_invocation(repository, abr_path=abr_path, create_folder=create_folder)
-    args = disk_tool_storage_args(repository, abr_path=abr_path, create_folder=create_folder)
-    options: list[str] = []
-    env: dict[str, str] = {}
-    index = 0
-    while index < len(args):
-        flag = args[index]
-        if flag in _CREDENTIAL_FLAGS and index + 1 < len(args):
-            env[_CREDENTIAL_FLAGS[flag]] = args[index + 1]
-            index += 2
-            continue
-        options.append(flag)
-        index += 1
-    return options, env
+    return disk_tool_storage_args(repository, abr_path=abr_path, create_folder=create_folder), {}
 
 
 def progress_percent(line: str) -> int | None:
