@@ -35,7 +35,9 @@ install needs instead.
 
 Every `/api/v1` call needs a session, so `auth login` comes first. The shipped
 `admin`/`admin` is a bootstrap credential - change it with
-`abr auth change-password`.
+`abr auth change-password`. It holds the Administrator role; give everyone else
+the role they need (`abr user add --name alice --role backup_operator`, see
+`doc/RBAC.md`).
 
 Stop the server with `./scripts/stop_srv.sh`, and remove the virtualenv and the
 MongoDB bundle with `./scripts/clear.sh`.
@@ -98,6 +100,8 @@ VDDK, or a vCenter or Hyper-V endpoint.
   after a server loss.
 - [Hyper-V backup and recovery](doc/HyperVBackup.md) - what Hyper-V backup and
   recovery need from the host, how they run, and what to check when they fail.
+- [Roles, permissions and the audit log](doc/RBAC.md) - the built-in roles,
+  the permission matrix, how requests are authorized, and the audit log.
 
 Note: the environment and service setup in the deployment runbook and the ESXi
 sample is current, but their scenario commands still use the pre-v4.1 CLI
