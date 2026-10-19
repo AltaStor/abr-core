@@ -77,15 +77,15 @@ def apply_repository_immutability(repository_id: str) -> RepositoryImmutabilityA
 
 
 register(router, [
-    ("", create_repository, ["POST"]),
-    ("/test-s3", test_s3_connection, ["POST"]),
-    ("/test-immutability", test_s3_immutability, ["POST"]),
-    ("", list_repositories, ["GET"]),
-    ("/{repository_id}", get_repository, ["GET"]),
-    ("/{repository_id}", patch_repository, ["PATCH"]),
-    ("/{repository_id}", delete_repository, ["DELETE"]),
-    ("/{repository_id}/rescan", rescan_repository, ["POST"]),
-    ("/{repository_id}/verify", verify_repository, ["POST"]),
-    ("/{repository_id}/verify-immutability", verify_repository_immutability, ["POST"]),
-    ("/{repository_id}/apply-immutability", apply_repository_immutability, ["POST"]),
+    ("", create_repository, ["POST"], "repository.create"),
+    ("/test-s3", test_s3_connection, ["POST"], "repository.create"),
+    ("/test-immutability", test_s3_immutability, ["POST"], "repository.create"),
+    ("", list_repositories, ["GET"], "repository.view"),
+    ("/{repository_id}", get_repository, ["GET"], "repository.view"),
+    ("/{repository_id}", patch_repository, ["PATCH"], "repository.edit"),
+    ("/{repository_id}", delete_repository, ["DELETE"], "repository.delete"),
+    ("/{repository_id}/rescan", rescan_repository, ["POST"], "repository.rescan"),
+    ("/{repository_id}/verify", verify_repository, ["POST"], "repository.verify"),
+    ("/{repository_id}/verify-immutability", verify_repository_immutability, ["POST"], "repository.verify"),
+    ("/{repository_id}/apply-immutability", apply_repository_immutability, ["POST"], "repository.apply_immutability"),
 ])

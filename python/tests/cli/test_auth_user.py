@@ -379,14 +379,14 @@ class UserCommandsTests(_IsolatedConfigDirCase):
         getpass_mock.side_effect = ["Passw0rd!", "Passw0rd!"]
         request_mock.return_value = _FakeResponse({"id": "u2", "name": "alice", "fullName": "Alice"})
 
-        args = _args(name="alice", full_name="Alice")
+        args = _args(name="alice", full_name="Alice", role="backup_operator")
         with redirect_stdout(io.StringIO()):
             exit_code = UserCommands().add(args)
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             request_mock.call_args.kwargs["json"],
-            {"name": "alice", "fullName": "Alice", "password": "Passw0rd!"},
+            {"name": "alice", "fullName": "Alice", "role": "backup_operator", "password": "Passw0rd!"},
         )
 
     @patch("python.cli.commands.user_commands.getpass.getpass")
@@ -395,7 +395,7 @@ class UserCommandsTests(_IsolatedConfigDirCase):
         with patch("python.cli.api.client.requests.request") as request_mock:
             request_mock.return_value = _FakeResponse({"id": "u2", "name": "alice", "fullName": ""})
             with redirect_stdout(io.StringIO()):
-                UserCommands().add(_args(name="alice", full_name=""))
+                UserCommands().add(_args(name="alice", full_name="", role="auditor"))
         self.assertEqual(request_mock.call_args.kwargs["json"]["password"], "match-pass")
 
     @patch("python.cli.api.client.requests.request")

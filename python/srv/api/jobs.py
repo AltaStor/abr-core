@@ -65,12 +65,12 @@ def run_retention(job_id: str, payload: RunRetentionRequest = Body(default_facto
 
 
 register(router, [
-    ("", create_job, ["POST"]),
-    ("/copy", create_copy_job, ["POST"]),
-    ("", list_jobs, ["GET"]),
-    ("/{job_id}", get_job, ["GET"]),
-    ("/{job_id}", patch_job, ["PATCH"]),
-    ("/{job_id}", delete_job, ["DELETE"]),
-    ("/{job_id}/start", start_job, ["POST"]),
-    ("/{job_id}/retention", run_retention, ["POST"]),
+    ("", create_job, ["POST"], "job.create"),
+    ("/copy", create_copy_job, ["POST"], "job.create"),
+    ("", list_jobs, ["GET"], "job.view"),
+    ("/{job_id}", get_job, ["GET"], "job.view"),
+    ("/{job_id}", patch_job, ["PATCH"], "job.edit"),
+    ("/{job_id}", delete_job, ["DELETE"], "job.delete"),
+    ("/{job_id}/start", start_job, ["POST"], "job.start"),
+    ("/{job_id}/retention", run_retention, ["POST"], "job.retention"),
 ])

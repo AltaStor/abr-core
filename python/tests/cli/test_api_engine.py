@@ -44,7 +44,7 @@ class AbrV41CliTests(unittest.TestCase):
 
     def test_root_command_tree_is_v41_only(self) -> None:
         help_output = self.parser.format_help()
-        self.assertIn("{auth,user,repo,inventory,job,session,backup,restore,system}", help_output)
+        self.assertIn("{auth,user,role,audit,repo,inventory,job,session,backup,restore,system}", help_output)
         self.assertNotIn("license", help_output)
 
     def test_obsolete_commands_are_rejected(self) -> None:

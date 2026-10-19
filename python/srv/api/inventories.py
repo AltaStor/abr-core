@@ -58,12 +58,12 @@ def test_inventory(inventory_id: str) -> InventoryTestResult:
 
 
 register(router, [
-    ("", create_inventory, ["POST"]),
-    ("", list_inventories, ["GET"]),
-    ("/vms/tree", list_inventory_vm_tree, ["GET"]),
-    ("/{inventory_id}", get_inventory, ["GET"]),
-    ("/{inventory_id}", patch_inventory, ["PATCH"]),
-    ("/{inventory_id}", delete_inventory, ["DELETE"]),
-    ("/{inventory_id}/rescan", rescan_inventory, ["POST"]),
-    ("/{inventory_id}/test", test_inventory, ["POST"]),
+    ("", create_inventory, ["POST"], "inventory.create"),
+    ("", list_inventories, ["GET"], "inventory.view"),
+    ("/vms/tree", list_inventory_vm_tree, ["GET"], "inventory.view"),
+    ("/{inventory_id}", get_inventory, ["GET"], "inventory.view"),
+    ("/{inventory_id}", patch_inventory, ["PATCH"], "inventory.edit"),
+    ("/{inventory_id}", delete_inventory, ["DELETE"], "inventory.delete"),
+    ("/{inventory_id}/rescan", rescan_inventory, ["POST"], "inventory.rescan"),
+    ("/{inventory_id}/test", test_inventory, ["POST"], "inventory.test"),
 ])

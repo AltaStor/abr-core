@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, TypeVar
@@ -14,6 +16,7 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from python.srv.db.db_manager import Database
 from python.srv.services.api_errors import api_error
+from python.srv.services.rbac import with_default_role
 
 from .credential_encryption import (
     KEY_REPAIR_HINT,
@@ -37,6 +40,8 @@ REPOSITORIES: dict[str, dict[str, Any]] = {}
 BACKUPS: dict[str, dict[str, Any]] = {}
 USERS: dict[str, dict[str, Any]] = {}
 SESSIONS: dict[str, dict[str, Any]] = {}
+# Audit records when there is no catalog database, newest last.
+AUDIT_RECORDS: deque[dict[str, Any]] = deque(maxlen=10_000)
 
 TASK_LOCK = threading.Lock()
 CATALOG_LOCK = threading.RLock()
@@ -489,6 +494,42 @@ def delete_other_sessions_for_user(user_id: str, keep_token: str) -> None:
                     db.delete("sessions", "token", token)
 
 
+def append_audit_record(record: dict[str, Any]) -> None:
+    db = get_database()
+    if db is not None:
+        _run_db_write(lambda: db.insert("audit", record))
+        return
+    with CATALOG_LOCK:
+        AUDIT_RECORDS.append(dict(record))
+
+
+def _matches_audit_query(record: dict[str, Any], query: dict[str, Any]) -> bool:
+    for key, wanted in query.items():
+        value = record.get(key)
+        if isinstance(wanted, dict):
+            if "$gte" in wanted and not (isinstance(value, str) and value >= wanted["$gte"]):
+                return False
+            if "$lte" in wanted and not (isinstance(value, str) and value <= wanted["$lte"]):
+                return False
+            if "$regex" in wanted and not (isinstance(value, str) and re.search(wanted["$regex"], value)):
+                return False
+        elif value != wanted:
+            return False
+    return True
+
+
+def query_audit_records(query: dict[str, Any], *, offset: int, limit: int) -> tuple[list[dict[str, Any]], int]:
+    """Newest-first page of audit records matching ``query``: exact values, a
+    ``{"$gte"/"$lte": ...}`` range on a timestamp, or a ``{"$regex": "^prefix"}``
+    on a function ID."""
+    db = get_database()
+    if db is not None:
+        return db.find_page("audit", query, sort_field="timestamp", skip=offset, limit=limit)
+    with CATALOG_LOCK:
+        matches = [dict(record) for record in reversed(AUDIT_RECORDS) if _matches_audit_query(record, query)]
+    return matches[offset : offset + limit], len(matches)
+
+
 def load_tasks() -> dict[str, dict[str, Any]]:
     db = get_database()
     if db is None:
@@ -635,6 +676,7 @@ def restore_catalog(snapshot: dict[str, Any]) -> dict[str, int]:
             delete_user(str(existing["id"]))
             LOGGER.info("Import replaces user %s with the one from the export.", existing.get("name"))
         for user in (snapshot.get("users") or {}).values():
+            with_default_role(user)
             persist_user(user)
         counts["users"] = len(snapshot.get("users") or {})
 

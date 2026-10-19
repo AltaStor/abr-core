@@ -21,7 +21,7 @@ class _Api(unittest.TestCase):
         for store in (BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, SESSIONS, TASKS, USERS):
             store.clear()
             self.addCleanup(store.clear)
-        app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user"}
+        app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user", "role": "administrator"}
         self.addCleanup(app.dependency_overrides.pop, require_session, None)
         self.client = self.enterContext(TestClient(app))
 
@@ -45,26 +45,26 @@ class UserNameAndPasswordTests(_Api):
     def test_a_user_name_longer_than_64_characters_is_refused(self) -> None:
         error = self._refused(auth_service.create_user, {"name": "n" * 65, "password": "Abcde1234"})
         self.assertIn("at most 64", error.message)
-        self.assertEqual(auth_service.create_user({"name": "n" * 64, "password": "Abcde1234"})["name"], "n" * 64)
+        self.assertEqual(auth_service.create_user({"name": "n" * 64, "password": "Abcde1234", "role": "auditor"})["name"], "n" * 64)
 
     def test_a_password_longer_than_128_characters_is_refused(self) -> None:
         error = self._refused(auth_service.create_user, {"name": "alice", "password": "A1" * 50000})
         self.assertIn("at most 128", error.message)
-        self.assertEqual(auth_service.create_user({"name": "alice", "password": "a" * 128})["name"], "alice")
+        self.assertEqual(auth_service.create_user({"name": "alice", "password": "a" * 128, "role": "auditor"})["name"], "alice")
 
     def test_a_blank_password_or_one_equal_to_the_user_name_is_refused(self) -> None:
         self.assertIn("only spaces", self._refused(auth_service.create_user, {"name": "alice", "password": " " * 8}).message)
         self.assertIn("user name", self._refused(auth_service.create_user, {"name": "alice.admin", "password": "Alice.Admin"}).message)
 
     def test_the_bootstrap_admin_is_still_created_and_flagged(self) -> None:
-        user = auth_service.create_user({"name": "root", "password": "root"}, enforce_password_policy=False)
+        user = auth_service.create_user({"name": "root", "password": "root", "role": "administrator"}, enforce_password_policy=False)
         self.assertTrue(user["passwordPolicyExempt"])
 
 
 class ChangePasswordTests(_Api):
     def setUp(self) -> None:
         super().setUp()
-        self.user = auth_service.create_user({"name": "alice", "password": "InitPass123"})
+        self.user = auth_service.create_user({"name": "alice", "password": "InitPass123", "role": "auditor"})
 
     def _change(self, new_password: str):
         return auth_service.change_password(self.user["id"], "InitPass123", new_password, keep_token="token")
@@ -79,7 +79,7 @@ class ChangePasswordTests(_Api):
                     self.assertIn(expected, self._refused(self._change, new_password).message)
 
     def test_a_new_password_equal_to_the_user_name_is_refused(self) -> None:
-        operator = auth_service.create_user({"name": "operator1", "password": "InitPass123"})
+        operator = auth_service.create_user({"name": "operator1", "password": "InitPass123", "role": "auditor"})
         error = self._refused(auth_service.change_password, operator["id"], "InitPass123", "Operator1", keep_token="token")
         self.assertIn("user name", error.message)
 

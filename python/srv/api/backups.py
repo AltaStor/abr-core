@@ -66,10 +66,10 @@ def import_backup(payload: ImportBackupRequest = Body(default_factory=ImportBack
 
 
 register(router, [
-    ("", list_backups, ["GET"]),
-    ("/tree", list_backup_tree, ["GET"]),
-    ("/{backup_id}", get_backup, ["GET"]),
-    ("/{backup_id}", delete_backup, ["DELETE"]),
-    ("/{backup_id}/verify", verify_backup, ["POST"]),
-    ("/import", import_backup, ["POST"]),
+    ("", list_backups, ["GET"], "backup.view"),
+    ("/tree", list_backup_tree, ["GET"], "backup.view"),
+    ("/{backup_id}", get_backup, ["GET"], "backup.view"),
+    ("/{backup_id}", delete_backup, ["DELETE"], "backup.delete"),
+    ("/{backup_id}/verify", verify_backup, ["POST"], "backup.verify"),
+    ("/import", import_backup, ["POST"], "backup.import"),
 ])

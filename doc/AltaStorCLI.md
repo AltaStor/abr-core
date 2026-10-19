@@ -12,7 +12,11 @@ Semantic Model
 
 auth = session login/logout against the REST API 
 
-user = accounts allowed to authenticate 
+user = accounts allowed to authenticate, each holding one role 
+
+role = built-in roles and the functions each allows 
+
+audit = the record of every command and user or role change 
 
 repo = backup storage targets 
 
@@ -102,6 +106,8 @@ COMMAND TREE
 abr 
 ├─ auth 
 ├─ user 
+├─ role 
+├─ audit 
 ├─ repo 
 ├─ inventory 
 ├─ job 
@@ -141,22 +147,60 @@ abr auth change-password
 Note: 
 Always acts on the current session's account, never another user's. abr auth login warns if the account is still on its default password. 
 
+abr auth whoami 
+
+Description: Show the signed-in user, their role, and the function IDs that role allows. 
+
+abr auth whoami [--output json] 
+
+PERMISSIONS 
+
+Every command runs one product function, named by a function ID such as job.start or backup.delete, and each command's --help ends with the one it needs ("Permission: job.start"). The server checks the signed-in user's role before it runs anything, for the CLI, --output json automation, the Web UI and direct API calls alike; see doc/RBAC.md for the roles and what each allows. 
+
+A command the role does not allow is not run, and the CLI exits with code 7: 
+
+Error: Permission denied: The Auditor role does not allow job.start (start a job). 
+
+With --output json, stderr carries the machine-readable error: 
+
+{"error": {"code": "permission_denied", "message": "...", "details": {"function_id": "job.start", "role": "auditor", "reason": "not_permitted"}}} 
+
+A disabled account, or one without a valid role, cannot sign in (exit 7, code account_disabled or role_invalid). 
+
 USER COMMANDS 
 
-Manage accounts allowed to authenticate. Requires an existing session. The first user is created at startup from ABR_BOOTSTRAP_ADMIN_USER / ABR_BOOTSTRAP_ADMIN_PASSWORD, not via this command. 
+Manage accounts allowed to authenticate. Requires an existing session. The first user is created at startup from ABR_BOOTSTRAP_ADMIN_USER / ABR_BOOTSTRAP_ADMIN_PASSWORD, not via this command, and holds the administrator role. Every user holds exactly one role: administrator, backup_administrator, backup_operator, restore_operator or auditor. 
+
+At least one enabled Administrator always remains: the last one cannot be demoted, disabled or deleted (exit 4, code last_administrator). 
 
 abr user add 
 
-Description: Add a new user. Prompts for the password; there is no --password flag. The name is 1 to 64 Latin letters, numbers, spaces, dots, underscores or hyphens and starts with a letter or number. The password is 8 to 128 characters, not only spaces, and not the user name. 
+Description: Add a new user with a role. Prompts for the password; there is no --password flag. The name is 1 to 64 Latin letters, numbers, spaces, dots, underscores or hyphens and starts with a letter or number. The password is 8 to 128 characters, not only spaces, and not the user name. 
 
-abr user add --name <name> [--full-name <text>] 
+abr user add --name <name> --role <role> [--full-name <text>] 
 
 Example: 
-abr user add --name alice --full-name "Alice Doe" 
+abr user add --name alice --full-name "Alice Doe" --role backup_operator 
+
+abr user edit 
+
+Description: Change a user's role, full name, or enabled state. A role change applies to the user's next request. Disabling a user ends their sessions and stops them signing in. 
+
+abr user edit --name <name> [--id <id>] [--role <role>] [--full-name <text>] [--enable | --disable] 
+
+Examples: 
+abr user edit --name alice --role restore_operator 
+abr user edit --name alice --disable 
+
+abr user info 
+
+Description: Show one user, with their role and whether they are enabled. 
+
+abr user info --name <name> [--id <id>] 
 
 abr user list 
 
-Description: Show all users. Never includes password hashes. 
+Description: Show all users with their roles. Never includes password hashes. 
 
 abr user list [--output json] 
 
@@ -165,6 +209,45 @@ abr user delete
 Description: Delete a user and invalidate their sessions. 
 
 abr user delete --name <name> [--id <id>] 
+
+ROLE COMMANDS 
+
+The roles are built in and cannot be created, changed or deleted. 
+
+abr role list 
+
+Description: Show the roles, with how many functions each allows. 
+
+abr role list [--output json] 
+
+abr role info 
+
+Description: Show a role's permission, allowed or disabled, on every function. A function a role does not list is disabled. 
+
+abr role info --id <role-id> | --name <role-name> 
+
+Examples: 
+abr role info --id backup_operator 
+abr role info --name "Restore Operator" 
+
+abr role functions 
+
+Description: Show every product function by function ID, with its category (read, operate, configure, destructive, administer, self-service). 
+
+abr role functions [--output json] 
+
+AUDIT COMMANDS 
+
+abr audit list 
+
+Description: Show the audit log, newest first: the time (UTC), the user and the role they held then, the function ID, the target, the result (allowed, denied or failed), the session the command started, and the interface it came from (cli, web or api). Every command from any interface is recorded, and every user or role change; reads the Web UI repeats in the background are not. Passwords, keys and tokens are masked before a record is written. 
+
+abr audit list [--user <name>] [--function <function-id | area.>] [--result allowed|denied|failed] [--since <iso>] [--until <iso>] [--limit <n>] [--offset <n>] 
+
+Examples: 
+abr audit list --result denied 
+abr audit list --user alice --since 2026-10-01 
+abr --output json audit list --function job. --limit 500 
 
 REPOSITORY COMMANDS 
 

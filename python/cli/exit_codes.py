@@ -11,3 +11,5 @@ NOT_FOUND = 3
 INVALID_STATE = 4
 UNAUTHORIZED = 5
 VALIDATION_FAILED = 6
+# The signed-in user's role does not allow the command, or the account is disabled.
+PERMISSION_DENIED = 7

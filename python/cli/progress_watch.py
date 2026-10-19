@@ -60,7 +60,7 @@ def watch_session(
     last_line_length = 0
     last_plain_print = 0.0
     while True:
-        session = api_client.get(f"api/v1/sessions/{session_id}")
+        session = api_client.get(f"api/v1/sessions/{session_id}", refresh=True)
         state = str(session.get("state") or "")
         line = f"{_format_bar(session.get('progress'))} {_latest_message(session)}"
 

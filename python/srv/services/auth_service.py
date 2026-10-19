@@ -31,6 +31,7 @@ from python.srv.core.mongo_db_wrapper import (
 from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
 
+from . import rbac
 from .api_errors import api_error
 
 LOGGER = logging.getLogger(__name__)
@@ -120,6 +121,8 @@ def _public_user(user: dict[str, Any]) -> dict[str, Any]:
         "id": user["id"],
         "name": user["name"],
         "fullName": user.get("fullName", ""),
+        "role": user.get("role"),
+        "enabled": rbac.is_enabled(user),
         "created_at": user.get("created_at"),
         "passwordPolicyExempt": bool(user.get("password_policy_exempt", False)),
     }
@@ -135,6 +138,43 @@ def list_users() -> list[dict[str, Any]]:
         _public_user(user)
         for user in sorted(catalog_records(USERS), key=lambda item: str(item.get("name") or "").lower())
     ]
+
+
+def get_user(user_id: str) -> dict[str, Any]:
+    return _public_user(_user_or_404(user_id))
+
+
+def _user_or_404(user_id: str) -> dict[str, Any]:
+    user = USERS.get(user_id)
+    if user is None:
+        raise api_error(404, "user_not_found", f"User not found: {user_id}")
+    return user
+
+
+def _role_or_422(value: Any) -> str:
+    role = rbac.resolve_role(value)
+    if role is None:
+        known = ", ".join(role.id for role in rbac.ROLES)
+        if value is None or value == "":
+            raise api_error(422, "invalid_user", f"A role is required: one of {known}.")
+        raise api_error(422, "invalid_role", f"Unknown role {value!r}: use one of {known}.", role=value)
+    return role.id
+
+
+def _refuse_losing_the_last_administrator(user: dict[str, Any], change: str) -> None:
+    """At least one enabled Administrator must remain, or nobody could manage
+    users and roles any more."""
+    if not rbac.is_active_administrator(user):
+        return
+    others = [other for other in rbac.active_administrators(catalog_records(USERS)) if other["id"] != user["id"]]
+    if not others:
+        raise api_error(
+            409,
+            "last_administrator",
+            f"Cannot {change} {user['name']}: it is the last active Administrator. "
+            "Give another enabled user the Administrator role first.",
+            user_id=user["id"],
+        )
 
 
 def password_problem(name: str, password: Any) -> str | None:
@@ -166,6 +206,7 @@ def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True
     problem = password_problem(name, password)
     if problem and enforce_password_policy:
         raise api_error(422, "invalid_user", problem)
+    role = _role_or_422(payload.get("role"))
     if _find_user_by_name(name) is not None:
         raise api_error(409, "user_exists", f"A user named {name!r} already exists.")
 
@@ -174,6 +215,8 @@ def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True
         "id": str(uuid4()),
         "name": name,
         "fullName": full_name,
+        "role": role,
+        "enabled": True,
         "passwd": hash_password(name, password),
         "created_at": now,
         "updated_at": now,
@@ -187,10 +230,40 @@ def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True
     return _public_user(record)
 
 
+def update_user(user_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Change a user's full name, role or enabled state. Answers the user and
+    what changed, as ``{field: {"from": old, "to": new}}``."""
+    user = _user_or_404(user_id)
+    updated = dict(user)
+    if "fullName" in payload and payload["fullName"] is not None:
+        updated["fullName"] = str(payload["fullName"]).strip()
+    if "role" in payload and payload["role"] is not None:
+        updated["role"] = _role_or_422(payload["role"])
+    if "enabled" in payload and payload["enabled"] is not None:
+        if not isinstance(payload["enabled"], bool):
+            raise api_error(422, "invalid_user", "enabled must be true or false.")
+        updated["enabled"] = payload["enabled"]
+
+    changes = {
+        field: {"from": user.get(field), "to": updated.get(field)}
+        for field in ("fullName", "role", "enabled")
+        if user.get(field) != updated.get(field)
+    }
+    if not changes:
+        return _public_user(user), changes
+    if not rbac.is_active_administrator(updated):
+        _refuse_losing_the_last_administrator(user, "disable" if not rbac.is_enabled(updated) else "demote")
+
+    updated["updated_at"] = utc_now()
+    persist_user(updated)
+    if not rbac.is_enabled(updated):
+        delete_sessions_for_user(user_id)
+    return _public_user(updated), changes
+
+
 def remove_user(user_id: str) -> dict[str, Any]:
-    user = USERS.get(user_id)
-    if user is None:
-        raise api_error(404, "user_not_found", f"User not found: {user_id}")
+    user = _user_or_404(user_id)
+    _refuse_losing_the_last_administrator(user, "delete")
     if len(USERS) <= 1:
         raise api_error(
             409,
@@ -256,6 +329,13 @@ def login(
         raise api_error(401, "invalid_credentials", "Invalid username or password.")
 
     _clear_failures(key)
+    if not rbac.is_enabled(user):
+        raise api_error(403, "account_disabled", "This account is disabled. Ask an Administrator to enable it.")
+    if rbac.role_id_of(user) is None:
+        raise api_error(
+            403, "role_invalid", "This account has no valid role. Ask an Administrator to assign one.",
+            role=user.get("role"),
+        )
 
     client = "web" if client_type == "web" else "cli"
 
@@ -286,7 +366,22 @@ def login(
         session["absolute_expires_at"] = absolute_expires_at
         reported_expires_at = absolute_expires_at
     persist_session(session)
-    return {"token": token, "expires_at": reported_expires_at, "user": _public_user(user)}
+    return {
+        "token": token,
+        "expires_at": reported_expires_at,
+        "user": _public_user(user),
+        "permissions": rbac.allowed_functions(user["role"]),
+    }
+
+
+def whoami(user_id: str) -> dict[str, Any]:
+    user = _user_or_404(user_id)
+    role = rbac.ROLES_BY_ID.get(rbac.role_id_of(user) or "")
+    return {
+        "user": _public_user(user),
+        "role": rbac.role_to_dto(role, with_permissions=False) if role else None,
+        "permissions": rbac.allowed_functions(role.id if role else None),
+    }
 
 
 def extend_session(token: str, duration_seconds: int) -> dict[str, Any]:
@@ -361,6 +456,9 @@ def authenticate(token: str | None) -> dict[str, Any] | None:
     if user is None:
         _session_write_best_effort(lambda: delete_session(token), "an orphaned session removal")
         return None
+    if not rbac.is_enabled(user):
+        _session_write_best_effort(lambda: delete_session(token), "a disabled user's session removal")
+        return None
 
     new_expiry = _now_dt() + timedelta(seconds=session_ttl_seconds())
     absolute_expires_at = _parse_dt(session.get("absolute_expires_at"))
@@ -368,7 +466,7 @@ def authenticate(token: str | None) -> dict[str, Any] | None:
         new_expiry = min(new_expiry, absolute_expires_at)
     _renew_session_in_background(token, {"expires_at": new_expiry.isoformat()})
 
-    return {"token": token, "user_id": user["id"], "user_name": user["name"]}
+    return {"token": token, "user_id": user["id"], "user_name": user["name"], "role": user.get("role")}
 
 
 def bootstrap_admin_if_needed() -> None:
@@ -387,5 +485,41 @@ def bootstrap_admin_if_needed() -> None:
     # exists to get the very first login working (e.g. local dev convenience
     # defaults), and the account it creates is flagged (password_policy_exempt)
     # so CLI/UI can nag about it -- see create_user().
-    create_user({"name": name, "password": password, "fullName": "Administrator"}, enforce_password_policy=False)
+    create_user(
+        {"name": name, "password": password, "fullName": "Administrator", "role": rbac.ADMINISTRATOR},
+        enforce_password_policy=False,
+    )
     LOGGER.info("Bootstrapped initial admin user %r.", name)
+
+
+def backfill_user_roles() -> int:
+    """Give users from before roles existed the Administrator role, which is
+    what they could do then. Answers how many changed."""
+    changed = 0
+    for user in catalog_records(USERS):
+        updated = dict(user)
+        if rbac.with_default_role(updated):
+            persist_user(updated)
+            changed += 1
+    return changed
+
+
+def ensure_import_keeps_an_administrator(snapshot: dict[str, Any], replaced: list[dict[str, Any]]) -> None:
+    """Refuse a catalog import after which no enabled Administrator would be
+    left: imported users replace current ones by ID and, when ``replaced``, by
+    name."""
+    after = {user["id"]: user for user in catalog_records(USERS)}
+    for user in replaced:
+        after.pop(str(user.get("id")), None)
+    for user in (snapshot.get("users") or {}).values():
+        if isinstance(user, dict) and user.get("id"):
+            incoming = dict(user)
+            rbac.with_default_role(incoming)
+            after[str(incoming["id"])] = incoming
+    if after and not rbac.active_administrators(after.values()):
+        raise api_error(
+            409,
+            "last_administrator",
+            "The import would leave no enabled Administrator, so nobody could manage users and roles. "
+            "Nothing was imported.",
+        )

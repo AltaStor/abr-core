@@ -373,7 +373,7 @@ class UserManagementTests(AuthApiTestCase):
 
         created = self.client.post(
             "/api/v1/users",
-            json={"name": "alice", "password": "AlicePassw0rd", "fullName": "Alice Doe"},
+            json={"name": "alice", "password": "AlicePassw0rd", "fullName": "Alice Doe", "role": "backup_operator"},
             headers=headers,
         )
         self.assertEqual(created.status_code, 200)
@@ -394,10 +394,10 @@ class UserManagementTests(AuthApiTestCase):
 
     def test_duplicate_user_name_is_rejected(self) -> None:
         headers = self._auth_headers(self._admin_token())
-        self.client.post("/api/v1/users", json={"name": "bob", "password": "BobPassw0rd"}, headers=headers)
+        self.client.post("/api/v1/users", json={"name": "bob", "password": "BobPassw0rd", "role": "auditor"}, headers=headers)
 
         duplicate = self.client.post(
-            "/api/v1/users", json={"name": "bob", "password": "AnotherPassw0rd"}, headers=headers
+            "/api/v1/users", json={"name": "bob", "password": "AnotherPassw0rd", "role": "auditor"}, headers=headers
         )
         self.assertEqual(duplicate.status_code, 409)
         self.assertEqual(duplicate.json()["error"]["code"], "user_exists")
@@ -413,11 +413,11 @@ class UserManagementTests(AuthApiTestCase):
 
         response = self.client.delete(f"/api/v1/users/{admin_id}", headers=headers)
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.json()["error"]["code"], "last_user")
+        self.assertEqual(response.json()["error"]["code"], "last_administrator")
 
     def test_deleting_a_user_invalidates_their_sessions(self) -> None:
         admin_headers = self._auth_headers(self._admin_token())
-        self.client.post("/api/v1/users", json={"name": "dana", "password": "DanaPassw0rd"}, headers=admin_headers)
+        self.client.post("/api/v1/users", json={"name": "dana", "password": "DanaPassw0rd", "role": "backup_operator"}, headers=admin_headers)
         dana_login = self._login(name="dana", password="DanaPassw0rd")
         dana_token = dana_login.json()["token"]
         dana_id = dana_login.json()["user"]["id"]
@@ -543,7 +543,7 @@ class UnicodeLoginTests(AuthApiTestCase):
         admin_headers = self._auth_headers(self._login().json()["token"])
         created = self.client.post(
             "/api/v1/users",
-            json={"name": "oleh", "password": "пароль-Юнікод-8", "fullName": "Олег Шевченко"},
+            json={"name": "oleh", "password": "пароль-Юнікод-8", "fullName": "Олег Шевченко", "role": "auditor"},
             headers=admin_headers,
         )
         self.assertEqual(created.status_code, 200)

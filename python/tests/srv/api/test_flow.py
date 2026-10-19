@@ -39,7 +39,7 @@ class BackupServerApiFlowTests(unittest.TestCase):
         )
         reachable.start()
         self.addCleanup(reachable.stop)
-        app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user"}
+        app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user", "role": "administrator"}
         self.client_cm = TestClient(app)
         self.client = self.client_cm.__enter__()
         self._repo_root = tempfile.mkdtemp(prefix="abr-test-repos-")

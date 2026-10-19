@@ -8,6 +8,21 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
 
 ### Added
 
+- Role-based access control. Every user holds one of five built-in roles
+  (Administrator, Backup Administrator, Backup Operator, Restore Operator,
+  Auditor), and every API operation and `abr` command runs one product function
+  (`job.start`, `backup.delete`, ...) that the server checks against the
+  user's role before it runs, for the Web UI, the CLI, `--output json`
+  automation and the API alike. A denied request answers `403
+  permission_denied` with the function ID and role, and the CLI exits with code
+  7. The last enabled Administrator cannot be demoted, disabled or deleted.
+  `abr user edit`, `abr user info`, `abr role list|info|functions`,
+  `abr auth whoami`, `PATCH /api/v1/users/{id}`, `GET /api/v1/roles`,
+  `GET /api/v1/functions` and `GET /api/v1/auth/me`. See `doc/RBAC.md`.
+- An audit log of every command and every user or role change, from every
+  interface: time (UTC), user, the role they held, function, target, result
+  (allowed, denied or failed) and the session the command started, with
+  credentials masked. `abr audit list` and `GET /api/v1/audit`.
 - Hyper-V backup and recovery: full and incremental (resilient change
   tracking) backups of Hyper-V VMs, standalone or clustered, from
   application-consistent recovery checkpoints with a crash-consistent
@@ -83,6 +98,9 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
 
 ### Changed
 
+- `abr user add` and `POST /api/v1/users` need a role (`--role`). Users from
+  before roles existed become Administrators when the server starts, which is
+  what they could do before.
 - Inventory credentials are stored encrypted and session tokens as digests.
 - Secret settings are masked in the catalog-restore response.
 - User, password and job input is validated strictly.
