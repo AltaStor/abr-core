@@ -33,7 +33,9 @@ class CliContext:
         return cls(
             base_url=base_url,
             output=str(getattr(args, "output", "table")),
-            api_client=AltaStorApiClient(base_url=base_url, token=resolve_token(base_url)),
+            api_client=AltaStorApiClient(
+                base_url=base_url, token=resolve_token(base_url), command=getattr(args, "command", None)
+            ),
             output_renderer=CliOutputRenderer(),
         )
 

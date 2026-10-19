@@ -34,7 +34,7 @@ class WatchSessionTests(unittest.TestCase):
 
         self.assertEqual(result["state"], "completed")
         self.assertEqual(api_client.get.call_count, 3)
-        api_client.get.assert_called_with("api/v1/sessions/sess-1")
+        api_client.get.assert_called_with("api/v1/sessions/sess-1", refresh=True)
 
     def test_stops_on_every_terminal_state(self) -> None:
         for terminal_state in ("completed", "failed", "stopped", "canceled"):

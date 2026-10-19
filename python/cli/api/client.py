@@ -39,11 +39,13 @@ class AltaStorApiClient:
         timeout: int = 30,
         token: str | None = None,
         verify: bool | str = False,
+        command: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.token = token
         self.verify = verify
+        self.command = command
         self._version_checked = False
 
     def _check_api_version(self, response: requests.Response) -> None:
@@ -88,6 +90,7 @@ class AltaStorApiClient:
         json: Any = None,
         params: dict[str, Any] | None = None,
         timeout: int | None = None,
+        refresh: bool = False,
     ) -> Any:
         headers: dict[str, str] = {
             "X-Client-Type": "cli",
@@ -95,6 +98,12 @@ class AltaStorApiClient:
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        # Names the command in the server's audit log; a refresh is a read the
+        # CLI repeats on its own (progress polling), which the log leaves out.
+        if self.command:
+            headers["X-ABR-Command"] = self.command
+        if refresh:
+            headers["X-ABR-Refresh"] = "1"
         request_kwargs: dict[str, Any] = {
             "json": json,
             "params": params,
@@ -114,8 +123,10 @@ class AltaStorApiClient:
             return None
         return response.json()
 
-    def get(self, path: str, params: dict[str, Any] | None = None, timeout: int | None = None) -> Any:
-        return self._request("GET", path, params=params, timeout=timeout)
+    def get(
+        self, path: str, params: dict[str, Any] | None = None, timeout: int | None = None, *, refresh: bool = False
+    ) -> Any:
+        return self._request("GET", path, params=params, timeout=timeout, refresh=refresh)
 
     def post(
         self,

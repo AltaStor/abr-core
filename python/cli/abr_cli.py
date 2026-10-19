@@ -12,7 +12,7 @@ from python.cli.core.logger_conf import setup_logging
 
 from .command_not_implemented_error import CommandNotImplementedError
 from .errors import CliError, cli_error_from_exception
-from .exit_codes import GENERAL_ERROR, INVALID_USAGE, UNAUTHORIZED
+from .exit_codes import GENERAL_ERROR, INVALID_USAGE, PERMISSION_DENIED, UNAUTHORIZED
 from .parsing.parser_builder import LOG_LEVEL_CHOICES, AltaStorParserBuilder
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,9 @@ def main(argv: list[str] | None = None) -> int:
                 cli_error = CliError(
                     code=str(detail.get("code") or "runtime_error"),
                     message=str(detail.get("message") or message),
-                    exit_code=4
+                    exit_code=PERMISSION_DENIED
+                    if exc.response.status_code == 403
+                    else 4
                     if exc.response.status_code in {409, 503}
                     else 3
                     if exc.response.status_code == 404

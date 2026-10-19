@@ -34,7 +34,7 @@ class _FakeResponse:
 
 
 class _FakeApiClient:
-    def get(self, path: str, params=None, timeout=None):  # noqa: ANN001
+    def get(self, path: str, params=None, timeout=None, refresh=False):  # noqa: ANN001
         return {"items": []}
 
     def post(self, path: str, json=None, params=None, timeout=None):  # noqa: ANN001

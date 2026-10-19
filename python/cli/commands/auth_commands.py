@@ -84,6 +84,19 @@ class AuthCommands:
         )
         change_password.set_defaults(handler=self.change_password)
 
+        whoami = commands.add_parser(
+            "whoami",
+            help="Show the signed-in user, their role and what it allows.",
+            description=(
+                "Show the signed-in user, their role, and the function IDs that role allows.\n\n"
+                "Examples:\n"
+                "  abr auth whoami\n"
+                "  abr --output json auth whoami"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        whoami.set_defaults(handler=self.whoami)
+
     def login(self, args) -> int:
         deps = CommandDependencies(args)
         name = args.name or os.environ.get(USERNAME_ENV_VAR)
@@ -102,11 +115,16 @@ class AuthCommands:
         result = deps.context.api_client.post("api/v1/auth/login", json={"name": name, "password": password})
         token_store.save_token(deps.context.base_url, result["token"], result["expires_at"])
 
+        role = result["user"].get("role")
+        confirmation = (
+            f"Logged in as {result['user']['name']}{f' ({role})' if role else ''} "
+            f"(session expires {result['expires_at']})."
+        )
         if getattr(args, "print_token", False):
-            print(f"Logged in as {result['user']['name']} (session expires {result['expires_at']}).", file=sys.stderr)
+            print(confirmation, file=sys.stderr)
             print(result["token"])
         else:
-            print(f"Logged in as {result['user']['name']} (session expires {result['expires_at']}).")
+            print(confirmation)
 
         if result["user"].get("passwordPolicyExempt"):
             print(
@@ -124,6 +142,22 @@ class AuthCommands:
         finally:
             token_store.clear_token(deps.context.base_url)
         print("Logged out.")
+        return 0
+
+    def whoami(self, args) -> int:
+        deps = CommandDependencies(args)
+        payload = deps.context.api_client.get("api/v1/auth/me")
+        if deps.context.output != "table":
+            deps.context.print_output(payload)
+            return 0
+        user = payload.get("user") or {}
+        role = payload.get("role") or {}
+        full_name = f" ({user['fullName']})" if user.get("fullName") else ""
+        print(f"User:  {user.get('name')}{full_name}")
+        print(f"Role:  {role.get('name') or user.get('role') or '-'}")
+        print("Allowed functions:")
+        for function_id in payload.get("permissions") or []:
+            print(f"  {function_id}")
         return 0
 
     def change_password(self, args) -> int:

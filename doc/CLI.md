@@ -9,6 +9,8 @@ command tree follows ABR CLI v4.1:
 abr
   auth
   user
+  role
+  audit
   repo
   inventory
   job
@@ -28,6 +30,9 @@ Important notes:
 
 - Every `/api/v1` call requires a session: run `abr auth login` first (see
   [AltaStorCLI.md](./AltaStorCLI.md#authentication-commands)).
+- Every command needs its function to be allowed by the signed-in user's role
+  (its `--help` names it); a denied command exits with code 7. See
+  [RBAC.md](./RBAC.md).
 - After `abr inventory add`, run `abr inventory rescan` before using VM names
   in `abr job create`.
 - `abr job start --full` is the canonical full-backup flag.
