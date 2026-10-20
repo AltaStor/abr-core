@@ -114,6 +114,7 @@ from python.srv.services.inventory_management import (
     normalize_inventory_type,
 )
 from python.srv.services.backup_mode import object_lock_actual_retention_days
+from python.srv.services import clock_guard
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
 
@@ -5581,7 +5582,7 @@ def _point_object_lock(point: dict[str, Any], now: datetime) -> tuple[str, str] 
     return None
 
 
-def _new_retention_report(job: dict[str, Any], vm_id: str, repository_id: str | None) -> dict[str, Any]:
+def new_retention_report(job: dict[str, Any], vm_id: str, repository_id: str | None) -> dict[str, Any]:
     return {
         "job_id": str(job.get("id") or ""),
         "vm_id": vm_id,
@@ -5593,6 +5594,7 @@ def _new_retention_report(job: dict[str, Any], vm_id: str, repository_id: str | 
         "failed": [],
         "kept_for_chain": [],
         "skipped_reason": None,
+        "clock_blocked": None,
     }
 
 
@@ -5616,15 +5618,28 @@ def apply_retention_to_chain(
     """
     failures: list[dict[str, Any]] = []
     if report is None:
-        report = _new_retention_report(job, vm_id, repository_id)
+        report = new_retention_report(job, vm_id, repository_id)
     points = _points_for_job_vm_repo(str(job["id"]), vm_id, repository_id)
     report["points"] = len(points)
     if not points:
         return failures
     report["vm_name"] = points[-1].get("vm_name")
+    clock_block = clock_guard.retention_block()
+    report["clock_blocked"] = clock_block
+    if clock_block and not dry_run:
+        report["skipped_reason"] = clock_block
+        LOGGER.warning(
+            "Retention deleted nothing for job %s, VM %s in repository %s: %s",
+            job.get("id"),
+            report.get("vm_name") or vm_id,
+            repository_id,
+            clock_block,
+        )
+        return failures
     _apply_gfs_marks(points, dict(job.get("gfs") or {}))
     now = _now_utc()
-    cutoff = now - timedelta(days=int(job.get("retention_days") or 0))
+    retention_days = int(job.get("retention_days") or 0)
+    cutoff = now - timedelta(days=retention_days)
     retention_dates = _retention_dates(points)
 
     def expired(point: dict[str, Any]) -> bool:
@@ -5689,6 +5704,20 @@ def apply_retention_to_chain(
                 delete_backup(point["id"])
                 _RETENTION_LOCK_REPORTED.discard(point_id)
                 report["removed"].append(point_id)
+                LOGGER.info(
+                    "Retention removed restore point %s (%s, created %s) of job %s, VM %s, repository %s: "
+                    "it and the points that chain onto it are older than the job's retention of %d day(s) "
+                    "(cutoff %s, server time %s)",
+                    point_id,
+                    point.get("execution_type") or "unknown",
+                    point.get("created_at"),
+                    job.get("id"),
+                    report.get("vm_name") or vm_id,
+                    repository_id,
+                    retention_days,
+                    cutoff.isoformat(timespec="seconds"),
+                    now.isoformat(timespec="seconds"),
+                )
             else:
                 LOGGER.error(
                     "Retention failed to delete backup artifacts; keeping catalog entry for retry: "
@@ -5758,7 +5787,7 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
     }
     chains = []
     for vm_id, repository_id in _job_chains(str(job["id"])):
-        report = _new_retention_report(job, vm_id, repository_id)
+        report = new_retention_report(job, vm_id, repository_id)
         if vm_id in busy_vms:
             report["skipped_reason"] = "a backup of this VM is running"
             report["points"] = len(_points_for_job_vm_repo(str(job["id"]), vm_id, repository_id))
@@ -5779,6 +5808,7 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         "job_id": str(job["id"]),
         "job_name": str(job.get("name") or ""),
         "dry_run": bool(dry_run),
+        "clock_blocked": clock_guard.retention_block(),
         "retention_days": int(job.get("retention_days") or 0),
         "gfs": dict(job.get("gfs") or {}),
         "summary": summary,
@@ -9534,6 +9564,7 @@ def system_health() -> dict[str, Any]:
         "inventories": "ok",
         "scheduler": "ok",
         "task_pool": "ok",
+        "clock": "jump_detected" if clock_guard.retention_block() else "ok",
     }
     # "not_configured" is the in-memory mode (no MONGODB_URI); it is a
     # deployment choice, not a fault, so it does not degrade the overall status.

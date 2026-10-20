@@ -550,7 +550,9 @@ class JobCommands:
         for chain in result.get("chains") or []:
             held = chain.get("held") or []
             notes = []
-            if chain.get("skipped_reason"):
+            if chain.get("skipped_reason") and chain.get("skipped_reason") == chain.get("clock_blocked"):
+                notes.append("skipped: server clock jumped forward")
+            elif chain.get("skipped_reason"):
                 notes.append(f"skipped: {chain['skipped_reason']}")
             if held:
                 last = max(str(item.get("until") or "") for item in held)
@@ -597,6 +599,14 @@ class JobCommands:
             deps.context.print_output({"items": self._retention_rows(result)}, self._retention_columns(dry_run))
         else:
             deps.context.print_output(result)
+        clock_blocked = result.get("clock_blocked") if isinstance(result, dict) else None
+        if clock_blocked:
+            print(
+                f"Warning: {clock_blocked}" if dry_run else f"Error: {clock_blocked}",
+                file=sys.stderr,
+            )
+            if not dry_run:
+                return INVALID_STATE
         if int(summary.get("failed") or 0):
             print(
                 f"Error: {int(summary.get('failed'))} expired restore point(s) could not be removed and are kept "

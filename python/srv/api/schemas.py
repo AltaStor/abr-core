@@ -26,6 +26,7 @@ DocArray = Annotated[Any, Field(json_schema_extra={"type": "array"})]
 DocStrArray = Annotated[Any, Field(json_schema_extra={"type": "array", "items": {"type": "string"}})]
 DocObjectArray = Annotated[Any, Field(json_schema_extra={"type": "array", "items": {"type": "object"}})]
 DocStrOrNull = Annotated[Any, Field(json_schema_extra={"anyOf": [{"type": "string"}, {"type": "null"}]})]
+DocIntOrNull = Annotated[Any, Field(json_schema_extra={"anyOf": [{"type": "integer"}, {"type": "null"}]})]
 
 
 class ScheduleDTO(_LenientModel):
@@ -158,6 +159,22 @@ class SystemComponentsDTO(_LenientModel):
     inventories: DocStr = None
     scheduler: DocStr = None
     task_pool: DocStr = None
+    clock: DocStr = None
+
+
+class SystemClockDTO(_LenientModel):
+    blocked: DocBool = None
+    server_time: DocStr = None
+    last_known_at: DocStrOrNull = None
+    detected_at: DocStrOrNull = None
+    last_trusted_at: DocStrOrNull = None
+    jump_seconds: DocIntOrNull = None
+    source: DocStrOrNull = None
+    threshold_hours: DocInt = None
+    confirmed_at: DocStrOrNull = None
+    confirmed_by: DocStrOrNull = None
+    message: DocStrOrNull = None
+    was_blocked: DocBool = None
 
 
 class SystemCountsDTO(_LenientModel):
@@ -1239,6 +1256,7 @@ class RetentionChainDTO(_LenientModel):
     failed: DocStrArray = None
     kept_for_chain: DocStrArray = None
     skipped_reason: DocStrOrNull = None
+    clock_blocked: DocStrOrNull = None
 
 
 class RetentionSummaryDTO(_LenientModel):
@@ -1254,6 +1272,7 @@ class RetentionRunResult(_LenientModel):
     job_id: DocStr = None
     job_name: DocStr = None
     dry_run: DocBool = None
+    clock_blocked: DocStrOrNull = None
     retention_days: DocInt = None
     gfs: GfsDTO | DocObject = None
     summary: RetentionSummaryDTO | DocObject = None

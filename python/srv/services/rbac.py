@@ -77,6 +77,7 @@ FUNCTIONS: tuple[Function, ...] = (
     _f("system.support_bundle", "Generate a support bundle", ADMINISTER),
     _f("system.export", "Export the catalog and configuration", ADMINISTER),
     _f("system.import", "Import a catalog export over the current catalog", ADMINISTER),
+    _f("system.clock_confirm", "Confirm the server time after a clock jump so retention deletes again", ADMINISTER),
     _f("tls.view", "View the HTTPS certificate", READ),
     _f("tls.edit", "Install or revert the HTTPS certificate", ADMINISTER),
     _f("user.view", "List and view users", READ),

@@ -22,6 +22,7 @@ except ModuleNotFoundError:
 
 from python.srv.api.auth_guard import require_session
 from python.srv.backup_server import app
+from python.srv.core import mongo_db_wrapper
 from python.srv.core.mongo_db_wrapper import (
     BACKUPS,
     HYPERVISORS,
@@ -94,6 +95,9 @@ class SecureArchiveTests(unittest.TestCase):
 class SystemCatalogSnapshotApiTests(unittest.TestCase):
     def setUp(self) -> None:
         _reset_catalog()
+        in_memory = patch.object(mongo_db_wrapper, "get_database", return_value=None)
+        in_memory.start()
+        self.addCleanup(in_memory.stop)
         app.dependency_overrides[require_session] = lambda: {"user_id": "test-user", "user_name": "test-user", "role": "administrator"}
         self.client_cm = TestClient(app)
         self.client = self.client_cm.__enter__()

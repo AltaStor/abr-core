@@ -136,6 +136,7 @@ class Database:
             "sessions": "token",
             "hypervisors": "id",
             "resources": "resource_key",
+            "system_state": "id",
         }
         for collection, field in specs.items():
             self._db[collection].create_index([(field, ASCENDING)], unique=True, name=f"uq_{field}")

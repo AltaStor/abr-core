@@ -54,6 +54,7 @@ other role is allowed exactly what it lists.
 | `system.support_bundle` | administer | ✓ | – | – | – | – |
 | `system.export` | administer | ✓ | – | – | – | – |
 | `system.import` | administer | ✓ | – | – | – | – |
+| `system.clock_confirm` | administer | ✓ | – | – | – | – |
 | `tls.view` | read | ✓ | – | – | – | ✓ |
 | `tls.edit` | administer | ✓ | – | – | – | – |
 | `user.view` | read | ✓ | – | – | – | ✓ |

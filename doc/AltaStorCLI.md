@@ -541,6 +541,8 @@ Notes:
 • A full backup and the incrementals on it go together, only once every one of them is older than --retention-days and none is kept by GFS, newest first - so whatever stays always restores. Under a GFS-kept full, its expired incrementals may go on their own. 
 • A restore point still under S3 Object Lock is not even tried: it is reported as held (with the date its lock ends), and so are the older points it depends on. They go on a later pass. 
 • A chain with a backup of the same VM running is skipped and reported, so the point that backup chains onto cannot go from under it. 
+• Age is measured against the server clock. After the clock jumps forward by more than BACKUPSERVER_CLOCK_JUMP_HOURS (24 by default), while the server runs or between two runs, retention deletes nothing - here or after a backup - until an Administrator confirms the time with abr system clock confirm. Backups keep running, and each session carries a warning. The command then exits 4 and names the jump; --dry-run still shows what would go. 
+• Every removed restore point is written to the server log with its creation date, the cutoff and the server time it was measured against. 
 • The table lists each chain (VM and repository) with its points, what was (or would be) removed, what is held, and why. --output json returns the API's full report. The command exits 1 when an expired point could not be removed; it stays in the catalog for the next pass. 
 
 abr job delete 
@@ -753,6 +755,24 @@ abr system health
 Description: Show component health status. 
 
 abr system health [--output json] 
+
+The clock component reads jump_detected while retention is blocked by a forward clock jump (see abr system clock); that degrades the status and the command exits 4. 
+
+abr system clock show 
+
+Description: Show the server time, the last time it was known to be right, and whether retention is blocked by a forward clock jump. 
+
+abr system clock show [--output json] 
+
+The server writes its time to the catalog every 5 minutes. A jump of more than BACKUPSERVER_CLOCK_JUMP_HOURS (24 by default) blocks retention: one seen while the server runs (the wall clock against its monotonic clock), or a gap between the last time written and the next start - the server was off that long or its clock was moved. The block survives a restart. The command exits 4 while it is blocked. 
+
+abr system clock confirm 
+
+Description: Confirm the current server time is right, so retention deletes expired restore points again on its next pass. Administrator only; it is recorded in the audit log. 
+
+abr system clock confirm 
+
+Check the time first: a restore point removed on a wrong clock cannot be brought back. 
 
 abr system export 
 

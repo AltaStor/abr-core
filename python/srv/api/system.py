@@ -7,6 +7,7 @@ from fastapi import Body, Query, Request
 
 from python.srv.services import (
     abr_v41,
+    clock_guard,
     support_bundle_service,
     system_log_service,
     tls_certificate_service,
@@ -19,6 +20,7 @@ from .schemas import (
     CatalogSnapshotRequest,
     CatalogSnapshotResult,
     SupportBundleResult,
+    SystemClockDTO,
     SystemHealthDTO,
     SystemInfoDTO,
     SystemLogsDTO,
@@ -50,6 +52,19 @@ def system_health() -> SystemHealthDTO:
     is unreachable, never that a dependency is.
     """
     return abr_v41.system_health()
+
+
+def system_clock() -> SystemClockDTO:
+    return clock_guard.status()
+
+
+def confirm_system_clock(request: Request) -> SystemClockDTO:
+    result = clock_guard.confirm(getattr(request.state, "user_name", None))
+    audit = getattr(request.state, "audit", None)
+    if audit is not None:
+        audit.details["was_blocked"] = result["was_blocked"]
+        audit.details["confirmed_time"] = result["server_time"]
+    return result
 
 
 def system_logs(
@@ -133,6 +148,8 @@ register(router, [
     ("/version", system_version, ["GET"], "system.view"),
     ("/info", system_info, ["GET"], "system.view"),
     ("/health", system_health, ["GET"], "system.view"),
+    ("/clock", system_clock, ["GET"], "system.view"),
+    ("/clock/confirm", confirm_system_clock, ["POST"], "system.clock_confirm"),
     ("/logs", system_logs, ["GET"], "system.logs"),
     ("/catalog-snapshot", export_catalog_snapshot, ["POST"], "system.export"),
     ("/catalog-restore", import_catalog_snapshot, ["POST"], "system.import"),

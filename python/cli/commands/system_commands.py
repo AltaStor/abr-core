@@ -65,6 +65,41 @@ class SystemCommands:
         )
         health.set_defaults(handler=self.health)
 
+        clock = commands.add_parser(
+            "clock",
+            help="Show or confirm the server clock that retention measures from.",
+            description=(
+                "Retention deletes nothing after the server clock jumps forward by more than "
+                "BACKUPSERVER_CLOCK_JUMP_HOURS, while running or between two runs, until an "
+                "Administrator confirms the time is right."
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        clock_commands = clock.add_subparsers(dest="clock_command", required=True)
+        clock_show = clock_commands.add_parser(
+            "show",
+            help="Show the server time and whether retention is blocked by a clock jump.",
+            description=(
+                "Show the server time, the last time it was known to be right, and whether retention is "
+                "blocked by a forward clock jump. Exits with 4 while it is blocked.\n\n"
+                "Examples:\n  abr system clock show"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        clock_show.set_defaults(handler=self.clock_show)
+        clock_confirm = clock_commands.add_parser(
+            "confirm",
+            help="Confirm the server time is right so retention deletes expired restore points again.",
+            description=(
+                "Confirm the current server time is right. Retention takes the restore points' age from it "
+                "again, so expired points go on its next pass. Check the time first: a point removed on a "
+                "wrong clock cannot be brought back.\n\n"
+                "Examples:\n  abr system clock confirm"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        clock_confirm.set_defaults(handler=self.clock_confirm)
+
         export = commands.add_parser(
             "export",
             help="Export DB catalog + configuration to an encrypted archive",
@@ -135,6 +170,26 @@ class SystemCommands:
         )
         if isinstance(payload, dict) and payload.get("status") not in (None, "ok"):
             return INVALID_STATE
+        return 0
+
+    def clock_show(self, args) -> int:
+        deps = CommandDependencies(args)
+        payload = deps.context.api_client.get("api/v1/system/clock")
+        deps.context.print_output(payload)
+        if isinstance(payload, dict) and payload.get("blocked"):
+            return INVALID_STATE
+        return 0
+
+    def clock_confirm(self, args) -> int:
+        deps = CommandDependencies(args)
+        payload = deps.context.api_client.post("api/v1/system/clock/confirm")
+        if deps.context.output == "table" and isinstance(payload, dict):
+            if payload.get("was_blocked"):
+                print(f"Server time {payload.get('server_time')} confirmed; retention deletes expired restore points again.")
+            else:
+                print(f"Server time {payload.get('server_time')} confirmed; retention was not blocked.")
+            return 0
+        deps.context.print_output(payload)
         return 0
 
     def export(self, args) -> int:

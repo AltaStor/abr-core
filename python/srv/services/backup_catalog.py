@@ -43,6 +43,7 @@ from python.srv.services.abr_v41 import (
     chain_clock_anomalies,
     extend_segment_object_lock,
     normalize_backup_point,
+    new_retention_report,
     normalize_job_record,
 )
 from python.srv.services.api_errors import ApiError
@@ -497,9 +498,10 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
                 "Could not check the dates of chain %s against the server clock",
                 normalized_record.get("chain_id"),
             )
+        report = new_retention_report(normalized_job, retention_vm_id, retention_repository_id)
         try:
             failures = apply_retention_to_chain(
-                normalized_job, vm_id=retention_vm_id, repository_id=retention_repository_id
+                normalized_job, vm_id=retention_vm_id, repository_id=retention_repository_id, report=report
             )
         except (OSError, ApiError) as exc:
             logger.exception(
@@ -516,6 +518,24 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
                 repository_id=retention_repository_id,
             )
         else:
+            if report.get("clock_blocked"):
+                _record_session_warning(
+                    task,
+                    str(report["clock_blocked"]),
+                    job_id=str(normalized_job.get("id") or ""),
+                    vm_id=retention_vm_id,
+                    repository_id=retention_repository_id,
+                )
+            if report["removed"]:
+                _append_task_log(
+                    task,
+                    level="info",
+                    message=(
+                        f"Retention removed {len(report['removed'])} restore point(s) older than "
+                        f"{int(normalized_job.get('retention_days') or 0)} day(s): {', '.join(report['removed'])}"
+                    ),
+                    component="retention",
+                )
             for failure in failures:
                 _record_session_warning(
                     task,
