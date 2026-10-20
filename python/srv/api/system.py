@@ -68,8 +68,17 @@ def confirm_system_clock(request: Request) -> SystemClockDTO:
 
 
 def system_logs(
-    limit: int | None = Query(default=None, ge=1, le=system_log_service.MAX_LIMIT),
-    level: str | None = Query(default=None, pattern="^(debug|info|warn|error)$"),
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=system_log_service.MAX_LIMIT,
+        description=f"How many of the newest lines, 1 to {system_log_service.MAX_LIMIT} ({system_log_service.DEFAULT_LIMIT} when omitted)",
+    ),
+    level: str | None = Query(
+        default=None,
+        pattern="^(debug|info|warn|error)$",
+        description="Lowest level returned: debug, info, warn or error (warn answers warnings and errors)",
+    ),
 ) -> SystemLogsDTO:
     """Newest-first tail of the appliance's own server log.
 

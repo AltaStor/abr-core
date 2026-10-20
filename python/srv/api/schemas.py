@@ -3,9 +3,16 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, get_args
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, SkipValidation
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    SkipValidation,
+    StrictBool,
+)
 
 
 class _LenientModel(BaseModel):
@@ -671,29 +678,89 @@ def _lax_int(value: Any) -> Any:
 
 
 LaxStr = SkipValidation[str]
-LaxBool = SkipValidation[bool]
+LaxBool = StrictBool
 LaxInt = Annotated[int | None, BeforeValidator(_lax_int)]
 RawInt = SkipValidation[int]
 
 
+def _checked_booleans(model: type[BaseModel]) -> BeforeValidator:
+    keys = tuple(name for name, field in model.model_fields.items() if LaxBool in get_args(field.annotation))
+
+    def check(value: Any) -> Any:
+        for item in value if isinstance(value, list) else [value]:
+            if not isinstance(item, dict):
+                continue
+            for key in keys:
+                if item.get(key) is not None and not isinstance(item[key], bool):
+                    raise ValueError(f"{key} must be true or false")
+        return value
+
+    return BeforeValidator(check)
+
+
+OMITTED_KEEPS = "null or omitted leaves it as it is"
+INVENTORY_NAME = "The inventory's name, not its ID, matched whole and case-insensitively; give this or inventory_id"
+INVENTORY_ID = "The inventory's ID, not its name; give this or inventory"
+REPOSITORY_NAME = "The repository's name, not its ID, matched whole and case-insensitively; give this or the ID field"
+REPOSITORY_ID = "The repository's ID, not its name; give this or the name field"
+JOB_VMS = (
+    "VMs to back up: a list, or one comma-separated text. Each item is a VM's ID (vCenter instance UUID, Hyper-V VM ID), "
+    "its name matched whole and case-insensitively, or its inventory path"
+)
+FULL_SCHEDULE_STATE = (
+    "true or false switches that full schedule on or off and keeps its settings; null or omitted keeps the schedule's own "
+    "enabled (true)"
+)
+FULL_SCHEDULE_STATE_EDIT = (
+    "true or false switches that full schedule on or off and keeps its settings; the state it already has answers 200 "
+    f"without moving its next run; {OMITTED_KEEPS}"
+)
+LEGACY_FULL_DAYS = "Older form of the full schedule: weekdays (mon..sun) at the base schedule's time; prefer the *_full_schedule object"
+S3_PATH_STYLE = (
+    "true addresses objects as endpoint/bucket/key, false as bucket.endpoint/key; null or omitted: true when endpoint_url is "
+    "given, false for AWS"
+)
+S3_VERIFY_TLS = "false accepts the endpoint's certificate without checking it; null or omitted: true"
+CREATE_BUCKET = "true creates the bucket when it does not exist yet; false, null or omitted: the bucket must already exist"
+INSECURE = "true accepts the server's certificate without checking it; false checks it"
+POWER_ON = "true powers the restored VM on; false, null or omitted leaves it off"
+PRESERVE_MAC = "true is refused (not supported yet); false, null or omitted gives the restored VM new MAC addresses"
+PRESERVE_FIRMWARE = "true keeps the source VM's firmware (BIOS or EFI); false lets the target decide; null or omitted: the restore context's default"
+CONNECT_NICS = "true, null or omitted connects the restored VM's network adapters at power-on; false leaves them disconnected"
+RESTORE_POINT_ID = "ID of the restore point to restore, as GET /restore/points lists it; restore_point_id and point_id are the same field"
+RESTORE_BACKUP = (
+    "Backup chain ID as GET /backups lists it (backup::<job>::<vm>::<repository>); without a restore point ID the newest "
+    "available point of that chain (of vm, when given) is restored; backup and backup_id are the same field"
+)
+RESTORE_TARGET_INVENTORY_NAME = "Inventory to restore into, by name (case-insensitive); omitted with target_inventory_id, the restore context's default"
+RESTORE_TARGET_INVENTORY_ID = "Inventory to restore into, by ID; omitted with target_inventory, the restore context's default"
+RESTORE_TARGET_HOST = "Host to restore onto: its ID or its name (case-insensitive); target_host and target_host_id are the same field"
+RESTORE_TARGET_DATASTORE = (
+    "Datastore to place the VM on: its ID or its name (case-insensitive); target_datastore and target_datastore_id are "
+    "the same field"
+)
+ROLE = "Role ID or name in any case, with spaces or hyphens for underscores: backup_operator, Backup Operator, backup-operator"
+SCHEDULE_TYPE = "daily, weekly, monthly, periodic (interval) or cron; type, schedule_type and kind are the same field"
+
+
 class ScheduleRequest(_LenientModel):
-    type: LaxStr | None = None
-    schedule_type: LaxStr | None = None
-    kind: LaxStr | None = None
-    time: LaxStr | None = None
-    start_time: LaxStr | None = None
-    days: DocStrArray = None
-    weekdays: DocStrArray = None
+    type: LaxStr | None = Field(default=None, description=SCHEDULE_TYPE)
+    schedule_type: LaxStr | None = Field(default=None, description=SCHEDULE_TYPE)
+    kind: LaxStr | None = Field(default=None, description=SCHEDULE_TYPE)
+    time: LaxStr | None = Field(default=None, description="HH:MM in the schedule's time zone (daily, weekly, monthly); time and start_time are the same field")
+    start_time: LaxStr | None = Field(default=None, description="HH:MM in the schedule's time zone (daily, weekly, monthly); time and start_time are the same field")
+    days: DocStrArray = Field(default=None, description="Weekly schedules: weekdays as mon..sun or full names; days and weekdays are the same field")
+    weekdays: DocStrArray = Field(default=None, description="Weekly schedules: weekdays as mon..sun or full names; days and weekdays are the same field")
     day_of_month: LaxInt = None
-    every: LaxStr | None = None
-    interval_minutes: LaxInt = None
+    every: LaxStr | None = Field(default=None, description="Periodic schedules: 15m, 1h, 6h, 1d and the like; or interval_minutes")
+    interval_minutes: LaxInt = Field(default=None, description="Periodic schedules: the interval in minutes; or every")
     expression: LaxStr | None = None
-    timezone: LaxStr | None = None
-    enabled: LaxBool | None = None
+    timezone: LaxStr | None = Field(default=None, description="IANA time zone such as Europe/Kyiv or UTC; null or omitted, the server's own")
+    enabled: LaxBool | None = Field(default=None, description="false keeps the schedule without running it; true, null or omitted runs it")
 
 
 class GfsRequest(_LenientModel):
-    enabled: LaxBool | None = None
+    enabled: LaxBool | None = Field(default=None, description="false suspends GFS protection and keeps the counts; true, null or omitted keeps restore points GFS marks")
     weekly: LaxInt = None
     monthly: LaxInt = None
     yearly: LaxInt = None
@@ -702,12 +769,12 @@ class GfsRequest(_LenientModel):
 class TaskParametersRequest(_LenientModel):
     compression_level: LaxInt = None
     on_quiesce_failure: LaxStr | None = None
-    encryption_enabled: LaxBool | None = None
+    encryption_enabled: LaxBool | None = Field(default=None, description="true encrypts new backups with encryption_key, which is then required; false does not. On edit, null clears the stored value (no encryption)")
     encryption_key: LaxStr | None = None
     encryption_key_id: LaxStr | None = None
     tool_timeout_seconds: LaxInt = None
-    app_aware: LaxBool | None = None
-    dedup: LaxBool | None = None
+    app_aware: LaxBool | None = Field(default=None, description="Stored with the job for the console; backups do not act on it")
+    dedup: LaxBool | None = Field(default=None, description="Stored with the job for the console; backups do not act on it")
 
 
 class S3Request(_LenientModel):
@@ -718,8 +785,8 @@ class S3Request(_LenientModel):
     access_key: LaxStr | None = None
     secret_key: LaxStr | None = None
     profile: LaxStr | None = None
-    path_style: LaxBool | None = None
-    verify_tls: LaxBool | None = None
+    path_style: LaxBool | None = Field(default=None, description=S3_PATH_STYLE)
+    verify_tls: LaxBool | None = Field(default=None, description=S3_VERIFY_TLS)
 
 
 class ImmutabilityRequest(_LenientModel):
@@ -729,10 +796,10 @@ class ImmutabilityRequest(_LenientModel):
 
 
 class RestoreDatastoreMapping(_LenientModel):
-    source_datastore_id: LaxStr | None = None
-    source_datastore: LaxStr | None = None
-    target_datastore_id: LaxStr | None = None
-    target_datastore: LaxStr | None = None
+    source_datastore_id: LaxStr | None = Field(default=None, description="Not read; give source_datastore")
+    source_datastore: LaxStr | None = Field(default=None, description="Name of the source datastore whose disks move")
+    target_datastore_id: LaxStr | None = Field(default=None, description="Datastore they move to: its ID or its name (case-insensitive); used when target_datastore is absent")
+    target_datastore: LaxStr | None = Field(default=None, description="Datastore they move to: its ID or its name (case-insensitive)")
 
 
 class CreateInventoryRequest(_LenientModel):
@@ -744,7 +811,7 @@ class CreateInventoryRequest(_LenientModel):
     username: LaxStr | None = None
     password: LaxStr | None = None
     token: LaxStr | None = None
-    insecure: LaxBool | None = None
+    insecure: LaxBool | None = Field(default=None, description="true accepts the server's certificate without checking it; false, null or omitted checks it")
     description: LaxStr | None = None
 
 
@@ -756,7 +823,7 @@ class UpdateInventoryRequest(_LenientModel):
     username: LaxStr | None = None
     password: LaxStr | None = None
     token: LaxStr | None = None
-    insecure: LaxBool | None = None
+    insecure: LaxBool | None = Field(default=None, description=f"{INSECURE}; {OMITTED_KEEPS}")
     description: LaxStr | None = None
 
 
@@ -770,7 +837,7 @@ class CreateRepositoryRequest(_LenientModel):
     username: LaxStr | None = None
     password: LaxStr | None = None
     description: LaxStr | None = None
-    s3: SkipValidation[S3Request] | None = None
+    s3: Annotated[SkipValidation[S3Request] | None, _checked_booleans(S3Request)] = None
     bucket: LaxStr | None = None
     prefix: LaxStr | None = None
     region: LaxStr | None = None
@@ -778,10 +845,10 @@ class CreateRepositoryRequest(_LenientModel):
     access_key: LaxStr | None = None
     secret_key: LaxStr | None = None
     profile: LaxStr | None = None
-    path_style: LaxBool | None = None
-    verify_tls: LaxBool | None = None
-    immutability: SkipValidation[ImmutabilityRequest] | None = None
-    create_bucket: LaxBool | None = None
+    path_style: LaxBool | None = Field(default=None, description=S3_PATH_STYLE)
+    verify_tls: LaxBool | None = Field(default=None, description=S3_VERIFY_TLS)
+    immutability: Annotated[SkipValidation[ImmutabilityRequest] | None, _checked_booleans(ImmutabilityRequest)] = None
+    create_bucket: LaxBool | None = Field(default=None, description=CREATE_BUCKET)
 
 
 class UpdateRepositoryRequest(_LenientModel):
@@ -793,7 +860,7 @@ class UpdateRepositoryRequest(_LenientModel):
     username: LaxStr | None = None
     password: LaxStr | None = None
     description: LaxStr | None = None
-    s3: SkipValidation[S3Request] | None = None
+    s3: Annotated[SkipValidation[S3Request] | None, _checked_booleans(S3Request)] = None
     bucket: LaxStr | None = None
     prefix: LaxStr | None = None
     region: LaxStr | None = None
@@ -801,112 +868,112 @@ class UpdateRepositoryRequest(_LenientModel):
     access_key: LaxStr | None = None
     secret_key: LaxStr | None = None
     profile: LaxStr | None = None
-    path_style: LaxBool | None = None
-    verify_tls: LaxBool | None = None
-    immutability: SkipValidation[ImmutabilityRequest] | None = None
-    create_bucket: LaxBool | None = None
+    path_style: LaxBool | None = Field(default=None, description=S3_PATH_STYLE)
+    verify_tls: LaxBool | None = Field(default=None, description=S3_VERIFY_TLS)
+    immutability: Annotated[SkipValidation[ImmutabilityRequest] | None, _checked_booleans(ImmutabilityRequest)] = None
+    create_bucket: LaxBool | None = Field(default=None, description=CREATE_BUCKET)
 
 
 class CreateJobRequest(_LenientModel):
     name: LaxStr | None = None
-    vms: list[LaxStr] | LaxStr | None = None
-    inventory: LaxStr | None = None
-    inventory_id: LaxStr | None = None
-    repo: LaxStr | None = None
-    repo_id: LaxStr | None = None
-    schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
-    enabled: LaxBool | None = None
+    vms: list[LaxStr] | LaxStr | None = Field(default=None, description=JOB_VMS)
+    inventory: LaxStr | None = Field(default=None, description="The inventory's name, not its ID, matched whole and case-insensitively; omitted with inventory_id, the one inventory that holds every VM in vms")
+    inventory_id: LaxStr | None = Field(default=None, description="The inventory's ID, not its name; omitted with inventory, the one inventory that holds every VM in vms")
+    repo: LaxStr | None = Field(default=None, description=REPOSITORY_NAME)
+    repo_id: LaxStr | None = Field(default=None, description=REPOSITORY_ID)
+    schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
+    enabled: LaxBool | None = Field(default=None, description="Used only when no schedule is given; with a schedule its own enabled decides. null or omitted: true")
     retention_days: RawInt | None = None
-    retention_min_fulls: RawInt | None = None
-    gfs: SkipValidation[GfsRequest] | None = None
-    active_full_days: list[Any] | LaxStr | None = None
-    active_full_days_csv: LaxStr | None = None
-    synthetic_full_days: list[Any] | LaxStr | None = None
-    synthetic_full_days_csv: LaxStr | None = None
-    active_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
-    synthetic_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
-    active_full_enabled: LaxBool | None = None
-    synthetic_full_enabled: LaxBool | None = None
+    retention_min_fulls: RawInt | None = Field(default=None, description="How many of the newest full backups of each VM, with their incrementals, retention keeps whatever their age; 0 to 100, null or omitted: 0")
+    gfs: Annotated[SkipValidation[GfsRequest] | None, _checked_booleans(GfsRequest)] = None
+    active_full_days: list[Any] | LaxStr | None = Field(default=None, description=LEGACY_FULL_DAYS)
+    active_full_days_csv: LaxStr | None = Field(default=None, description=LEGACY_FULL_DAYS)
+    synthetic_full_days: list[Any] | LaxStr | None = Field(default=None, description=LEGACY_FULL_DAYS)
+    synthetic_full_days_csv: LaxStr | None = Field(default=None, description=LEGACY_FULL_DAYS)
+    active_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
+    synthetic_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
+    active_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE)
+    synthetic_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE)
     description: LaxStr | None = None
-    task_parameters: SkipValidation[TaskParametersRequest] | None = None
-    backup_options: SkipValidation[TaskParametersRequest] | None = None
+    task_parameters: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = None
+    backup_options: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = Field(default=None, description="Older spelling of task_parameters, read only when task_parameters is absent")
 
 
 class CreateCopyJobRequest(_LenientModel):
     name: LaxStr | None = None
-    source: LaxStr | None = None
-    source_job: LaxStr | None = None
-    source_id: LaxStr | None = None
-    source_job_id: LaxStr | None = None
-    repo: LaxStr | None = None
-    repository: LaxStr | None = None
-    repo_id: LaxStr | None = None
-    repository_id: LaxStr | None = None
-    schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
-    enabled: LaxBool | None = None
-    retention_days: RawInt | None = None
-    retention_min_fulls: RawInt | None = None
+    source: LaxStr | None = Field(default=None, description="The job to copy, by name (case-insensitive); source and source_job are the same field; or source_id")
+    source_job: LaxStr | None = Field(default=None, description="The job to copy, by name (case-insensitive); source and source_job are the same field; or source_id")
+    source_id: LaxStr | None = Field(default=None, description="The job to copy, by ID; source_id and source_job_id are the same field; or source")
+    source_job_id: LaxStr | None = Field(default=None, description="The job to copy, by ID; source_id and source_job_id are the same field; or source")
+    repo: LaxStr | None = Field(default=None, description="Repository for the copy, by name (case-insensitive); repo and repository are the same field; omitted with the ID, the source job's")
+    repository: LaxStr | None = Field(default=None, description="Repository for the copy, by name (case-insensitive); repo and repository are the same field; omitted with the ID, the source job's")
+    repo_id: LaxStr | None = Field(default=None, description="Repository for the copy, by ID; repo_id and repository_id are the same field; omitted with the name, the source job's")
+    repository_id: LaxStr | None = Field(default=None, description="Repository for the copy, by ID; repo_id and repository_id are the same field; omitted with the name, the source job's")
+    schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
+    enabled: LaxBool | None = Field(default=None, description="true or false switches the copy's schedule on or off; null or omitted keeps the copied schedule's state")
+    retention_days: RawInt | None = Field(default=None, description="null or omitted: the source job's")
+    retention_min_fulls: RawInt | None = Field(default=None, description="0 to 100; null or omitted: the source job's")
     description: LaxStr | None = None
 
 
 class UpdateJobRequest(_LenientModel):
     name: LaxStr | None = None
-    schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
-    enabled: LaxBool | None = None
+    schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
+    enabled: LaxBool | None = Field(default=None, description=f"true or false switches the whole job and its base schedule on or off; {OMITTED_KEEPS}")
     retention_days: RawInt | None = None
-    retention_min_fulls: RawInt | None = None
+    retention_min_fulls: RawInt | None = Field(default=None, description=f"0 to 100; 0 switches it off; {OMITTED_KEEPS}")
     gfs_weekly: RawInt | None = None
     gfs_monthly: RawInt | None = None
     gfs_yearly: RawInt | None = None
-    gfs_enabled: LaxBool | None = None
-    active_full_days: list[Any] | LaxStr | None = None
-    synthetic_full_days: list[Any] | LaxStr | None = None
-    active_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
-    synthetic_full_schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
-    active_full_enabled: LaxBool | None = None
-    synthetic_full_enabled: LaxBool | None = None
+    gfs_enabled: LaxBool | None = Field(default=None, description=f"false suspends GFS protection and keeps the counts, true resumes it; {OMITTED_KEEPS}")
+    active_full_days: list[Any] | LaxStr | None = Field(default=None, description=LEGACY_FULL_DAYS)
+    synthetic_full_days: list[Any] | LaxStr | None = Field(default=None, description=LEGACY_FULL_DAYS)
+    active_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
+    synthetic_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
+    active_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE_EDIT)
+    synthetic_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE_EDIT)
     description: LaxStr | None = None
-    task_parameters: SkipValidation[TaskParametersRequest] | None = None
-    repo: LaxStr | None = None
-    repo_id: LaxStr | None = None
-    inventory: LaxStr | None = None
-    inventory_id: LaxStr | None = None
-    vms: list[LaxStr] | LaxStr | None = None
-    source_job: LaxStr | None = None
-    source_job_id: LaxStr | None = None
+    task_parameters: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = Field(default=None, description="Merged into the stored ones: a key set to null goes back to its default, keys left out are kept")
+    repo: LaxStr | None = Field(default=None, description=REPOSITORY_NAME)
+    repo_id: LaxStr | None = Field(default=None, description=REPOSITORY_ID)
+    inventory: LaxStr | None = Field(default=None, description=INVENTORY_NAME)
+    inventory_id: LaxStr | None = Field(default=None, description=INVENTORY_ID)
+    vms: list[LaxStr] | LaxStr | None = Field(default=None, description=f"{JOB_VMS}; replaces the job's VM list")
+    source_job: LaxStr | None = Field(default=None, description="Backup copy jobs only: the source job by name (case-insensitive); or source_job_id")
+    source_job_id: LaxStr | None = Field(default=None, description="Backup copy jobs only: the source job by ID; or source_job")
 
 
 class StartJobRequest(_LenientModel):
-    force_full: LaxBool | None = None
-    force_synthetic: LaxBool | None = None
-    target_repository_id: LaxStr | None = None
+    force_full: LaxBool | None = Field(default=None, description="true takes an active full backup now; false, null or omitted lets the job's schedules decide. Not together with force_synthetic")
+    force_synthetic: LaxBool | None = Field(default=None, description="true builds a synthetic full from the stored chain (it needs a full and at least one incremental); false, null or omitted lets the schedules decide")
+    target_repository_id: LaxStr | None = Field(default=None, description="With force_synthetic only: ID, not name, of the repository to write the synthetic full to; omitted, the job's own")
 
 
 class RunRetentionRequest(_LenientModel):
-    dry_run: LaxBool | None = None
+    dry_run: LaxBool | None = Field(default=None, description="true only reports what retention would remove; false, null or omitted runs it and deletes the expired restore points")
 
 
 class StopSessionRequest(_LenientModel):
-    force: LaxBool | None = None
+    force: LaxBool | None = Field(default=None, description="Only worded differently in the session log; a stop works the same with true, false, null or omitted")
 
 
 class ImportBackupRequest(_LenientModel):
     path: LaxStr | None = None
-    repo: LaxStr | None = None
-    repo_id: LaxStr | None = None
+    repo: LaxStr | None = Field(default=None, description=REPOSITORY_NAME)
+    repo_id: LaxStr | None = Field(default=None, description=REPOSITORY_ID)
 
 
 class CreateUserRequest(_LenientModel):
     name: LaxStr | None = None
     password: LaxStr | None = None
     fullName: LaxStr | None = None
-    role: LaxStr | None = None
+    role: LaxStr | None = Field(default=None, description=ROLE)
 
 
 class UpdateUserRequest(_LenientModel):
     fullName: LaxStr | None = None
-    role: LaxStr | None = None
-    enabled: SkipValidation[bool] | None = None
+    role: LaxStr | None = Field(default=None, description=f"{ROLE}; {OMITTED_KEEPS}")
+    enabled: SkipValidation[bool] | None = Field(default=None, description=f"false stops the user signing in, true lets them again; {OMITTED_KEEPS}")
 
 
 
@@ -925,26 +992,26 @@ class UserResult(_LenientModel):
 
 
 class StartRestoreTarget(_LenientModel):
-    inventory_id: LaxStr | None = None
-    inventory: LaxStr | None = None
-    host_id: LaxStr | None = None
-    datastore_id: LaxStr | None = None
-    vm_name: LaxStr | None = None
-    folder_id: LaxStr | None = None
-    resource_pool_id: LaxStr | None = None
+    inventory_id: LaxStr | None = Field(default=None, description=RESTORE_TARGET_INVENTORY_ID)
+    inventory: LaxStr | None = Field(default=None, description=RESTORE_TARGET_INVENTORY_NAME)
+    host_id: LaxStr | None = Field(default=None, description="Host to restore onto: its ID or its name (case-insensitive)")
+    datastore_id: LaxStr | None = Field(default=None, description="Datastore to place the VM on: its ID or its name (case-insensitive)")
+    vm_name: LaxStr | None = Field(default=None, description="Name of the restored VM; null or omitted, the restore context's default")
+    folder_id: LaxStr | None = Field(default=None, description="Not supported yet; a value is refused")
+    resource_pool_id: LaxStr | None = Field(default=None, description="Not supported yet; a value is refused")
 
 
 class StartRestoreOptions(_LenientModel):
-    power_on_after_restore: LaxBool | None = None
-    preserve_mac_addresses: LaxBool | None = None
-    preserve_firmware: LaxBool | None = None
-    connect_nics: LaxBool | None = None
+    power_on_after_restore: LaxBool | None = Field(default=None, description=POWER_ON)
+    preserve_mac_addresses: LaxBool | None = Field(default=None, description=PRESERVE_MAC)
+    preserve_firmware: LaxBool | None = Field(default=None, description=PRESERVE_FIRMWARE)
+    connect_nics: LaxBool | None = Field(default=None, description=CONNECT_NICS)
     disk_provisioning: LaxStr | None = None
 
 
 class StartRestoreNetworkMapping(_LenientModel):
-    source_nic_id: LaxStr | None = None
-    target_network_id: LaxStr | None = None
+    source_nic_id: LaxStr | None = Field(default=None, description="A source network adapter's ID as GET /restore/context lists it under source_vm.nics")
+    target_network_id: LaxStr | None = Field(default=None, description="Network to connect it to, as GET /restore/context lists it under networks")
 
 
 class VerifyBackupRequest(_LenientModel):
@@ -952,41 +1019,41 @@ class VerifyBackupRequest(_LenientModel):
 
 
 class StartRestoreRequest(_LenientModel):
-    restore_point_id: LaxStr | None = None
-    point_id: LaxStr | None = None
-    backup_id: LaxStr | None = None
-    backup: LaxStr | None = None
-    inventory_id: LaxStr | None = None
-    repository_id: LaxStr | None = None
-    repository: LaxStr | None = None
-    repo_id: LaxStr | None = None
-    repo: LaxStr | None = None
-    restore_mode: LaxStr | None = None
-    target: SkipValidation[StartRestoreTarget] | None = None
-    options: SkipValidation[StartRestoreOptions] | None = None
-    network_mappings: SkipValidation[list[StartRestoreNetworkMapping]] | None = None
+    restore_point_id: LaxStr | None = Field(default=None, description=RESTORE_POINT_ID)
+    point_id: LaxStr | None = Field(default=None, description=RESTORE_POINT_ID)
+    backup_id: LaxStr | None = Field(default=None, description=RESTORE_BACKUP)
+    backup: LaxStr | None = Field(default=None, description=RESTORE_BACKUP)
+    inventory_id: LaxStr | None = Field(default=None, description="ID of the inventory the restore point was backed up from; refused with 409 when it does not match")
+    repository_id: LaxStr | None = Field(default=None, description="Repository holding the restore point, by ID (repository_id and repo_id are the same field); refused when it does not hold it")
+    repository: LaxStr | None = Field(default=None, description="Repository holding the restore point, by name (case-insensitive); repository and repo are the same field")
+    repo_id: LaxStr | None = Field(default=None, description="Repository holding the restore point, by ID (repository_id and repo_id are the same field); refused when it does not hold it")
+    repo: LaxStr | None = Field(default=None, description="Repository holding the restore point, by name (case-insensitive); repository and repo are the same field")
+    restore_mode: LaxStr | None = Field(default=None, description="new_vm (also new) or in_place (also overwrite, needs force); null or omitted: new_vm, or in_place when only force is given")
+    target: Annotated[SkipValidation[StartRestoreTarget] | None, _checked_booleans(StartRestoreTarget)] = None
+    options: Annotated[SkipValidation[StartRestoreOptions] | None, _checked_booleans(StartRestoreOptions)] = None
+    network_mappings: Annotated[SkipValidation[list[StartRestoreNetworkMapping]] | None, _checked_booleans(StartRestoreNetworkMapping)] = None
     network_map: DocStrArray = None
     datastore_map: DocStrArray = None
     disk_datastore_map: DocStrArray = None
     nic_network_map: DocStrArray = None
-    datastore_mappings: SkipValidation[list[RestoreDatastoreMapping]] | None = None
-    target_inventory: LaxStr | None = None
-    target_inventory_id: LaxStr | None = None
-    target_host: LaxStr | None = None
-    target_host_id: LaxStr | None = None
-    target_datastore: LaxStr | None = None
-    target_datastore_id: LaxStr | None = None
-    target_vm_name: LaxStr | None = None
-    name: LaxStr | None = None
-    power_on: LaxBool | None = None
-    power_on_after_restore: LaxBool | None = None
-    preserve_mac_addresses: LaxBool | None = None
-    preserve_firmware: LaxBool | None = None
-    connect_nics: LaxBool | None = None
-    disk_provisioning: LaxStr | None = None
-    disk_type: LaxStr | None = None
+    datastore_mappings: Annotated[SkipValidation[list[RestoreDatastoreMapping]] | None, _checked_booleans(RestoreDatastoreMapping)] = None
+    target_inventory: LaxStr | None = Field(default=None, description=RESTORE_TARGET_INVENTORY_NAME)
+    target_inventory_id: LaxStr | None = Field(default=None, description=RESTORE_TARGET_INVENTORY_ID)
+    target_host: LaxStr | None = Field(default=None, description=RESTORE_TARGET_HOST)
+    target_host_id: LaxStr | None = Field(default=None, description=RESTORE_TARGET_HOST)
+    target_datastore: LaxStr | None = Field(default=None, description=RESTORE_TARGET_DATASTORE)
+    target_datastore_id: LaxStr | None = Field(default=None, description=RESTORE_TARGET_DATASTORE)
+    target_vm_name: LaxStr | None = Field(default=None, description="Name of the restored VM; target_vm_name and name are the same field; null or omitted, the restore context's default")
+    name: LaxStr | None = Field(default=None, description="Name of the restored VM; target_vm_name and name are the same field; null or omitted, the restore context's default")
+    power_on: LaxBool | None = Field(default=None, description=f"{POWER_ON}; power_on and power_on_after_restore are the same field")
+    power_on_after_restore: LaxBool | None = Field(default=None, description=f"{POWER_ON}; power_on and power_on_after_restore are the same field")
+    preserve_mac_addresses: LaxBool | None = Field(default=None, description=PRESERVE_MAC)
+    preserve_firmware: LaxBool | None = Field(default=None, description=PRESERVE_FIRMWARE)
+    connect_nics: LaxBool | None = Field(default=None, description=CONNECT_NICS)
+    disk_provisioning: LaxStr | None = Field(default=None, description="thin, thick or eager-zeroed; disk_provisioning and disk_type are the same field; null or omitted keeps the source's")
+    disk_type: LaxStr | None = Field(default=None, description="thin, thick or eager-zeroed; disk_provisioning and disk_type are the same field; null or omitted keeps the source's")
     encryption_key: LaxStr | None = None
-    force: LaxBool | None = None
+    force: LaxBool | None = Field(default=None, description="true authorizes an in-place restore that overwrites the source VM; refused for a restore to a new VM")
 
 
 class RestoreStartResult(SessionDTO):

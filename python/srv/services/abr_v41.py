@@ -4743,11 +4743,11 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             updated.get("schedule"),
             updated.get("created_at"),
         )
+        changed = True
         if schedule_value == updated.get(schedule_key):
             continue
         updated[schedule_key] = schedule_value
         updated[next_run_key] = _execution_schedule_next_run(schedule_value)
-        changed = True
     if "description" in payload:
         description = str(payload.get("description") or "").strip()
         _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)

@@ -14,13 +14,22 @@ router = build_router("/audit", tag="audit")
 
 
 def list_audit_records(
-    limit: int | None = Query(default=None, ge=1, le=audit_service.LIST_LIMIT_MAX),
-    offset: int = Query(default=0, ge=0),
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=audit_service.LIST_LIMIT_MAX,
+        description=f"Page size, 1 to {audit_service.LIST_LIMIT_MAX} ({audit_service.LIST_LIMIT_DEFAULT} when omitted)",
+    ),
+    offset: int = Query(default=0, ge=0, description="How many of the newest matching records to skip"),
     user: str | None = Query(default=None, description="Only records of this user name"),
     function: str | None = Query(
         default=None, description="A function ID, or an area with a trailing dot (job.) for all of its functions"
     ),
-    result: str | None = Query(default=None, pattern="^(allowed|denied|failed)$"),
+    result: str | None = Query(
+        default=None,
+        pattern="^(allowed|denied|failed)$",
+        description="Only records with this result: allowed, denied (the role does not permit it) or failed",
+    ),
     since: str | None = Query(default=None, description="ISO 8601 timestamp; records at or after it"),
     until: str | None = Query(default=None, description="ISO 8601 timestamp; records at or before it"),
 ) -> AuditList:
