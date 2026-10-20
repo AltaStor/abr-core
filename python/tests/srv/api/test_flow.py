@@ -745,6 +745,54 @@ class BackupServerApiFlowTests(unittest.TestCase):
         listed = self.client.get("/api/v1/jobs")
         self.assertFalse(any(item["name"] == "retention-zero-job" for item in listed.json()["items"]))
 
+    def test_retention_min_fulls_is_off_unless_set_and_follows_create_copy_and_edit(self) -> None:
+        inventory = self._create_mock_inventory("test-min-fulls-hv")
+        repository = self._create_repository("min-fulls-repo", "local", path="/backup/min-fulls")
+        plain = self._create_backup_job(
+            name="min-fulls-plain", inventory_id=inventory["id"], vm_names=["vm-1"], repo_id=repository["id"]
+        )
+        self.assertEqual(plain["retention_min_fulls"], 0)
+
+        guarded = self.client.post(
+            "/api/v1/jobs",
+            json={
+                "name": "min-fulls-guarded",
+                "vms": ["vm-1"],
+                "inventory_id": inventory["id"],
+                "repo_id": repository["id"],
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+                "retention_min_fulls": 2,
+            },
+        )
+        self.assertEqual(guarded.status_code, 200, guarded.text)
+        self.assertEqual(guarded.json()["retention_min_fulls"], 2)
+
+        inherited = self.client.post("/api/v1/jobs/copy", json={"name": "min-fulls-clone", "source_id": guarded.json()["id"]})
+        overridden = self.client.post(
+            "/api/v1/jobs/copy",
+            json={"name": "min-fulls-clone-3", "source_id": guarded.json()["id"], "retention_min_fulls": 3},
+        )
+        self.assertEqual((inherited.json()["retention_min_fulls"], overridden.json()["retention_min_fulls"]), (2, 3))
+
+        renamed = self.client.patch(f"/api/v1/jobs/{guarded.json()['id']}", json={"description": "untouched floor"})
+        self.assertEqual(renamed.json()["retention_min_fulls"], 2)
+        switched_off = self.client.patch(f"/api/v1/jobs/{guarded.json()['id']}", json={"retention_min_fulls": 0})
+        self.assertEqual(switched_off.status_code, 200, switched_off.text)
+        self.assertEqual(switched_off.json()["retention_min_fulls"], 0)
+
+    def test_retention_min_fulls_outside_0_to_100_is_refused(self) -> None:
+        inventory = self._create_mock_inventory("test-min-fulls-bad-hv")
+        repository = self._create_repository("min-fulls-bad-repo", "local", path="/backup/min-fulls-bad")
+        job = self._create_backup_job(
+            name="min-fulls-bad", inventory_id=inventory["id"], vm_names=["vm-1"], repo_id=repository["id"]
+        )
+        for value in (-1, 101, "2", True, 1.5):
+            with self.subTest(value=value):
+                response = self.client.patch(f"/api/v1/jobs/{job['id']}", json={"retention_min_fulls": value})
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertIn("retention-min-fulls must be a whole number from 0 to 100", response.json()["error"]["message"])
+        self.assertEqual(self.client.get(f"/api/v1/jobs/{job['id']}").json()["retention_min_fulls"], 0)
+
     def test_new_and_copied_jobs_keep_their_backups_in_id_named_folders(self) -> None:
         inventory = self._create_mock_inventory("test-layout-hv")
         repository = self._create_repository("layout-repo", "local", path="/backup/layout")

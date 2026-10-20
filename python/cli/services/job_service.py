@@ -449,6 +449,8 @@ class JobService:
             payload["description"] = description
         if schedule is not None:
             payload["schedule"] = schedule
+        if getattr(args, "retention_min_fulls", None) is not None:
+            payload["retention_min_fulls"] = int(args.retention_min_fulls)
         task_parameter_updates = self._build_task_parameter_updates(args, creating=True)
         # Nothing exists yet to clear, so drop any None (reset) markers.
         non_null_updates = {key: value for key, value in task_parameter_updates.items() if value is not None}
@@ -474,6 +476,8 @@ class JobService:
         }
         if getattr(args, "retention_days", None) is not None:
             payload["retention_days"] = int(args.retention_days)
+        if getattr(args, "retention_min_fulls", None) is not None:
+            payload["retention_min_fulls"] = int(args.retention_min_fulls)
         description = self._coalesce_string(getattr(args, "description", None))
         if description:
             payload["description"] = description
@@ -512,6 +516,8 @@ class JobService:
 
         if getattr(args, "retention_days", None) is not None:
             payload["retention_days"] = int(args.retention_days)
+        if getattr(args, "retention_min_fulls", None) is not None:
+            payload["retention_min_fulls"] = int(args.retention_min_fulls)
 
         for source_field, payload_field in (
             ("gfs_weekly", "gfs_weekly"),

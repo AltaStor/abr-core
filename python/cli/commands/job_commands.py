@@ -279,6 +279,15 @@ class JobCommands:
         schedule_state.add_argument("--disabled", action="store_true", help="Disable the schedule")
         parser.add_argument("--description", help="Job description")
         parser.add_argument("--retention-days", type=int, default=retention_default, help="Operational retention in days")
+        parser.add_argument(
+            "--retention-min-fulls",
+            dest="retention_min_fulls",
+            type=int,
+            help=(
+                "How many of the newest full backups of each VM, with the incrementals on them, retention always "
+                "keeps whatever their age (0-100; 0, the default, keeps none beyond --retention-days)"
+            ),
+        )
         if include_compression_encryption_flags:
             parser.add_argument(
                 "--compression-level",
@@ -557,6 +566,8 @@ class JobCommands:
             if held:
                 last = max(str(item.get("until") or "") for item in held)
                 notes.append(f"Object Lock until {last}")
+            if chain.get("kept_min_fulls"):
+                notes.append(f"{len(chain['kept_min_fulls'])} expired kept as the newest full(s)")
             if chain.get("failed"):
                 notes.append("could not remove " + ", ".join(chain["failed"]))
             rows.append(
@@ -588,9 +599,11 @@ class JobCommands:
                     f", GFS {int(gfs.get('weekly') or 0)} weekly / {int(gfs.get('monthly') or 0)} monthly / "
                     f"{int(gfs.get('yearly') or 0)} yearly"
                 )
+            min_fulls = int(result.get("retention_min_fulls") or 0)
+            floor_text = f", at least the newest {min_fulls} full backup(s)" if min_fulls else ""
             verb = "would remove" if dry_run else "removed"
             print(
-                f"Retention of job {result.get('job_name')}: keep {result.get('retention_days')} day(s){gfs_text}. "
+                f"Retention of job {result.get('job_name')}: keep {result.get('retention_days')} day(s){floor_text}{gfs_text}. "
                 f"{int(summary.get('removed') or 0)} of {int(summary.get('points') or 0)} restore point(s) {verb}"
                 + (", nothing changed (dry run)" if dry_run else "")
                 + ".",

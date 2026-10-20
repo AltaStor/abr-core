@@ -319,6 +319,7 @@ class JobDTO(_LenientModel):
     enabled: bool = False
     schedule_state: str | None = None
     retention_days: int | None = None
+    retention_min_fulls: int | None = None
     gfs: GfsDTO | DocObject = None
     active_full_days: DocStrArray = None
     synthetic_full_days: DocStrArray = None
@@ -816,6 +817,7 @@ class CreateJobRequest(_LenientModel):
     schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
     enabled: LaxBool | None = None
     retention_days: RawInt | None = None
+    retention_min_fulls: RawInt | None = None
     gfs: SkipValidation[GfsRequest] | None = None
     active_full_days: list[Any] | LaxStr | None = None
     active_full_days_csv: LaxStr | None = None
@@ -843,6 +845,7 @@ class CreateCopyJobRequest(_LenientModel):
     schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
     enabled: LaxBool | None = None
     retention_days: RawInt | None = None
+    retention_min_fulls: RawInt | None = None
     description: LaxStr | None = None
 
 
@@ -851,6 +854,7 @@ class UpdateJobRequest(_LenientModel):
     schedule: SkipValidation[ScheduleRequest] | LaxStr | None = None
     enabled: LaxBool | None = None
     retention_days: RawInt | None = None
+    retention_min_fulls: RawInt | None = None
     gfs_weekly: RawInt | None = None
     gfs_monthly: RawInt | None = None
     gfs_yearly: RawInt | None = None
@@ -1255,6 +1259,7 @@ class RetentionChainDTO(_LenientModel):
     held: list[RetentionHoldDTO] | DocObjectArray = None
     failed: DocStrArray = None
     kept_for_chain: DocStrArray = None
+    kept_min_fulls: DocStrArray = None
     skipped_reason: DocStrOrNull = None
     clock_blocked: DocStrOrNull = None
 
@@ -1264,6 +1269,7 @@ class RetentionSummaryDTO(_LenientModel):
     points: DocInt = None
     removed: DocInt = None
     held: DocInt = None
+    kept_min_fulls: DocInt = None
     failed: DocInt = None
     skipped: DocInt = None
 
@@ -1274,6 +1280,7 @@ class RetentionRunResult(_LenientModel):
     dry_run: DocBool = None
     clock_blocked: DocStrOrNull = None
     retention_days: DocInt = None
+    retention_min_fulls: DocInt = None
     gfs: GfsDTO | DocObject = None
     summary: RetentionSummaryDTO | DocObject = None
     chains: list[RetentionChainDTO] | DocArray = None

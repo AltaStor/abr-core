@@ -3854,6 +3854,7 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
     item["schedule"] = normalize_schedule_payload(raw_schedule)
     item["schedule_summary"] = item.get("schedule_summary") or _render_schedule_summary(item["schedule"])
     item["retention_days"] = int(item.get("retention_days") or metadata.get("retention_days") or 14)
+    item["retention_min_fulls"] = int(item.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS)
     gfs = item.get("gfs") if isinstance(item.get("gfs"), dict) else {}
     if not gfs and isinstance(item.get("gfs_policy"), dict):
         gfs = item["gfs_policy"]
@@ -3924,6 +3925,8 @@ def resolve_job(name: str | None = None, record_id: str | None = None) -> dict[s
 
 
 MAX_RETENTION_DAYS = 3650
+DEFAULT_RETENTION_MIN_FULLS = 0
+MAX_RETENTION_MIN_FULLS = 100
 MAX_GFS_COUNTS = {"weekly": 520, "monthly": 120, "yearly": 99}
 
 
@@ -3943,6 +3946,18 @@ def _validate_retention_days(value: Any) -> int:
         retention_days=value,
     )
     return days
+
+
+def _validate_retention_min_fulls(value: Any) -> int:
+    count = _whole_number(value)
+    _ensure(
+        count is not None and 0 <= count <= MAX_RETENTION_MIN_FULLS,
+        422,
+        "invalid_job",
+        f"retention-min-fulls must be a whole number from 0 to {MAX_RETENTION_MIN_FULLS}",
+        retention_min_fulls=value,
+    )
+    return count
 
 
 def _validate_gfs_counts(gfs: dict[str, Any]) -> dict[str, int]:
@@ -4207,6 +4222,7 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "enabled": bool(normalized.get("enabled")),
         "schedule_state": normalized.get("schedule_state"),
         "retention_days": normalized.get("retention_days"),
+        "retention_min_fulls": normalized.get("retention_min_fulls"),
         "gfs": normalized.get("gfs"),
         "active_full_days": normalized.get("active_full_days"),
         "synthetic_full_days": normalized.get("synthetic_full_days"),
@@ -4403,6 +4419,11 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     raw_schedule = payload.get("schedule")
     schedule = _schedule_from_request(raw_schedule) if raw_schedule not in (None, "") else None
     retention_days = _validate_retention_days(payload["retention_days"]) if "retention_days" in payload else 14
+    retention_min_fulls = (
+        _validate_retention_min_fulls(payload["retention_min_fulls"])
+        if payload.get("retention_min_fulls") is not None
+        else DEFAULT_RETENTION_MIN_FULLS
+    )
     raw_gfs = payload.get("gfs")
     gfs = _validate_gfs_counts(raw_gfs if isinstance(raw_gfs, dict) else payload)
     gfs["enabled"] = _coerce_gfs_enabled(raw_gfs.get("enabled") if isinstance(raw_gfs, dict) else None)
@@ -4486,6 +4507,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "repo_name": repository["name"],
         "schedule": schedule,
         "retention_days": retention_days,
+        "retention_min_fulls": retention_min_fulls,
         "gfs": gfs,
         "active_full_days": active_full_days,
         "synthetic_full_days": synthetic_full_days,
@@ -4529,6 +4551,10 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         raw_retention_days = source_job.get("retention_days")
         retention_days = int(raw_retention_days) if raw_retention_days is not None else 14
+    if payload.get("retention_min_fulls") is not None:
+        retention_min_fulls = _validate_retention_min_fulls(payload["retention_min_fulls"])
+    else:
+        retention_min_fulls = int(source_job.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS)
     description = str(payload.get("description") or source_job.get("description") or "").strip()
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
@@ -4552,6 +4578,7 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
         "repo_name": repository["name"] if repository is not None else source_job["repo_name"],
         "schedule": schedule,
         "retention_days": retention_days,
+        "retention_min_fulls": retention_min_fulls,
         "gfs": {
             "weekly": int(source_gfs.get("weekly") or 0),
             "monthly": int(source_gfs.get("monthly") or 0),
@@ -4668,6 +4695,9 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         changed = True
     if "retention_days" in payload and payload["retention_days"] is not None:
         updated["retention_days"] = _validate_retention_days(payload["retention_days"])
+        changed = True
+    if payload.get("retention_min_fulls") is not None:
+        updated["retention_min_fulls"] = _validate_retention_min_fulls(payload["retention_min_fulls"])
         changed = True
     gfs_enabled_given = payload.get("gfs_enabled") is not None
     if gfs_enabled_given or any(key in payload for key in ("gfs_weekly", "gfs_monthly", "gfs_yearly")):
@@ -5593,6 +5623,7 @@ def new_retention_report(job: dict[str, Any], vm_id: str, repository_id: str | N
         "held": [],
         "failed": [],
         "kept_for_chain": [],
+        "kept_min_fulls": [],
         "skipped_reason": None,
         "clock_blocked": None,
     }
@@ -5661,6 +5692,22 @@ def apply_retention_to_chain(
             continue
         if all_expired and not any(point.get("gfs_protected") for point in segment):
             to_delete.extend(segment)
+    min_fulls = int(job.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS)
+    newest_segments = _segment_points(points)[-min_fulls:] if min_fulls > 0 else []
+    newest_fulls = {point["id"] for segment in newest_segments for point in segment}
+    floor_kept = [point for point in to_delete if point["id"] in newest_fulls]
+    if floor_kept:
+        report["kept_min_fulls"] = [str(point.get("id") or "") for point in floor_kept]
+        to_delete = [point for point in to_delete if point["id"] not in newest_fulls]
+        LOGGER.info(
+            "Retention keeps %d expired restore point(s) of job %s, VM %s, repository %s: they belong to the "
+            "newest %d full backup(s) of the chain, which the job keeps whatever their age (retention-min-fulls)",
+            len(floor_kept),
+            job.get("id"),
+            report.get("vm_name") or vm_id,
+            repository_id,
+            min_fulls,
+        )
     to_delete = _keep_points_others_still_need(to_delete, points, job_id=str(job.get("id") or ""))
     if not to_delete:
         for point in points:
@@ -5801,6 +5848,7 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         "points": sum(item["points"] for item in chains),
         "removed": sum(len(item["removed"]) for item in chains),
         "held": sum(len(item["held"]) for item in chains),
+        "kept_min_fulls": sum(len(item["kept_min_fulls"]) for item in chains),
         "failed": sum(len(item["failed"]) for item in chains),
         "skipped": sum(1 for item in chains if item["skipped_reason"]),
     }
@@ -5810,6 +5858,7 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         "dry_run": bool(dry_run),
         "clock_blocked": clock_guard.retention_block(),
         "retention_days": int(job.get("retention_days") or 0),
+        "retention_min_fulls": int(job.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS),
         "gfs": dict(job.get("gfs") or {}),
         "summary": summary,
         "chains": chains,
