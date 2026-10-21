@@ -279,6 +279,15 @@ class JobCommands:
         schedule_state.add_argument("--disabled", action="store_true", help="Disable the schedule")
         parser.add_argument("--description", help="Job description")
         parser.add_argument("--retention-days", type=int, default=retention_default, help="Operational retention in days")
+        parser.add_argument(
+            "--retention-min-fulls",
+            dest="retention_min_fulls",
+            type=int,
+            help=(
+                "How many of the newest full backups of each VM, with the incrementals on them, retention always "
+                "keeps whatever their age (0-100; 0, the default, keeps none beyond --retention-days)"
+            ),
+        )
         if include_compression_encryption_flags:
             parser.add_argument(
                 "--compression-level",
@@ -344,12 +353,12 @@ class JobCommands:
             parser.add_argument(
                 "--synthetic-full-days",
                 type=parse_optional_weekday_csv,
-                help="Synthetic full weekdays, comma-separated Mon-Sun; pass none to turn it off",
+                help="Synthetic full weekdays, comma-separated Mon-Sun, for a weekly schedule only; none turns a weekly one off",
             )
             parser.add_argument(
                 "--active-full-days",
                 type=parse_optional_weekday_csv,
-                help="Active full weekdays, comma-separated Mon-Sun; pass none to turn it off",
+                help="Active full weekdays, comma-separated Mon-Sun, for a weekly schedule only; none turns a weekly one off",
             )
             for prefix, label in (("active-full", "Active full"), ("synthetic-full", "Synthetic full")):
                 dest = prefix.replace("-", "_")
@@ -550,11 +559,15 @@ class JobCommands:
         for chain in result.get("chains") or []:
             held = chain.get("held") or []
             notes = []
-            if chain.get("skipped_reason"):
+            if chain.get("skipped_reason") and chain.get("skipped_reason") == chain.get("clock_blocked"):
+                notes.append("skipped: server clock jumped forward")
+            elif chain.get("skipped_reason"):
                 notes.append(f"skipped: {chain['skipped_reason']}")
             if held:
                 last = max(str(item.get("until") or "") for item in held)
                 notes.append(f"Object Lock until {last}")
+            if chain.get("kept_min_fulls"):
+                notes.append(f"{len(chain['kept_min_fulls'])} expired kept as the newest full(s)")
             if chain.get("failed"):
                 notes.append("could not remove " + ", ".join(chain["failed"]))
             rows.append(
@@ -586,9 +599,11 @@ class JobCommands:
                     f", GFS {int(gfs.get('weekly') or 0)} weekly / {int(gfs.get('monthly') or 0)} monthly / "
                     f"{int(gfs.get('yearly') or 0)} yearly"
                 )
+            min_fulls = int(result.get("retention_min_fulls") or 0)
+            floor_text = f", at least the newest {min_fulls} full backup(s)" if min_fulls else ""
             verb = "would remove" if dry_run else "removed"
             print(
-                f"Retention of job {result.get('job_name')}: keep {result.get('retention_days')} day(s){gfs_text}. "
+                f"Retention of job {result.get('job_name')}: keep {result.get('retention_days')} day(s){floor_text}{gfs_text}. "
                 f"{int(summary.get('removed') or 0)} of {int(summary.get('points') or 0)} restore point(s) {verb}"
                 + (", nothing changed (dry run)" if dry_run else "")
                 + ".",
@@ -597,6 +612,14 @@ class JobCommands:
             deps.context.print_output({"items": self._retention_rows(result)}, self._retention_columns(dry_run))
         else:
             deps.context.print_output(result)
+        clock_blocked = result.get("clock_blocked") if isinstance(result, dict) else None
+        if clock_blocked:
+            print(
+                f"Warning: {clock_blocked}" if dry_run else f"Error: {clock_blocked}",
+                file=sys.stderr,
+            )
+            if not dry_run:
+                return INVALID_STATE
         if int(summary.get("failed") or 0):
             print(
                 f"Error: {int(summary.get('failed'))} expired restore point(s) could not be removed and are kept "

@@ -155,6 +155,8 @@ class JobService:
         ("every", "--every"),
     )
 
+    _DAYLESS_SCHEDULE_TYPES = frozenset({"daily", "monthly", "periodic", "cron"})
+
     _SCHEDULE_TYPE_DETAILS = {
         "daily": ("time",),
         "weekly": ("days", "time"),
@@ -229,8 +231,11 @@ class JobService:
             state_only = bool(getattr(args, f"{prefix}_enabled", False) or getattr(args, f"{prefix}_disabled", False))
             prefixed = _ExecutionScheduleArgs(args, prefix)
             has_details = cls._schedule_detail_fields_present(prefixed)
-            if cls._is_empty_value(requested) and not has_details and getattr(prefixed, "days", None) is not None:
-                cls._reject_days_a_schedule_cannot_use(job.get(key), prefix)
+            if getattr(prefixed, "days", None) is not None:
+                if cls._is_empty_value(requested):
+                    cls._reject_days_a_schedule_cannot_use(job.get(key), prefix)
+                elif str(requested).strip().lower() in cls._DAYLESS_SCHEDULE_TYPES:
+                    cls._reject_days_a_schedule_cannot_use({"type": str(requested).strip().lower()}, prefix)
             if cls._is_empty_value(requested) and not state_only and not has_details:
                 continue
             if not cls._is_empty_value(requested) and str(requested).strip().lower() in {"none", "off"}:
@@ -449,6 +454,8 @@ class JobService:
             payload["description"] = description
         if schedule is not None:
             payload["schedule"] = schedule
+        if getattr(args, "retention_min_fulls", None) is not None:
+            payload["retention_min_fulls"] = int(args.retention_min_fulls)
         task_parameter_updates = self._build_task_parameter_updates(args, creating=True)
         # Nothing exists yet to clear, so drop any None (reset) markers.
         non_null_updates = {key: value for key, value in task_parameter_updates.items() if value is not None}
@@ -474,6 +481,8 @@ class JobService:
         }
         if getattr(args, "retention_days", None) is not None:
             payload["retention_days"] = int(args.retention_days)
+        if getattr(args, "retention_min_fulls", None) is not None:
+            payload["retention_min_fulls"] = int(args.retention_min_fulls)
         description = self._coalesce_string(getattr(args, "description", None))
         if description:
             payload["description"] = description
@@ -512,6 +521,8 @@ class JobService:
 
         if getattr(args, "retention_days", None) is not None:
             payload["retention_days"] = int(args.retention_days)
+        if getattr(args, "retention_min_fulls", None) is not None:
+            payload["retention_min_fulls"] = int(args.retention_min_fulls)
 
         for source_field, payload_field in (
             ("gfs_weekly", "gfs_weekly"),

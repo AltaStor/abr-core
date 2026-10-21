@@ -125,7 +125,7 @@ class HyperVRetentionUnderObjectLockTests(unittest.TestCase):
             store.clear()
 
     def test_expired_points_still_under_lock_are_held_and_never_deleted(self) -> None:
-        report = abr_v41._new_retention_report(JOBS["job-1"], "vm-1", "repo-1")
+        report = abr_v41.new_retention_report(JOBS["job-1"], "vm-1", "repo-1")
         locked = {"immutability": "governance", "retention_days": 30}
         with patch.object(abr_v41, "remove_disk_tool_backup") as remove, patch.object(abr_v41, "persist_backup"), patch.object(
             abr_v41, "read_storage_backup_info", return_value=locked

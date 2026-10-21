@@ -91,7 +91,7 @@ class AuthCommands:
                 "Show the signed-in user, their role, and the function IDs that role allows.\n\n"
                 "Examples:\n"
                 "  abr auth whoami\n"
-                "  abr --output json auth whoami"
+                "  abr auth whoami --output json"
             ),
             formatter_class=CompactHelpFormatter,
         )

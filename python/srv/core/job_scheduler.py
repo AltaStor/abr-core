@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .mongo_db_wrapper import HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, catalog_records, persist_job, persist_task
 from .server_defaults import env_int
 from .utils import utc_now
+from python.srv.services import clock_guard
 from python.srv.services.abr_v41 import (
     execution_phases,
     job_clock_anomalies,
@@ -88,6 +89,10 @@ class JobScheduler:
     def _poll_loop(self) -> None:
         logger.debug("Job scheduler thread started.")
         while not self._stop_event.is_set():
+            try:
+                clock_guard.tick()
+            except Exception as exc:
+                logger.exception("Could not check the server clock: %s", exc)
             try:
                 self._dispatch_due_jobs()
             except Exception as exc:

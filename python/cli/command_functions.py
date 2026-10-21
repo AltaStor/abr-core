@@ -66,6 +66,8 @@ COMMAND_FUNCTIONS: dict[str, str] = {
     "restore start": "restore.start",
     "system version": "system.view",
     "system health": "system.view",
+    "system clock show": "system.view",
+    "system clock confirm": "system.clock_confirm",
     "system export": "system.export",
     "system import": "system.import",
     "system get-support-bundle": "system.support_bundle",

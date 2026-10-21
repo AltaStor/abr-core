@@ -114,6 +114,7 @@ from python.srv.services.inventory_management import (
     normalize_inventory_type,
 )
 from python.srv.services.backup_mode import object_lock_actual_retention_days
+from python.srv.services import clock_guard
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
 
@@ -1544,13 +1545,22 @@ def _inventory_endpoint_key(record: dict[str, Any]) -> tuple[str, int]:
 
 
 def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
-    inventory_type = normalize_inventory_type(str(payload.get("type") or ""))
-    if inventory_type not in creatable_inventory_types():
-        raise api_error(
-            422,
-            "invalid_inventory",
-            f"Unsupported inventory type: {inventory_type}. Supported types: {', '.join(creatable_inventory_types())}",
-        )
+    requested_type = str(payload.get("type") or "").strip()
+    supported_types = ", ".join(creatable_inventory_types())
+    _ensure(
+        bool(requested_type),
+        422,
+        "invalid_inventory",
+        f"Inventory type is required. Supported types: {supported_types}",
+    )
+    _ensure(
+        requested_type.lower() in creatable_inventory_types(),
+        422,
+        "invalid_inventory",
+        f"Unsupported inventory type: {requested_type}. Supported types: {supported_types}",
+        type=requested_type,
+    )
+    inventory_type = normalize_inventory_type(requested_type)
     name = str(payload.get("name") or "")
     address = str(payload.get("address") or "").strip()
     port = int(payload.get("port") or 0) if payload.get("port") is not None else None
@@ -3853,6 +3863,7 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
     item["schedule"] = normalize_schedule_payload(raw_schedule)
     item["schedule_summary"] = item.get("schedule_summary") or _render_schedule_summary(item["schedule"])
     item["retention_days"] = int(item.get("retention_days") or metadata.get("retention_days") or 14)
+    item["retention_min_fulls"] = int(item.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS)
     gfs = item.get("gfs") if isinstance(item.get("gfs"), dict) else {}
     if not gfs and isinstance(item.get("gfs_policy"), dict):
         gfs = item["gfs_policy"]
@@ -3923,6 +3934,8 @@ def resolve_job(name: str | None = None, record_id: str | None = None) -> dict[s
 
 
 MAX_RETENTION_DAYS = 3650
+DEFAULT_RETENTION_MIN_FULLS = 0
+MAX_RETENTION_MIN_FULLS = 100
 MAX_GFS_COUNTS = {"weekly": 520, "monthly": 120, "yearly": 99}
 
 
@@ -3942,6 +3955,18 @@ def _validate_retention_days(value: Any) -> int:
         retention_days=value,
     )
     return days
+
+
+def _validate_retention_min_fulls(value: Any) -> int:
+    count = _whole_number(value)
+    _ensure(
+        count is not None and 0 <= count <= MAX_RETENTION_MIN_FULLS,
+        422,
+        "invalid_job",
+        f"retention-min-fulls must be a whole number from 0 to {MAX_RETENTION_MIN_FULLS}",
+        retention_min_fulls=value,
+    )
+    return count
 
 
 def _validate_gfs_counts(gfs: dict[str, Any]) -> dict[str, int]:
@@ -4206,6 +4231,7 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "enabled": bool(normalized.get("enabled")),
         "schedule_state": normalized.get("schedule_state"),
         "retention_days": normalized.get("retention_days"),
+        "retention_min_fulls": normalized.get("retention_min_fulls"),
         "gfs": normalized.get("gfs"),
         "active_full_days": normalized.get("active_full_days"),
         "synthetic_full_days": normalized.get("synthetic_full_days"),
@@ -4402,6 +4428,11 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     raw_schedule = payload.get("schedule")
     schedule = _schedule_from_request(raw_schedule) if raw_schedule not in (None, "") else None
     retention_days = _validate_retention_days(payload["retention_days"]) if "retention_days" in payload else 14
+    retention_min_fulls = (
+        _validate_retention_min_fulls(payload["retention_min_fulls"])
+        if payload.get("retention_min_fulls") is not None
+        else DEFAULT_RETENTION_MIN_FULLS
+    )
     raw_gfs = payload.get("gfs")
     gfs = _validate_gfs_counts(raw_gfs if isinstance(raw_gfs, dict) else payload)
     gfs["enabled"] = _coerce_gfs_enabled(raw_gfs.get("enabled") if isinstance(raw_gfs, dict) else None)
@@ -4485,6 +4516,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "repo_name": repository["name"],
         "schedule": schedule,
         "retention_days": retention_days,
+        "retention_min_fulls": retention_min_fulls,
         "gfs": gfs,
         "active_full_days": active_full_days,
         "synthetic_full_days": synthetic_full_days,
@@ -4528,6 +4560,10 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         raw_retention_days = source_job.get("retention_days")
         retention_days = int(raw_retention_days) if raw_retention_days is not None else 14
+    if payload.get("retention_min_fulls") is not None:
+        retention_min_fulls = _validate_retention_min_fulls(payload["retention_min_fulls"])
+    else:
+        retention_min_fulls = int(source_job.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS)
     description = str(payload.get("description") or source_job.get("description") or "").strip()
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
@@ -4551,6 +4587,7 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
         "repo_name": repository["name"] if repository is not None else source_job["repo_name"],
         "schedule": schedule,
         "retention_days": retention_days,
+        "retention_min_fulls": retention_min_fulls,
         "gfs": {
             "weekly": int(source_gfs.get("weekly") or 0),
             "monthly": int(source_gfs.get("monthly") or 0),
@@ -4668,6 +4705,9 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     if "retention_days" in payload and payload["retention_days"] is not None:
         updated["retention_days"] = _validate_retention_days(payload["retention_days"])
         changed = True
+    if payload.get("retention_min_fulls") is not None:
+        updated["retention_min_fulls"] = _validate_retention_min_fulls(payload["retention_min_fulls"])
+        changed = True
     gfs_enabled_given = payload.get("gfs_enabled") is not None
     if gfs_enabled_given or any(key in payload for key in ("gfs_weekly", "gfs_monthly", "gfs_yearly")):
         current_gfs = updated.get("gfs") if isinstance(updated.get("gfs"), dict) else {}
@@ -4712,11 +4752,11 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             updated.get("schedule"),
             updated.get("created_at"),
         )
+        changed = True
         if schedule_value == updated.get(schedule_key):
             continue
         updated[schedule_key] = schedule_value
         updated[next_run_key] = _execution_schedule_next_run(schedule_value)
-        changed = True
     if "description" in payload:
         description = str(payload.get("description") or "").strip()
         _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
@@ -5581,7 +5621,7 @@ def _point_object_lock(point: dict[str, Any], now: datetime) -> tuple[str, str] 
     return None
 
 
-def _new_retention_report(job: dict[str, Any], vm_id: str, repository_id: str | None) -> dict[str, Any]:
+def new_retention_report(job: dict[str, Any], vm_id: str, repository_id: str | None) -> dict[str, Any]:
     return {
         "job_id": str(job.get("id") or ""),
         "vm_id": vm_id,
@@ -5592,7 +5632,9 @@ def _new_retention_report(job: dict[str, Any], vm_id: str, repository_id: str | 
         "held": [],
         "failed": [],
         "kept_for_chain": [],
+        "kept_min_fulls": [],
         "skipped_reason": None,
+        "clock_blocked": None,
     }
 
 
@@ -5616,15 +5658,28 @@ def apply_retention_to_chain(
     """
     failures: list[dict[str, Any]] = []
     if report is None:
-        report = _new_retention_report(job, vm_id, repository_id)
+        report = new_retention_report(job, vm_id, repository_id)
     points = _points_for_job_vm_repo(str(job["id"]), vm_id, repository_id)
     report["points"] = len(points)
     if not points:
         return failures
     report["vm_name"] = points[-1].get("vm_name")
+    clock_block = clock_guard.retention_block()
+    report["clock_blocked"] = clock_block
+    if clock_block and not dry_run:
+        report["skipped_reason"] = clock_block
+        LOGGER.warning(
+            "Retention deleted nothing for job %s, VM %s in repository %s: %s",
+            job.get("id"),
+            report.get("vm_name") or vm_id,
+            repository_id,
+            clock_block,
+        )
+        return failures
     _apply_gfs_marks(points, dict(job.get("gfs") or {}))
     now = _now_utc()
-    cutoff = now - timedelta(days=int(job.get("retention_days") or 0))
+    retention_days = int(job.get("retention_days") or 0)
+    cutoff = now - timedelta(days=retention_days)
     retention_dates = _retention_dates(points)
 
     def expired(point: dict[str, Any]) -> bool:
@@ -5646,6 +5701,22 @@ def apply_retention_to_chain(
             continue
         if all_expired and not any(point.get("gfs_protected") for point in segment):
             to_delete.extend(segment)
+    min_fulls = int(job.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS)
+    newest_segments = _segment_points(points)[-min_fulls:] if min_fulls > 0 else []
+    newest_fulls = {point["id"] for segment in newest_segments for point in segment}
+    floor_kept = [point for point in to_delete if point["id"] in newest_fulls]
+    if floor_kept:
+        report["kept_min_fulls"] = [str(point.get("id") or "") for point in floor_kept]
+        to_delete = [point for point in to_delete if point["id"] not in newest_fulls]
+        LOGGER.info(
+            "Retention keeps %d expired restore point(s) of job %s, VM %s, repository %s: they belong to the "
+            "newest %d full backup(s) of the chain, which the job keeps whatever their age (retention-min-fulls)",
+            len(floor_kept),
+            job.get("id"),
+            report.get("vm_name") or vm_id,
+            repository_id,
+            min_fulls,
+        )
     to_delete = _keep_points_others_still_need(to_delete, points, job_id=str(job.get("id") or ""))
     if not to_delete:
         for point in points:
@@ -5689,6 +5760,20 @@ def apply_retention_to_chain(
                 delete_backup(point["id"])
                 _RETENTION_LOCK_REPORTED.discard(point_id)
                 report["removed"].append(point_id)
+                LOGGER.info(
+                    "Retention removed restore point %s (%s, created %s) of job %s, VM %s, repository %s: "
+                    "it and the points that chain onto it are older than the job's retention of %d day(s) "
+                    "(cutoff %s, server time %s)",
+                    point_id,
+                    point.get("execution_type") or "unknown",
+                    point.get("created_at"),
+                    job.get("id"),
+                    report.get("vm_name") or vm_id,
+                    repository_id,
+                    retention_days,
+                    cutoff.isoformat(timespec="seconds"),
+                    now.isoformat(timespec="seconds"),
+                )
             else:
                 LOGGER.error(
                     "Retention failed to delete backup artifacts; keeping catalog entry for retry: "
@@ -5758,7 +5843,7 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
     }
     chains = []
     for vm_id, repository_id in _job_chains(str(job["id"])):
-        report = _new_retention_report(job, vm_id, repository_id)
+        report = new_retention_report(job, vm_id, repository_id)
         if vm_id in busy_vms:
             report["skipped_reason"] = "a backup of this VM is running"
             report["points"] = len(_points_for_job_vm_repo(str(job["id"]), vm_id, repository_id))
@@ -5772,6 +5857,7 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         "points": sum(item["points"] for item in chains),
         "removed": sum(len(item["removed"]) for item in chains),
         "held": sum(len(item["held"]) for item in chains),
+        "kept_min_fulls": sum(len(item["kept_min_fulls"]) for item in chains),
         "failed": sum(len(item["failed"]) for item in chains),
         "skipped": sum(1 for item in chains if item["skipped_reason"]),
     }
@@ -5779,7 +5865,9 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         "job_id": str(job["id"]),
         "job_name": str(job.get("name") or ""),
         "dry_run": bool(dry_run),
+        "clock_blocked": clock_guard.retention_block(),
         "retention_days": int(job.get("retention_days") or 0),
+        "retention_min_fulls": int(job.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS),
         "gfs": dict(job.get("gfs") or {}),
         "summary": summary,
         "chains": chains,
@@ -9534,6 +9622,7 @@ def system_health() -> dict[str, Any]:
         "inventories": "ok",
         "scheduler": "ok",
         "task_pool": "ok",
+        "clock": "jump_detected" if clock_guard.retention_block() else "ok",
     }
     # "not_configured" is the in-memory mode (no MONGODB_URI); it is a
     # deployment choice, not a fault, so it does not degrade the overall status.

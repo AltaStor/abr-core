@@ -72,7 +72,7 @@ from .core.mongo_db_wrapper import (
     load_tasks,
     load_users,
 )
-from .services import auth_service, backup_catalog, tls_certificate_service
+from .services import auth_service, backup_catalog, clock_guard, tls_certificate_service
 from .services.abr_v41 import PRODUCT_NAME, product_version
 from .core.server_defaults import env_int
 from .core.task_pool import TaskProcessPool
@@ -293,6 +293,11 @@ async def lifespan(_: FastAPI):
 
         auth_service.bootstrap_admin_if_needed()
 
+        try:
+            clock_guard.load()
+        except Exception:
+            logger.exception("Could not check the server clock against its last known time; continuing startup.")
+
         TASK_POOL = TaskProcessPool(
             WORKER_COUNT,
             max_concurrent_backups=MAX_CONCURRENT_BACKUPS,
@@ -351,6 +356,7 @@ async def lifespan(_: FastAPI):
             logger.debug("Stopping job scheduler...")
             JOB_SCHEDULER.stop()
             JOB_SCHEDULER = None
+        clock_guard.forget()
         if TASK_POOL:
             logger.debug("Stopping task pool...")
             TASK_POOL.stop(wait=True)

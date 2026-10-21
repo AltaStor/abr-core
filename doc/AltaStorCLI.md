@@ -469,7 +469,7 @@ abr job create
 
 Description: Create a backup job for one or more virtual machines and optionally attach an enabled or disabled schedule. Supported schedule types are daily, weekly, monthly, and periodic. Each VM may be listed once. --retention-days is a whole number from 1 to 3650 (14 when omitted); the GFS counts are whole numbers up to 520 weekly, 120 monthly and 99 yearly; a schedule's time zone, when given through the API, must be an IANA name such as Europe/Kyiv or UTC. 
 
-abr job create --name <name> (--repository <name> | --repository-id <id>) [--inventory <name> | --inventory-id <id>] (--vm <vm> ... | --vms "<vm1,vm2,...>") [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] [--on-quiesce-failure <fail|crash-consistent>] 
+abr job create --name <name> (--repository <name> | --repository-id <id>) [--inventory <name> | --inventory-id <id>] (--vm <vm> ... | --vms "<vm1,vm2,...>") [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] [--on-quiesce-failure <fail|crash-consistent>] 
 
 Examples: 
 abr job create --name "Production VMs" --inventory "vcenter-main" --vm "vm-101" --vm "vm-102" --repository "repo-local-01" --schedule daily --time "23:00" --enabled 
@@ -491,11 +491,13 @@ abr job edit --name "Nightly with Fulls" --synthetic-full-schedule none
 
 Notes & Behavior: 
 --retention-days = operational rolling retention affecting non-GFS points 
+--retention-min-fulls = how many of the newest full backups of each VM, with the incrementals on them, retention keeps whatever their age. 0, the default, keeps nothing beyond --retention-days, as jobs did before the setting: a chain whose points are all older than --retention-days (a VM that left the job, a job that has not run that long) goes entirely on abr job retention. With 1 the newest full and its incrementals always stay, so a VM never loses its last restore point to retention; 2 keeps the two newest, up to 100. It only adds to what --retention-days, GFS and Object Lock already keep. A copied job takes the source job's value unless --retention-min-fulls is given; abr job edit --retention-min-fulls 0 switches it off. 
 --gfs-* = extended lifecycle marks enforced during automated block evaluation. 
 A job carries three independent schedules: the base --schedule produces incrementals, --active-full-schedule reads the full VM again, and --synthetic-full-schedule takes an incremental and merges it into a new full on the repository. When more than one is due at the same moment the job runs a single session, with active full taking priority over synthetic full and synthetic full over the incremental. Each full schedule takes either form of switch-off: --active-full-schedule none / --synthetic-full-schedule none removes it and forgets its settings, while --active-full-disabled / --synthetic-full-disabled suspends it and keeps them for a later --active-full-enabled / --synthetic-full-enabled. 
 A backup job cannot be created without at least one enabled full backup schedule - an active full, a synthetic full, or the legacy day lists - because operational retention can only free a chain once a newer full starts the next one, and a job that only ever takes incrementals keeps a chain that retention can never prune. The same check runs on edit whenever retention or a full schedule is touched, so the last remaining full schedule cannot be removed or suspended. 
 The full schedules ride along with the job: a job whose base schedule is disabled, or which has no base schedule at all, runs nothing until it is enabled again. 
 Jobs that already use --active-full-days or --synthetic-full-days keep working: those day lists are read as weekly full schedules at the job's own schedule time. 
+--active-full-days and --synthetic-full-days belong to weekly full schedules only: job create and job edit refuse them, none included, with a daily, monthly or periodic one and leave the job as it was. --active-full-schedule none or --synthetic-full-schedule none turns such a schedule off. 
 A backup of a VMware VM takes its snapshot with quiescing, so VMware Tools flushes the guest and runs its pre-freeze scripts or VSS writers first. --on-quiesce-failure sets what happens when that fails: fail (the default) ends that VM's session as failed, naming the cause the guest reported and where to look (/etc/vmware-tools/backupScripts.d/ on Linux, 'vssadmin list writers' on Windows); crash-consistent takes the snapshot again without quiescing and completes with a warning. Either way the session, abr backup info and abr restore point list show whether each backup is quiesced or crash-consistent, and a crash-consistent backup carries a warning that says why. 
 
 Hyper-V jobs follow the same schedule rules: a full backup, then incrementals from Hyper-V's resilient change tracking, with active and synthetic fulls on their own schedules (see doc/HyperVBackup.md). Their disks are written by abr-vhdx-tool on the Hyper-V host, so their repository must be S3, or a local repository whose folder is shared to the hosts over SMB (abr repo edit --server --share, see doc/HyperVBackup.md); a run against any other repository fails with the reason. One option is Hyper-V only: 
@@ -508,7 +510,7 @@ abr job create-copy
 
 Description: Clone an existing job configuration. The copied job receives a new ID and name while preserving inventory, selected VMs, repository, schedule configuration, schedule enabled/disabled state, and existing backup options. Optional repository, schedule, and retention overrides are still accepted for compatibility. 
 
-abr job create-copy --name <name> (--source <name> | --source-id <id>) [--repository <name> | --repository-id <id>] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] 
+abr job create-copy --name <name> (--source <name> | --source-id <id>) [--repository <name> | --repository-id <id>] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--retention-days <int>] [--retention-min-fulls <0..100>] 
 
 Example: 
 abr job create-copy --name "Copied Job" --source "Existing Job" 
@@ -529,7 +531,7 @@ abr job edit
 
 Description: Update job configuration binding, scheduling, schedule state, or protected targets. 
 
-abr job edit --name <name> [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--repository <repo_name>] [--inventory <inventory_name>] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] [--on-quiesce-failure <fail|crash-consistent>] 
+abr job edit --name <name> [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--repository <repo_name>] [--inventory <inventory_name>] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] [--on-quiesce-failure <fail|crash-consistent>] 
 
 abr job retention 
 
@@ -541,6 +543,9 @@ Notes:
 • A full backup and the incrementals on it go together, only once every one of them is older than --retention-days and none is kept by GFS, newest first - so whatever stays always restores. Under a GFS-kept full, its expired incrementals may go on their own. 
 • A restore point still under S3 Object Lock is not even tried: it is reported as held (with the date its lock ends), and so are the older points it depends on. They go on a later pass. 
 • A chain with a backup of the same VM running is skipped and reported, so the point that backup chains onto cannot go from under it. 
+• Age is measured against the server clock. After the clock jumps forward by more than BACKUPSERVER_CLOCK_JUMP_HOURS (24 by default), while the server runs or between two runs, retention deletes nothing - here or after a backup - until an Administrator confirms the time with abr system clock confirm. Backups keep running, and each session carries a warning. The command then exits 4 and names the jump; --dry-run still shows what would go. 
+• With --retention-min-fulls N the newest N full backups of each chain and their incrementals are kept whatever their age; the table's NOTE says how many expired points stayed for that reason. 
+• Every removed restore point is written to the server log with its creation date, the cutoff and the server time it was measured against. 
 • The table lists each chain (VM and repository) with its points, what was (or would be) removed, what is held, and why. --output json returns the API's full report. The command exits 1 when an expired point could not be removed; it stays in the catalog for the next pass. 
 
 abr job delete 
@@ -753,6 +758,24 @@ abr system health
 Description: Show component health status. 
 
 abr system health [--output json] 
+
+The clock component reads jump_detected while retention is blocked by a forward clock jump (see abr system clock); that degrades the status and the command exits 4. 
+
+abr system clock show 
+
+Description: Show the server time, the last time it was known to be right, and whether retention is blocked by a forward clock jump. 
+
+abr system clock show [--output json] 
+
+The server writes its time to the catalog every 5 minutes. A jump of more than BACKUPSERVER_CLOCK_JUMP_HOURS (24 by default) blocks retention: one seen while the server runs (the wall clock against its monotonic clock), or a gap between the last time written and the next start - the server was off that long or its clock was moved. The block survives a restart. The command exits 4 while it is blocked. 
+
+abr system clock confirm 
+
+Description: Confirm the current server time is right, so retention deletes expired restore points again on its next pass. Administrator only; it is recorded in the audit log. 
+
+abr system clock confirm 
+
+Check the time first: a restore point removed on a wrong clock cannot be brought back. 
 
 abr system export 
 

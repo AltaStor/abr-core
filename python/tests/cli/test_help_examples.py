@@ -38,6 +38,8 @@ class CliHelpExamplesTests(unittest.TestCase):
             if "Examples:" not in help_text:
                 continue
             examples_block = help_text.split("Examples:", 1)[1]
+            for section in ("\npositional arguments:", "\noptions:"):
+                examples_block = examples_block.split(section, 1)[0]
             for line in examples_block.splitlines():
                 line = line.strip()
                 if "abr " not in line:

@@ -24,6 +24,7 @@ EXPECTED_MATRIX = {
     "system.support_bundle": "A",
     "system.export": "A",
     "system.import": "A",
+    "system.clock_confirm": "A",
     "tls.view": "AU",
     "tls.edit": "A",
     "user.view": "AU",

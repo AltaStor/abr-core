@@ -42,6 +42,7 @@ USERS: dict[str, dict[str, Any]] = {}
 SESSIONS: dict[str, dict[str, Any]] = {}
 # Audit records when there is no catalog database, newest last.
 AUDIT_RECORDS: deque[dict[str, Any]] = deque(maxlen=10_000)
+SYSTEM_STATE: dict[str, dict[str, Any]] = {}
 
 TASK_LOCK = threading.Lock()
 CATALOG_LOCK = threading.RLock()
@@ -372,6 +373,24 @@ def delete_backup(backup_id: str) -> bool:
             deleted = True
         BACKUPS.pop(backup_id, None)
         return deleted
+
+
+def load_system_state(state_id: str) -> dict[str, Any] | None:
+    db = get_database()
+    if db is not None:
+        record = db.get("system_state", "id", state_id)
+        return dict(record) if isinstance(record, dict) else None
+    with CATALOG_LOCK:
+        record = SYSTEM_STATE.get(state_id)
+        return dict(record) if record else None
+
+
+def persist_system_state(record: dict[str, Any]) -> None:
+    with CATALOG_LOCK:
+        db = get_database()
+        if db is not None:
+            _run_db_write(lambda: db.upsert("system_state", "id", record))
+        SYSTEM_STATE[str(record["id"])] = dict(record)
 
 
 def load_users() -> dict[str, dict[str, Any]]:

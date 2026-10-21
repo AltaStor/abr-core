@@ -36,6 +36,31 @@ _RETRYABLE = (
 _RETRY_ATTEMPTS = 3
 _RETRY_BASE_DELAY = 0.5
 _RETRY_MAX_DELAY = 30.0  # cap so backoff can never grow unbounded
+OUTAGE_SINGLE_ATTEMPT_SECONDS = 60.0
+
+_outage_since: float | None = None
+
+
+def _in_outage() -> bool:
+    return _outage_since is not None and time.monotonic() - _outage_since < OUTAGE_SINGLE_ATTEMPT_SECONDS
+
+
+def _note_outage(name: str, exc: Exception) -> None:
+    global _outage_since
+    if not _in_outage():
+        logger.error(
+            "The catalog database did not answer %s (%s); for the next %d s every database call makes a single "
+            "attempt, so requests fail fast, until it answers again",
+            name, exc, OUTAGE_SINGLE_ATTEMPT_SECONDS,
+        )
+    _outage_since = time.monotonic()
+
+
+def _note_answer() -> None:
+    global _outage_since
+    if _outage_since is not None:
+        logger.warning("The catalog database answers again; database calls retry as usual")
+        _outage_since = None
 
 
 def _utc_now() -> datetime:
@@ -51,30 +76,37 @@ def _retry(attempts: int = _RETRY_ATTEMPTS, base_delay: float = _RETRY_BASE_DELA
 
             delay = base_delay
             last_exc: Exception | None = None
+            tries = 1 if _in_outage() else attempts
 
-            for attempt in range(1, attempts + 1):
+            for attempt in range(1, tries + 1):
                 try:
-                    return fn(self, *args, **kwargs)
+                    result = fn(self, *args, **kwargs)
                 except _RETRYABLE as exc:
                     last_exc = exc
+                    if attempt == tries:
+                        break
                     # Capped exponential backoff with full jitter: spreads retries
                     # so a DB blip across many concurrent callers can't synchronize
                     # into a reconnect storm that pins the CPU.
                     sleep_for = random.uniform(0, min(delay, _RETRY_MAX_DELAY))
                     logger.warning(
                         "Transient DB error in %s (attempt %d/%d): %s — retrying in %.2fs…",
-                        fn.__name__, attempt, attempts, exc, sleep_for,
+                        fn.__name__, attempt, tries, exc, sleep_for,
                     )
                     time.sleep(sleep_for)
                     delay = min(delay * 2, _RETRY_MAX_DELAY)
                 except PyMongoError as exc:
                     logger.error("Non-retryable DB error in %s: %s", fn.__name__, exc)
                     raise
+                else:
+                    _note_answer()
+                    return result
             logger.error(
                 "All %d attempts failed in %s. Last error: %s",
-                attempts, fn.__name__, last_exc,
+                tries, fn.__name__, last_exc,
             )
             if last_exc is not None:
+                _note_outage(fn.__name__, last_exc)
                 raise last_exc
 
         return wrapper
@@ -136,6 +168,7 @@ class Database:
             "sessions": "token",
             "hypervisors": "id",
             "resources": "resource_key",
+            "system_state": "id",
         }
         for collection, field in specs.items():
             self._db[collection].create_index([(field, ASCENDING)], unique=True, name=f"uq_{field}")

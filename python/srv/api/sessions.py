@@ -21,14 +21,40 @@ router = build_router("/sessions", tag="sessions")
 
 
 def list_sessions(
-    job: str | None = Query(default=None),
+    job: str | None = Query(
+        default=None,
+        description=(
+            "Only sessions of the job with this name: the job's name, not its ID, matched whole and case-insensitively "
+            "(nightly finds Nightly, night finds nothing). Sessions of a deleted job no longer carry a job and are not matched."
+        ),
+    ),
     type: str | None = Query(default=None, description="Only sessions of this type: backup, restore, verify or delete"),
-    run_id: str | None = Query(default=None),
-    limit: int | None = Query(default=None, ge=1, le=abr_v41.SESSION_PAGE_LIMIT_MAX),
-    offset: int = Query(default=0, ge=0),
-    page: int | None = Query(default=None, ge=1),
-    per_page: int | None = Query(default=None, ge=1, le=abr_v41.SESSION_PAGE_LIMIT_MAX),
-    since: str | None = Query(default=None),
+    run_id: str | None = Query(
+        default=None,
+        description="Only the sessions of one run of a job: the run_id of a session, or last_run.id of the job",
+    ),
+    limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=abr_v41.SESSION_PAGE_LIMIT_MAX,
+        description=f"Page size, 1 to {abr_v41.SESSION_PAGE_LIMIT_MAX}, used with offset; omitted, every match is returned",
+    ),
+    offset: int = Query(default=0, ge=0, description="How many of the newest matching sessions to skip, used with limit"),
+    page: int | None = Query(
+        default=None,
+        ge=1,
+        description="Page number from 1, used with per_page; page or per_page given wins over limit and offset",
+    ),
+    per_page: int | None = Query(
+        default=None,
+        ge=1,
+        le=abr_v41.SESSION_PAGE_LIMIT_MAX,
+        description=f"Page size for page, 1 to {abr_v41.SESSION_PAGE_LIMIT_MAX} ({abr_v41.SESSION_PAGE_DEFAULT} when only page is given)",
+    ),
+    since: str | None = Query(
+        default=None,
+        description="Only sessions started at or after this ISO 8601 time, for example 2026-10-20T00:00:00Z",
+    ),
 ) -> SessionList:
     """Newest-first page of sessions.
 

@@ -22,7 +22,12 @@ from .schemas import (
 router = build_router("/backups", tag="backups")
 
 
-def list_backups(repo: str | None = Query(default=None)) -> BackupList:
+def list_backups(
+    repo: str | None = Query(
+        default=None,
+        description="Only chains in the repository with this name: the repository's name, not its ID, matched whole and case-insensitively",
+    ),
+) -> BackupList:
     return {"items": abr_v41.list_backup_chains(repo_name=repo)}
 
 
@@ -36,16 +41,31 @@ def get_backup(backup_id: str) -> BackupChainDTO:
 
 def delete_backup(
     backup_id: str,
-    segment: str | None = Query(default=None),
-    force: bool = Query(default=False),
-    wait: bool = Query(default=True),
+    segment: str | None = Query(
+        default=None,
+        description=(
+            "Delete only one segment of the chain, a full backup and the incrementals on it: the restore point ID of "
+            "that segment's full backup. Omitted, the whole chain is deleted"
+        ),
+    ),
+    force: bool = Query(
+        default=False,
+        description="true deletes restore points GFS keeps; without it such a delete is refused with 409 gfs_protected_backup",
+    ),
+    wait: bool = Query(
+        default=True,
+        description="true answers when the delete has finished; false starts it as a session and answers at once with the session ID",
+    ),
 ) -> BackupDeleteResult:
     return abr_v41.delete_backup_chain_request(backup_id, segment_id=segment, force=force, wait=wait)
 
 
 def verify_backup(
     backup_id: str,
-    wait: bool = Query(default=True),
+    wait: bool = Query(
+        default=True,
+        description="true answers with the verdict when the check has finished; false starts it as a session and answers at once with the session ID",
+    ),
     payload: VerifyBackupRequest = Body(default_factory=VerifyBackupRequest),
 ) -> BackupVerifyResult:
     body = unset_excluded(payload)

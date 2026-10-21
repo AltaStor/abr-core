@@ -20,14 +20,28 @@ from .schemas import (
 router = build_router("/restore", tag="restore")
 
 
-def list_restore_vms(inventory: str | None = Query(default=None)) -> RestoreVmList:
+def list_restore_vms(
+    inventory: str | None = Query(
+        default=None,
+        description="Only VMs backed up from the inventory with this name: the inventory's name, not its ID, matched whole and case-insensitively",
+    ),
+) -> RestoreVmList:
     return {"items": abr_v41.restore_vm_list(inventory_name=inventory)}
 
 
 def list_restore_point_catalog(
-    vm: str | None = Query(default=None),
-    backup: str | None = Query(default=None),
-    inventory: str | None = Query(default=None),
+    vm: str | None = Query(
+        default=None,
+        description="Only restore points of this VM: its ID, or its name matched whole and case-insensitively",
+    ),
+    backup: str | None = Query(
+        default=None,
+        description="Only restore points of this backup chain: the chain ID as GET /backups lists it (backup::<job>::<vm>::<repository>)",
+    ),
+    inventory: str | None = Query(
+        default=None,
+        description="Only restore points from this inventory: its ID, or its name matched whole and case-insensitively",
+    ),
 ) -> RestorePointList:
     return {"items": abr_v41.list_restore_points(vm=vm, backup_id=backup, inventory=inventory)}
 
@@ -36,7 +50,9 @@ def list_restore_points(vm_id: str) -> RestorePointList:
     return {"items": abr_v41.restore_point_list(vm_id)}
 
 
-def get_restore_context(restore_point_id: str = Query(...)) -> RestoreContextDTO:
+def get_restore_context(
+    restore_point_id: str = Query(..., description="ID of the restore point to restore, as GET /restore/points lists it"),
+) -> RestoreContextDTO:
     return abr_v41.get_restore_context(restore_point_id)
 
 

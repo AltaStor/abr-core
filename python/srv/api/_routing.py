@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 
 from python.srv.services import audit_service, rbac
@@ -22,6 +23,12 @@ FUNCTION_ID_KEY = "x-function-id"
 
 def function_id_of(route: APIRoute) -> str | None:
     return (route.openapi_extra or {}).get(FUNCTION_ID_KEY)
+
+
+def _error_status(error: BaseException | None) -> int:
+    if isinstance(error, RequestValidationError):
+        return 422
+    return getattr(error, "status_code", 500)
 
 
 class AuditedRoute(APIRoute):
@@ -56,7 +63,7 @@ class AuditedRoute(APIRoute):
                     client=request.client.host if request.client else None,
                     query=dict(request.query_params),
                     body=body,
-                    status=response.status_code if response is not None else getattr(error, "status_code", 500),
+                    status=response.status_code if response is not None else _error_status(error),
                     response_body=getattr(response, "body", None),
                     exc=error,
                 )
