@@ -353,12 +353,12 @@ class JobCommands:
             parser.add_argument(
                 "--synthetic-full-days",
                 type=parse_optional_weekday_csv,
-                help="Synthetic full weekdays, comma-separated Mon-Sun; pass none to turn it off",
+                help="Synthetic full weekdays, comma-separated Mon-Sun, for a weekly schedule only; none turns a weekly one off",
             )
             parser.add_argument(
                 "--active-full-days",
                 type=parse_optional_weekday_csv,
-                help="Active full weekdays, comma-separated Mon-Sun; pass none to turn it off",
+                help="Active full weekdays, comma-separated Mon-Sun, for a weekly schedule only; none turns a weekly one off",
             )
             for prefix, label in (("active-full", "Active full"), ("synthetic-full", "Synthetic full")):
                 dest = prefix.replace("-", "_")
