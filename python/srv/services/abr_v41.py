@@ -1545,13 +1545,22 @@ def _inventory_endpoint_key(record: dict[str, Any]) -> tuple[str, int]:
 
 
 def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
-    inventory_type = normalize_inventory_type(str(payload.get("type") or ""))
-    if inventory_type not in creatable_inventory_types():
-        raise api_error(
-            422,
-            "invalid_inventory",
-            f"Unsupported inventory type: {inventory_type}. Supported types: {', '.join(creatable_inventory_types())}",
-        )
+    requested_type = str(payload.get("type") or "").strip()
+    supported_types = ", ".join(creatable_inventory_types())
+    _ensure(
+        bool(requested_type),
+        422,
+        "invalid_inventory",
+        f"Inventory type is required. Supported types: {supported_types}",
+    )
+    _ensure(
+        requested_type.lower() in creatable_inventory_types(),
+        422,
+        "invalid_inventory",
+        f"Unsupported inventory type: {requested_type}. Supported types: {supported_types}",
+        type=requested_type,
+    )
+    inventory_type = normalize_inventory_type(requested_type)
     name = str(payload.get("name") or "")
     address = str(payload.get("address") or "").strip()
     port = int(payload.get("port") or 0) if payload.get("port") is not None else None

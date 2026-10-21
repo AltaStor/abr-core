@@ -745,6 +745,37 @@ class BackupServerApiFlowTests(unittest.TestCase):
         listed = self.client.get("/api/v1/jobs")
         self.assertFalse(any(item["name"] == "retention-zero-job" for item in listed.json()["items"]))
 
+    def test_an_inventory_without_a_type_or_with_an_unknown_one_is_refused_with_422(self) -> None:
+        before = self.client.get("/api/v1/inventories").json()["items"]
+        for body, message in (
+            ({}, "Inventory type is required"),
+            ({"name": "x"}, "Inventory type is required"),
+            ({"type": None}, "Inventory type is required"),
+            ({"name": "x", "type": None}, "Inventory type is required"),
+            ({"name": "x", "type": ""}, "Inventory type is required"),
+            ({"name": "x", "type": "   "}, "Inventory type is required"),
+            ({"name": "x", "type": "nope"}, "Unsupported inventory type: nope"),
+            ({"name": "x", "type": 5}, "Unsupported inventory type: 5"),
+        ):
+            with self.subTest(body=body):
+                response = self.client.post("/api/v1/inventories", json=body)
+
+                self.assertEqual(response.status_code, 422, response.text)
+                error = response.json()["error"]
+                self.assertEqual(error["code"], "invalid_inventory")
+                self.assertIn(message, error["message"])
+                self.assertIn("Supported types:", error["message"])
+        self.assertEqual(self.client.get("/api/v1/inventories").json()["items"], before)
+
+    def test_an_inventory_type_is_still_read_in_any_case(self) -> None:
+        response = self.client.post(
+            "/api/v1/inventories",
+            json={"name": "test-mixed-case-type", "type": "MOCK", "address": "mock://mixed", "username": "mock", "password": "mock"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["type"], "mock")
+
     def test_retention_min_fulls_is_off_unless_set_and_follows_create_copy_and_edit(self) -> None:
         inventory = self._create_mock_inventory("test-min-fulls-hv")
         repository = self._create_repository("min-fulls-repo", "local", path="/backup/min-fulls")
