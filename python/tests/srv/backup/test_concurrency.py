@@ -328,6 +328,10 @@ class ReconnectBackoffTest(unittest.TestCase):
     so _retry() just retries the same call on the same client.
     """
 
+    def setUp(self):
+        dm._outage_since = None
+        self.addCleanup(setattr, dm, "_outage_since", None)
+
     def test_backoff_grows_and_is_jittered(self):
         sleeps: list[float] = []
         orig_sleep = dm.time.sleep
