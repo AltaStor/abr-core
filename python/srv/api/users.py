@@ -37,10 +37,13 @@ def create_user(payload: CreateUserRequest = Body(default_factory=CreateUserRequ
 def update_user(
     user_id: str, request: Request, payload: UpdateUserRequest = Body(default_factory=UpdateUserRequest)
 ) -> PublicUserDTO:
-    """Change a user's full name, role or enabled state. Disabling a user ends
-    their sessions. The last enabled Administrator cannot be demoted or
-    disabled."""
-    user, changes = auth_service.update_user(user_id, unset_excluded(payload))
+    """Change a user's login name, full name, role, enabled state or password.
+    Disabling a user or giving them a new password ends their sessions; a
+    user's own password needs their current one (POST /auth/change-password).
+    The last enabled Administrator cannot be demoted or disabled."""
+    user, changes = auth_service.update_user(
+        user_id, unset_excluded(payload), acting_user_id=getattr(request.state, "user_id", None)
+    )
     if changes:
         request.state.audit.details["changes"] = changes
     return user

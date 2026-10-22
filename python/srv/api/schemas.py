@@ -971,6 +971,8 @@ class CreateUserRequest(_LenientModel):
 
 
 class UpdateUserRequest(_LenientModel):
+    name: LaxStr | None = Field(default=None, description=f"The login name; the password stays as it was unless a new one is given; {OMITTED_KEEPS}")
+    password: LaxStr | None = Field(default=None, description=f"A new password, which signs the user out everywhere; not for the caller's own, which needs the current one (POST /auth/change-password); {OMITTED_KEEPS}")
     fullName: LaxStr | None = None
     role: LaxStr | None = Field(default=None, description=f"{ROLE}; {OMITTED_KEEPS}")
     enabled: SkipValidation[bool] | None = Field(default=None, description=f"false stops the user signing in, true lets them again; {OMITTED_KEEPS}")

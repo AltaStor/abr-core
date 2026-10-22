@@ -127,9 +127,12 @@ the server refuses the request either way.
 
 - `abr user add --role <role>` / `POST /api/v1/users` creates a user; the role
   is required.
-- `abr user edit` / `PATCH /api/v1/users/{id}` changes the role, the full name,
-  or the enabled state (`enabled: false` disables). A role change applies to
-  the user's next request.
+- `abr user edit` / `PATCH /api/v1/users/{id}` changes the login name, the
+  full name, the role, the enabled state (`enabled: false` disables) or the
+  password. A role change applies to the user's next request. A new login name
+  keeps the password; a new password (`--reset-password`, `password`) ends the
+  user's sessions, and is refused with `409 own_password` for the caller's own,
+  which `abr auth change-password` changes with the current one.
 - At least one enabled Administrator always remains. Demoting, disabling or
   deleting the last one is refused with `409 last_administrator`, and so is a
   catalog import (`system import`) that would leave none.

@@ -49,17 +49,25 @@ class UserCommands:
 
         edit = commands.add_parser(
             "edit",
-            help="Change a user's role, full name, or enabled state.",
+            help="Change a user's login name, full name, role, enabled state, or password.",
             description=(
-                "Change a user's role, full name, or enabled state. Disabling a user ends their "
-                "sessions. The last enabled Administrator cannot be demoted or disabled.\n\n"
+                "Change a user's login name, full name, role, enabled state, or password. A new login "
+                "name keeps the password. Disabling a user or setting a new password ends their "
+                "sessions; your own password is changed with abr auth change-password, which asks for "
+                "the current one. The last enabled Administrator cannot be demoted or disabled.\n\n"
                 "Examples:\n"
                 "  abr user edit --name jdoe --role restore_operator\n"
+                "  abr user edit --name jdoe --new-name jane.doe\n"
+                "  abr user edit --name jdoe --reset-password\n"
                 "  abr user edit --name jdoe --disable"
             ),
             formatter_class=CompactHelpFormatter,
         )
         add_name_or_id_selector(edit, name_help="Login name", id_help="User ID")
+        edit.add_argument("--new-name", help="New login name")
+        edit.add_argument(
+            "--reset-password", action="store_true", help="Prompt for a new password for the user"
+        )
         edit.add_argument("--full-name", help="New display/full name")
         edit.add_argument("--role", help=ROLE_HELP)
         state = edit.add_mutually_exclusive_group()
@@ -121,9 +129,9 @@ class UserCommands:
         return str(matches[0]["id"])
 
     @staticmethod
-    def _prompt_new_password() -> str:
+    def _prompt_new_password(prompt: str = "Set password for new user: ") -> str:
         while True:
-            password = getpass.getpass("Set password for new user: ")
+            password = getpass.getpass(prompt)
             if len(password) < 8:
                 print("Password must be at least 8 characters", file=sys.stderr)
                 continue
@@ -149,13 +157,22 @@ class UserCommands:
     def edit(self, args: argparse.Namespace) -> int:
         payload = {
             key: value
-            for key, value in (("fullName", args.full_name), ("role", args.role), ("enabled", args.enabled))
+            for key, value in (
+                ("name", args.new_name),
+                ("fullName", args.full_name),
+                ("role", args.role),
+                ("enabled", args.enabled),
+            )
             if value is not None
         }
-        if not payload:
-            raise ValueError("Nothing to change: pass --role, --full-name, --enable or --disable")
+        if not payload and not args.reset_password:
+            raise ValueError(
+                "Nothing to change: pass --new-name, --full-name, --role, --enable, --disable or --reset-password"
+            )
         deps = CommandDependencies(args)
         user_id = self._resolve_id(deps, args)
+        if args.reset_password:
+            payload["password"] = self._prompt_new_password("New password for the user: ")
         deps.context.print_output(deps.context.api_client.patch(f"api/v1/users/{user_id}", json=payload))
         return 0
 

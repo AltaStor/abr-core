@@ -38,6 +38,9 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   to carry; such local repositories become SMB repositories when the server
   starts or a catalog holding them is imported, and a local repository no
   longer takes `--server` or `--share`.
+- `abr user edit --new-name` and `--reset-password`, and `name` and `password`
+  in `PATCH /api/v1/users/{id}`: an Administrator renames a user, who keeps
+  their password, or gives them a new password, which ends their sessions.
 - Hyper-V job option `--guest-consistency`.
 - `abr job retention [--dry-run]` and `POST /api/v1/jobs/{id}/retention`
   apply (or preview) a job's retention across all of its chains and report,

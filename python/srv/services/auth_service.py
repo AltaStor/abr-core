@@ -80,6 +80,13 @@ def _verify_password(name: str, raw_password: str, stored_hash: str) -> bool:
     return hmac.compare_digest(hash_password(name, raw_password), stored_hash)
 
 
+def _hash_name(user: dict[str, Any], name: str) -> str:
+    """The name a user's password hash was made with. A rename without a new
+    password keeps the old name for it in ``passwd_name``, since the hash can
+    only be made again from the password itself."""
+    return str(user.get("passwd_name") or name)
+
+
 def _now_dt() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -189,11 +196,8 @@ def password_problem(name: str, password: Any) -> str | None:
     return None
 
 
-def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True) -> dict[str, Any]:
-    name = str(payload.get("name") or "").strip()
-    full_name = str(payload.get("fullName") or "").strip()
-    password = payload.get("password")
-
+def _user_name_or_422(value: Any) -> str:
+    name = str(value or "").strip()
     if not NAME_PATTERN.fullmatch(name):
         raise api_error(
             422,
@@ -203,12 +207,25 @@ def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True
         )
     if len(name) > MAX_USER_NAME_LENGTH:
         raise api_error(422, "invalid_user", f"User name must be at most {MAX_USER_NAME_LENGTH} characters.")
+    return name
+
+
+def _refuse_taken_name(name: str, *, user_id: str | None = None) -> None:
+    existing = _find_user_by_name(name)
+    if existing is not None and existing["id"] != user_id:
+        raise api_error(409, "user_exists", f"A user named {name!r} already exists.")
+
+
+def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True) -> dict[str, Any]:
+    name = _user_name_or_422(payload.get("name"))
+    full_name = str(payload.get("fullName") or "").strip()
+    password = payload.get("password")
+
     problem = password_problem(name, password)
     if problem and enforce_password_policy:
         raise api_error(422, "invalid_user", problem)
     role = _role_or_422(payload.get("role"))
-    if _find_user_by_name(name) is not None:
-        raise api_error(409, "user_exists", f"A user named {name!r} already exists.")
+    _refuse_taken_name(name)
 
     now = utc_now()
     record = {
@@ -230,11 +247,35 @@ def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True
     return _public_user(record)
 
 
-def update_user(user_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Change a user's full name, role or enabled state. Answers the user and
-    what changed, as ``{field: {"from": old, "to": new}}``."""
+def update_user(
+    user_id: str, payload: dict[str, Any], *, acting_user_id: str | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Change a user's name, full name, role, enabled state or password.
+    Answers the user and what changed, as ``{field: {"from": old, "to": new}}``
+    (a new password only as its field, without values)."""
     user = _user_or_404(user_id)
     updated = dict(user)
+    if "name" in payload and payload["name"] is not None:
+        updated["name"] = _user_name_or_422(payload["name"])
+        _refuse_taken_name(updated["name"], user_id=user_id)
+    password = payload.get("password")
+    if password is not None:
+        if user_id == acting_user_id:
+            raise api_error(
+                409,
+                "own_password",
+                "Change your own password with your current one: Change password in the console, "
+                "or abr auth change-password.",
+                user_id=user_id,
+            )
+        problem = password_problem(updated["name"], password)
+        if problem:
+            raise api_error(422, "invalid_user", problem)
+        updated["passwd"] = hash_password(updated["name"], password)
+        updated.pop("passwd_name", None)
+        updated["password_policy_exempt"] = False
+    elif updated["name"] != user["name"]:
+        updated["passwd_name"] = _hash_name(user, user["name"])
     if "fullName" in payload and payload["fullName"] is not None:
         updated["fullName"] = str(payload["fullName"]).strip()
     if "role" in payload and payload["role"] is not None:
@@ -246,9 +287,11 @@ def update_user(user_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any], 
 
     changes = {
         field: {"from": user.get(field), "to": updated.get(field)}
-        for field in ("fullName", "role", "enabled")
+        for field in ("name", "fullName", "role", "enabled")
         if user.get(field) != updated.get(field)
     }
+    if password is not None:
+        changes["password"] = {"from": None, "to": None}
     if not changes:
         return _public_user(user), changes
     if not rbac.is_active_administrator(updated):
@@ -256,7 +299,9 @@ def update_user(user_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any], 
 
     updated["updated_at"] = utc_now()
     persist_user(updated)
-    if not rbac.is_enabled(updated):
+    # A new password set by somebody else signs the user out everywhere: who
+    # holds a session now no longer knows the password it was opened with.
+    if not rbac.is_enabled(updated) or password is not None:
         delete_sessions_for_user(user_id)
     return _public_user(updated), changes
 
@@ -289,7 +334,7 @@ def change_password(user_id: str, current_password: str, new_password: str, *, k
     if _prune_and_count_failures(key, login_lockout_seconds()) >= login_max_attempts():
         raise api_error(429, "too_many_attempts", "Too many failed attempts. Try again later.")
 
-    if not _verify_password(name, current_password, user["passwd"]):
+    if not _verify_password(_hash_name(user, name), current_password, user["passwd"]):
         _record_failure(key)
         raise api_error(401, "invalid_credentials", "Current password is incorrect.")
     _clear_failures(key)
@@ -297,11 +342,12 @@ def change_password(user_id: str, current_password: str, new_password: str, *, k
     problem = password_problem(name, new_password)
     if problem:
         raise api_error(422, "invalid_user", problem)
-    if _verify_password(name, new_password, user["passwd"]):
+    if _verify_password(_hash_name(user, name), new_password, user["passwd"]):
         raise api_error(422, "invalid_user", "The new password must differ from the current one.")
 
     updated = dict(user)
     updated["passwd"] = hash_password(name, new_password)
+    updated.pop("passwd_name", None)
     updated["password_policy_exempt"] = False
     updated["updated_at"] = utc_now()
     persist_user(updated)
@@ -322,7 +368,7 @@ def login(
 
     user = _find_user_by_name(name)
     stored_hash = user["passwd"] if user is not None else hash_password(name, "")
-    valid = _verify_password(name, password, stored_hash) if user is not None else False
+    valid = _verify_password(_hash_name(user, name), password, stored_hash) if user is not None else False
 
     if user is None or not valid:
         _record_failure(key)

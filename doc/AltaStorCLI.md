@@ -184,12 +184,14 @@ abr user add --name alice --full-name "Alice Doe" --role backup_operator
 
 abr user edit 
 
-Description: Change a user's role, full name, or enabled state. A role change applies to the user's next request. Disabling a user ends their sessions and stops them signing in. 
+Description: Change a user's login name, full name, role, enabled state, or password. A role change applies to the user's next request. A new login name keeps the user's password and sessions. --reset-password prompts for a new password and ends the user's sessions; your own password is changed with abr auth change-password, which asks for the current one. Disabling a user ends their sessions and stops them signing in. 
 
-abr user edit --name <name> [--id <id>] [--role <role>] [--full-name <text>] [--enable | --disable] 
+abr user edit --name <name> [--id <id>] [--new-name <name>] [--reset-password] [--role <role>] [--full-name <text>] [--enable | --disable] 
 
 Examples: 
 abr user edit --name alice --role restore_operator 
+abr user edit --name alice --new-name alice.doe 
+abr user edit --name alice --reset-password 
 abr user edit --name alice --disable 
 
 abr user info 
