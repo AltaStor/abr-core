@@ -139,6 +139,56 @@ class BooleanFieldsThroughTheApiTests(unittest.TestCase):
         self.assertTrue(response.json()["active_full_schedule"]["enabled"])
         self.assertEqual(JOBS["job-1"].get("active_full_next_run_at"), next_run)
 
+    def test_switching_a_schedule_the_job_does_not_have_is_refused_and_changes_nothing(self) -> None:
+        before = dict(JOBS["job-1"])
+        for body in (
+            {"synthetic_full_enabled": True},
+            {"synthetic_full_enabled": False},
+            {"synthetic_full_enabled": True, "retention_days": 9},
+            {"synthetic_full_enabled": True, "synthetic_full_schedule": None},
+        ):
+            with self.subTest(body=body):
+                response = self.client.patch("/api/v1/jobs/job-1", json=body)
+                self.assertEqual(response.status_code, 422, response.text)
+                error = response.json()["error"]
+                self.assertEqual(error["code"], "invalid_job")
+                self.assertIn("synthetic_full_enabled", error["message"])
+                self.assertIn("give synthetic_full_schedule", error["message"])
+        self.assertEqual(JOBS["job-1"], before)
+
+    def test_a_switch_given_with_the_schedule_it_switches_still_applies(self) -> None:
+        response = self.client.patch(
+            "/api/v1/jobs/job-1",
+            json={
+                "synthetic_full_enabled": False,
+                "synthetic_full_schedule": {"kind": "weekly", "weekdays": ["Sat"], "time": "03:00", "timezone": "UTC"},
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["synthetic_full_schedule"]["enabled"])
+
+        JOBS["job-1"].pop("synthetic_full_schedule")
+        response = self.client.patch("/api/v1/jobs/job-1", json={"synthetic_full_enabled": True, "synthetic_full_days": ["sat"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["synthetic_full_schedule"]["enabled"])
+
+    def test_creating_a_job_with_a_switch_for_a_schedule_it_does_not_give_is_refused(self) -> None:
+        for flag in (True, False):
+            with self.subTest(flag=flag):
+                response = self.client.post(
+                    "/api/v1/jobs",
+                    json={
+                        "name": "weekly",
+                        "repo_id": "repo-1",
+                        "vms": ["vm-1"],
+                        "active_full_schedule": {"kind": "weekly", "weekdays": ["Sun"], "time": "02:00", "timezone": "UTC"},
+                        "synthetic_full_enabled": flag,
+                    },
+                )
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertIn("synthetic_full_enabled", response.json()["error"]["message"])
+        self.assertEqual(list(JOBS), ["job-1"])
+
 
 class RefusedBooleanIsAuditedTests(RbacApiCase):
     def test_a_refused_dry_run_is_audited_as_a_422_with_its_body(self) -> None:

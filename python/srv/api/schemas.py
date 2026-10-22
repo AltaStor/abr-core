@@ -709,11 +709,12 @@ JOB_VMS = (
 )
 FULL_SCHEDULE_STATE = (
     "true or false switches that full schedule on or off and keeps its settings; null or omitted keeps the schedule's own "
-    "enabled (true)"
+    "enabled (true); true or false without that schedule (its object or weekdays) in the request answers 422"
 )
 FULL_SCHEDULE_STATE_EDIT = (
     "true or false switches that full schedule on or off and keeps its settings; the state it already has answers 200 "
-    f"without moving its next run; {OMITTED_KEEPS}"
+    "without moving its next run; true or false for a schedule the job does not have, and the request does not give, "
+    f"answers 422; {OMITTED_KEEPS}"
 )
 LEGACY_FULL_DAYS = "Older form of the full schedule: weekdays (mon..sun) at the base schedule's time; prefer the *_full_schedule object"
 S3_PATH_STYLE = (

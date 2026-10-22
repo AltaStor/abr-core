@@ -4415,6 +4415,7 @@ def _requested_execution_schedule_state(payload: dict[str, Any], schedule_key: s
 
 
 def _execution_schedule_with_state(
+    schedule_key: str,
     schedule: Any,
     state: bool | None,
     legacy_days: Any,
@@ -4426,7 +4427,16 @@ def _execution_schedule_with_state(
     if isinstance(schedule, dict):
         return dict(schedule, enabled=state)
     derived = _schedule_from_legacy_days(_normalize_day_list(legacy_days), base_schedule, created_at)
-    return dict(derived, enabled=state) if isinstance(derived, dict) else schedule
+    field = _execution_schedule_state_key(schedule_key)
+    _ensure(
+        isinstance(derived, dict),
+        422,
+        "invalid_job",
+        f"{field} switches the job's {schedule_key.removesuffix('_schedule').replace('_', ' ')} schedule on or off, "
+        f"and the job has none: give {schedule_key} to create one",
+        field=field,
+    )
+    return dict(derived, enabled=state)
 
 
 def _has_full_backup_schedule(schedule: Any, legacy_days: Any) -> bool:
@@ -4477,6 +4487,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         synthetic_full_days = []
     now = utc_now()
     active_full_schedule = _execution_schedule_with_state(
+        "active_full_schedule",
         active_full_schedule,
         _requested_execution_schedule_state(payload, "active_full_schedule"),
         active_full_days,
@@ -4484,6 +4495,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         now,
     )
     synthetic_full_schedule = _execution_schedule_with_state(
+        "synthetic_full_schedule",
         synthetic_full_schedule,
         _requested_execution_schedule_state(payload, "synthetic_full_schedule"),
         synthetic_full_days,
@@ -4777,6 +4789,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if state is None:
             continue
         schedule_value = _execution_schedule_with_state(
+            schedule_key,
             updated.get(schedule_key),
             state,
             updated.get(days_key),
