@@ -12,9 +12,10 @@ or out of date.
 
 Both sides have to reach the repository: the tool on the host writes and reads
 the disks, and the backup server keeps the manifests, merges chains, applies
-retention and verifies with abr-vmdk-tool. Both reach an S3 repository. A local
-repository is a folder of the appliance, which the hosts reach only when it is
-shared over SMB: its server and share name the UNC path they use for it.
+retention and verifies with abr-vmdk-tool. Both reach an S3 repository. An SMB
+repository is a share the appliance mounts at its path: its server and share
+name the UNC path the hosts use for the same folder. A local repository is a
+folder of the appliance alone, which the hosts cannot reach.
 """
 
 from __future__ import annotations
@@ -35,8 +36,8 @@ DEFAULT_REMOTE_WORK_DIR = r"C:\ProgramData\AltaStor\abr-hyperv"
 
 HYPERV_REPOSITORY_MESSAGE = (
     "Hyper-V disks are written and read by abr-vhdx-tool on the Hyper-V host, which reaches S3 "
-    "repositories, and local repositories only through an SMB share of their folder. Use an S3 "
-    "repository, or give this one the share the hosts reach it by (abr repo edit --server --share)"
+    "and SMB repositories only, not a folder of the appliance. Use an S3 repository, or an SMB "
+    "repository (abr repo add --type smb --path --server --share)"
 )
 
 _PROGRESS_LINE = re.compile(r"^\s*(\d{1,3})%\s*$")
@@ -112,8 +113,8 @@ def host_bundle(script_dir: Path) -> HostBundle:
     )
 
 
-def _is_local_repository(repository: dict[str, Any] | None) -> bool:
-    return isinstance(repository, dict) and str(repository.get("type") or "").strip().lower() == "local"
+def _is_smb_repository(repository: dict[str, Any] | None) -> bool:
+    return isinstance(repository, dict) and str(repository.get("type") or "").strip().lower() == "smb"
 
 
 def _repository_field(repository: dict[str, Any], name: str) -> str:
@@ -122,9 +123,9 @@ def _repository_field(repository: dict[str, Any], name: str) -> str:
 
 
 def windows_share(repository: dict[str, Any] | None) -> str | None:
-    r"""The UNC path Hyper-V hosts reach a local repository's folder by,
+    r"""The UNC path Hyper-V hosts reach an SMB repository's folder by,
     \\server\share[\folder], from its server and share; None without them."""
-    if not _is_local_repository(repository):
+    if not _is_smb_repository(repository):
         return None
     server = _repository_field(repository, "server").strip().strip("\\/")
     share = _repository_field(repository, "share").strip().replace("/", "\\").strip("\\")
@@ -141,7 +142,7 @@ def ensure_hyperv_repository(repository: dict[str, Any] | None) -> None:
 def _share_invocation(
     repository: dict[str, Any], *, abr_path: str | None, create_folder: bool
 ) -> tuple[list[str], dict[str, str]]:
-    """A local repository's folder as the hosts see it: the same place under
+    """An SMB repository's folder as the hosts see it: the same place under
     its share, which run_tool.ps1 opens with the repository's account (a
     WinRM session has no network credentials of its own)."""
     share = windows_share(repository) or ""

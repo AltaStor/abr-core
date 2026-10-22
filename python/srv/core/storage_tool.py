@@ -203,11 +203,33 @@ def is_s3_repository(repository: dict[str, Any] | None) -> bool:
     return str(repository.get("type") or "").strip().lower() == "s3"
 
 
-def is_abr_repository(repository: dict[str, Any] | None) -> bool:
-    """Repositories backed by the .abr format (both local-file and S3)."""
+# Repositories that are a folder of the appliance: a local one, or an SMB one,
+# whose path is where the appliance mounts the share its hosts reach.
+FILE_REPOSITORY_TYPES = frozenset({"local", "smb"})
+
+
+def is_file_repository(repository: dict[str, Any] | None) -> bool:
     if not isinstance(repository, dict):
         return False
-    return str(repository.get("type") or "").strip().lower() in {"local", "s3"}
+    return str(repository.get("type") or "").strip().lower() in FILE_REPOSITORY_TYPES
+
+
+def is_abr_repository(repository: dict[str, Any] | None) -> bool:
+    """Repositories backed by the .abr format (folders and S3)."""
+    return is_file_repository(repository) or is_s3_repository(repository)
+
+
+def with_smb_type(repository: dict[str, Any]) -> bool:
+    """A local repository that names an SMB share, which is how SMB
+    repositories were kept before they had a type of their own, becomes one.
+    Answers whether it changed."""
+    metadata = repository.get("metadata") if isinstance(repository.get("metadata"), dict) else {}
+    if str(repository.get("type") or "").strip().lower() != "local":
+        return False
+    if not str(metadata.get("server") or "").strip() or not str(metadata.get("share") or "").strip():
+        return False
+    repository["type"] = "smb"
+    return True
 
 
 def s3_block_generation_days() -> int:
@@ -362,10 +384,10 @@ def disk_tool_storage_args(
 ) -> list[str]:
     """Backup-storage options for abr-vmdk-tool (the --folder/--mode/--path form)."""
     repo_type = str(repository.get("type") or "").strip().lower()
-    if repo_type == "local":
+    if repo_type in FILE_REPOSITORY_TYPES:
         folder = str(abr_path if abr_path is not None else repository.get("path") or "").strip()
         if not folder:
-            raise StorageToolError("local repository is missing a path")
+            raise StorageToolError(f"{repo_type} repository is missing a path")
         # File-mode .abr backend: the mover writes backups directly under that
         # folder as <name>.abri/.abrd/.abrm, so the whole location is --folder
         # and there is no --path/credentials/region to pass.

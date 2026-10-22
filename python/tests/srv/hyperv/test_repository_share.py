@@ -17,8 +17,8 @@ from python.srv.plugins.hyperv.hyperv import HyperVNode
 RUN_TOOL = Path(vhdx_tool.__file__).resolve().parent / "scripts" / "run_tool.ps1"
 
 
-def _local_repository(root: str, **share: str) -> dict:
-    return {"id": "repo-1", "name": "HV-Local", "type": "local", "path": root, **share}
+def _smb_repository(root: str, **share: str) -> dict:
+    return {"id": "repo-1", "name": "HV-SMB", "type": "smb", "path": root, **share}
 
 
 class ShareInvocationTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class ShareInvocationTests(unittest.TestCase):
         self.root = tempfile.mkdtemp(prefix="et-test-share-")
 
     def test_the_tool_writes_through_the_share_with_the_repositorys_account(self) -> None:
-        repository = _local_repository(
+        repository = _smb_repository(
             self.root, server="192.0.2.90", share="hv-backups", username="abr-share", password="s3cret"
         )
 
@@ -45,7 +45,7 @@ class ShareInvocationTests(unittest.TestCase):
         self.assertNotIn("s3cret", " ".join(args))
 
     def test_a_share_that_goes_on_into_a_folder_is_opened_at_its_root(self) -> None:
-        repository = _local_repository(self.root, server="backup01", share="hv/altastor", username="abr-share", password="x")
+        repository = _smb_repository(self.root, server="backup01", share="hv/altastor", username="abr-share", password="x")
 
         args, env = vhdx_tool.storage_invocation(repository, abr_path=f"{self.root}/job-1")
 
@@ -53,10 +53,16 @@ class ShareInvocationTests(unittest.TestCase):
         self.assertEqual(env["ABR_SMB_SHARE"], r"\\backup01\hv")
 
     def test_a_folder_outside_the_repository_is_refused(self) -> None:
-        repository = _local_repository(self.root, server="backup01", share="hv", username="abr-share", password="x")
+        repository = _smb_repository(self.root, server="backup01", share="hv", username="abr-share", password="x")
 
         with self.assertRaises(vhdx_tool.VhdxToolError):
             vhdx_tool.storage_invocation(repository, abr_path="/somewhere/else")
+
+    def test_a_local_repository_is_refused_even_with_a_share_left_on_it(self) -> None:
+        repository = {"id": "repo-1", "name": "HV-Local", "type": "local", "path": self.root, "server": "backup01", "share": "hv"}
+
+        with self.assertRaises(vhdx_tool.VhdxToolError):
+            vhdx_tool.storage_invocation(repository, abr_path=self.root)
 
 
 class RunToolOpensTheShareTests(unittest.TestCase):

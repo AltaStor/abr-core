@@ -183,7 +183,7 @@ class AbrV41RepositoryCommandTests(unittest.TestCase):
                 "id": "repo-1",
                 "name": "Archive",
                 "type": "smb",
-                "path": "//nas/archive",
+                "path": "/mnt/archive",
                 "status": "available",
             }
         )
@@ -192,7 +192,7 @@ class AbrV41RepositoryCommandTests(unittest.TestCase):
             output="json",
             name="Archive",
             type="smb",
-            path=None,
+            path="/mnt/archive",
             address="//nas/archive",
             server=None,
             share=None,
@@ -211,7 +211,7 @@ class AbrV41RepositoryCommandTests(unittest.TestCase):
             json={
                 "name": "Archive",
                 "type": "smb",
-                "path": None,
+                "path": "/mnt/archive",
                 "server": "nas",
                 "share": "archive",
                 "username": "backup",
@@ -500,7 +500,7 @@ class AbrV41EngineTests(unittest.TestCase):
         TASKS.clear()
         BACKUPS.clear()
         REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Repo", "type": "local", "path": "/tmp", "metadata": {"supports_synthetic_full": True}}
-        REPOSITORIES["repo-2"] = {"id": "repo-2", "name": "NoSynth", "type": "smb", "path": "//host/share", "metadata": {"supports_synthetic_full": False}}
+        REPOSITORIES["repo-2"] = {"id": "repo-2", "name": "NoSynth", "type": "nfs", "path": "host:/export", "metadata": {"supports_synthetic_full": False}}
 
     def _job(self, **overrides):
         base = {
@@ -2422,19 +2422,21 @@ class AbrV41EngineTests(unittest.TestCase):
         )
 
     def test_create_repository_record_accepts_remote_address_and_preserves_description(self) -> None:
+        REPOSITORIES.clear()
+        mount = tempfile.mkdtemp(prefix="abr-smb-repo-")
         repository = abr_v41.create_repository_record(
             {
                 "name": "Archive",
                 "type": "smb",
-                "address": "//nas/archive",
+                "path": mount,
+                "address": "\\\\nas\\archive",
                 "username": "backup",
                 "password": "secret",
                 "description": "Archive tier",
             }
         )
 
-        self.assertEqual(repository["path"], "//nas/archive")
-        self.assertEqual(repository["address"], "//nas/archive")
+        self.assertEqual(repository["path"], mount)
         self.assertEqual(repository["server"], "nas")
         self.assertEqual(repository["share"], "archive")
         self.assertEqual(repository["username"], "backup")

@@ -209,6 +209,7 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
             {
                 "name": "probe-smb",
                 "type": "smb",
+                "path": self.enterContext(tempfile.TemporaryDirectory()),
                 "server": "10.255.255.9",
                 "share": "backups",
                 "username": "probe-user",

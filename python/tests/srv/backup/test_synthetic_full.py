@@ -706,7 +706,7 @@ class SyntheticFullRunTests(unittest.TestCase):
         self.assertIn("would not be restorable", str(error.exception))
 
     def test_unsupported_repository_type_is_rejected(self) -> None:
-        REPOSITORIES[REPO_ID] = {"id": REPO_ID, "name": "Share", "type": "smb", "path": "//host/share"}
+        REPOSITORIES[REPO_ID] = {"id": REPO_ID, "name": "Export", "type": "nfs", "path": "host:/export"}
 
         with self.assertRaises(SyntheticFullValidationError) as error:
             synthetic_full.run_synthetic_full(self._task())
@@ -859,8 +859,8 @@ class SyntheticFullJobStartTests(unittest.TestCase):
         from python.srv.services.abr_v41 import resolve_job_execution
         from python.srv.services.api_errors import ApiError
 
-        REPOSITORIES[REPO_ID] = {"id": REPO_ID, "name": "Share", "type": "smb", "path": "//host/share"}
-        job = {"id": JOB_ID, "repo_id": REPO_ID, "repo_name": "Share"}
+        REPOSITORIES[REPO_ID] = {"id": REPO_ID, "name": "Export", "type": "nfs", "path": "host:/export"}
+        job = {"id": JOB_ID, "repo_id": REPO_ID, "repo_name": "Export"}
 
         with self.assertRaises(ApiError) as error:
             resolve_job_execution(job, vm_id=VM_ID, force_full=False, force_synthetic=True)

@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from python.srv.core.mongo_db_wrapper import REPOSITORIES
-from python.srv.core.storage_tool import StorageToolError
+from python.srv.core.storage_tool import StorageToolError, with_smb_type
 from python.srv.services import abr_v41
 from python.srv.services.api_errors import ApiError
 
@@ -226,7 +226,7 @@ class BucketProvisioningTests(unittest.TestCase):
         self.assertIn("--create-folder", args)
 
 
-class LocalRegistrationValidationTests(unittest.TestCase):
+class _FolderCase(unittest.TestCase):
     def setUp(self) -> None:
         REPOSITORIES.clear()
         self._root = tempfile.mkdtemp(prefix="abr-repo-validation-")
@@ -241,6 +241,8 @@ class LocalRegistrationValidationTests(unittest.TestCase):
         path.chmod(0o750)
         return str(path)
 
+
+class LocalRegistrationValidationTests(_FolderCase):
     def test_a_usable_path_is_created(self) -> None:
         repository = abr_v41.create_repository_record(
             {"name": "LocalRepo", "type": "local", "path": self._path("good")}
@@ -271,6 +273,70 @@ class LocalRegistrationValidationTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, "repository_validation_failed")
         self.assertEqual(list(REPOSITORIES), [])
+
+    def test_a_local_repository_takes_no_share(self) -> None:
+        with self.assertRaises(ApiError) as caught:
+            abr_v41.create_repository_record(
+                {"name": "LocalRepo", "type": "local", "path": self._path("hv"), "server": "backup01", "share": "hv"}
+            )
+
+        self.assertIn("SMB repository", caught.exception.message)
+        self.assertEqual(list(REPOSITORIES), [])
+
+
+class SmbRegistrationValidationTests(_FolderCase):
+    def test_the_share_and_the_folder_it_is_mounted_at_are_kept(self) -> None:
+        mount = self._path("hv")
+        repository = abr_v41.create_repository_record(
+            {"name": "SmbRepo", "type": "smb", "path": mount, "address": r"\\backup01\hv\altastor"}
+        )
+
+        self.assertEqual((repository["type"], repository["path"]), ("smb", mount))
+        self.assertEqual((repository["server"], repository["share"]), ("backup01", "hv/altastor"))
+        self.assertEqual(REPOSITORIES[repository["id"]]["last_verify"]["status"], "success")
+
+    def test_a_share_without_the_folder_it_is_mounted_at_is_refused(self) -> None:
+        for path in (None, r"\\backup01\hv"):
+            with self.subTest(path=path), self.assertRaises(ApiError) as caught:
+                abr_v41.create_repository_record(
+                    {"name": "SmbRepo", "type": "smb", "path": path, "server": "backup01", "share": "hv"}
+                )
+            self.assertEqual(caught.exception.status_code, 422)
+        self.assertEqual(list(REPOSITORIES), [])
+
+    def test_an_smb_repository_cannot_lose_its_share(self) -> None:
+        repository = abr_v41.create_repository_record(
+            {"name": "SmbRepo", "type": "smb", "path": self._path("hv"), "server": "backup01", "share": "hv"}
+        )
+
+        with self.assertRaises(ApiError):
+            abr_v41.edit_repository_record(repository["id"], {"server": "", "share": ""})
+
+    def test_removing_the_account_drops_its_password(self) -> None:
+        repository = abr_v41.create_repository_record(
+            {
+                "name": "SmbRepo",
+                "type": "smb",
+                "path": self._path("hv"),
+                "server": "backup01",
+                "share": "hv",
+                "username": "CORP\\backupsvc",
+                "password": "s3cret",
+            }
+        )
+
+        abr_v41.edit_repository_record(repository["id"], {"username": ""})
+
+        metadata = REPOSITORIES[repository["id"]]["metadata"]
+        self.assertEqual((metadata["username"], metadata["password"]), (None, None))
+
+    def test_a_local_repository_with_a_share_from_before_becomes_an_smb_repository(self) -> None:
+        local = {"id": "r1", "type": "local", "path": "/srv/hv", "metadata": {"server": "backup01", "share": "hv"}}
+        plain = {"id": "r2", "type": "local", "path": "/srv/x", "metadata": {"server": None, "share": None}}
+
+        self.assertTrue(with_smb_type(local))
+        self.assertFalse(with_smb_type(plain))
+        self.assertEqual((local["type"], plain["type"]), ("smb", "local"))
 
 
 if __name__ == "__main__":

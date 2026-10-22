@@ -76,6 +76,7 @@ from python.srv.core.storage_tool import (
     immutability_is_enabled,
     immutability_rank,
     is_abr_repository,
+    is_file_repository,
     is_s3_repository,
     list_disk_tool_backups,
     SECRET_MASK,
@@ -2027,7 +2028,7 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         storage["used_bytes"] = catalog["used_bytes"]
     else:
         path_value = str(item.get("path") or "").strip()
-        if path_value and repo_type == "local":
+        if path_value and is_file_repository(item):
             permissions = _local_path_permissions(Path(path_value))
             storage["permissions"] = permissions
             warnings.extend(_local_repository_permission_warnings(Path(path_value), permissions))
@@ -2092,7 +2093,7 @@ def _split_repository_address(repo_type: str, address: str) -> tuple[str, str]:
         return server.strip(), share.strip()
     if repo_type == "smb":
         normalized = value.replace("\\", "/")
-        _ensure(bool(SMB_PATTERN.fullmatch(normalized)), 422, "invalid_repository", "SMB repositories must use //host/share", address=value)
+        _ensure(bool(SMB_PATTERN.fullmatch(normalized)), 422, "invalid_repository", "SMB shares must be written \\\\server\\share or //server/share", address=value)
         server, share = normalized.lstrip("/").split("/", 1)
         return server.strip(), share.strip()
     raise api_error(422, "invalid_repository", "Only NFS and SMB repositories use remote addresses", repo_type=repo_type)
@@ -2406,21 +2407,47 @@ def resolve_repository(name: str | None = None, record_id: str | None = None) ->
     return normalize_repository_record(resolve_selector(catalog_records(REPOSITORIES), name=name, record_id=record_id, label="Repository"))
 
 
-def _ensure_local_repository_share(server: Any, share: Any, username: Any, password: Any) -> None:
-    """A local repository's server and share name the SMB share Hyper-V hosts
-    reach its folder by (abr-vhdx-tool writes there from the host); its
-    username and password are the account that opens it."""
+def _ensure_smb_repository_share(server: Any, share: Any, username: Any, password: Any) -> None:
+    """An SMB repository's server and share name the share Hyper-V hosts reach
+    its folder by (abr-vhdx-tool writes there from the host); its username and
+    password are the account that opens it, else the inventory's."""
     _ensure(
-        bool(str(server or "").strip()) == bool(str(share or "").strip()),
+        bool(str(server or "").strip()) and bool(str(share or "").strip()),
         422,
         "invalid_repository",
-        "A local repository's SMB share for Hyper-V hosts needs both --server and --share",
+        "smb repositories require --server and --share, or --address \\\\server\\share",
     )
     _ensure(
         not str(username or "").strip() or bool(str(password or "")),
         422,
         "invalid_repository",
-        "A local repository's SMB share account needs --password with --username",
+        "An SMB repository's account needs --password with --username",
+    )
+
+
+def _refuse_local_repository_share(server: Any, share: Any) -> None:
+    """Local repositories used to carry the SMB share their folder was
+    exported as; that is an SMB repository now."""
+    _ensure(
+        not str(server or "").strip() and not str(share or "").strip(),
+        422,
+        "invalid_repository",
+        "A local repository has no SMB share: add the folder as an SMB repository "
+        "(--type smb --path --server --share) for Hyper-V hosts to reach it",
+    )
+
+
+def _ensure_appliance_folder(repo_type: str, path: str) -> None:
+    """A file repository's path is a folder of this appliance; for an SMB one,
+    where the appliance mounts the share, never the share itself."""
+    _ensure(bool(path), 422, "invalid_repository", f"{repo_type} repositories require --path")
+    _ensure(
+        repo_type != "smb" or not SMB_PATTERN.fullmatch(path.replace("\\", "/")),
+        422,
+        "invalid_repository",
+        "An SMB repository's --path is the folder this appliance mounts the share at; "
+        "give the share itself with --address or --server and --share",
+        path=path,
     )
 
 
@@ -2439,10 +2466,14 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
     _validate_text_fields(payload, REPOSITORY_TEXT_FIELDS, code="invalid_repository")
     _ensure(repo_type in REPO_TYPES, 422, "invalid_repository", "Repository type must be one of: local, nfs, smb, s3", repo_type=repo_type)
     s3_config: dict[str, Any] | None = None
-    if repo_type == "local":
-        if not path and address:
-            path = address
-        _ensure(bool(path), 422, "invalid_repository", "local repositories require --path")
+    if repo_type == "smb" and address and (not server or not share):
+        parsed_server, parsed_share = _split_repository_address(repo_type, address)
+        server = server or parsed_server
+        share = share or parsed_share
+    elif repo_type == "local" and not path and address:
+        path = address
+    if is_file_repository({"type": repo_type}):
+        _ensure_appliance_folder(repo_type, path or "")
         local_path = Path(path)
         exists, is_dir, access_error = _stat_operator_path(local_path)
         if access_error is not None:
@@ -2450,7 +2481,11 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
         _ensure(exists, 422, "invalid_repository", f"Path does not exist: {local_path}", path=path)
         _ensure(is_dir, 422, "invalid_repository", f"Path is not a directory: {local_path}", path=path)
         _reject_insecure_local_repository_path(local_path)
-        _ensure_local_repository_share(server, share, username, password)
+        if repo_type == "smb":
+            _ensure_smb_repository_share(server, share, username, password)
+            password = password if username else None
+        else:
+            _refuse_local_repository_share(server, share)
     elif repo_type == "s3":
         s3_config = _normalize_s3_configuration(payload)
         if description and not s3_config.get("description"):
@@ -2467,8 +2502,6 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
         _ensure(bool(server), 422, "invalid_repository", f"{repo_type} repositories require --server")
         _ensure(bool(share), 422, "invalid_repository", f"{repo_type} repositories require --share")
         path = _build_repository_path(repo_type, server, share)
-        if repo_type == "smb":
-            _ensure(bool(username and password), 422, "invalid_repository", "smb repositories require username and password")
     for existing in catalog_records(REPOSITORIES):
         if str(existing.get("name") or "").lower() == name.lower():
             raise api_error(409, "repository_name_exists", "Repository name already exists", name=name)
@@ -2584,28 +2617,34 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         changed = True
     metadata = dict(updated.get("metadata") if isinstance(updated.get("metadata"), dict) else {})
     repo_type = str(updated.get("type") or "")
-    if repo_type == "local":
+    if is_file_repository(updated):
         local_path = None
         if "path" in payload and payload["path"] is not None:
             local_path = str(payload["path"]).strip()
-        elif "address" in payload and payload["address"] is not None:
+        elif repo_type == "local" and "address" in payload and payload["address"] is not None:
             local_path = str(payload["address"]).strip()
         if local_path is not None:
             updated["path"] = local_path
             changed = True
-        _ensure(bool(str(updated.get("path") or "").strip()), 422, "invalid_repository", "local repositories require --path")
+        _ensure_appliance_folder(repo_type, str(updated.get("path") or "").strip())
         if local_path is not None and local_path != original_path:
             _reject_insecure_local_repository_path(Path(local_path))
-        for field_name in ("server", "share"):
-            if field_name in payload and payload[field_name] is not None:
-                metadata[field_name] = str(payload[field_name]).strip() or None
+        if repo_type == "smb":
+            if payload.get("address") is not None and payload.get("server") is None and payload.get("share") is None:
+                metadata["server"], metadata["share"] = _split_repository_address(repo_type, str(payload["address"]))
                 changed = True
-        _ensure_local_repository_share(
-            metadata.get("server"),
-            metadata.get("share"),
-            payload.get("username", metadata.get("username")),
-            payload.get("password", metadata.get("password")),
-        )
+            for field_name in ("server", "share"):
+                if field_name in payload and payload[field_name] is not None:
+                    metadata[field_name] = str(payload[field_name]).strip() or None
+                    changed = True
+            _ensure_smb_repository_share(
+                metadata.get("server"),
+                metadata.get("share"),
+                payload.get("username", metadata.get("username")),
+                payload.get("password", metadata.get("password")),
+            )
+        else:
+            _refuse_local_repository_share(payload.get("server"), payload.get("share"))
     elif repo_type == "s3":
         current_s3 = extract_s3_config(updated)
         next_s3 = _normalize_s3_configuration(payload, existing=current_s3)
@@ -2669,6 +2708,10 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
             value = str(payload[field_name]).strip() if field_name != "password" else str(payload[field_name])
             metadata[field_name] = value or None
             changed = True
+    if repo_type == "smb" and not metadata.get("username"):
+        # Without an account the hosts open the share with the inventory's,
+        # so a password left behind would only be a secret kept for nothing.
+        metadata["password"] = None
     if repo_type != "s3":
         metadata["address"] = updated.get("path")
         updated["metadata"] = metadata
@@ -2820,26 +2863,14 @@ def _verify_local_repository(repository: dict[str, Any], *, whole_chains: bool =
 
 
 def _verify_remote_repository(repository: dict[str, Any]) -> dict[str, Any]:
-    repo_type = str(repository.get("type") or "")
     metadata = repository.get("metadata") if isinstance(repository.get("metadata"), dict) else {}
     server = str(metadata.get("server") or "").strip()
     share = str(metadata.get("share") or "").strip()
-    username = str(metadata.get("username") or "").strip()
-    password = str(metadata.get("password") or "").strip()
     checks = []
-    if repo_type == "nfs":
-        path = str(repository.get("path") or "")
-        if not NFS_PATTERN.fullmatch(path):
-            return {"status": "error", "checks": [{"name": "format", "status": "failed"}], "message": "NFS repositories must use host:/export/path"}
-        checks.append({"name": "format", "status": "ok"})
-    else:
-        path = str(repository.get("path") or "")
-        if not SMB_PATTERN.fullmatch(path):
-            return {"status": "error", "checks": [{"name": "format", "status": "failed"}], "message": "SMB repositories must use //host/share"}
-        checks.append({"name": "format", "status": "ok"})
-        if not username or not password:
-            return {"status": "error", "checks": [*checks, {"name": "credentials", "status": "failed"}], "message": "SMB repositories require credentials"}
-        checks.append({"name": "credentials", "status": "ok"})
+    path = str(repository.get("path") or "")
+    if not NFS_PATTERN.fullmatch(path):
+        return {"status": "error", "checks": [{"name": "format", "status": "failed"}], "message": "NFS repositories must use host:/export/path"}
+    checks.append({"name": "format", "status": "ok"})
     _ensure(bool(server and share), 422, "invalid_repository", "Remote repository metadata is incomplete", repository_id=repository.get("id"))
     try:
         socket.getaddrinfo(server, None)
@@ -3570,7 +3601,7 @@ def test_s3_connection(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _repository_verification_result(repository: dict[str, Any]) -> dict[str, Any]:
     repo_type = str(repository.get("type") or "")
-    if repo_type == "local":
+    if is_file_repository(repository):
         return _verify_local_repository(repository, whole_chains=True)
     if repo_type == "s3":
         return _verify_s3_repository(repository, whole_chains=True)
@@ -3616,7 +3647,7 @@ def _repository_registration_checks(
     record: dict[str, Any], *, create_bucket: bool = False
 ) -> dict[str, Any] | None:
     repo_type = str(record.get("type") or "")
-    if repo_type == "local":
+    if is_file_repository(record):
         return _verify_local_repository(record)
     if repo_type != "s3":
         return None

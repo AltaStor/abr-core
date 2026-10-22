@@ -151,6 +151,7 @@ class S3RepositorySupportTests(unittest.TestCase):
             {
                 "name": "probe-smb",
                 "type": "smb",
+                "path": self._local_repo_path("probe-smb"),
                 "server": "10.255.255.9",
                 "share": "backups",
                 "username": "probe-user",
@@ -169,6 +170,7 @@ class S3RepositorySupportTests(unittest.TestCase):
             {
                 "name": "probe-smb-2",
                 "type": "smb",
+                "path": self._local_repo_path("probe-smb-2"),
                 "server": "10.255.255.9",
                 "share": "backups",
                 "username": "probe-user",

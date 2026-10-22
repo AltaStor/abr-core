@@ -22,6 +22,7 @@ from python.srv.core.mongo_db_wrapper import (
     catalog_records,
     persist_backup,
     persist_job,
+    persist_repository,
     persist_task,
 )
 from python.srv.core.storage_tool import (
@@ -35,6 +36,7 @@ from python.srv.core.storage_tool import (
     remove_disk_tool_backup,
     repository_cache_root,
     safe_path_component,
+    with_smb_type,
 )
 from python.srv.core.utils import utc_now
 from python.srv.services.abr_v41 import (
@@ -620,6 +622,18 @@ def backfill_job_encryption_keys() -> int:
         }
         persist_job(enriched)
         updated += 1
+    return updated
+
+
+def backfill_smb_repository_types() -> int:
+    """Local repositories that name an SMB share become SMB repositories,
+    the type that carries a share now. Answers how many changed."""
+    updated = 0
+    for repository in catalog_records(REPOSITORIES):
+        converted = dict(repository)
+        if with_smb_type(converted):
+            persist_repository(converted)
+            updated += 1
     return updated
 
 

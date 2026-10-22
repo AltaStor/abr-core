@@ -136,6 +136,14 @@ def _validate_create_args(args: argparse.Namespace) -> None:
     if repo_type == "local":
         if not getattr(args, "path", None):
             raise ValueError("local repositories require --path")
+        if getattr(args, "server", None) or getattr(args, "share", None):
+            raise ValueError("local repositories have no SMB share: use --type smb for a folder Hyper-V hosts reach")
+        return
+    if repo_type == "smb":
+        if not getattr(args, "path", None):
+            raise ValueError("smb repositories require --path, the folder this appliance mounts the share at")
+        if not getattr(args, "address", None) and not (getattr(args, "server", None) and getattr(args, "share", None)):
+            raise ValueError("smb repositories require --address \\\\server\\share, or --server and --share")
         return
     if repo_type == "s3":
         s3_payload = _build_s3_payload(args)
@@ -159,8 +167,6 @@ def _validate_create_args(args: argparse.Namespace) -> None:
     share = getattr(args, "share", None)
     if not address and not (server and share):
         raise ValueError(f"{repo_type} repositories require --address or --server and --share")
-    if repo_type == "smb" and (not getattr(args, "username", None) or not getattr(args, "password", None)):
-        raise ValueError("smb repositories require --username and --password")
 
 
 def _validate_edit_args(current: dict[str, object], args: argparse.Namespace) -> None:
@@ -232,10 +238,9 @@ class RepositoryCommands:
                 "and --secret-key VALUE, which show them to every local user.\n\n"
                 "Examples:\n"
                 '  abr repo add --name "Local-Repo-1" --type local --path /mnt/backups/repo1\n'
-                '  abr repo add --name "HV-Local" --type local --path /mnt/backups/hv --server backup01 '
-                '--share hv --username "CORP\\backupsvc"\n'
-                '  abr repo add --name "SMB-Repo" --type smb --address //fileserver/backups '
-                "--username backupsvc\n"
+                '  abr repo add --name "SMB-Repo" --type smb --path /mnt/hv --address \'\\\\fileserver\\hv\' '
+                '--username "CORP\\backupsvc"\n'
+                "  abr repo add --name \"SMB-Repo-2\" --type smb --path /mnt/hv2 --server backup01 --share hv2\n"
                 '  abr repo add --name "S3-Repo" --type s3 --bucket altastor-backups --region us-east-1 '
                 "--access-key AKIA...\n"
                 f'  {REPO_SECRET_KEY_ENV_VAR}=... abr repo add --name "S3-WORM" --type s3 --bucket altastor-objectlock '
@@ -245,17 +250,18 @@ class RepositoryCommands:
         )
         add.add_argument("--name", required=True, help="Repository name")
         add.add_argument("--type", required=True, choices=("local", "nfs", "smb", "s3"), help="Repository type")
-        add.add_argument("--path", help="Local repository path")
-        add.add_argument("--address", help="NFS host:/export or SMB //host/share")
         add.add_argument(
-            "--server",
-            help="Remote repository server; for a local repository, the SMB server Hyper-V hosts reach its folder on",
+            "--path",
+            help="Folder of a local repository, or the folder this appliance mounts an SMB repository's share at",
         )
+        add.add_argument("--address", help="NFS host:/export, or the share of an SMB repository: \\\\server\\share")
+        add.add_argument("--server", help="Remote repository server, or the server of an SMB repository's share")
+        add.add_argument("--share", help="Remote repository share/export, or an SMB repository's share (and folder)")
         add.add_argument(
-            "--share",
-            help="Remote repository share/export; for a local repository, the SMB share (and folder) of --path",
+            "--username",
+            help="Repository username; for an SMB repository, the account Hyper-V hosts open its share with "
+            "(the inventory's when there is none)",
         )
-        add.add_argument("--username", help="Repository username (for a local repository, the SMB share's account)")
         add_secret_argument(add, "--password", env_var=REPO_PASSWORD_ENV_VAR, help_text="Repository password")
         add.add_argument("--description", help="Repository description")
         add.add_argument("--bucket", help="S3 bucket name")
@@ -340,7 +346,7 @@ class RepositoryCommands:
                 "Edit repository settings.\n\n"
                 "Examples:\n"
                 '  abr repo edit --name "Local-Repo-1" --description "Primary on-prem repository"\n'
-                '  abr repo edit --name "Local-Repo-1" --server backup01 --share repo1 --username "CORP\\backupsvc" '
+                '  abr repo edit --name "SMB-Repo" --server backup01 --share repo1 --username "CORP\\backupsvc" '
                 "--password\n"
                 '  abr repo edit --id <repo-id> --new-name "Local-Repo-1-Renamed"\n'
                 '  abr repo edit --name "S3-WORM" --immutable governance --immutability-days 30\n'
@@ -350,15 +356,11 @@ class RepositoryCommands:
         )
         add_name_or_id_selector(edit, name_help="Repository name", id_help="Repository ID")
         edit.add_argument("--new-name", help="Updated repository name")
-        edit.add_argument("--path", help="Updated local repository path")
-        edit.add_argument("--address", help="Updated remote repository address")
-        edit.add_argument(
-            "--server", help="Updated remote repository server, or a local repository's SMB server (\"\" removes it)"
-        )
-        edit.add_argument(
-            "--share", help="Updated remote repository share/export, or a local repository's SMB share (\"\" removes it)"
-        )
-        edit.add_argument("--username", help="Updated repository username")
+        edit.add_argument("--path", help="Updated folder of a local repository, or where an SMB repository's share is mounted")
+        edit.add_argument("--address", help="Updated remote repository address, or an SMB repository's \\\\server\\share")
+        edit.add_argument("--server", help="Updated remote repository server, or the server of an SMB repository's share")
+        edit.add_argument("--share", help="Updated remote repository share/export, or an SMB repository's share")
+        edit.add_argument("--username", help="Updated repository username (\"\" for an SMB repository's share: the inventory's account)")
         add_secret_argument(edit, "--password", env_var=REPO_PASSWORD_ENV_VAR, help_text="Updated repository password")
         edit.add_argument("--description", help="Updated repository description")
         edit.add_argument("--bucket", help="Updated S3 bucket name")
@@ -472,7 +474,7 @@ class RepositoryCommands:
             getattr(args, "password", None),
             env_var=REPO_PASSWORD_ENV_VAR,
             prompt="Repository password",
-            needed=repo_type in {"smb", "local"} and bool(getattr(args, "username", None)),
+            needed=repo_type == "smb" and bool(getattr(args, "username", None)),
         )
         args.secret_key = resolve_secret(
             getattr(args, "secret_key", None),

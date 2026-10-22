@@ -229,6 +229,12 @@ async def lifespan(_: FastAPI):
         JOBS.update(load_jobs())
         REPOSITORIES.clear()
         REPOSITORIES.update(load_repositories())
+        try:
+            typed = backup_catalog.backfill_smb_repository_types()
+            if typed:
+                logger.info("Turned %d local repository(ies) with an SMB share into SMB repositories.", typed)
+        except Exception:
+            logger.exception("SMB repository type backfill failed; continuing startup without it.")
         BACKUPS.clear()
         BACKUPS.update(load_backups())
         try:

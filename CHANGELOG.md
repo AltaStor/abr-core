@@ -31,8 +31,13 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   host, storage and virtual switch mapping. Disks are moved by abr-vhdx-tool
   (the `abr-vhdx-tools` repository) on the Hyper-V host, which the appliance
   deploys there (`ALTASTOR_VHDX_TOOL_PATH`, `ALTASTOR_HYPERV_TOOL_PATH`);
-  Hyper-V jobs need an S3 repository, or a local one shared to the hosts over
-  SMB (`abr repo edit --server --share`). See `doc/HyperVBackup.md`.
+  Hyper-V jobs need an S3 or SMB repository. See `doc/HyperVBackup.md`.
+- SMB repositories (`abr repo add --type smb --path --address`): a share
+  Hyper-V hosts reach, which the appliance mounts at `--path`, with the account
+  the hosts open it with. They take over the SMB share local repositories used
+  to carry; such local repositories become SMB repositories when the server
+  starts or a catalog holding them is imported, and a local repository no
+  longer takes `--server` or `--share`.
 - Hyper-V job option `--guest-consistency`.
 - `abr job retention [--dry-run]` and `POST /api/v1/jobs/{id}/retention`
   apply (or preview) a job's retention across all of its chains and report,

@@ -30,6 +30,7 @@ from .credential_encryption import (
     token_digest,
 )
 from .server_defaults import env_int
+from .storage_tool import with_smb_type
 from .utils import utc_now
 
 HYPERVISORS: dict[str, dict[str, Any]] = {}
@@ -704,6 +705,7 @@ def restore_catalog(snapshot: dict[str, Any]) -> dict[str, int]:
         counts["hypervisors"] = len(snapshot.get("hypervisors") or {})
 
         for repository in (snapshot.get("repositories") or {}).values():
+            with_smb_type(repository)
             persist_repository(repository)
         counts["repositories"] = len(snapshot.get("repositories") or {})
 

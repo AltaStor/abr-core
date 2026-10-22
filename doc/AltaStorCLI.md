@@ -263,8 +263,11 @@ For --type s3: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--
 
 The SMB password comes from ABR_REPO_PASSWORD and the S3 secret key from ABR_REPO_SECRET_KEY, or is asked for interactively. A value typed after --password or --secret-key is still accepted, but every local user can read it (ps, /proc) while the command runs, and it stays in the shell history. 
 
+An smb repository is an SMB share for Hyper-V hosts: --address `\\server\share` (or --server and --share) names it as the hosts reach it, --path is the folder this appliance mounts the same share at, and --username and --password are the account the hosts open it with (the inventory's when there is none). A local repository is a folder of the appliance alone and takes no share. 
+
 Example: 
 abr repo add --name MyLocal --type local --path /mnt/backup 
+abr repo add --name MySmb --type smb --path /mnt/hv --address '\\\\backup01\\hv' --username 'CORP\\backupsvc' --password 
 ABR_REPO_SECRET_KEY='...' abr repo add --name MyWorm --type s3 --bucket altastor-objectlock --region us-east-1 --endpoint-url http://minio.local:9000 --path-style --access-key AKIA... --immutable governance --immutability-days 30 
 
 Note: a local path that is world-writable is refused - its directory mode is the 
@@ -334,7 +337,7 @@ Description: Update repository settings.
 
 abr repo edit --name <name> [--path <path>] [--server <host/ip>] [--share <name>] [--username <user>] [--password [<pass>]] [--description <text>] 
 
-For a local repository, --server and --share name the SMB share Hyper-V hosts reach its folder by, and --username and --password the account that opens it; --server "" --share "" removes the share. 
+For an smb repository, --address or --server and --share change the share Hyper-V hosts reach it by, which it cannot be without, and --username and --password the account that opens it; --username "" leaves that to the inventory's account. A local repository takes no share. 
 
 For an s3 repository: [--bucket <name>] [--prefix <key-prefix>] [--region <region>] [--endpoint-url <url>] [--access-key <key>] [--secret-key [<key>]] [--profile <name>] [--path-style | --virtual-host-style] [--verify-tls | --no-verify-tls] [--immutable <none|governance|compliance>] [--immutability-days <days>] [--immutability-retention <job|minimum>] 
 
@@ -500,7 +503,7 @@ Jobs that already use --active-full-days or --synthetic-full-days keep working: 
 --active-full-days and --synthetic-full-days belong to weekly full schedules only: job create and job edit refuse them, none included, with a daily, monthly or periodic one and leave the job as it was. --active-full-schedule none or --synthetic-full-schedule none turns such a schedule off. 
 A backup of a VMware VM takes its snapshot with quiescing, so VMware Tools flushes the guest and runs its pre-freeze scripts or VSS writers first. --on-quiesce-failure sets what happens when that fails: fail (the default) ends that VM's session as failed, naming the cause the guest reported and where to look (/etc/vmware-tools/backupScripts.d/ on Linux, 'vssadmin list writers' on Windows); crash-consistent takes the snapshot again without quiescing and completes with a warning. Either way the session, abr backup info and abr restore point list show whether each backup is quiesced or crash-consistent, and a crash-consistent backup carries a warning that says why. 
 
-Hyper-V jobs follow the same schedule rules: a full backup, then incrementals from Hyper-V's resilient change tracking, with active and synthetic fulls on their own schedules (see doc/HyperVBackup.md). Their disks are written by abr-vhdx-tool on the Hyper-V host, so their repository must be S3, or a local repository whose folder is shared to the hosts over SMB (abr repo edit --server --share, see doc/HyperVBackup.md); a run against any other repository fails with the reason. One option is Hyper-V only: 
+Hyper-V jobs follow the same schedule rules: a full backup, then incrementals from Hyper-V's resilient change tracking, with active and synthetic fulls on their own schedules (see doc/HyperVBackup.md). Their disks are written by abr-vhdx-tool on the Hyper-V host, so their repository must be S3 or SMB (abr repo add --type smb, see doc/HyperVBackup.md); a run against any other repository fails with the reason. One option is Hyper-V only: 
 • --guest-consistency <application|crash> sets the recovery checkpoint's consistency. application (the default) quiesces a running guest through VSS and, when the guest cannot be quiesced, takes a crash-consistent checkpoint and says so in the session. crash never involves the guest. A VM that is off, saved or paused always gets a crash-consistent checkpoint, which is consistent since nothing runs inside it. 
 
 Example: 
@@ -568,7 +571,7 @@ Notes:
 • A run refused because the chain cannot be merged (no incrementals, a full in the middle, disks that do not match) exits 6, separately from 4 used when a run fails while it is already under way. 
 • Synthetic Full day: a plain `job start` on a job-designated Synthetic Full day runs like the scheduled one - an incremental first, then the synthetic full merging it - so it works on a chain that holds only a full, and the merged full holds today's changes. `--synthetic` still merges the chain as it stands and is refused at once when there is nothing to merge. 
 • Priority notice: If the current day matches both synthetic and active targets in the job parameters, Active Full always takes priority. 
-• Repository capability notice: If today is a job-designated Synthetic Full day, but the target repository does not natively support synthesis, the engine transparently escalates the run execution to an Active Full. nfs and smb repositories are in that group; local and s3 both merge natively. 
+• Repository capability notice: If today is a job-designated Synthetic Full day, but the target repository does not natively support synthesis, the engine transparently escalates the run execution to an Active Full. nfs repositories are in that group; local, smb and s3 all merge natively. 
 • --wait follows the started session's real progress (abr-vmdk-tool's own percent per disk) on stderr as a live bar until it finishes, then prints the final session state; stdout stays clean for scripting either way. When the sessions it starts are all for one VM (the incremental and the synthetic full of a Synthetic Full day), --wait follows them in order and stops at the first one that does not complete. If the job starts sessions for more than one VM, --wait refuses to guess which one to follow and instead prints all of their session IDs so you can watch each with `abr session info --id <id> --watch`. Without --wait, the command returns immediately with the queued session(s), same as before this flag existed. If the followed session does not end completed (failed/stopped/canceled), the command exits with the same non-zero code used elsewhere for an unhealthy state, so `abr job start --wait || alert ...` reacts to the run's real outcome instead of always seeing exit 0. 
 
 SESSION COMMANDS 
