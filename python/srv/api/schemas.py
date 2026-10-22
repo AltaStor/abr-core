@@ -424,6 +424,7 @@ class RepositoryCatalogSummaryDTO(_LenientModel):
 class RestorePointReconcileDTO(_LenientModel):
     checked: DocInt = None
     marked_missing: DocInt = None
+    marked_chain_broken: DocInt = None
     restored: DocInt = None
     unreadable: DocInt = None
 

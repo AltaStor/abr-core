@@ -5460,16 +5460,42 @@ def _point_artifact_locations(point: dict[str, Any]) -> list[tuple[str, str]]:
     return locations
 
 
+POINT_MISSING = "missing"
+POINT_CHAIN_BROKEN = "chain_broken"
+
+
+def _missing_ancestor(point: dict[str, Any], by_id: dict[str, dict[str, Any]], gone: set[str], unknown: set[str]) -> str | None:
+    seen: set[str] = set()
+    parent_id = str(point.get("parent_point_id") or "")
+    while parent_id and parent_id in by_id and parent_id not in seen:
+        if parent_id in gone:
+            return parent_id
+        if parent_id in unknown:
+            return None
+        seen.add(parent_id)
+        parent_id = str(by_id[parent_id].get("parent_point_id") or "")
+    return ""
+
+
 def reconcile_repository_points(repository: dict[str, Any]) -> dict[str, int]:
     repository_id = str(repository.get("id") or "")
     listings: dict[str, set[str] | None] = {}
-    summary = {"checked": 0, "marked_missing": 0, "restored": 0, "unreadable": 0}
-    for record in catalog_records(BACKUPS):
-        point = normalize_backup_point(record)
-        if str(point.get("repository_id") or "") != repository_id:
-            continue
+    summary = {"checked": 0, "marked_missing": 0, "marked_chain_broken": 0, "restored": 0, "unreadable": 0}
+    points = [
+        point
+        for point in (normalize_backup_point(record) for record in catalog_records(BACKUPS))
+        if str(point.get("repository_id") or "") == repository_id
+    ]
+    gone: set[str] = set()
+    unknown: set[str] = set()
+    present: list[dict[str, Any]] = []
+    for point in points:
+        point_id = str(point.get("id") or "")
+        status = str(point.get("status") or "available")
         locations = _point_artifact_locations(point)
         if not locations:
+            if status == POINT_MISSING:
+                gone.add(point_id)
             continue
         summary["checked"] += 1
         absent = False
@@ -5482,21 +5508,47 @@ def reconcile_repository_points(repository: dict[str, Any]) -> dict[str, int]:
                 unreadable = True
             elif backup_name not in names:
                 absent = True
-        status = str(point.get("status") or "available")
         if unreadable:
             summary["unreadable"] += 1
+            unknown.add(point_id)
             continue
-        if absent and status != "missing":
-            point["status"] = "missing"
+        if not absent:
+            present.append(point)
+            continue
+        gone.add(point_id)
+        if status != POINT_MISSING:
+            point["status"] = POINT_MISSING
+            point.pop("missing_ancestor_id", None)
             persist_backup(point)
             summary["marked_missing"] += 1
             LOGGER.warning(
                 "Restore point has no stored data left; marking it missing: point=%s repository=%s",
-                point.get("id"),
+                point_id,
                 repository_id,
             )
-        elif not absent and status == "missing":
+    by_id = {str(point.get("id") or ""): point for point in points}
+    for point in present:
+        status = str(point.get("status") or "available")
+        ancestor = _missing_ancestor(point, by_id, gone, unknown)
+        if ancestor is None:
+            continue
+        if ancestor:
+            if status == POINT_CHAIN_BROKEN and point.get("missing_ancestor_id") == ancestor:
+                continue
+            point["status"] = POINT_CHAIN_BROKEN
+            point["missing_ancestor_id"] = ancestor
+            persist_backup(point)
+            summary["marked_chain_broken"] += 1
+            LOGGER.warning(
+                "Restore point builds on a restore point with no stored data left; marking its chain broken: "
+                "point=%s missing=%s repository=%s",
+                point.get("id"),
+                ancestor,
+                repository_id,
+            )
+        elif status in {POINT_MISSING, POINT_CHAIN_BROKEN}:
             point["status"] = "available"
+            point.pop("missing_ancestor_id", None)
             persist_backup(point)
             summary["restored"] += 1
     return summary
@@ -6310,7 +6362,7 @@ def _normalize_backup_health(value: Any) -> str:
         return "valid"
     if normalized in {"warning", "degraded"}:
         return "warning"
-    if normalized in {"missing", "deleted", "failed", "corrupt", "invalid", "error", "unavailable"}:
+    if normalized in {"missing", "chain_broken", "deleted", "failed", "corrupt", "invalid", "error", "unavailable"}:
         return "invalid"
     return "unknown"
 
@@ -9244,13 +9296,21 @@ def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
 def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     point = _resolve_restore_source_point(payload)
     point_id = str(point.get("id") or "")
+    missing_ancestor = str(point.get("missing_ancestor_id") or "") if point.get("status") == POINT_CHAIN_BROKEN else ""
     _ensure(
         _restore_point_is_available(point),
         409,
         "restore_point_unavailable",
-        "Restore point is not available for restore",
+        (
+            f"Restore point is not available for restore: it builds on restore point {missing_ancestor}, whose data "
+            "repo rescan found missing from the repository. Bring that data back and run repo rescan again, or "
+            "restore an earlier point"
+        )
+        if missing_ancestor
+        else "Restore point is not available for restore",
         point_id=point_id,
         status=point.get("status"),
+        **({"missing_point_id": missing_ancestor} if missing_ancestor else {}),
     )
 
     request = _normalize_restore_request_payload(payload, point)

@@ -357,7 +357,7 @@ abr repo remove --name <name> [--id <id>]
 
 abr repo rescan 
 
-Description: Refresh repository metadata and catalog state. 
+Description: Refresh repository metadata and catalog state. A restore point whose stored data is gone is marked `missing`, and every restore point that builds on it is marked `chain_broken`; restore start refuses both. Once the data is back, the next rescan marks them `available` again. 
 
 abr repo rescan --name <name> [--id <id>] 
 
