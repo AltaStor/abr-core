@@ -16,12 +16,16 @@ logger = logging.getLogger(__name__)
 
 
 def _refresh_backup_decision(task: dict[str, object]) -> dict[str, object]:
-    from python.srv.services.abr_v41 import bind_backup_parent, refresh_queued_backup_decision
+    from python.srv.services.abr_v41 import bind_backup_parent, note_vm_reassignment, refresh_queued_backup_decision
 
     try:
         task = refresh_queued_backup_decision(task)
     except Exception:
         logger.exception("Could not re-check the backup type of task '%s' at start; it runs as queued", task.get("id"))
+    try:
+        task = note_vm_reassignment(task)
+    except Exception:
+        logger.exception("Could not check whether task '%s' backs up a VM its job was moved to", task.get("id"))
     try:
         return bind_backup_parent(task)
     except Exception:

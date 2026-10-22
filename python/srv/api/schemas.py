@@ -347,6 +347,7 @@ class JobDTO(_LenientModel):
     next_incremental_run_at: str | None = None
     last_run_at: str | None = None
     clock_anomalies: DocObjectArray = None
+    vm_reassignments: DocObjectArray = None
     last_session_id: str | None = None
     last_run: JobRunDTO | None = None
     active_sessions: DocObjectArray = None

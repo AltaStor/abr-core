@@ -452,7 +452,7 @@ abr inventory remove --name <name> [--id <id>]
 
 abr inventory rescan 
 
-Description: Refresh the discovered object catalog. 
+Description: Refresh the discovered object catalog. A job keeps its VM by ID, whatever the VM is called now. Only when a job's VM is gone from the inventory and another VM carries its name does the rescan move the job to that VM; abr job info then shows the move as a warning, and so does the next backup session of that VM. 
 
 abr inventory rescan --name <name> [--id <id>] 
 
