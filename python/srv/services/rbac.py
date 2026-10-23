@@ -70,7 +70,8 @@ FUNCTIONS: tuple[Function, ...] = (
     _f("auth.logout", "Sign out", SELF_SERVICE),
     _f("auth.whoami", "Show the signed-in user, role and permissions", READ),
     _f("auth.change_password", "Change one's own password", SELF_SERVICE),
-    _f("auth.extend_session", "Change the current web session's duration", SELF_SERVICE),
+    _f("auth.extend_session", "Change the current web session's inactivity timeout", SELF_SERVICE),
+    _f("auth.touch_session", "Keep the current session alive after a user action", SELF_SERVICE),
     _f("dashboard.view", "View the dashboard summary", READ),
     _f("system.view", "View version, appliance information and health", READ),
     _f("system.logs", "Read the appliance's server log", READ),
@@ -154,6 +155,7 @@ _EVERY_ROLE = (
     "auth.whoami",
     "auth.change_password",
     "auth.extend_session",
+    "auth.touch_session",
     "dashboard.view",
     "system.view",
 )

@@ -18,6 +18,7 @@ EXPECTED_MATRIX = {
     "auth.whoami": "ABORU",
     "auth.change_password": "ABORU",
     "auth.extend_session": "ABORU",
+    "auth.touch_session": "ABORU",
     "dashboard.view": "ABORU",
     "system.view": "ABORU",
     "system.logs": "ABU",

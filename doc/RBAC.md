@@ -48,6 +48,7 @@ other role is allowed exactly what it lists.
 | `auth.whoami` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `auth.change_password` | self-service | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `auth.extend_session` | self-service | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `auth.touch_session` | self-service | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `dashboard.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `system.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `system.logs` | read | ✓ | ✓ | – | – | ✓ |
@@ -167,7 +168,8 @@ name in the parameters, and in any text that reads like one (`password=...`,
 
 Reads that a client repeats on its own are not recorded: the Web UI's
 background refresh and the CLI's progress polling send `X-ABR-Refresh: 1`. Such
-a read is still recorded when it is denied, and every action is recorded.
+a read is still recorded when it is denied, and every action is recorded. The
+Web UI's keep-alive (`auth.touch_session`) is not recorded either.
 
 Records are stored in the catalog's `audit` collection (in memory when the
 server runs without MongoDB), and each one is also written as a line to the

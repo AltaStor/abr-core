@@ -63,6 +63,10 @@ def web_session_ttl_max_seconds() -> int:
     return env_int("ABR_WEB_SESSION_MAX_SECONDS")
 
 
+def web_session_lifetime_seconds() -> int:
+    return env_int("ABR_WEB_SESSION_LIFETIME_SECONDS", minimum=0)
+
+
 def login_max_attempts() -> int:
     return env_int("ABR_LOGIN_MAX_ATTEMPTS")
 
@@ -386,35 +390,26 @@ def login(
     client = "web" if client_type == "web" else "cli"
 
     if client == "web" and duration_seconds is not None:
-        minimum, maximum = web_session_ttl_min_seconds(), web_session_ttl_max_seconds()
-        if not isinstance(duration_seconds, int) or not (minimum <= duration_seconds <= maximum):
-            raise api_error(
-                422,
-                "invalid_session_duration",
-                f"Session duration must be between {minimum} and {maximum} seconds.",
-            )
+        _ensure_web_session_duration(duration_seconds)
 
     now = _now_dt()
-    ttl = session_ttl_seconds()
-    expires_at = (now + timedelta(seconds=ttl)).isoformat()
     token = secrets.token_urlsafe(32)
     session = {
         "token": token,
         "user_id": user["id"],
-        "expires_at": expires_at,
+        "expires_at": (now + timedelta(seconds=session_ttl_seconds())).isoformat(),
         "created_at": utc_now(),
         "client": client,
     }
-    reported_expires_at = expires_at
     if client == "web":
-        web_ttl = duration_seconds if duration_seconds is not None else web_session_ttl_seconds()
-        absolute_expires_at = (now + timedelta(seconds=web_ttl)).isoformat()
-        session["absolute_expires_at"] = absolute_expires_at
-        reported_expires_at = absolute_expires_at
+        lifetime = web_session_lifetime_seconds()
+        session["idle_timeout_seconds"] = duration_seconds if duration_seconds is not None else web_session_ttl_seconds()
+        session["absolute_expires_at"] = (now + timedelta(seconds=lifetime)).isoformat() if lifetime else None
+        session["expires_at"] = _renewed_expiry(session, now).isoformat()
     persist_session(session)
     return {
         "token": token,
-        "expires_at": reported_expires_at,
+        **_session_expiry(session),
         "user": _public_user(user),
         "permissions": rbac.allowed_functions(user["role"]),
     }
@@ -430,17 +425,7 @@ def whoami(user_id: str) -> dict[str, Any]:
     }
 
 
-def extend_session(token: str, duration_seconds: int) -> dict[str, Any]:
-    """Adjust the current web session's absolute expiry in place (the
-    Settings -> Security token-lifetime slider) -- takes effect immediately
-    rather than waiting for the next login. CLI sessions have no adjustable
-    duration and are rejected."""
-    session = get_session(token)
-    if session is None:
-        raise api_error(401, "unauthorized", "Missing, invalid, or expired session token.")
-    if str(session.get("client") or "") != "web":
-        raise api_error(400, "session_not_extendable", "Only web sessions support an adjustable duration.")
-
+def _ensure_web_session_duration(duration_seconds: Any) -> None:
     minimum, maximum = web_session_ttl_min_seconds(), web_session_ttl_max_seconds()
     if not isinstance(duration_seconds, int) or not (minimum <= duration_seconds <= maximum):
         raise api_error(
@@ -449,14 +434,44 @@ def extend_session(token: str, duration_seconds: int) -> dict[str, Any]:
             f"Session duration must be between {minimum} and {maximum} seconds.",
         )
 
-    now = _now_dt()
-    absolute_expires_at = now + timedelta(seconds=duration_seconds)
-    expires_at = min(now + timedelta(seconds=session_ttl_seconds()), absolute_expires_at)
-    renew_session(
-        token,
-        {"expires_at": expires_at.isoformat(), "absolute_expires_at": absolute_expires_at.isoformat()},
-    )
-    return {"expires_at": absolute_expires_at.isoformat()}
+
+def _renewed_expiry(session: dict[str, Any], now: datetime) -> datetime:
+    if str(session.get("client") or "") == "web":
+        idle = session.get("idle_timeout_seconds")
+        expiry = now + timedelta(seconds=idle if isinstance(idle, int) and idle > 0 else web_session_ttl_seconds())
+    else:
+        expiry = now + timedelta(seconds=session_ttl_seconds())
+    absolute_expires_at = _parse_dt(session.get("absolute_expires_at"))
+    return min(expiry, absolute_expires_at) if absolute_expires_at is not None else expiry
+
+
+def _session_expiry(session: dict[str, Any]) -> dict[str, Any]:
+    return {"expires_at": session.get("expires_at"), "absolute_expires_at": session.get("absolute_expires_at")}
+
+
+def _live_session(token: str) -> dict[str, Any]:
+    session = get_session(token)
+    if session is None:
+        raise api_error(401, "unauthorized", "Missing, invalid, or expired session token.")
+    return session
+
+
+def extend_session(token: str, duration_seconds: int) -> dict[str, Any]:
+    session = _live_session(token)
+    if str(session.get("client") or "") != "web":
+        raise api_error(400, "session_not_extendable", "Only web sessions support an adjustable duration.")
+    _ensure_web_session_duration(duration_seconds)
+    updated = {**session, "idle_timeout_seconds": duration_seconds}
+    updated["expires_at"] = _renewed_expiry(updated, _now_dt()).isoformat()
+    renew_session(token, {"idle_timeout_seconds": duration_seconds, "expires_at": updated["expires_at"]})
+    return _session_expiry(updated)
+
+
+def touch_session(token: str) -> dict[str, Any]:
+    session = _live_session(token)
+    updated = {**session, "expires_at": _renewed_expiry(session, _now_dt()).isoformat()}
+    renew_session(token, {"expires_at": updated["expires_at"]})
+    return _session_expiry(updated)
 
 
 def logout(token: str) -> None:
@@ -486,7 +501,7 @@ def _renew_session_in_background(token: str, fields: dict[str, Any]) -> None:
     threading.Thread(target=_run, name="session-renewal", daemon=True).start()
 
 
-def authenticate(token: str | None) -> dict[str, Any] | None:
+def authenticate(token: str | None, *, background: bool = False) -> dict[str, Any] | None:
     if not token:
         return None
     session = get_session(token)
@@ -506,11 +521,8 @@ def authenticate(token: str | None) -> dict[str, Any] | None:
         _session_write_best_effort(lambda: delete_session(token), "a disabled user's session removal")
         return None
 
-    new_expiry = _now_dt() + timedelta(seconds=session_ttl_seconds())
-    absolute_expires_at = _parse_dt(session.get("absolute_expires_at"))
-    if absolute_expires_at is not None:
-        new_expiry = min(new_expiry, absolute_expires_at)
-    _renew_session_in_background(token, {"expires_at": new_expiry.isoformat()})
+    if not (background and str(session.get("client") or "") == "web" and "idle_timeout_seconds" in session):
+        _renew_session_in_background(token, {"expires_at": _renewed_expiry(session, _now_dt()).isoformat()})
 
     return {"token": token, "user_id": user["id"], "user_name": user["name"], "role": user.get("role")}
 
