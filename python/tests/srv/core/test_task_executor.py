@@ -8826,6 +8826,54 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertIn("Disk backup failed for [datastore1] demo-vm/demo-vm.vmdk", message)
         self.assertNotIn("while this backup ran", message)
 
+    def _backup_whose_data_mover_ends(self, returncode: int, stderr: str) -> tuple[str, list, list[str]]:
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            self._write_abr_artifacts(command)
+            return FakeCompletedProcess(returncode=returncode, stderr=stderr)
+
+        with patch.object(
+            FakeVCenterNode, "server_time", create=True, return_value=datetime(2026, 10, 9, tzinfo=timezone.utc)
+        ), patch.object(FakeVCenterNode, "vm_changes_since", create=True, return_value=[]), self.assertLogs(
+            "python.srv.plugins.vcenter.vcenter_backup", level="ERROR"
+        ) as logs:
+            result, leftovers = self._run_stopped_backup(fake_run)
+        self.assertEqual(result["status"], "failed")
+        return str((result.get("result") or {}).get("message") or ""), leftovers, logs.output
+
+    def test_a_data_mover_killed_mid_backup_is_reported_as_killed(self) -> None:
+        message, leftovers, logs = self._backup_whose_data_mover_ends(
+            -9, "Disk '[datastore1] demo-vm/demo-vm.vmdk' opened using transport mode 'nbd'\n"
+        )
+
+        self.assertEqual(
+            message,
+            "Disk backup failed for [datastore1] demo-vm/demo-vm.vmdk: the data mover ended unexpectedly: "
+            "abr-vmdk-tool was terminated by signal 9 (SIGKILL) (SIGKILL usually comes from the kernel's "
+            "out-of-memory killer; journalctl -k on the backup server shows it). Its last output: "
+            "Disk '[datastore1] demo-vm/demo-vm.vmdk' opened using transport mode 'nbd'",
+        )
+        self.assertEqual(leftovers, [])
+        self.assertTrue(any("terminated by signal 9 (SIGKILL)" in line for line in logs))
+
+    def test_a_data_mover_that_exits_without_saying_why_is_reported_with_its_exit_code(self) -> None:
+        message, _leftovers, logs = self._backup_whose_data_mover_ends(3, "Disk '[datastore1] x.vmdk' opened using transport mode 'nbd'")
+
+        self.assertIn("the data mover ended unexpectedly: abr-vmdk-tool exited with code 3. Its last output: Disk", message)
+        self.assertNotIn("out-of-memory", message)
+        self.assertTrue(any("abr-vmdk-tool exited with code 3" in line for line in logs))
+
+    def test_a_data_mover_that_reports_its_own_error_keeps_that_error_as_the_cause(self) -> None:
+        message, _leftovers, logs = self._backup_whose_data_mover_ends(
+            7, "Error: failed to open disk '[datastore1] demo-vm/demo-vm.vmdk': Unknown error"
+        )
+
+        self.assertEqual(
+            message,
+            "Disk backup failed for [datastore1] demo-vm/demo-vm.vmdk: "
+            "Error: failed to open disk '[datastore1] demo-vm/demo-vm.vmdk': Unknown error",
+        )
+        self.assertTrue(any("(abr-vmdk-tool exited with code 7)" in line for line in logs))
+
     def test_without_the_vcenter_time_the_failure_is_not_explained_by_guesswork(self) -> None:
         with patch.object(FakeVCenterNode, "vm_changes_since", create=True) as asked:
             result, _leftovers = self._run_stopped_backup(self._failed_disk_open)

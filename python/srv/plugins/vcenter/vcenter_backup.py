@@ -8,13 +8,14 @@ import re
 import json
 import logging
 import shutil
+import signal
 import time
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from ...core.subprocess_util import DataPathStalled, ProcessCancelled, run_capped
+from ...core.subprocess_util import DataPathStalled, ProcessCancelled, describe_process_end, run_capped
 from ...core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV
 from ...core.server_defaults import env_int
 from ...core.task_executor import TaskStopRequested, cancel_requested
@@ -1230,6 +1231,14 @@ def _direct_host_access_refused_message(datastore_path: str, host: str) -> str:
 _WRITE_FAILURE = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _NO_SPACE = re.compile(r"no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _CONNECTION_LOST = re.compile(r"refused connection|connection (?:was )?(?:reset|lost|timed out)|NBD_ERR_NETWORK", re.IGNORECASE)
+_TOOL_REPORTED_FAILURE = re.compile(
+    r"error|fail|refused|denied|cannot|unable|not found|invalid|no space|not enough space|disk full|ENOSPC|NBD_ERR",
+    re.IGNORECASE,
+)
+DATA_MOVER = "abr-vmdk-tool"
+OUT_OF_MEMORY_HINT = (
+    "SIGKILL usually comes from the kernel's out-of-memory killer; journalctl -k on the backup server shows it"
+)
 
 
 def _repository_free_bytes(repository: dict[str, Any] | None) -> int | None:
@@ -1286,6 +1295,26 @@ def _vm_changes_message(vm_name: str, changes: list[tuple[str, str, Any]], failu
         )
         return f"VM '{vm_name}' was {described} while this backup ran, so {consequence}."
     return f"VM '{vm_name}' was {described} while this backup ran. {failure}"
+
+
+def _unexpected_data_mover_end(completed: Any) -> str | None:
+    returncode = int(completed.returncode)
+    output = (completed.stderr or completed.stdout or "").strip()
+    if returncode > 0 and _TOOL_REPORTED_FAILURE.search(output):
+        return None
+    last_line = next((line.strip() for line in reversed(output.splitlines()) if line.strip()), "")
+    message = f"the data mover ended unexpectedly: {describe_process_end(DATA_MOVER, returncode)}"
+    if returncode == -signal.SIGKILL:
+        message += f" ({OUT_OF_MEMORY_HINT})"
+    return message + (f". Its last output: {last_line}" if last_line else ". It printed nothing")
+
+
+def _disk_tool_failure(completed: Any, repository: dict[str, Any] | None, **context: Any) -> str:
+    unexpected = _unexpected_data_mover_end(completed)
+    if unexpected is not None:
+        return unexpected
+    output = (completed.stderr or completed.stdout or "").strip()
+    return _disk_failure_message(repository, output or f"exit code {completed.returncode}", **context)
 
 
 def _disk_failure_message(
@@ -2373,13 +2402,12 @@ def run_vcenter_backup(
                             )
                             disk_tool_stdout = completed.stdout or ""
                             if completed.returncode != 0:
-                                stderr = (completed.stderr or completed.stdout or "").strip()
                                 raise VCenterBackupError(
                                     f"Full disk backup failed for {datastore_path} while "
                                     "recovering from a missing CBT change ID: "
-                                    + _disk_failure_message(
+                                    + _disk_tool_failure(
+                                        completed,
                                         repository,
-                                        stderr or f"exit code {completed.returncode}",
                                         needed_bytes=full_disk_bytes,
                                         needed_is_disk_size=True,
                                         free_before=free_before_disk,
@@ -2452,8 +2480,6 @@ def run_vcenter_backup(
                             )
                             disk_tool_stdout = completed.stdout or ""
                             if completed.returncode != 0:
-                                stderr = (completed.stderr or completed.stdout or "").strip()
-
                                 diagnostic_path = final_destination_path.with_suffix(
                                     final_destination_path.suffix + ".diagnostics.json"
                                 )
@@ -2494,9 +2520,9 @@ def run_vcenter_backup(
                                 if not incremental_fallback_full and not incremental_fallback_metadata:
                                     raise VCenterBackupError(
                                         f"Incremental disk backup failed for {datastore_path}: "
-                                        + _disk_failure_message(
+                                        + _disk_tool_failure(
+                                            completed,
                                             repository,
-                                            stderr or f"exit code {completed.returncode}",
                                             needed_bytes=changed_bytes,
                                             needed_is_disk_size=False,
                                             free_before=free_before_disk,
@@ -2568,12 +2594,14 @@ def run_vcenter_backup(
                                     )
                                     disk_tool_stdout = fallback_completed.stdout or ""
                                     if fallback_completed.returncode != 0:
-                                        fallback_stderr = (
-                                            fallback_completed.stderr
-                                            or fallback_completed.stdout
-                                            or ""
-                                        ).strip()
-                                        fallback_error = fallback_stderr or f"exit code {fallback_completed.returncode}"
+                                        fallback_error = _disk_tool_failure(
+                                            fallback_completed,
+                                            repository,
+                                            needed_bytes=full_disk_bytes,
+                                            needed_is_disk_size=True,
+                                            free_before=free_before_disk,
+                                            data_host=data_host,
+                                        )
                                     else:
                                         incremental_full_fallback_used = True
 
@@ -2582,27 +2610,16 @@ def run_vcenter_backup(
                                         raise VCenterBackupError(
                                             "Incremental disk backup failed for "
                                             f"{datastore_path}: "
-                                            + _disk_failure_message(
+                                            + _disk_tool_failure(
+                                                completed,
                                                 repository,
-                                                stderr or f"exit code {completed.returncode}",
                                                 needed_bytes=changed_bytes,
                                                 needed_is_disk_size=False,
                                                 free_before=free_before_disk,
                                                 data_host=data_host,
                                             )
                                             + ". Full fallback also failed: "
-                                            + (
-                                                _disk_failure_message(
-                                                    repository,
-                                                    fallback_error,
-                                                    needed_bytes=full_disk_bytes,
-                                                    needed_is_disk_size=True,
-                                                    free_before=free_before_disk,
-                                                    data_host=data_host,
-                                                )
-                                                if fallback_error
-                                                else "not attempted"
-                                            )
+                                            + (fallback_error or "not attempted")
                                         )
                                     incremental_metadata_fallback_used = True
                                     disk_store_mode = "metadata-fallback"
@@ -3016,25 +3033,23 @@ def run_vcenter_backup(
                                 if value.strip()
                             )
                     if completed.returncode != 0:
-                        stderr = (completed.stderr or completed.stdout or "").strip()
+                        failure = _disk_tool_failure(
+                            completed,
+                            repository,
+                            needed_bytes=disk_total_bytes,
+                            needed_is_disk_size=True,
+                            free_before=free_before_disk,
+                            data_host=data_host,
+                        )
                         logger.error(
-                            "Disk backup failed for %s: %s",
+                            "Disk backup failed for %s: %s (%s)",
                             datastore_path,
-                            stderr or f"exit code {completed.returncode}",
+                            failure,
+                            describe_process_end(DATA_MOVER, completed.returncode),
                         )
                         if direct_host_refused:
                             raise VCenterBackupError(_direct_host_access_refused_message(datastore_path, host))
-                        raise VCenterBackupError(
-                            f"Disk backup failed for {datastore_path}: "
-                            + _disk_failure_message(
-                                repository,
-                                stderr or f"exit code {completed.returncode}",
-                                needed_bytes=disk_total_bytes,
-                                needed_is_disk_size=True,
-                                free_before=free_before_disk,
-                                data_host=data_host,
-                            )
-                        )
+                        raise VCenterBackupError(f"Disk backup failed for {datastore_path}: {failure}")
 
                     disk_duration = time.time() - disk_start_time
                     logger.info("Successfully backed up disk %d in %.2f seconds.", index, disk_duration)
