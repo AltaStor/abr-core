@@ -5,14 +5,22 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from .mongo_db_wrapper import TASKS, TASK_LOCK, claim_task, load_queued_tasks, persist_task
-from ..services.backup_catalog import register_backup_from_completed_task
+from ..services.backup_catalog import discard_unregistered_output, register_backup_from_completed_task
 from .task_executor import TaskStopRequested, run_task
 from .utils import utc_now
 
 logger = logging.getLogger(__name__)
+
+CATALOG_UNAVAILABLE = "catalog_unavailable"
+UNRECORDED_RETRY_SECONDS = 30
+
+
+def _catalog_unavailable(exc: BaseException) -> bool:
+    return getattr(exc, "code", None) == CATALOG_UNAVAILABLE
 
 
 def _refresh_backup_decision(task: dict[str, object]) -> dict[str, object]:
@@ -85,6 +93,10 @@ class TaskProcessPool:
         self._futures_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._poller: threading.Thread | None = None
+        self._unrecorded: set[str] = set()
+        self._unrecorded_lock = threading.Lock()
+        self._unrecorded_retry_at = 0.0
+        self._unrecorded_retry: threading.Thread | None = None
 
     def start(self) -> None:
         if self._executor is not None:
@@ -130,6 +142,10 @@ class TaskProcessPool:
                 self._dispatch_available_work()
             except Exception as exc:
                 logger.exception("Unexpected error in poll loop: %s", exc)
+            try:
+                self._retry_unrecorded_outcomes()
+            except Exception as exc:
+                logger.exception("Could not start recording the outcomes left unrecorded: %s", exc)
             finally:
                 self._stop_event.wait(self._poll_interval_seconds)
         logger.debug("Task poller thread exiting.")
@@ -312,10 +328,11 @@ class TaskProcessPool:
             if result.get("progress") is None:
                 previous_result = task.get("result") if isinstance(task.get("result"), dict) else {}
                 result["progress"] = 100 if final_status == "completed" else previous_result.get("progress")
-            task["status"] = final_status
-            task["result"] = result
-            task["updated_at"] = outcome["updated_at"]
-            logs = task.get("logs") if isinstance(task.get("logs"), list) else []
+            finished = dict(task)
+            finished["status"] = final_status
+            finished["result"] = result
+            finished["updated_at"] = outcome["updated_at"]
+            logs = list(task.get("logs") if isinstance(task.get("logs"), list) else [])
             logs.append(
                 {
                     "timestamp": utc_now(),
@@ -324,14 +341,91 @@ class TaskProcessPool:
                     "message": str(result.get("message") or f"Task {final_status}"),
                 }
             )
-            task["logs"] = logs
+            finished["logs"] = logs
+            unrecorded_backup = None
             try:
-                persist_task(dict(task))
-                created_point = register_backup_from_completed_task(task)
-                if isinstance(created_point, dict) and isinstance(task.get("result"), dict):
-                    task["result"]["restore_point_id"] = created_point.get("id")
-                    task["result"]["backup_id"] = created_point.get("chain_id")
-                if created_point or task.get("warnings"):
-                    persist_task(dict(task))
+                persist_task(dict(finished))
+                created_point = register_backup_from_completed_task(finished)
+                if isinstance(created_point, dict):
+                    result["restore_point_id"] = created_point.get("id")
+                    result["backup_id"] = created_point.get("chain_id")
+                if created_point or finished.get("warnings"):
+                    persist_task(dict(finished))
             except Exception as exc:
                 logger.error("Failed to persist final outcome for task '%s': %s", task_id, exc)
+                if _catalog_unavailable(exc) and finished.get("task_type") == "backup":
+                    with self._unrecorded_lock:
+                        self._unrecorded.add(task_id)
+                    if final_status == "completed" and not result.get("restore_point_id"):
+                        unrecorded_backup = finished
+            if unrecorded_backup is None:
+                TASKS[task_id] = finished
+        if unrecorded_backup is not None:
+            self._fail_unrecorded_backup(task_id, unrecorded_backup)
+
+    def _fail_unrecorded_backup(self, task_id: str, snapshot: dict[str, object]) -> None:
+        removed = False
+        try:
+            removed = discard_unregistered_output(snapshot)
+        except Exception:
+            logger.exception("Could not remove the data of backup task '%s', whose outcome was not recorded", task_id)
+        parameters = snapshot.get("parameters") if isinstance(snapshot.get("parameters"), dict) else {}
+        vm_name = parameters.get("vm_name") or snapshot.get("resource_external_id") or "the VM"
+        message = (
+            f"The backup of {vm_name} ran to the end, but its restore point could not be recorded because the "
+            "catalog database is unavailable; "
+            + ("its data was removed from the repository" if removed else "its data stays in the repository until it is removed by hand")
+            + ". Run the job again once the database is back"
+        )
+        logger.error("Backup task '%s' failed: %s", task_id, message)
+        failed = dict(snapshot)
+        result = dict(snapshot.get("result") if isinstance(snapshot.get("result"), dict) else {})
+        result.update({"message": message, "failure_kind": CATALOG_UNAVAILABLE})
+        failed["status"] = "failed"
+        failed["result"] = result
+        failed["updated_at"] = utc_now()
+        logs = list(snapshot.get("logs") if isinstance(snapshot.get("logs"), list) else [])
+        logs.append({"timestamp": utc_now(), "level": "error", "component": "engine", "message": message})
+        failed["logs"] = logs
+        with TASK_LOCK:
+            if task_id not in TASKS:
+                return
+            TASKS[task_id] = failed
+            record = dict(failed)
+        try:
+            persist_task(record)
+        except Exception:
+            return
+        with self._unrecorded_lock:
+            self._unrecorded.discard(task_id)
+
+    def _retry_unrecorded_outcomes(self) -> None:
+        with self._unrecorded_lock:
+            if not self._unrecorded:
+                return
+        now = time.monotonic()
+        if now < self._unrecorded_retry_at:
+            return
+        if self._unrecorded_retry is not None and self._unrecorded_retry.is_alive():
+            return
+        self._unrecorded_retry_at = now + UNRECORDED_RETRY_SECONDS
+        self._unrecorded_retry = threading.Thread(
+            target=self._record_unrecorded_outcomes, name="unrecorded-outcomes", daemon=True
+        )
+        self._unrecorded_retry.start()
+
+    def _record_unrecorded_outcomes(self) -> None:
+        with self._unrecorded_lock:
+            pending = sorted(self._unrecorded)
+        for task_id in pending:
+            with TASK_LOCK:
+                task = TASKS.get(task_id)
+                record = dict(task) if task is not None else None
+            if record is not None:
+                try:
+                    persist_task(record)
+                except Exception:
+                    return
+                logger.info("Recorded the outcome of task '%s' now that the catalog database answers again.", task_id)
+            with self._unrecorded_lock:
+                self._unrecorded.discard(task_id)

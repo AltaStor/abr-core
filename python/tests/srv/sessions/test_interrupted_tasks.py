@@ -67,6 +67,10 @@ class FakeNode:
         return self.lock_held
 
 
+def _removed_names(remove_mock) -> list[str]:
+    return [call.args[2] for call in remove_mock.call_args_list]
+
+
 class SweepTestCase(unittest.TestCase):
     def setUp(self) -> None:
         for store in (BACKUPS, HYPERVISORS, REPOSITORIES, TASKS):
@@ -118,8 +122,37 @@ class InterruptedTaskReconciliationTests(SweepTestCase):
         self.assertEqual(TASKS["task-a"]["result"]["failure_kind"], "interrupted")
         self.assertIn("server stopped", TASKS["task-a"]["result"]["message"])
         self.assertTrue(TASKS["task-a"]["result"]["finished_at"])
-        self.assertEqual(remove_mock.call_count, 1)
-        self.assertEqual(remove_mock.call_args.args[2], "01-disk.vmdk")
+        self.assertEqual(_removed_names(remove_mock), ["01-disk.vmdk", "manifest"])
+
+    @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value={"01-disk.vmdk"})
+    def test_the_manifests_go_with_the_data_and_the_folder_with_them(self, list_mock) -> None:
+        TASKS["task-m"] = _task("task-m", "running")
+        folder = self._output_dir("task-m")
+        (folder / "manifest.json").write_text("{}")
+        (folder / "manifest.abrm").write_bytes(b"meta")
+
+        def tool_remove(repository, abr_path, name, timeout=None):
+            for path in pathlib.Path(abr_path).glob(f"{name}*"):
+                path.unlink()
+
+        with patch("python.srv.services.backup_catalog.remove_disk_tool_backup", side_effect=tool_remove):
+            backup_catalog.fail_interrupted_tasks()
+
+        self.assertFalse(folder.exists())
+
+    def test_discarding_reports_whether_everything_went(self) -> None:
+        task = _task("task-r", "running")
+        self._output_dir("task-r")
+        with patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value={"01-disk.vmdk"}), patch(
+            "python.srv.services.backup_catalog.remove_disk_tool_backup"
+        ):
+            self.assertTrue(backup_catalog.discard_unregistered_output(task))
+        with patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value={"01-disk.vmdk"}), patch(
+            "python.srv.services.backup_catalog.remove_disk_tool_backup", side_effect=RuntimeError("busy")
+        ):
+            self.assertFalse(backup_catalog.discard_unregistered_output(task))
+        with patch("python.srv.services.backup_catalog.list_disk_tool_backups", side_effect=RuntimeError("cannot list")):
+            self.assertFalse(backup_catalog.discard_unregistered_output(task))
 
     @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
     @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value=set())
@@ -193,7 +226,8 @@ class InterruptedTaskReconciliationTests(SweepTestCase):
 
         self.assertEqual(abandoned, 1)
         self.assertEqual(TASKS["task-e"]["status"], "failed")
-        self.assertEqual(remove_mock.call_count, 2)
+        self.assertEqual(len(_removed_names(remove_mock)), 3)
+        self.assertEqual(_removed_names(remove_mock)[-1], "manifest")
 
     def test_a_slow_sweep_does_not_hold_up_the_caller(self) -> None:
         self._sweep_now.side_effect = self._real_sweep_spawn
@@ -247,7 +281,7 @@ class InterruptedBackupSnapshotTests(SweepTestCase):
         self.assertEqual(TASKS["task-s1"]["status"], "failed")
         self.assertEqual(TASKS["task-s1"]["result"]["failure_kind"], "interrupted")
         self.assertNotIn("backup_snapshot", TASKS["task-s1"]["result"])
-        self.assertEqual(remove_mock.call_count, 1)
+        self.assertEqual(_removed_names(remove_mock), ["01-disk.vmdk", "manifest"])
 
     @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
     @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value={"01-disk.vmdk"})
@@ -301,7 +335,7 @@ class InterruptedBackupSnapshotTests(SweepTestCase):
             TASKS["task-s2"]["result"]["backup_snapshot"],
             {"vm_name": "web01", "name": "FullBackup_1790942477"},
         )
-        self.assertEqual(remove_mock.call_count, 1)
+        self.assertEqual(_removed_names(remove_mock), ["01-disk.vmdk", "manifest"])
         self.assertEqual(
             backup_catalog.stranded_backup_snapshots(HV_ID, "web01"),
             [("task-s2", "FullBackup_1790942477")],
@@ -329,7 +363,7 @@ class InterruptedBackupSnapshotTests(SweepTestCase):
         self.assertEqual(abandoned, 1)
         self.build_plugin.assert_not_called()
         self.assertIn("backup_snapshot", TASKS["task-s4"]["result"])
-        self.assertEqual(remove_mock.call_count, 1)
+        self.assertEqual(_removed_names(remove_mock), ["01-disk.vmdk", "manifest"])
 
     @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
     @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value={"01-disk.vmdk"})
