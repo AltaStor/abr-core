@@ -54,6 +54,7 @@ from ...services.backup_mode import (
     object_lock_generation_plan,
     resolve_job_backup_mode,
 )
+from .vcenter_disk_types import DISK_PLACEMENT_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,13 @@ class VCenterBackupError(RuntimeError):
 ProgressCallback = Callable[[dict[str, object]], None] | None
 
 _SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _disk_placement_fields(*sources: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field: next((source.get(field) for source in sources if source.get(field) is not None), None)
+        for field in DISK_PLACEMENT_FIELDS
+    }
 
 
 def _repo_root() -> Path:
@@ -1881,6 +1889,7 @@ def run_vcenter_backup(
                             "source_disk_type_code": disk.get("source_disk_type_code"),
                             "source_disk_type_name": disk.get("source_disk_type_name"),
                             "source_disk_eager_zeroed": disk.get("source_disk_eager_zeroed"),
+                            **_disk_placement_fields(disk),
                         },
                     }
                     for disk in live_disks
@@ -1899,6 +1908,7 @@ def run_vcenter_backup(
                             "source_disk_type_code": disk.get("source_disk_type_code"),
                             "source_disk_type_name": disk.get("source_disk_type_name"),
                             "source_disk_eager_zeroed": disk.get("source_disk_eager_zeroed"),
+                            **_disk_placement_fields(disk),
                         },
                     }
                     for disk in live_disks
@@ -1988,6 +1998,10 @@ def run_vcenter_backup(
                         uuid or None,
                     )
                     updates["uuid"] = live_uuid
+
+                live_placement = _disk_placement_fields(live_disk)
+                if any(payload.get(field) != value for field, value in live_placement.items()):
+                    updates.update(live_placement)
 
                 if not updates:
                     refreshed_disks.append(disk)
@@ -2666,6 +2680,7 @@ def run_vcenter_backup(
                                 if payload.get("source_disk_eager_zeroed") is not None
                                 else disk.get("source_disk_eager_zeroed")
                             ),
+                            **_disk_placement_fields(payload, disk),
                             "change_id": change_id,
                             "previous_change_id": query_change_id,
                             "utility_change_id": utility_change_id,
@@ -3088,6 +3103,7 @@ def run_vcenter_backup(
                                 if payload.get("source_disk_eager_zeroed") is not None
                                 else disk.get("source_disk_eager_zeroed")
                             ),
+                            **_disk_placement_fields(payload, disk),
                             "change_id": str(
                                 (
                                     change_id_by_uuid.get(str(payload.get("uuid") or disk.get("uuid") or ""))

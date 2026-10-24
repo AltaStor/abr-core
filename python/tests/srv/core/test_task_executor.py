@@ -72,6 +72,7 @@ class FakeCompletedProcess:
 
 
 class FakeVCenterNode:
+    live_disk_placement: dict[str, object] | None = None
     snapshots_created: list[str] = []
     snapshots_removed: list[str] = []
     attachments: list[dict[str, object]] = []
@@ -235,6 +236,7 @@ class FakeVCenterNode:
                 "uuid": "disk-uuid-1",
                 "source_disk_type_code": int(VddkDiskType.VMFS_THIN),
                 "source_disk_type_name": "vmfs_thin",
+                **(FakeVCenterNode.live_disk_placement or {}),
             }
         ]
 
@@ -286,6 +288,7 @@ class FakeVCenterNode:
         disk_uuid: str | None = None,
         thin_provisioned: bool | None = None,
         eager_zeroed: bool = False,
+        placement: dict[str, object] | None = None,
     ) -> dict[str, object]:
         payload = {
             "vm_name": vm_name,
@@ -294,6 +297,7 @@ class FakeVCenterNode:
             "disk_uuid": disk_uuid,
             "thin_provisioned": thin_provisioned,
             "eager_zeroed": eager_zeroed,
+            "placement": placement,
             "controller_key": 1000,
             "unit_number": 1,
             "label": disk_label or "Restored disk",
@@ -309,6 +313,7 @@ class FakeVCenterNode:
         datastore_name: str,
         config_metadata: dict[str, object],
         disk_layout: list[dict[str, object]] | None = None,
+        disk_placements: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
         disk_paths = [
             f"[{datastore_name}] {vm_name}/{disk['file_name']}"
@@ -323,6 +328,7 @@ class FakeVCenterNode:
             "config_metadata": config_metadata,
             "vm_moref": "vm-restore-001",
             "disk_layout": disk_layout or [],
+            "disk_placements": disk_placements,
             "disk_paths": disk_paths,
             "requested_firmware": requested_firmware,
             "restored_firmware": restored_firmware,
@@ -432,6 +438,7 @@ class TaskExecutorTests(unittest.TestCase):
         HYPERVISORS.clear()
         RESOURCES_BY_HV.clear()
         BACKUPS.clear()
+        FakeVCenterNode.live_disk_placement = None
         FakeVCenterNode.snapshots_created.clear()
         FakeVCenterNode.snapshots_removed.clear()
         FakeVCenterNode.attachments.clear()
@@ -6063,6 +6070,199 @@ class TaskExecutorTests(unittest.TestCase):
         )
         self.assertEqual(recorded_commands[0][1], "restore")
         self.assertIn("[ds-01] demo-vm-restored/01-demo-vm.vmdk", recorded_commands[0])
+
+    def test_a_backup_records_the_controller_and_slot_the_live_disk_is_on(self) -> None:
+        FakeVCenterNode.live_disk_placement = {"controller_type": "sata", "controller_bus": 0, "unit_number": 5}
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            },
+            ("disk", "vm-uuid-1-disk-1"): {
+                "resource_type": "disk",
+                "external_id": "vm-uuid-1-disk-1",
+                "name": "Hard disk 1",
+                "payload": {
+                    "vm_id": "vm-uuid-1",
+                    "capacity_gb": 40,
+                    "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                    "uuid": "disk-uuid-1",
+                    "controller_type": "paravirtual",
+                    "controller_bus": 0,
+                    "unit_number": 0,
+                },
+            },
+        }
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "task-vcenter-placement",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {"destination_dir": temp_dir, "tool_path": EXISTING_TOOL_PATH},
+            }
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch(
+                    "python.srv.plugins.vcenter.vcenter_backup.run_capped",
+                    return_value=FakeCompletedProcess(returncode=0, stdout="ok"),
+                ),
+            ):
+                result = run_task(task)
+            manifest_payload = json.loads(
+                pathlib.Path(result["result"]["manifest_path"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["status"], "completed")
+        disk = manifest_payload["disks"][0]
+        self.assertEqual(
+            (disk["controller_type"], disk["controller_bus"], disk["unit_number"]),
+            ("sata", 0, 5),
+        )
+
+    def test_a_vm_restore_hands_each_disk_its_recorded_controller_and_slot(self) -> None:
+        placements = [
+            {"controller_type": "paravirtual", "controller_bus": 0, "unit_number": 3},
+            {"controller_type": "sata", "controller_bus": 0, "unit_number": 5},
+        ]
+        for service_type in ("VirtualCenter", "HostAgent"):
+            with self.subTest(service_type=service_type):
+                FakeVCenterNode.service_type = service_type
+                FakeVCenterNode.created_vms.clear()
+                FakeVCenterNode.attachments.clear()
+                FakeVCenterNode.created_managed_disks.clear()
+                result, progress = self._restore_two_disks(placements)
+
+                self.assertEqual(result["status"], "completed")
+                shell = FakeVCenterNode.created_vms[0]
+                self.assertEqual(
+                    shell["disk_placements"],
+                    [
+                        {"label": "Hard disk 1", **placements[0]},
+                        {"label": "Hard disk 2", **placements[1]},
+                    ],
+                )
+                messages = [str(update.get("message")) for update in progress]
+                self.assertIn("Hard disk 1 placed on PVSCSI 0:3, as it was backed up", messages)
+                self.assertIn("Hard disk 2 placed on SATA 0:5, as it was backed up", messages)
+                if service_type == "HostAgent":
+                    self.assertEqual(
+                        [attachment["placement"] for attachment in FakeVCenterNode.attachments],
+                        shell["disk_placements"],
+                    )
+
+    def test_a_vm_restore_from_a_point_without_placements_keeps_the_old_layout_and_says_so(self) -> None:
+        result, progress = self._restore_two_disks([{}, {}])
+
+        self.assertEqual(result["status"], "completed")
+        self.assertIsNone(FakeVCenterNode.created_vms[0]["disk_placements"])
+        self.assertTrue(
+            any(
+                "does not record which controller and slot each disk was on" in str(update.get("message"))
+                for update in progress
+            )
+        )
+
+    def _restore_two_disks(
+        self, placements: list[dict[str, object]]
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        progress: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            disks = []
+            for index, placement in enumerate(placements, start=1):
+                (pathlib.Path(temp_dir) / f"0{index}-demo-vm.vmdk").write_text("fake-vmdk", encoding="utf-8")
+                disks.append(
+                    {
+                        "index": index,
+                        "disk_label": f"Hard disk {index}",
+                        "capacity_gb": 20,
+                        "datastore_path": f"[ds-01] demo-vm/demo-vm_{index}.vmdk",
+                        "destination_path": "",
+                        "abr_path": str(pathlib.Path(temp_dir)),
+                        "abr_backup_name": f"0{index}-demo-vm.vmdk",
+                        "storage_mode": "local",
+                        "store_mode": "full",
+                        **placement,
+                    }
+                )
+            manifest_path = pathlib.Path(temp_dir) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "vm_name": "demo-vm",
+                        "vm_config": {
+                            "guest_id": "debian12_64Guest",
+                            "num_cpu": 2,
+                            "memory_mb": 2048,
+                            "network_adapters": [],
+                        },
+                        "disks": disks,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._register_backup_point("point-placement", manifest_path)
+            task = {
+                "id": "task-restore-placement",
+                "status": "queued",
+                "task_type": "restore",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "manifest_path": str(manifest_path),
+                    "point_id": "point-placement",
+                    "target_vm_name": "demo-vm-restored",
+                    "target_host_name": "esx-01.local",
+                    "target_datastore_name": "ds-01",
+                    "disk_type": "thin-provisioned",
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch(
+                    "python.srv.plugins.vcenter.vcenter_restore.run_capped",
+                    return_value=FakeCompletedProcess(returncode=0, stdout="ok"),
+                ),
+            ):
+                result = run_task(task, progress_callback=progress.append)
+        return result, progress
 
     def test_hostagent_vm_restore_recreates_an_eager_zeroed_source_disk(self) -> None:
         FakeVCenterNode.service_type = "HostAgent"
