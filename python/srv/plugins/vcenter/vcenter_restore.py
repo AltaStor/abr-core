@@ -652,6 +652,19 @@ def _report_disk_placements(
         _emit_progress(progress_callback, "prepare", 5, message, worker_mode="vcenter-abr-vmdk-tool")
 
 
+def _report_boot_order(progress_callback: ProgressCallback, report: list[dict[str, Any]]) -> None:
+    restored = [str(item.get("device")) for item in report if item.get("restored")]
+    messages = [f"Boot order restored: {', '.join(restored)}"] if restored else []
+    messages.extend(
+        f"{item.get('device')} was left out of the boot order: {item.get('reason')}"
+        for item in report
+        if not item.get("restored")
+    )
+    for message in messages:
+        logger.info("%s", message)
+        _emit_progress(progress_callback, "finalize", 84, message, worker_mode="vcenter-abr-vmdk-tool")
+
+
 def _report_network_adapters(
     progress_callback: ProgressCallback,
     adapters: Any,
@@ -954,6 +967,7 @@ def run_vcenter_restore(
                 restored_network_adapters = _report_network_adapters(
                     progress_callback, created_vm.get("network_adapters"), target_host_name
                 )
+                boot_order_report: list[dict[str, Any]] | None = None
                 thumbprint = node.get_thumbprint()
                 created_disk_paths = created_vm.get("disk_paths", [])
                 if not isinstance(created_disk_paths, list):
@@ -1174,6 +1188,16 @@ def run_vcenter_restore(
                         }
                     )
 
+                source_boot_order = vm_config.get("boot_order")
+                if isinstance(source_boot_order, list) and source_boot_order:
+                    boot_order_report = node.apply_boot_order(
+                        create_vm_name,
+                        source_boot_order,
+                        network_adapters=created_vm.get("network_adapters"),
+                        vm_moref=str(created_vm.get("vm_moref") or ""),
+                    )
+                    _report_boot_order(progress_callback, boot_order_report)
+
                 if is_in_place:
                     # Every disk is now fully written and verified on the
                     # staging VM — only now is it safe to touch the original.
@@ -1310,6 +1334,7 @@ def run_vcenter_restore(
             "disk_types": parameters.get("disk_types") if isinstance(parameters.get("disk_types"), dict) else None,
             "network_map": network_map if isinstance(network_map, dict) else None,
             "network_adapters": restored_network_adapters,
+            "boot_order": boot_order_report,
             "transport_mode": transport_mode,
             "service_type": service_type,
             "power_on": bool(parameters.get("power_on")),

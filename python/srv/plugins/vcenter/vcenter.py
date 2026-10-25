@@ -167,6 +167,44 @@ def _disk_placement(disk: Any, devices_by_key: dict[Any, Any]) -> dict[str, Any]
     }
 
 
+def _boot_order_entries(config: Any) -> list[dict[str, Any]]:
+    boot_options = getattr(config, "bootOptions", None)
+    devices = list(getattr(getattr(config, "hardware", None), "device", None) or [])
+    devices_by_key = {getattr(device, "key", None): device for device in devices}
+    entries: list[dict[str, Any]] = []
+    for bootable in getattr(boot_options, "bootOrder", None) or []:
+        device = devices_by_key.get(getattr(bootable, "deviceKey", None))
+        label = getattr(getattr(device, "deviceInfo", None), "label", None)
+        if isinstance(bootable, vim.vm.BootOptions.BootableDiskDevice):
+            entries.append(
+                {
+                    "type": "disk",
+                    "label": label,
+                    "uuid": getattr(getattr(device, "backing", None), "uuid", None),
+                    **_disk_placement(device, devices_by_key),
+                }
+            )
+        elif isinstance(bootable, vim.vm.BootOptions.BootableEthernetDevice):
+            entries.append({"type": "network", "label": label})
+        elif isinstance(bootable, vim.vm.BootOptions.BootableCdromDevice):
+            entries.append({"type": "cdrom"})
+        elif isinstance(bootable, vim.vm.BootOptions.BootableFloppyDevice):
+            entries.append({"type": "floppy"})
+    return entries
+
+
+def _boot_entry_name(entry: dict[str, Any]) -> str:
+    kind = entry.get("type")
+    if kind == "cdrom":
+        return "CD/DVD drive"
+    if kind == "floppy":
+        return "floppy drive"
+    label = str(entry.get("label") or "a device the source VM no longer had")
+    if kind == "disk" and entry.get("controller_type"):
+        return f"{label} ({describe_disk_placement(entry)})"
+    return label
+
+
 def _is_slot_number(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
@@ -1095,6 +1133,7 @@ class VCenterNode(Hypervisor):
             "power_state": str(summary.runtime.powerState),
             "source_host": getattr(host, "name", None),
             "network_adapters": adapters,
+            "boot_order": _boot_order_entries(config),
         }
 
     def list_hosts(self) -> List[Dict[str, Any]]:
@@ -1919,6 +1958,89 @@ class VCenterNode(Hypervisor):
             "power_state": "poweredOff",
             "changed": True,
         }
+
+    def apply_boot_order(
+        self,
+        vm_name: str,
+        boot_order: list[dict[str, Any]],
+        *,
+        network_adapters: list[dict[str, Any]] | None = None,
+        vm_moref: str | None = None,
+    ) -> list[dict[str, Any]]:
+        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
+        if vm is None:
+            vm = self._get_vm(vm_name)
+        if not vm:
+            raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
+
+        devices = list(vm.config.hardware.device)
+        devices_by_key = {getattr(device, "key", None): device for device in devices}
+        disks = [device for device in devices if isinstance(device, vim.vm.device.VirtualDisk)]
+        network_cards = sorted(
+            (device for device in devices if isinstance(device, vim.vm.device.VirtualEthernetCard)),
+            key=lambda device: device.key,
+        )
+        adapters = [adapter for adapter in network_adapters or [] if isinstance(adapter, dict)]
+        restored_labels = [str(adapter.get("label") or "") for adapter in adapters if adapter.get("attached", True)]
+        dropped_labels = {str(adapter.get("label") or "") for adapter in adapters if not adapter.get("attached", True)}
+
+        order: list[Any] = []
+        report: list[dict[str, Any]] = []
+        for entry in boot_order:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("type")
+            name = _boot_entry_name(entry)
+            bootable = None
+            reason = ""
+            if kind == "disk":
+                placement = {field: entry.get(field) for field in ("controller_type", "controller_bus", "unit_number")}
+                device = next(
+                    (
+                        disk
+                        for disk in disks
+                        if placement["controller_type"] and _disk_placement(disk, devices_by_key) == placement
+                    ),
+                    None,
+                ) or next(
+                    (disk for disk in disks if entry.get("uuid") and getattr(disk.backing, "uuid", None) == entry["uuid"]),
+                    None,
+                )
+                if device is None:
+                    reason = "the restored VM has no such disk"
+                else:
+                    bootable = vim.vm.BootOptions.BootableDiskDevice(deviceKey=device.key)
+            elif kind == "network":
+                label = str(entry.get("label") or "")
+                position = restored_labels.index(label) if label in restored_labels else None
+                if position is not None and position < len(network_cards):
+                    bootable = vim.vm.BootOptions.BootableEthernetDevice(deviceKey=network_cards[position].key)
+                elif label in dropped_labels:
+                    reason = "the adapter was not restored because its network is missing on the target host"
+                else:
+                    reason = "the restored VM has no such network adapter"
+            elif kind == "cdrom":
+                if any(isinstance(device, vim.vm.device.VirtualCdrom) for device in devices):
+                    bootable = vim.vm.BootOptions.BootableCdromDevice()
+                else:
+                    reason = "the restored VM has no CD/DVD drive"
+            elif kind == "floppy":
+                if any(isinstance(device, vim.vm.device.VirtualFloppy) for device in devices):
+                    bootable = vim.vm.BootOptions.BootableFloppyDevice()
+                else:
+                    reason = "the restored VM has no floppy drive"
+            else:
+                reason = f"boot device type {kind!r} is not known"
+            if bootable is None:
+                report.append({"device": name, "restored": False, "reason": reason})
+            else:
+                order.append(bootable)
+                report.append({"device": name, "restored": True, "reason": None})
+
+        if order:
+            task = vm.ReconfigVM_Task(spec=vim.vm.ConfigSpec(bootOptions=vim.vm.BootOptions(bootOrder=order)))
+            self._wait_for_task(task)
+        return report
 
     def power_on_vm(self, vm_name: str, vm_moref: str | None = None) -> dict[str, Any]:
         vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None

@@ -73,6 +73,7 @@ class FakeCompletedProcess:
 
 class FakeVCenterNode:
     live_disk_placement: dict[str, object] | None = None
+    boot_order_calls: list[dict[str, object]] | None = None
     snapshots_created: list[str] = []
     snapshots_removed: list[str] = []
     attachments: list[dict[str, object]] = []
@@ -341,6 +342,22 @@ class FakeVCenterNode:
         self.created_vms.append(payload)
         return payload
 
+    def apply_boot_order(
+        self,
+        vm_name: str,
+        boot_order: list[dict[str, object]],
+        *,
+        network_adapters: list[dict[str, object]] | None = None,
+        vm_moref: str | None = None,
+    ) -> list[dict[str, object]]:
+        FakeVCenterNode.boot_order_calls.append(
+            {"vm_name": vm_name, "boot_order": boot_order, "network_adapters": network_adapters, "vm_moref": vm_moref}
+        )
+        return [
+            {"device": "Hard disk 1 (PVSCSI 0:0)", "restored": True, "reason": None},
+            {"device": "CD/DVD drive", "restored": False, "reason": "the restored VM has no CD/DVD drive"},
+        ]
+
     def create_managed_disk(
         self,
         *,
@@ -444,6 +461,7 @@ class TaskExecutorTests(unittest.TestCase):
         RESOURCES_BY_HV.clear()
         BACKUPS.clear()
         FakeVCenterNode.live_disk_placement = None
+        FakeVCenterNode.boot_order_calls = []
         FakeVCenterNode.snapshots_created.clear()
         FakeVCenterNode.snapshots_removed.clear()
         FakeVCenterNode.attachments.clear()
@@ -6382,8 +6400,36 @@ class TaskExecutorTests(unittest.TestCase):
             )
         )
 
+    def test_a_vm_restore_rebuilds_the_source_boot_order_and_says_what_it_could_not(self) -> None:
+        boot_order = [
+            {"type": "disk", "label": "Hard disk 1", "controller_type": "paravirtual", "controller_bus": 0, "unit_number": 0},
+            {"type": "cdrom"},
+        ]
+
+        result, progress = self._restore_two_disks([{}, {}], boot_order=boot_order)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(FakeVCenterNode.boot_order_calls), 1)
+        call = FakeVCenterNode.boot_order_calls[0]
+        self.assertEqual((call["vm_name"], call["boot_order"], call["vm_moref"]), ("demo-vm-restored", boot_order, "vm-restore-001"))
+        messages = [str(update.get("message")) for update in progress]
+        self.assertIn("Boot order restored: Hard disk 1 (PVSCSI 0:0)", messages)
+        self.assertIn("CD/DVD drive was left out of the boot order: the restored VM has no CD/DVD drive", messages)
+        self.assertEqual(result["result"]["boot_order"][0]["device"], "Hard disk 1 (PVSCSI 0:0)")
+
+    def test_a_restore_point_without_a_boot_order_leaves_the_restored_vm_on_its_default(self) -> None:
+        for boot_order in (None, []):
+            with self.subTest(boot_order=boot_order):
+                FakeVCenterNode.boot_order_calls = []
+
+                result, _ = self._restore_two_disks([{}, {}], boot_order=boot_order)
+
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(FakeVCenterNode.boot_order_calls, [])
+                self.assertIsNone(result["result"]["boot_order"])
+
     def _restore_two_disks(
-        self, placements: list[dict[str, object]]
+        self, placements: list[dict[str, object]], boot_order: list[dict[str, object]] | None = None
     ) -> tuple[dict[str, object], list[dict[str, object]]]:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",
@@ -6433,6 +6479,7 @@ class TaskExecutorTests(unittest.TestCase):
                             "num_cpu": 2,
                             "memory_mb": 2048,
                             "network_adapters": [],
+                            **({"boot_order": boot_order} if boot_order is not None else {}),
                         },
                         "disks": disks,
                     }
