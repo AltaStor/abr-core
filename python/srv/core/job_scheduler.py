@@ -22,6 +22,7 @@ from python.srv.services.abr_v41 import (
     job_run_record,
     normalize_job_record,
     resolve_job_execution,
+    schedule_latest_next_run,
     schedule_next_run,
     stored_slot_next_run,
 )
@@ -212,9 +213,10 @@ class JobScheduler:
     ) -> datetime:
         try:
             soonest = self._compute_next_run_after(schedule, now)
+            latest = schedule_latest_next_run(schedule, until=now)
         except ValueError:
             return stored
-        if stored <= soonest:
+        if stored <= latest:
             return stored
         logger.warning(
             "Job '%s' had %s set to %s, later than the next run its schedule allows from %s. That value was "

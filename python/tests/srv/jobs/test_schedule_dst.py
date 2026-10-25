@@ -7,7 +7,11 @@ import unittest
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from python.srv.services.abr_v41 import normalize_schedule_payload, schedule_next_run
+from python.srv.services.abr_v41 import (
+    normalize_schedule_payload,
+    schedule_latest_next_run,
+    schedule_next_run,
+)
 
 KYIV = "Europe/Kyiv"
 KYIV_ZONE = ZoneInfo(KYIV)
@@ -33,6 +37,10 @@ NEXT_AFTER_THE_FIRST_PASS = {
 
 def _next_run(kind: str, after: datetime) -> datetime:
     return schedule_next_run(normalize_schedule_payload(SCHEDULES[kind]), after=after)
+
+
+def _latest_next_run(kind: str, until: datetime) -> datetime:
+    return schedule_latest_next_run(normalize_schedule_payload(SCHEDULES[kind]), until=until)
 
 
 class RepeatedHourTests(unittest.TestCase):
@@ -71,6 +79,32 @@ class RepeatedHourTests(unittest.TestCase):
         for kind, moment in expected.items():
             with self.subTest(kind=kind):
                 self.assertEqual(_next_run(kind, ordinary), moment)
+
+
+class LatestNextRunTests(unittest.TestCase):
+    def test_in_the_second_pass_a_run_already_taken_in_the_first_pass_is_not_offered_again(self) -> None:
+        for kind, expected in NEXT_AFTER_THE_FIRST_PASS.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(_latest_next_run(kind, INSIDE_REPEATED_HOUR), expected)
+
+    def test_at_the_very_start_of_the_second_pass_it_is_the_same(self) -> None:
+        start_of_second_pass = datetime(2026, 10, 25, 1, 0, tzinfo=timezone.utc)
+        for kind, expected in NEXT_AFTER_THE_FIRST_PASS.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(_latest_next_run(kind, start_of_second_pass), expected)
+
+    def test_outside_the_repeated_hour_it_is_the_next_run(self) -> None:
+        for moment in (BEFORE_THE_NIGHT, FIRST_PASS, SECOND_PASS, datetime(2026, 10, 20, 1, 5, tzinfo=timezone.utc)):
+            for kind in SCHEDULES:
+                with self.subTest(kind=kind, moment=moment):
+                    self.assertEqual(_latest_next_run(kind, moment), _next_run(kind, moment))
+
+    def test_a_periodic_schedule_is_unchanged(self) -> None:
+        schedule = normalize_schedule_payload({"type": "periodic", "every": "10m", "timezone": KYIV})
+        self.assertEqual(
+            schedule_latest_next_run(schedule, until=INSIDE_REPEATED_HOUR),
+            schedule_next_run(schedule, after=INSIDE_REPEATED_HOUR),
+        )
 
 
 if __name__ == "__main__":

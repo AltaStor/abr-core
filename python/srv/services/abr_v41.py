@@ -1017,6 +1017,28 @@ def schedule_next_run(schedule: dict[str, Any], *, after: datetime) -> datetime:
     raise api_error(422, "invalid_schedule", "Unsupported schedule kind", kind=kind)
 
 
+def schedule_latest_next_run(schedule: dict[str, Any], *, until: datetime) -> datetime:
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    latest = schedule_next_run(schedule, after=until)
+    repeat_start = _repeated_hour_start(until, schedule)
+    if repeat_start is None:
+        return latest
+    return max(latest, schedule_next_run(schedule, after=repeat_start - timedelta(microseconds=1)))
+
+
+def _repeated_hour_start(moment: datetime, schedule: dict[str, Any]) -> datetime | None:
+    if _localize(moment, schedule).fold == 0:
+        return None
+    start = moment.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    for _ in range(24 * 60):
+        earlier = start - timedelta(minutes=1)
+        if _localize(earlier, schedule).fold == 0:
+            return start
+        start = earlier
+    return None
+
+
 def schedule_today_matches_days(job: dict[str, Any], days: list[str], *, now: datetime) -> bool:
     if not days:
         return False
