@@ -212,6 +212,17 @@ class AuditLogTests(RbacApiCase):
         self.client.get("/api/v1/auth/me", headers=self.headers(rbac.AUDITOR, **refresh))
         self.assertEqual(self.audit(function_id="auth.whoami"), [])
 
+    def test_the_web_keep_alive_is_not_logged_but_a_duration_change_is(self) -> None:
+        for _ in range(3):
+            self.assertEqual(
+                self.client.post("/api/v1/auth/session/touch", headers=self.headers(rbac.AUDITOR)).status_code, 200
+            )
+        self.assertEqual(self.audit(function_id="auth.touch_session"), [])
+        self.client.put(
+            "/api/v1/auth/session/duration", json={"duration_seconds": 600}, headers=self.headers(rbac.AUDITOR)
+        )
+        self.assertEqual(len(self.audit(function_id="auth.extend_session")), 1)
+
     def test_records_have_one_format_across_interfaces(self) -> None:
         for client_type in ("web", "cli", None):
             extra = {"X-Client-Type": client_type} if client_type else {}

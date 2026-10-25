@@ -357,7 +357,7 @@ abr repo remove --name <name> [--id <id>]
 
 abr repo rescan 
 
-Description: Refresh repository metadata and catalog state. 
+Description: Refresh repository metadata and catalog state. A restore point whose stored data is gone is marked `missing`, and every restore point that builds on it is marked `chain_broken`; restore start refuses both. Once the data is back, the next rescan marks them `available` again. 
 
 abr repo rescan --name <name> [--id <id>] 
 
@@ -452,7 +452,7 @@ abr inventory remove --name <name> [--id <id>]
 
 abr inventory rescan 
 
-Description: Refresh the discovered object catalog. 
+Description: Refresh the discovered object catalog. A job keeps its VM by ID, whatever the VM is called now. Only when a job's VM is gone from the inventory and another VM carries its name does the rescan move the job to that VM; abr job info then shows the move as a warning, and so does the next backup session of that VM. 
 
 abr inventory rescan --name <name> [--id <id>] 
 

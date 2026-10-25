@@ -1011,9 +1011,32 @@ _MUTATING_SUBCOMMANDS = frozenset({"backup", "copy", "remove", "retention", "met
 _ABSENT_BACKUP_MARKERS = ("failed to open backup", "directory does not exist", "nosuchkey")
 
 
+_MISSING_DIRECTORY_REPORT = re.compile(r"Directory does not exist '(?P<path>[^'\n]+)'!?")
+
+
 def _reports_absent_backup(message: str) -> bool:
     lowered = message.lower()
     return any(marker in lowered for marker in _ABSENT_BACKUP_MARKERS)
+
+
+def _directory_read_error(path: str) -> str | None:
+    try:
+        with os.scandir(path) as entries:
+            next(entries, None)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        return exc.strerror or str(exc)
+    return None
+
+
+def _name_unreadable_directories(message: str) -> str:
+    def read_error_instead(match: re.Match[str]) -> str:
+        path = match.group("path")
+        reason = _directory_read_error(path)
+        return f"cannot read {path}: {reason}" if reason else match.group(0)
+
+    return _MISSING_DIRECTORY_REPORT.sub(read_error_instead, message)
 
 
 def _storage_operation_label(args: list[str]) -> str:
@@ -1079,7 +1102,7 @@ def run_disk_tool(
 
     elapsed = time.monotonic() - started
     if completed.returncode != 0:
-        stderr = (completed.stderr or completed.stdout or "").strip()
+        stderr = _name_unreadable_directories((completed.stderr or completed.stdout or "").strip())
         # Removing what was never written (cleanup after a failed run) is
         # not a storage problem worth a warning.
         absent = args[:1] == ["remove"] and _reports_absent_backup(stderr)

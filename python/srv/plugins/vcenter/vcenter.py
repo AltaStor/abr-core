@@ -23,6 +23,8 @@ from .vcenter_disk_types import (
     VddkDiskType,
     classify_vmware_disk_eager_zeroed,
     classify_vmware_disk_type,
+    describe_disk_placement,
+    disk_controller_display_name,
     hostagent_disk_type_from_code,
 )
 
@@ -132,6 +134,145 @@ def _scsi_controller_class_for_type(type_name: Any) -> type:
     return _SCSI_CONTROLLER_CLASS_BY_NAME.get(
         normalized, _SCSI_CONTROLLER_CLASS_BY_NAME[_DEFAULT_SCSI_CONTROLLER_TYPE]
     )
+
+
+_DISK_CONTROLLER_TYPE_NAMES: dict[type, str] = {
+    **_SCSI_CONTROLLER_TYPE_NAMES,
+    vim.vm.device.VirtualAHCIController: "sata",
+    vim.vm.device.VirtualNVMEController: "nvme",
+    vim.vm.device.VirtualIDEController: "ide",
+}
+_DISK_CONTROLLER_CLASS_BY_NAME: dict[str, type] = {
+    name: cls for cls, name in _DISK_CONTROLLER_TYPE_NAMES.items()
+}
+_DEFAULT_IDE_CONTROLLER_KEYS = {0: 200, 1: 201}
+
+
+def _disk_controller_type_name(device: Any) -> str | None:
+    for cls, name in _DISK_CONTROLLER_TYPE_NAMES.items():
+        if isinstance(device, cls):
+            return name
+    return None
+
+
+def _disk_placement(disk: Any, devices_by_key: dict[Any, Any]) -> dict[str, Any]:
+    controller = devices_by_key.get(getattr(disk, "controllerKey", None))
+    type_name = _disk_controller_type_name(controller)
+    if type_name is None and controller is not None:
+        type_name = type(controller).__name__
+    return {
+        "controller_type": type_name,
+        "controller_bus": getattr(controller, "busNumber", None),
+        "unit_number": getattr(disk, "unitNumber", None),
+    }
+
+
+def _boot_order_entries(config: Any) -> list[dict[str, Any]]:
+    boot_options = getattr(config, "bootOptions", None)
+    devices = list(getattr(getattr(config, "hardware", None), "device", None) or [])
+    devices_by_key = {getattr(device, "key", None): device for device in devices}
+    entries: list[dict[str, Any]] = []
+    for bootable in getattr(boot_options, "bootOrder", None) or []:
+        device = devices_by_key.get(getattr(bootable, "deviceKey", None))
+        label = getattr(getattr(device, "deviceInfo", None), "label", None)
+        if isinstance(bootable, vim.vm.BootOptions.BootableDiskDevice):
+            entries.append(
+                {
+                    "type": "disk",
+                    "label": label,
+                    "uuid": getattr(getattr(device, "backing", None), "uuid", None),
+                    **_disk_placement(device, devices_by_key),
+                }
+            )
+        elif isinstance(bootable, vim.vm.BootOptions.BootableEthernetDevice):
+            entries.append({"type": "network", "label": label})
+        elif isinstance(bootable, vim.vm.BootOptions.BootableCdromDevice):
+            entries.append({"type": "cdrom"})
+        elif isinstance(bootable, vim.vm.BootOptions.BootableFloppyDevice):
+            entries.append({"type": "floppy"})
+    return entries
+
+
+def _boot_entry_name(entry: dict[str, Any]) -> str:
+    kind = entry.get("type")
+    if kind == "cdrom":
+        return "CD/DVD drive"
+    if kind == "floppy":
+        return "floppy drive"
+    label = str(entry.get("label") or "a device the source VM no longer had")
+    if kind == "disk" and entry.get("controller_type"):
+        return f"{label} ({describe_disk_placement(entry)})"
+    return label
+
+
+def _is_slot_number(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _plan_disk_controllers(
+    disk_placements: list[dict[str, Any]],
+) -> tuple[list[tuple[str, int]], list[tuple[str, int, int]]]:
+    controllers: list[tuple[str, int]] = []
+    disk_slots: list[tuple[str, int, int]] = []
+    bus_owner: dict[tuple[str, int], str] = {}
+    slot_owner: dict[tuple[str, int, int], str] = {}
+    for index, placement in enumerate(disk_placements, start=1):
+        label = str(placement.get("label") or f"Hard disk {index}")
+        type_name = str(placement.get("controller_type") or "").strip().lower()
+        bus = placement.get("controller_bus")
+        unit = placement.get("unit_number")
+        if type_name not in _DISK_CONTROLLER_CLASS_BY_NAME:
+            raise ValueError(
+                f"{label} was on a {placement.get('controller_type') or 'unknown'} controller, "
+                "which this restore cannot recreate."
+            )
+        display = disk_controller_display_name(type_name)
+        if not _is_slot_number(bus) or not _is_slot_number(unit):
+            raise ValueError(
+                f"{label} was on a {display} controller, but the restore point records no valid "
+                f"bus and slot for it ({bus}:{unit}), so that bus cannot be recreated."
+            )
+        if type_name == "ide" and bus not in _DEFAULT_IDE_CONTROLLER_KEYS:
+            raise ValueError(
+                f"{label} was on IDE bus {bus}, which cannot be recreated: a VM has IDE buses 0 and 1 only."
+            )
+        family = "scsi" if type_name in _SCSI_CONTROLLER_CLASS_BY_NAME else type_name
+        owner = bus_owner.setdefault((family, bus), type_name)
+        if owner != type_name:
+            raise ValueError(
+                f"{label} needs a {display} controller on SCSI bus {bus}, which another disk of the "
+                f"restore point needs for a {disk_controller_display_name(owner)} controller."
+            )
+        slot = (family, bus, unit)
+        if slot in slot_owner:
+            raise ValueError(
+                f"{label} and {slot_owner[slot]} are both recorded at {display} {bus}:{unit}."
+            )
+        slot_owner[slot] = label
+        disk_slots.append((type_name, bus, unit))
+        if (type_name, bus) not in controllers:
+            controllers.append((type_name, bus))
+    return controllers, disk_slots
+
+
+def _disk_controller_specs(controllers: list[tuple[str, int]]) -> tuple[list[Any], dict[tuple[str, int], int]]:
+    specs: list[Any] = []
+    keys: dict[tuple[str, int], int] = {}
+    for position, (type_name, bus) in enumerate(controllers, start=1):
+        if type_name == "ide":
+            keys[(type_name, bus)] = _DEFAULT_IDE_CONTROLLER_KEYS[bus]
+            continue
+        controller = _DISK_CONTROLLER_CLASS_BY_NAME[type_name]()
+        controller.key = -100 - position
+        controller.busNumber = bus
+        if isinstance(controller, vim.vm.device.VirtualSCSIController):
+            controller.sharedBus = vim.vm.device.VirtualSCSIController.Sharing.noSharing
+        spec = vim.vm.device.VirtualDeviceSpec()
+        spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+        spec.device = controller
+        specs.append(spec)
+        keys[(type_name, bus)] = controller.key
+    return specs, keys
 
 
 def _distributed_portgroup_name(vm: Any, portgroup_key: str) -> str | None:
@@ -575,6 +716,7 @@ class VCenterNode(Hypervisor):
             return current
 
         disks = []
+        devices_by_key = {getattr(device, "key", None): device for device in vm.config.hardware.device}
         for device in vm.config.hardware.device:
             if not isinstance(device, vim.vm.device.VirtualDisk):
                 continue
@@ -597,6 +739,7 @@ class VCenterNode(Hypervisor):
                     "source_disk_eager_zeroed": classify_vmware_disk_eager_zeroed(
                         source_backing, disk_type_code
                     ),
+                    **_disk_placement(device, devices_by_key),
                 }
             )
         return disks
@@ -990,6 +1133,7 @@ class VCenterNode(Hypervisor):
             "power_state": str(summary.runtime.powerState),
             "source_host": getattr(host, "name", None),
             "network_adapters": adapters,
+            "boot_order": _boot_order_entries(config),
         }
 
     def list_hosts(self) -> List[Dict[str, Any]]:
@@ -1139,6 +1283,7 @@ class VCenterNode(Hypervisor):
         datastore_name: str,
         config_metadata: Dict[str, Any],
         disk_layout: List[Dict[str, Any]] | None = None,
+        disk_placements: list[dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         host = self._get_host(host_name)
         if host is None:
@@ -1164,20 +1309,35 @@ class VCenterNode(Hypervisor):
         if resource_pool is None:
             raise ValueError(f"Host '{host_name}' does not expose a resource pool.")
 
-        requested_scsi_controller_type = str(
-            config_metadata.get("scsi_controller_type") or _DEFAULT_SCSI_CONTROLLER_TYPE
-        ).strip().lower()
-        scsi_controller_class = _scsi_controller_class_for_type(requested_scsi_controller_type)
+        disk_layout = disk_layout or []
+        device_changes: list[Any] = []
+        if disk_placements:
+            if disk_layout and len(disk_layout) != len(disk_placements):
+                raise ValueError(
+                    f"Restore of '{vm_name}' has {len(disk_layout)} disk(s) to create but "
+                    f"{len(disk_placements)} disk placement(s)."
+                )
+            controllers, disk_slots = _plan_disk_controllers(disk_placements)
+            controller_specs, controller_keys = _disk_controller_specs(controllers)
+            device_changes.extend(controller_specs)
+            requested_scsi_controller_type = None
+            disk_controllers = [f"{disk_controller_display_name(name)} {bus}" for name, bus in controllers]
+        else:
+            requested_scsi_controller_type = str(
+                config_metadata.get("scsi_controller_type") or _DEFAULT_SCSI_CONTROLLER_TYPE
+            ).strip().lower()
+            scsi_controller_class = _scsi_controller_class_for_type(requested_scsi_controller_type)
 
-        scsi_spec = vim.vm.device.VirtualDeviceSpec()
-        scsi_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
-        scsi_controller = scsi_controller_class()
-        scsi_controller.key = 1000
-        scsi_controller.busNumber = 0
-        scsi_controller.sharedBus = vim.vm.device.VirtualSCSIController.Sharing.noSharing
-        scsi_spec.device = scsi_controller
+            scsi_spec = vim.vm.device.VirtualDeviceSpec()
+            scsi_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+            scsi_controller = scsi_controller_class()
+            scsi_controller.key = 1000
+            scsi_controller.busNumber = 0
+            scsi_controller.sharedBus = vim.vm.device.VirtualSCSIController.Sharing.noSharing
+            scsi_spec.device = scsi_controller
+            device_changes.append(scsi_spec)
+            disk_controllers = [f"{disk_controller_display_name(_scsi_controller_type_name(scsi_controller))} 0"]
 
-        device_changes: list[Any] = [scsi_spec]
         # What became of each adapter, so the restore can report it: an adapter
         # whose network is missing on the host is left out of the VM, and
         # before this list existed that only showed up as a server-log warning.
@@ -1199,11 +1359,15 @@ class VCenterNode(Hypervisor):
             )
 
         created_disk_paths: list[str] = []
-        disk_layout = disk_layout or []
         for index, disk in enumerate(disk_layout, start=1):
-            unit_number = index - 1
-            if unit_number >= 7:
-                unit_number += 1
+            if disk_placements:
+                type_name, bus, unit_number = disk_slots[index - 1]
+                controller_key = controller_keys[(type_name, bus)]
+            else:
+                controller_key = scsi_controller.key
+                unit_number = index - 1
+                if unit_number >= 7:
+                    unit_number += 1
 
             capacity_gb = float(disk.get("capacity_gb") or 1)
             disk_name = str(disk.get("file_name") or f"{index:02d}-disk.vmdk")
@@ -1217,7 +1381,7 @@ class VCenterNode(Hypervisor):
 
             virtual_disk = vim.vm.device.VirtualDisk()
             virtual_disk.key = -1000 - index
-            virtual_disk.controllerKey = scsi_controller.key
+            virtual_disk.controllerKey = controller_key
             virtual_disk.unitNumber = unit_number
             virtual_disk.capacityInKB = int(capacity_gb * 1024 * 1024)
             virtual_disk.deviceInfo = vim.Description()
@@ -1288,14 +1452,22 @@ class VCenterNode(Hypervisor):
                     requested_firmware,
                 )
         logger.info(
-            "Creating VM shell '%s' with SCSI controller type '%s' and Secure Boot requested=%s.",
+            "Creating VM shell '%s' with disk controllers %s and Secure Boot requested=%s.",
             vm_name,
-            requested_scsi_controller_type,
+            ", ".join(disk_controllers),
             requested_secure_boot,
         )
 
         task = datacenter.vmFolder.CreateVM_Task(config=config_spec, pool=resource_pool, host=host)
-        vm = self._wait_for_task(task)
+        try:
+            vm = self._wait_for_task(task)
+        except RuntimeError as exc:
+            if not disk_placements:
+                raise
+            raise RuntimeError(
+                f"Could not create VM '{vm_name}' with the disk controllers it was backed up with "
+                f"({', '.join(disk_controllers)}): {exc}"
+            ) from exc
         resulting_firmware = _normalize_vm_firmware(
             getattr(getattr(vm, "config", None), "firmware", None)
         )
@@ -1335,6 +1507,7 @@ class VCenterNode(Hypervisor):
             "requested_firmware": requested_firmware,
             "restored_firmware": resulting_firmware,
             "requested_scsi_controller_type": requested_scsi_controller_type,
+            "disk_controllers": disk_controllers,
             "requested_secure_boot": bool(requested_secure_boot) if requested_secure_boot is not None else None,
             "network_adapters": restored_adapters,
         }
@@ -1457,33 +1630,16 @@ class VCenterNode(Hypervisor):
         disk_uuid: str | None = None,
         thin_provisioned: bool | None = None,
         eager_zeroed: bool = False,
+        placement: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         vm = self._get_vm(vm_name)
         if not vm:
             raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
 
-        controller = None
-        used_unit_numbers: set[int] = set()
-        for device in vm.config.hardware.device:
-            if isinstance(device, vim.vm.device.VirtualSCSIController):
-                controller = device
-            if isinstance(device, vim.vm.device.VirtualDisk):
-                unit_number = getattr(device, "unitNumber", None)
-                if isinstance(unit_number, int):
-                    used_unit_numbers.add(unit_number)
-
-        if controller is None:
-            raise ValueError(f"VM '{vm_name}' does not have a SCSI controller.")
-
-        unit_number = None
-        for candidate in range(16):
-            if candidate == 7:
-                continue
-            if candidate not in used_unit_numbers:
-                unit_number = candidate
-                break
-        if unit_number is None:
-            raise ValueError(f"VM '{vm_name}' has no free SCSI unit slots.")
+        if placement:
+            controller, unit_number = self._placement_slot(vm, vm_name, placement, disk_label or datastore_path)
+        else:
+            controller, unit_number = self._first_free_scsi_slot(vm, vm_name)
 
         disk_spec = vim.vm.device.VirtualDeviceSpec()
         disk_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
@@ -1519,6 +1675,57 @@ class VCenterNode(Hypervisor):
             "unit_number": unit_number,
             "label": disk.deviceInfo.label,
         }
+
+    @staticmethod
+    def _first_free_scsi_slot(vm: Any, vm_name: str) -> tuple[Any, int]:
+        controller = None
+        used_unit_numbers: set[int] = set()
+        for device in vm.config.hardware.device:
+            if isinstance(device, vim.vm.device.VirtualSCSIController):
+                controller = device
+            if isinstance(device, vim.vm.device.VirtualDisk):
+                unit_number = getattr(device, "unitNumber", None)
+                if isinstance(unit_number, int):
+                    used_unit_numbers.add(unit_number)
+
+        if controller is None:
+            raise ValueError(f"VM '{vm_name}' does not have a SCSI controller.")
+
+        for candidate in range(16):
+            if candidate == 7:
+                continue
+            if candidate not in used_unit_numbers:
+                return controller, candidate
+        raise ValueError(f"VM '{vm_name}' has no free SCSI unit slots.")
+
+    @staticmethod
+    def _placement_slot(vm: Any, vm_name: str, placement: dict[str, Any], disk_name: str) -> tuple[Any, int]:
+        type_name = str(placement.get("controller_type") or "").strip().lower()
+        bus = placement.get("controller_bus")
+        unit_number = placement.get("unit_number")
+        where = describe_disk_placement(placement)
+        devices = list(vm.config.hardware.device)
+        controller = next(
+            (
+                device
+                for device in devices
+                if _disk_controller_type_name(device) == type_name and getattr(device, "busNumber", None) == bus
+            ),
+            None,
+        )
+        if controller is None:
+            raise ValueError(
+                f"VM '{vm_name}' has no {disk_controller_display_name(type_name)} controller on bus {bus} "
+                f"for {disk_name}, so it cannot go back to {where}."
+            )
+        for device in devices:
+            if (
+                isinstance(device, vim.vm.device.VirtualDisk)
+                and getattr(device, "controllerKey", None) == controller.key
+                and getattr(device, "unitNumber", None) == unit_number
+            ):
+                raise ValueError(f"{where} on VM '{vm_name}' is already taken, so {disk_name} cannot go back there.")
+        return controller, unit_number
 
     def create_managed_disk(
         self,
@@ -1751,6 +1958,89 @@ class VCenterNode(Hypervisor):
             "power_state": "poweredOff",
             "changed": True,
         }
+
+    def apply_boot_order(
+        self,
+        vm_name: str,
+        boot_order: list[dict[str, Any]],
+        *,
+        network_adapters: list[dict[str, Any]] | None = None,
+        vm_moref: str | None = None,
+    ) -> list[dict[str, Any]]:
+        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
+        if vm is None:
+            vm = self._get_vm(vm_name)
+        if not vm:
+            raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
+
+        devices = list(vm.config.hardware.device)
+        devices_by_key = {getattr(device, "key", None): device for device in devices}
+        disks = [device for device in devices if isinstance(device, vim.vm.device.VirtualDisk)]
+        network_cards = sorted(
+            (device for device in devices if isinstance(device, vim.vm.device.VirtualEthernetCard)),
+            key=lambda device: device.key,
+        )
+        adapters = [adapter for adapter in network_adapters or [] if isinstance(adapter, dict)]
+        restored_labels = [str(adapter.get("label") or "") for adapter in adapters if adapter.get("attached", True)]
+        dropped_labels = {str(adapter.get("label") or "") for adapter in adapters if not adapter.get("attached", True)}
+
+        order: list[Any] = []
+        report: list[dict[str, Any]] = []
+        for entry in boot_order:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("type")
+            name = _boot_entry_name(entry)
+            bootable = None
+            reason = ""
+            if kind == "disk":
+                placement = {field: entry.get(field) for field in ("controller_type", "controller_bus", "unit_number")}
+                device = next(
+                    (
+                        disk
+                        for disk in disks
+                        if placement["controller_type"] and _disk_placement(disk, devices_by_key) == placement
+                    ),
+                    None,
+                ) or next(
+                    (disk for disk in disks if entry.get("uuid") and getattr(disk.backing, "uuid", None) == entry["uuid"]),
+                    None,
+                )
+                if device is None:
+                    reason = "the restored VM has no such disk"
+                else:
+                    bootable = vim.vm.BootOptions.BootableDiskDevice(deviceKey=device.key)
+            elif kind == "network":
+                label = str(entry.get("label") or "")
+                position = restored_labels.index(label) if label in restored_labels else None
+                if position is not None and position < len(network_cards):
+                    bootable = vim.vm.BootOptions.BootableEthernetDevice(deviceKey=network_cards[position].key)
+                elif label in dropped_labels:
+                    reason = "the adapter was not restored because its network is missing on the target host"
+                else:
+                    reason = "the restored VM has no such network adapter"
+            elif kind == "cdrom":
+                if any(isinstance(device, vim.vm.device.VirtualCdrom) for device in devices):
+                    bootable = vim.vm.BootOptions.BootableCdromDevice()
+                else:
+                    reason = "the restored VM has no CD/DVD drive"
+            elif kind == "floppy":
+                if any(isinstance(device, vim.vm.device.VirtualFloppy) for device in devices):
+                    bootable = vim.vm.BootOptions.BootableFloppyDevice()
+                else:
+                    reason = "the restored VM has no floppy drive"
+            else:
+                reason = f"boot device type {kind!r} is not known"
+            if bootable is None:
+                report.append({"device": name, "restored": False, "reason": reason})
+            else:
+                order.append(bootable)
+                report.append({"device": name, "restored": True, "reason": None})
+
+        if order:
+            task = vm.ReconfigVM_Task(spec=vim.vm.ConfigSpec(bootOptions=vim.vm.BootOptions(bootOrder=order)))
+            self._wait_for_task(task)
+        return report
 
     def power_on_vm(self, vm_name: str, vm_moref: str | None = None) -> dict[str, Any]:
         vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None

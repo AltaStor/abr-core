@@ -10,7 +10,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from python.srv.services import auth_service, rbac
 from python.srv.services.api_errors import api_error
-from python.srv.services.audit_service import AuditContext, auth_session_ref, target_from_path
+from python.srv.services.audit_service import AuditContext, auth_session_ref, is_background_refresh, target_from_path
 
 _bearer_scheme = HTTPBearer(auto_error=False, description="Session token from POST /api/v1/auth/login")
 
@@ -19,7 +19,7 @@ def require_session(
     request: Request, credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme)
 ) -> dict:
     token = credentials.credentials if credentials else None
-    session = auth_service.authenticate(token)
+    session = auth_service.authenticate(token, background=is_background_refresh(request.headers))
     if session is None:
         raise api_error(401, "unauthorized", "Missing, invalid, or expired session token.")
 

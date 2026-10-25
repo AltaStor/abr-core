@@ -72,6 +72,8 @@ class FakeCompletedProcess:
 
 
 class FakeVCenterNode:
+    live_disk_placement: dict[str, object] | None = None
+    boot_order_calls: list[dict[str, object]] | None = None
     snapshots_created: list[str] = []
     snapshots_removed: list[str] = []
     attachments: list[dict[str, object]] = []
@@ -100,6 +102,8 @@ class FakeVCenterNode:
     snapshot_quiesced: bool = True
     tools_status: str = "toolsOk"
     raise_on_query_changed_disk_areas: Exception | None = None
+    raise_on_query_for_disk_keys: dict[int, Exception] | None = None
+    extra_live_disks: list[dict[str, object]] | None = None
     created_vm_firmware: str | None = None
     host_connected: bool = True
     keepalive_windows: int = 0
@@ -203,6 +207,8 @@ class FakeVCenterNode:
         )
         if FakeVCenterNode.raise_on_query_changed_disk_areas is not None:
             raise FakeVCenterNode.raise_on_query_changed_disk_areas
+        if disk_key in (FakeVCenterNode.raise_on_query_for_disk_keys or {}):
+            raise FakeVCenterNode.raise_on_query_for_disk_keys[disk_key]
         return [{"offset": 0, "length": 4096}, {"offset": 8192, "length": 4096}]
 
     def get_thumbprint(self) -> str:
@@ -235,7 +241,9 @@ class FakeVCenterNode:
                 "uuid": "disk-uuid-1",
                 "source_disk_type_code": int(VddkDiskType.VMFS_THIN),
                 "source_disk_type_name": "vmfs_thin",
-            }
+                **(FakeVCenterNode.live_disk_placement or {}),
+            },
+            *(FakeVCenterNode.extra_live_disks or []),
         ]
 
     def get_vm_restore_metadata(self, vm_name: str) -> dict[str, object]:
@@ -286,6 +294,7 @@ class FakeVCenterNode:
         disk_uuid: str | None = None,
         thin_provisioned: bool | None = None,
         eager_zeroed: bool = False,
+        placement: dict[str, object] | None = None,
     ) -> dict[str, object]:
         payload = {
             "vm_name": vm_name,
@@ -294,6 +303,7 @@ class FakeVCenterNode:
             "disk_uuid": disk_uuid,
             "thin_provisioned": thin_provisioned,
             "eager_zeroed": eager_zeroed,
+            "placement": placement,
             "controller_key": 1000,
             "unit_number": 1,
             "label": disk_label or "Restored disk",
@@ -309,6 +319,7 @@ class FakeVCenterNode:
         datastore_name: str,
         config_metadata: dict[str, object],
         disk_layout: list[dict[str, object]] | None = None,
+        disk_placements: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
         disk_paths = [
             f"[{datastore_name}] {vm_name}/{disk['file_name']}"
@@ -323,12 +334,29 @@ class FakeVCenterNode:
             "config_metadata": config_metadata,
             "vm_moref": "vm-restore-001",
             "disk_layout": disk_layout or [],
+            "disk_placements": disk_placements,
             "disk_paths": disk_paths,
             "requested_firmware": requested_firmware,
             "restored_firmware": restored_firmware,
         }
         self.created_vms.append(payload)
         return payload
+
+    def apply_boot_order(
+        self,
+        vm_name: str,
+        boot_order: list[dict[str, object]],
+        *,
+        network_adapters: list[dict[str, object]] | None = None,
+        vm_moref: str | None = None,
+    ) -> list[dict[str, object]]:
+        FakeVCenterNode.boot_order_calls.append(
+            {"vm_name": vm_name, "boot_order": boot_order, "network_adapters": network_adapters, "vm_moref": vm_moref}
+        )
+        return [
+            {"device": "Hard disk 1 (PVSCSI 0:0)", "restored": True, "reason": None},
+            {"device": "CD/DVD drive", "restored": False, "reason": "the restored VM has no CD/DVD drive"},
+        ]
 
     def create_managed_disk(
         self,
@@ -432,6 +460,8 @@ class TaskExecutorTests(unittest.TestCase):
         HYPERVISORS.clear()
         RESOURCES_BY_HV.clear()
         BACKUPS.clear()
+        FakeVCenterNode.live_disk_placement = None
+        FakeVCenterNode.boot_order_calls = []
         FakeVCenterNode.snapshots_created.clear()
         FakeVCenterNode.snapshots_removed.clear()
         FakeVCenterNode.attachments.clear()
@@ -463,6 +493,8 @@ class TaskExecutorTests(unittest.TestCase):
         FakeVCenterNode.snapshot_quiesced = True
         FakeVCenterNode.tools_status = "toolsOk"
         FakeVCenterNode.raise_on_query_changed_disk_areas = None
+        FakeVCenterNode.raise_on_query_for_disk_keys = None
+        FakeVCenterNode.extra_live_disks = None
         FakeVCenterNode.created_vm_firmware = None
         FakeVCenterNode.host_connected = True
         FakeVCenterNode.access_lock_held = False
@@ -2223,7 +2255,7 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertNotIn("nbdssl", command)
         self.assertEqual(command[command.index("--vmdk") + 1], "[datastore1] demo-vm/demo-vm.vmdk")
 
-    def test_vcenter_differential_backup_uses_latest_full_manifest(self) -> None:
+    def test_a_differential_is_taken_against_the_latest_full_and_never_recorded_as_a_full(self) -> None:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",
             "kind": "vcenter",
@@ -2329,17 +2361,10 @@ class TaskExecutorTests(unittest.TestCase):
                 with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
                     result = run_task(task)
 
-        self.assertEqual(result["status"], "completed")
-        payload = result["result"]
-        self.assertTrue(payload["differential"])
-        self.assertFalse(payload["incremental"])
-        self.assertEqual(payload["backup_mode"], "differential")
-        self.assertEqual(payload["disks"][0]["previous_change_id"], "full-change-001")
-        # The differential is taken against the latest FULL manifest, so the
-        # resolved parent manifest must be the full one, not the incremental.
-        self.assertEqual(
-            payload["disks"][0]["parent_manifest_path"],
-            str((full_task_root / "manifest.json").resolve()),
+        self.assertEqual(result["status"], "failed")
+        self.assertIn(
+            "would hold only the changes since the previous backup for Hard disk 1",
+            result["result"]["message"],
         )
         command = recorded_commands[0]
         self.assertEqual(command[command.index("--type") + 1], "incremental")
@@ -2569,24 +2594,227 @@ class TaskExecutorTests(unittest.TestCase):
                     return FakeCompletedProcess(returncode=1, stderr="query changed areas failed")
                 return FakeCompletedProcess(returncode=0, stdout="Done")
 
-            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
-                with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
-                    result = run_task(task)
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run),
+                patch("python.srv.plugins.vcenter.vcenter_backup.remove_disk_tool_backup") as remove,
+            ):
+                result = run_task(task)
+                diagnostics = list(pathlib.Path(temp_dir).rglob("*.diagnostics.json"))
 
         self.assertEqual(result["status"], "completed")
         payload = result["result"]
         self.assertEqual(payload["backup_mode"], "incremental-full-fallback")
         self.assertTrue(payload["incremental_full_fallback_used"])
-        self.assertEqual(payload["disks"][0]["store_mode"], "full-fallback")
-        self.assertTrue(payload["disks"][0]["diagnostic_path"].endswith(".diagnostics.json"))
+        self.assertNotIn("store_mode", payload["disks"][0])
+        self.assertEqual(len(diagnostics), 1)
         self.assertEqual(len(recorded_commands), 2)
         self.assertEqual(recorded_commands[0][recorded_commands[0].index("--type") + 1], "incremental")
         self.assertEqual(recorded_commands[1][1], "backup")
+        self.assertNotIn("--type", recorded_commands[1])
         self._assert_abr_mode_file(recorded_commands[1])
+        self.assertEqual([call.args[2] for call in remove.call_args_list], [payload["disks"][0]["abr_backup_name"]])
         # A full legacy copy was actually written -- the catalog must record
         # this as a full backup, not the scheduler's original "Incremental".
         self.assertEqual(payload["resolved_backup_type"], "ActiveFull")
         self.assertEqual(payload["resolved_backup_reason"], "IncrementalFallbackToFull")
+
+    def _two_disk_incremental(
+        self,
+        *,
+        fail_tool_for: str | None = None,
+        remove_side_effect: Exception | None = None,
+    ) -> tuple[dict[str, object], list[list[str]], object]:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+        FakeVCenterNode.extra_live_disks = [
+            {
+                "disk_label": "Hard disk 2",
+                "capacity_gb": 16,
+                "datastore_path": "[datastore1] demo-vm/demo-vm_1.vmdk",
+                "uuid": "disk-uuid-2",
+                "source_disk_type_code": int(VddkDiskType.VMFS_THIN),
+                "source_disk_type_name": "vmfs_thin",
+            }
+        ]
+        FakeVCenterNode.snapshot_change_ids = [
+            {
+                "disk_label": "Hard disk 1",
+                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                "change_id": "disk1-change-002",
+                "uuid": "disk-uuid-1",
+                "controller_key": 1000,
+                "unit_number": 0,
+                "key": 2000,
+            },
+            {
+                "disk_label": "Hard disk 2",
+                "datastore_path": "[datastore1] demo-vm/demo-vm_1.vmdk",
+                "change_id": "disk2-restarted/1",
+                "uuid": "disk-uuid-2",
+                "controller_key": 15000,
+                "unit_number": 0,
+                "key": 16000,
+            },
+        ]
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        recorded_commands: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous_task_root = pathlib.Path(temp_dir) / "demo-vm" / "task-full"
+            previous_task_root.mkdir(parents=True, exist_ok=True)
+            parent_manifest = previous_task_root / "manifest.json"
+            parent_manifest.write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "operation": "vm-backup",
+                        "vm_name": "demo-vm",
+                        "vm_external_id": "vm-uuid-1",
+                        "backup_mode": "full",
+                        "created_at": "2026-10-24T09:00:00+00:00",
+                        "disks": [
+                            {
+                                "index": 1,
+                                "disk_label": "Hard disk 1",
+                                "capacity_gb": 40,
+                                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                                "uuid": "disk-uuid-1",
+                                "change_id": "disk1-change-001",
+                                "abr_path": str(previous_task_root),
+                                "abr_backup_name": "01-demo-vm.vmdk",
+                                "storage_mode": "local",
+                            },
+                            {
+                                "index": 2,
+                                "disk_label": "Hard disk 2",
+                                "capacity_gb": 16,
+                                "datastore_path": "[datastore1] demo-vm/demo-vm_1.vmdk",
+                                "uuid": "disk-uuid-2",
+                                "change_id": "disk2-change-001",
+                                "abr_path": str(previous_task_root),
+                                "abr_backup_name": "02-demo-vm_1.vmdk",
+                                "storage_mode": "local",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task = {
+                "id": "task-vcenter-two-disks",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "incremental": True,
+                    "incremental_fallback_full": True,
+                    "destination_dir": temp_dir,
+                    "parent_manifest_path": str(parent_manifest),
+                    "parent_point_id": "point-full",
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                recorded_commands.append(command)
+                if fail_tool_for and "--type" in command and any(fail_tool_for in part for part in command):
+                    return FakeCompletedProcess(returncode=1, stderr="Error: failed to open parent backup")
+                return FakeCompletedProcess(returncode=0, stdout="Done")
+
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run),
+                patch(
+                    "python.srv.plugins.vcenter.vcenter_backup.remove_disk_tool_backup",
+                    side_effect=remove_side_effect,
+                ) as remove,
+                patch("python.srv.plugins.vcenter.vcenter_backup._backup_still_stored", return_value=True),
+            ):
+                result = run_task(task)
+        return result, recorded_commands, remove
+
+    def test_a_disk_whose_cbt_restarted_makes_the_run_a_full_of_every_disk(self) -> None:
+        FakeVCenterNode.raise_on_query_for_disk_keys = {
+            16000: FakeVimFault(
+                "Error caused by file /vmfs/volumes/uuid/demo-vm/demo-vm_1.vmdk",
+                fault_message_key="vim.hostd.vmsvc.cbt.cannotGetChanges",
+            )
+        }
+
+        result, commands, _ = self._two_disk_incremental()
+
+        self.assertEqual(result["status"], "completed")
+        payload = result["result"]
+        self.assertEqual((payload["resolved_backup_type"], payload["resolved_backup_reason"]), ("ActiveFull", "IncrementalFallbackToFull"))
+        self.assertIsNone(payload["parent_point_id"])
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.assertEqual(command[1], "backup")
+            self.assertNotIn("--type", command)
+            self.assertNotIn("--change-id", command)
+        self.assertEqual([disk.get("store_mode") for disk in payload["disks"]], [None, None])
+        self.assertEqual([disk["change_id"] for disk in payload["disks"]], ["disk1-change-002", "disk2-restarted/1"])
+
+    def test_a_cbt_fault_is_named_by_its_own_message_not_its_repr(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import _cbt_fault_text
+
+        described = FakeVimFault("Error caused by file /vmfs/x.vmdk", fault_message_key="vim.hostd.vmsvc.cbt.cannotGetChanges")
+        described.faultMessage[0].message = "Cannot compute changes for disk /vmfs/x.vmdk: Nonmatching change UUID."
+
+        self.assertEqual(_cbt_fault_text(described), "Cannot compute changes for disk /vmfs/x.vmdk: Nonmatching change UUID.")
+        self.assertEqual(_cbt_fault_text(FakeVimFault("Error caused by file /vmfs/x.vmdk")), "Error caused by file /vmfs/x.vmdk")
+        self.assertEqual(_cbt_fault_text(RuntimeError()), "RuntimeError")
+
+    def test_an_incremental_of_two_healthy_disks_stays_incremental_and_asks_cbt_once_per_disk(self) -> None:
+        result, commands, _ = self._two_disk_incremental()
+
+        self.assertEqual(result["status"], "completed")
+        payload = result["result"]
+        self.assertEqual(payload["resolved_backup_type"], "Incremental")
+        self.assertEqual(payload["parent_point_id"], "point-full")
+        self.assertEqual([disk["store_mode"] for disk in payload["disks"]], ["incremental", "incremental"])
+        self.assertEqual([c[c.index("--change-id") + 1] for c in commands], ["disk1-change-001", "disk2-change-001"])
+        self.assertEqual([q["disk_key"] for q in FakeVCenterNode.changed_area_queries], [2000, 16000])
+
+    def test_an_incremental_the_tool_cannot_store_is_retaken_as_a_full_of_every_disk(self) -> None:
+        result, commands, remove = self._two_disk_incremental(fail_tool_for="02-demo-vm_1.vmdk")
+
+        self.assertEqual(result["status"], "completed")
+        payload = result["result"]
+        self.assertEqual((payload["resolved_backup_type"], payload["resolved_backup_reason"]), ("ActiveFull", "IncrementalFallbackToFull"))
+        self.assertIsNone(payload["parent_point_id"])
+        self.assertEqual(["--type" in command for command in commands], [True, True, False, False])
+        self.assertEqual(sorted(call.args[2] for call in remove.call_args_list), ["01-demo-vm.vmdk", "02-demo-vm_1.vmdk"])
+        self.assertEqual([disk.get("store_mode") for disk in payload["disks"]], [None, None])
+
+    def test_a_full_that_cannot_be_retaken_fails_and_says_why(self) -> None:
+        result, commands, _ = self._two_disk_incremental(
+            fail_tool_for="02-demo-vm_1.vmdk", remove_side_effect=StorageToolError("object is locked")
+        )
+
+        self.assertEqual(result["status"], "failed")
+        message = result["result"]["message"]
+        self.assertIn("the incremental of disk [datastore1] demo-vm/demo-vm_1.vmdk failed", message)
+        self.assertIn("a full backup could not be taken instead", message)
+        self.assertEqual(len(commands), 2)
 
     def _run_direct_esxi_full_backup(self, stderr: str) -> tuple[dict, list[list[str]]]:
         FakeVCenterNode.service_type = "HostAgent"
@@ -6064,6 +6292,228 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(recorded_commands[0][1], "restore")
         self.assertIn("[ds-01] demo-vm-restored/01-demo-vm.vmdk", recorded_commands[0])
 
+    def test_a_backup_records_the_controller_and_slot_the_live_disk_is_on(self) -> None:
+        FakeVCenterNode.live_disk_placement = {"controller_type": "sata", "controller_bus": 0, "unit_number": 5}
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            },
+            ("disk", "vm-uuid-1-disk-1"): {
+                "resource_type": "disk",
+                "external_id": "vm-uuid-1-disk-1",
+                "name": "Hard disk 1",
+                "payload": {
+                    "vm_id": "vm-uuid-1",
+                    "capacity_gb": 40,
+                    "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                    "uuid": "disk-uuid-1",
+                    "controller_type": "paravirtual",
+                    "controller_bus": 0,
+                    "unit_number": 0,
+                },
+            },
+        }
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task = {
+                "id": "task-vcenter-placement",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {"destination_dir": temp_dir, "tool_path": EXISTING_TOOL_PATH},
+            }
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch(
+                    "python.srv.plugins.vcenter.vcenter_backup.run_capped",
+                    return_value=FakeCompletedProcess(returncode=0, stdout="ok"),
+                ),
+            ):
+                result = run_task(task)
+            manifest_payload = json.loads(
+                pathlib.Path(result["result"]["manifest_path"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result["status"], "completed")
+        disk = manifest_payload["disks"][0]
+        self.assertEqual(
+            (disk["controller_type"], disk["controller_bus"], disk["unit_number"]),
+            ("sata", 0, 5),
+        )
+
+    def test_a_vm_restore_hands_each_disk_its_recorded_controller_and_slot(self) -> None:
+        placements = [
+            {"controller_type": "paravirtual", "controller_bus": 0, "unit_number": 3},
+            {"controller_type": "sata", "controller_bus": 0, "unit_number": 5},
+        ]
+        for service_type in ("VirtualCenter", "HostAgent"):
+            with self.subTest(service_type=service_type):
+                FakeVCenterNode.service_type = service_type
+                FakeVCenterNode.created_vms.clear()
+                FakeVCenterNode.attachments.clear()
+                FakeVCenterNode.created_managed_disks.clear()
+                result, progress = self._restore_two_disks(placements)
+
+                self.assertEqual(result["status"], "completed")
+                shell = FakeVCenterNode.created_vms[0]
+                self.assertEqual(
+                    shell["disk_placements"],
+                    [
+                        {"label": "Hard disk 1", **placements[0]},
+                        {"label": "Hard disk 2", **placements[1]},
+                    ],
+                )
+                messages = [str(update.get("message")) for update in progress]
+                self.assertIn("Hard disk 1 placed on PVSCSI 0:3, as it was backed up", messages)
+                self.assertIn("Hard disk 2 placed on SATA 0:5, as it was backed up", messages)
+                if service_type == "HostAgent":
+                    self.assertEqual(
+                        [attachment["placement"] for attachment in FakeVCenterNode.attachments],
+                        shell["disk_placements"],
+                    )
+
+    def test_a_vm_restore_from_a_point_without_placements_keeps_the_old_layout_and_says_so(self) -> None:
+        result, progress = self._restore_two_disks([{}, {}])
+
+        self.assertEqual(result["status"], "completed")
+        self.assertIsNone(FakeVCenterNode.created_vms[0]["disk_placements"])
+        self.assertTrue(
+            any(
+                "does not record which controller and slot each disk was on" in str(update.get("message"))
+                for update in progress
+            )
+        )
+
+    def test_a_vm_restore_rebuilds_the_source_boot_order_and_says_what_it_could_not(self) -> None:
+        boot_order = [
+            {"type": "disk", "label": "Hard disk 1", "controller_type": "paravirtual", "controller_bus": 0, "unit_number": 0},
+            {"type": "cdrom"},
+        ]
+
+        result, progress = self._restore_two_disks([{}, {}], boot_order=boot_order)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(FakeVCenterNode.boot_order_calls), 1)
+        call = FakeVCenterNode.boot_order_calls[0]
+        self.assertEqual((call["vm_name"], call["boot_order"], call["vm_moref"]), ("demo-vm-restored", boot_order, "vm-restore-001"))
+        messages = [str(update.get("message")) for update in progress]
+        self.assertIn("Boot order restored: Hard disk 1 (PVSCSI 0:0)", messages)
+        self.assertIn("CD/DVD drive was left out of the boot order: the restored VM has no CD/DVD drive", messages)
+        self.assertEqual(result["result"]["boot_order"][0]["device"], "Hard disk 1 (PVSCSI 0:0)")
+
+    def test_a_restore_point_without_a_boot_order_leaves_the_restored_vm_on_its_default(self) -> None:
+        for boot_order in (None, []):
+            with self.subTest(boot_order=boot_order):
+                FakeVCenterNode.boot_order_calls = []
+
+                result, _ = self._restore_two_disks([{}, {}], boot_order=boot_order)
+
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(FakeVCenterNode.boot_order_calls, [])
+                self.assertIsNone(result["result"]["boot_order"])
+
+    def _restore_two_disks(
+        self, placements: list[dict[str, object]], boot_order: list[dict[str, object]] | None = None
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        progress: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            disks = []
+            for index, placement in enumerate(placements, start=1):
+                (pathlib.Path(temp_dir) / f"0{index}-demo-vm.vmdk").write_text("fake-vmdk", encoding="utf-8")
+                disks.append(
+                    {
+                        "index": index,
+                        "disk_label": f"Hard disk {index}",
+                        "capacity_gb": 20,
+                        "datastore_path": f"[ds-01] demo-vm/demo-vm_{index}.vmdk",
+                        "destination_path": "",
+                        "abr_path": str(pathlib.Path(temp_dir)),
+                        "abr_backup_name": f"0{index}-demo-vm.vmdk",
+                        "storage_mode": "local",
+                        "store_mode": "full",
+                        **placement,
+                    }
+                )
+            manifest_path = pathlib.Path(temp_dir) / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "vm_name": "demo-vm",
+                        "vm_config": {
+                            "guest_id": "debian12_64Guest",
+                            "num_cpu": 2,
+                            "memory_mb": 2048,
+                            "network_adapters": [],
+                            **({"boot_order": boot_order} if boot_order is not None else {}),
+                        },
+                        "disks": disks,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._register_backup_point("point-placement", manifest_path)
+            task = {
+                "id": "task-restore-placement",
+                "status": "queued",
+                "task_type": "restore",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "manifest_path": str(manifest_path),
+                    "point_id": "point-placement",
+                    "target_vm_name": "demo-vm-restored",
+                    "target_host_name": "esx-01.local",
+                    "target_datastore_name": "ds-01",
+                    "disk_type": "thin-provisioned",
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch(
+                    "python.srv.plugins.vcenter.vcenter_restore.run_capped",
+                    return_value=FakeCompletedProcess(returncode=0, stdout="ok"),
+                ),
+            ):
+                result = run_task(task, progress_callback=progress.append)
+        return result, progress
+
     def test_hostagent_vm_restore_recreates_an_eager_zeroed_source_disk(self) -> None:
         FakeVCenterNode.service_type = "HostAgent"
         HYPERVISORS["hv-vc"] = {
@@ -6549,8 +6999,7 @@ class TaskExecutorTests(unittest.TestCase):
 
         self.assertEqual(payload["backup_mode"], "incremental-full-fallback")
         self.assertTrue(payload["incremental_full_fallback_used"])
-        self.assertEqual(payload["disks"][0]["store_mode"], "full-no-cbt-baseline")
-        self.assertEqual(payload["disks"][0]["changed_area_count"], 0)
+        self.assertNotIn("store_mode", payload["disks"][0])
         self.assertEqual(len(recorded_commands), 1)
         self.assertEqual(payload["resolved_backup_type"], "ActiveFull")
         self.assertEqual(payload["resolved_backup_reason"], "IncrementalFallbackToFull")
@@ -8242,8 +8691,7 @@ class TaskExecutorTests(unittest.TestCase):
 
         self.assertEqual(payload["backup_mode"], "incremental-full-fallback")
         self.assertTrue(payload["incremental_full_fallback_used"])
-        self.assertEqual(payload["disks"][0]["store_mode"], "full-no-cbt-baseline")
-        self.assertEqual(payload["disks"][0]["changed_area_count"], 0)
+        self.assertNotIn("store_mode", payload["disks"][0])
         self.assertEqual(len(recorded_commands), 1)
         self.assertEqual(payload["resolved_backup_type"], "ActiveFull")
         self.assertEqual(payload["resolved_backup_reason"], "IncrementalFallbackToFull")
@@ -8825,6 +9273,54 @@ class TaskExecutorTests(unittest.TestCase):
         message = str((result.get("result") or {}).get("message") or "")
         self.assertIn("Disk backup failed for [datastore1] demo-vm/demo-vm.vmdk", message)
         self.assertNotIn("while this backup ran", message)
+
+    def _backup_whose_data_mover_ends(self, returncode: int, stderr: str) -> tuple[str, list, list[str]]:
+        def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+            self._write_abr_artifacts(command)
+            return FakeCompletedProcess(returncode=returncode, stderr=stderr)
+
+        with patch.object(
+            FakeVCenterNode, "server_time", create=True, return_value=datetime(2026, 10, 9, tzinfo=timezone.utc)
+        ), patch.object(FakeVCenterNode, "vm_changes_since", create=True, return_value=[]), self.assertLogs(
+            "python.srv.plugins.vcenter.vcenter_backup", level="ERROR"
+        ) as logs:
+            result, leftovers = self._run_stopped_backup(fake_run)
+        self.assertEqual(result["status"], "failed")
+        return str((result.get("result") or {}).get("message") or ""), leftovers, logs.output
+
+    def test_a_data_mover_killed_mid_backup_is_reported_as_killed(self) -> None:
+        message, leftovers, logs = self._backup_whose_data_mover_ends(
+            -9, "Disk '[datastore1] demo-vm/demo-vm.vmdk' opened using transport mode 'nbd'\n"
+        )
+
+        self.assertEqual(
+            message,
+            "Disk backup failed for [datastore1] demo-vm/demo-vm.vmdk: the data mover ended unexpectedly: "
+            "abr-vmdk-tool was terminated by signal 9 (SIGKILL) (SIGKILL usually comes from the kernel's "
+            "out-of-memory killer; journalctl -k on the backup server shows it). Its last output: "
+            "Disk '[datastore1] demo-vm/demo-vm.vmdk' opened using transport mode 'nbd'",
+        )
+        self.assertEqual(leftovers, [])
+        self.assertTrue(any("terminated by signal 9 (SIGKILL)" in line for line in logs))
+
+    def test_a_data_mover_that_exits_without_saying_why_is_reported_with_its_exit_code(self) -> None:
+        message, _leftovers, logs = self._backup_whose_data_mover_ends(3, "Disk '[datastore1] x.vmdk' opened using transport mode 'nbd'")
+
+        self.assertIn("the data mover ended unexpectedly: abr-vmdk-tool exited with code 3. Its last output: Disk", message)
+        self.assertNotIn("out-of-memory", message)
+        self.assertTrue(any("abr-vmdk-tool exited with code 3" in line for line in logs))
+
+    def test_a_data_mover_that_reports_its_own_error_keeps_that_error_as_the_cause(self) -> None:
+        message, _leftovers, logs = self._backup_whose_data_mover_ends(
+            7, "Error: failed to open disk '[datastore1] demo-vm/demo-vm.vmdk': Unknown error"
+        )
+
+        self.assertEqual(
+            message,
+            "Disk backup failed for [datastore1] demo-vm/demo-vm.vmdk: "
+            "Error: failed to open disk '[datastore1] demo-vm/demo-vm.vmdk': Unknown error",
+        )
+        self.assertTrue(any("(abr-vmdk-tool exited with code 7)" in line for line in logs))
 
     def test_without_the_vcenter_time_the_failure_is_not_explained_by_guesswork(self) -> None:
         with patch.object(FakeVCenterNode, "vm_changes_since", create=True) as asked:

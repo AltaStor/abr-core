@@ -36,7 +36,9 @@ from .vcenter_backup import (
     _sanitize_name,
 )
 from .vcenter_disk_types import (
+    DISK_PLACEMENT_FIELDS,
     VddkDiskType,
+    describe_disk_placement,
     disk_type_name_from_code,
     normalize_disk_type_selection,
 )
@@ -614,6 +616,55 @@ def _disk_type_details(
     }
 
 
+def _disk_placements(disk_entries: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    placements = [
+        {
+            "label": str(disk.get("disk_label") or f"Hard disk {index}"),
+            **{field: disk.get(field) for field in DISK_PLACEMENT_FIELDS},
+        }
+        for index, disk in enumerate(disk_entries, start=1)
+    ]
+    if not placements or any(placement.get("controller_type") in (None, "") for placement in placements):
+        return None
+    return placements
+
+
+def _report_disk_placements(
+    progress_callback: ProgressCallback,
+    placements: list[dict[str, Any]] | None,
+    disk_controllers: Any,
+) -> None:
+    if placements is None:
+        controllers = ", ".join(str(item) for item in disk_controllers or []) or "one SCSI controller"
+        messages = [
+            (
+                "The restore point does not record which controller and slot each disk was on "
+                f"(it was made before that was recorded): the disks go on {controllers} in disk order"
+            )
+        ]
+    else:
+        messages = [
+            f"{placement['label']} placed on {describe_disk_placement(placement)}, as it was backed up"
+            for placement in placements
+        ]
+    for message in messages:
+        logger.info("%s", message)
+        _emit_progress(progress_callback, "prepare", 5, message, worker_mode="vcenter-abr-vmdk-tool")
+
+
+def _report_boot_order(progress_callback: ProgressCallback, report: list[dict[str, Any]]) -> None:
+    restored = [str(item.get("device")) for item in report if item.get("restored")]
+    messages = [f"Boot order restored: {', '.join(restored)}"] if restored else []
+    messages.extend(
+        f"{item.get('device')} was left out of the boot order: {item.get('reason')}"
+        for item in report
+        if not item.get("restored")
+    )
+    for message in messages:
+        logger.info("%s", message)
+        _emit_progress(progress_callback, "finalize", 84, message, worker_mode="vcenter-abr-vmdk-tool")
+
+
 def _report_network_adapters(
     progress_callback: ProgressCallback,
     adapters: Any,
@@ -888,6 +939,7 @@ def run_vcenter_restore(
                 if is_virtual_center
                 else None
             )
+            disk_placements = _disk_placements(disk_entries)
             original_destroyed = False
             original_identity: dict[str, str] = {}
             identity_preserved = False
@@ -897,21 +949,25 @@ def run_vcenter_restore(
                 datastore_name=target_datastore_name,
                 config_metadata=vm_config,
                 disk_layout=disk_layout,
+                disk_placements=disk_placements,
             )
             try:
                 logger.info(
                     "Created VM shell %s on host %s datastore %s with resulting firmware %s, "
-                    "SCSI controller type %s, Secure Boot requested=%s",
+                    "disk controllers %s, Secure Boot requested=%s",
                     create_vm_name,
                     target_host_name,
                     target_datastore_name,
                     created_vm.get("restored_firmware") or "unknown",
-                    created_vm.get("requested_scsi_controller_type") or "unknown",
+                    ", ".join(created_vm.get("disk_controllers") or []) or "unknown",
                     created_vm.get("requested_secure_boot"),
                 )
+                if disk_entries:
+                    _report_disk_placements(progress_callback, disk_placements, created_vm.get("disk_controllers"))
                 restored_network_adapters = _report_network_adapters(
                     progress_callback, created_vm.get("network_adapters"), target_host_name
                 )
+                boot_order_report: list[dict[str, Any]] | None = None
                 thumbprint = node.get_thumbprint()
                 created_disk_paths = created_vm.get("disk_paths", [])
                 if not isinstance(created_disk_paths, list):
@@ -1005,6 +1061,7 @@ def run_vcenter_restore(
                             disk_uuid=disk.get("uuid"),
                             thin_provisioned=provisioning["thin_provisioned"],
                             eager_zeroed=provisioning["eager_zeroed"],
+                            placement=disk_placements[index - 1] if disk_placements else None,
                         )
                     progress = min(20 + int((index - 1) * 55 / max(len(disk_entries), 1)), 80)
                     progress_span = max(1, min(20 + int(index * 55 / max(len(disk_entries), 1)), 80) - progress)
@@ -1130,6 +1187,16 @@ def run_vcenter_restore(
                             ),
                         }
                     )
+
+                source_boot_order = vm_config.get("boot_order")
+                if isinstance(source_boot_order, list) and source_boot_order:
+                    boot_order_report = node.apply_boot_order(
+                        create_vm_name,
+                        source_boot_order,
+                        network_adapters=created_vm.get("network_adapters"),
+                        vm_moref=str(created_vm.get("vm_moref") or ""),
+                    )
+                    _report_boot_order(progress_callback, boot_order_report)
 
                 if is_in_place:
                     # Every disk is now fully written and verified on the
@@ -1259,6 +1326,7 @@ def run_vcenter_restore(
             "requested_firmware": requested_firmware,
             "restored_firmware": created_vm.get("restored_firmware"),
             "requested_scsi_controller_type": created_vm.get("requested_scsi_controller_type"),
+            "disk_controllers": created_vm.get("disk_controllers"),
             "requested_secure_boot": created_vm.get("requested_secure_boot"),
             "disk_count": len(restored_disks),
             "disks": restored_disks,
@@ -1266,6 +1334,7 @@ def run_vcenter_restore(
             "disk_types": parameters.get("disk_types") if isinstance(parameters.get("disk_types"), dict) else None,
             "network_map": network_map if isinstance(network_map, dict) else None,
             "network_adapters": restored_network_adapters,
+            "boot_order": boot_order_report,
             "transport_mode": transport_mode,
             "service_type": service_type,
             "power_on": bool(parameters.get("power_on")),

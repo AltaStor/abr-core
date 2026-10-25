@@ -780,6 +780,8 @@ def stranded_backup_snapshots(
     return pending
 
 
+MANIFEST_BACKUP_NAME = "manifest"
+MANIFEST_FILES = ("manifest.json", "manifest.abrm")
 _ACTIVE_TASK_STATES = {"queued", "running", "stopping"}
 
 
@@ -971,17 +973,17 @@ def _consolidate_after_interrupted_task(node: Any, task_id: str, vm_name: str) -
         )
 
 
-def _discard_interrupted_task_output(task: dict[str, Any]) -> None:
+def discard_unregistered_output(task: dict[str, Any]) -> bool:
     task_id = str(task.get("id") or "")
     if _task_output_is_registered(task_id):
         logger.info(
             "Task %s left output that a restore point already references, so it was kept.",
             task_id,
         )
-        return
+        return False
     location = _interrupted_task_output_location(task)
     if location is None:
-        return
+        return True
     repository, abr_path = location
     try:
         names = list_disk_tool_backups(repository, abr_path)
@@ -991,25 +993,38 @@ def _discard_interrupted_task_output(task: dict[str, Any]) -> None:
             task_id,
             abr_path,
         )
-        return
+        return False
+    removed_all = True
     for name in sorted(names):
         try:
             remove_disk_tool_backup(repository, abr_path, name, timeout=120)
             logger.info("Removed the partial backup %r that task %s left at %s.", name, task_id, abr_path)
         except Exception:
+            removed_all = False
             logger.warning(
                 "Could not remove the partial backup %r that task %s left at %s.",
                 name,
                 task_id,
                 abr_path,
             )
+    try:
+        remove_disk_tool_backup(repository, abr_path, MANIFEST_BACKUP_NAME, timeout=120)
+    except Exception:
+        pass
     if not is_s3_repository(repository):
         folder = Path(abr_path)
+        for leftover in MANIFEST_FILES:
+            try:
+                (folder / leftover).unlink(missing_ok=True)
+            except OSError:
+                removed_all = False
+                logger.warning("Could not remove %s that task %s left at %s.", leftover, task_id, abr_path)
         try:
             if folder.is_dir() and not any(folder.iterdir()):
                 folder.rmdir()
         except OSError:
             pass
+    return removed_all
 
 
 def fail_interrupted_tasks() -> int:
@@ -1064,7 +1079,7 @@ def _sweep_interrupted_tasks(tasks: list[dict[str, Any]]) -> None:
                 "Could not remove the snapshot interrupted task %s left behind", task.get("id")
             )
         try:
-            _discard_interrupted_task_output(task)
+            discard_unregistered_output(task)
         except Exception:
             logger.exception(
                 "Could not discard what interrupted task %s left behind", task.get("id")

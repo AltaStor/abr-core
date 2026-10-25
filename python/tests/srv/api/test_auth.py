@@ -20,7 +20,7 @@ except ModuleNotFoundError:
     from fastapi.testclient import TestClient
 
 from python.srv.backup_server import app
-from python.srv.core.mongo_db_wrapper import SESSIONS, USERS, session_key
+from python.srv.core.mongo_db_wrapper import SESSIONS, USERS, renew_session, session_key
 from python.srv.services import auth_service
 
 BOOTSTRAP_ENV = {
@@ -236,54 +236,62 @@ class WebSessionAbsoluteCeilingTests(AuthApiTestCase):
         self.assertIsNone(SESSIONS[session_key(token)].get("absolute_expires_at"))
 
     def test_web_session_ceiling_is_configurable_via_env_var(self) -> None:
-        with patch.dict("os.environ", {"ABR_WEB_SESSION_TTL_SECONDS": "120"}):
+        with patch.dict("os.environ", {"ABR_WEB_SESSION_LIFETIME_SECONDS": "120"}):
             token = self._login(client_type="web").json()["token"]
             absolute_expires_at = datetime.fromisoformat(SESSIONS[session_key(token)]["absolute_expires_at"])
             created_at = datetime.fromisoformat(SESSIONS[session_key(token)]["created_at"])
             delta = (absolute_expires_at - created_at).total_seconds()
             self.assertAlmostEqual(delta, 120, delta=5)
 
+    def test_a_lifetime_of_zero_means_no_ceiling(self) -> None:
+        with patch.dict("os.environ", {"ABR_WEB_SESSION_LIFETIME_SECONDS": "0"}):
+            response = self._login(client_type="web")
+        token = response.json()["token"]
+        self.assertIsNone(SESSIONS[session_key(token)]["absolute_expires_at"])
+        self.assertIsNone(response.json()["absolute_expires_at"])
+
 
 class PerLoginSessionDurationTests(AuthApiTestCase):
-    def test_chosen_duration_controls_this_logins_ceiling(self) -> None:
+    def _idle_seconds(self, token: str) -> float:
+        record = SESSIONS[session_key(token)]
+        return (datetime.fromisoformat(record["expires_at"]) - datetime.fromisoformat(record["created_at"])).total_seconds()
+
+    def test_chosen_duration_is_this_logins_inactivity_timeout(self) -> None:
         token = self._login(client_type="web", duration_seconds=3600).json()["token"]
+        self.assertEqual(SESSIONS[session_key(token)]["idle_timeout_seconds"], 3600)
+        self.assertAlmostEqual(self._idle_seconds(token), 3600, delta=5)
+
+    def test_the_ceiling_comes_from_the_appliance_not_from_the_chosen_duration(self) -> None:
+        token = self._login(client_type="web", duration_seconds=600).json()["token"]
         absolute_expires_at = datetime.fromisoformat(SESSIONS[session_key(token)]["absolute_expires_at"])
         created_at = datetime.fromisoformat(SESSIONS[session_key(token)]["created_at"])
-        delta = (absolute_expires_at - created_at).total_seconds()
-        self.assertAlmostEqual(delta, 3600, delta=5)
+        self.assertAlmostEqual(
+            (absolute_expires_at - created_at).total_seconds(), auth_service.web_session_lifetime_seconds(), delta=5
+        )
 
     def test_unspecified_duration_falls_back_to_the_appliance_default(self) -> None:
         token = self._login(client_type="web").json()["token"]
-        absolute_expires_at = datetime.fromisoformat(SESSIONS[session_key(token)]["absolute_expires_at"])
-        created_at = datetime.fromisoformat(SESSIONS[session_key(token)]["created_at"])
-        delta = (absolute_expires_at - created_at).total_seconds()
-        self.assertAlmostEqual(delta, auth_service.web_session_ttl_seconds(), delta=5)
+        self.assertEqual(SESSIONS[session_key(token)]["idle_timeout_seconds"], auth_service.web_session_ttl_seconds())
+        self.assertAlmostEqual(self._idle_seconds(token), auth_service.web_session_ttl_seconds(), delta=5)
 
     def test_two_separate_logins_can_choose_two_different_durations(self) -> None:
         token_a = self._login(client_type="web", duration_seconds=2400).json()["token"]
         token_b = self._login(client_type="web", duration_seconds=600).json()["token"]
 
-        delta_a = (
-            datetime.fromisoformat(SESSIONS[session_key(token_a)]["absolute_expires_at"])
-            - datetime.fromisoformat(SESSIONS[session_key(token_a)]["created_at"])
-        ).total_seconds()
-        delta_b = (
-            datetime.fromisoformat(SESSIONS[session_key(token_b)]["absolute_expires_at"])
-            - datetime.fromisoformat(SESSIONS[session_key(token_b)]["created_at"])
-        ).total_seconds()
-
-        self.assertAlmostEqual(delta_a, 2400, delta=5)
-        self.assertAlmostEqual(delta_b, 600, delta=5)
+        self.assertAlmostEqual(self._idle_seconds(token_a), 2400, delta=5)
+        self.assertAlmostEqual(self._idle_seconds(token_b), 600, delta=5)
 
     def test_choosing_a_duration_does_not_persist_to_a_later_unspecified_login(self) -> None:
         self._login(client_type="web", duration_seconds=3600)
 
         token = self._login(client_type="web").json()["token"]
-        delta = (
-            datetime.fromisoformat(SESSIONS[session_key(token)]["absolute_expires_at"])
-            - datetime.fromisoformat(SESSIONS[session_key(token)]["created_at"])
-        ).total_seconds()
-        self.assertAlmostEqual(delta, auth_service.web_session_ttl_seconds(), delta=5)
+        self.assertAlmostEqual(self._idle_seconds(token), auth_service.web_session_ttl_seconds(), delta=5)
+
+    def test_an_inactivity_timeout_past_the_ceiling_ends_at_the_ceiling(self) -> None:
+        with patch.dict("os.environ", {"ABR_WEB_SESSION_LIFETIME_SECONDS": "900"}):
+            token = self._login(client_type="web", duration_seconds=3600).json()["token"]
+        record = SESSIONS[session_key(token)]
+        self.assertEqual(record["expires_at"], record["absolute_expires_at"])
 
     def test_out_of_range_duration_is_rejected_at_login(self) -> None:
         too_short = self._login(client_type="web", duration_seconds=10)
@@ -304,6 +312,7 @@ class PerLoginSessionDurationTests(AuthApiTestCase):
         self.assertEqual(response.status_code, 200)
         token = response.json()["token"]
         self.assertIsNone(SESSIONS[session_key(token)].get("absolute_expires_at"))
+        self.assertNotIn("idle_timeout_seconds", SESSIONS[session_key(token)])
 
     def test_rejected_duration_leaves_no_session_behind(self) -> None:
         before = set(SESSIONS.keys())
@@ -312,27 +321,16 @@ class PerLoginSessionDurationTests(AuthApiTestCase):
 
 
 class ReportedExpiryTests(AuthApiTestCase):
-    def test_web_login_reports_the_chosen_ceiling_not_the_sliding_window(self) -> None:
+    def test_web_login_reports_when_an_idle_session_ends_and_the_ceiling(self) -> None:
         response = self._login(client_type="web", duration_seconds=3600)
         token = response.json()["token"]
+        record = SESSIONS[session_key(token)]
 
+        self.assertEqual(response.json()["expires_at"], record["expires_at"])
+        self.assertEqual(response.json()["absolute_expires_at"], record["absolute_expires_at"])
+        created_at = datetime.fromisoformat(record["created_at"])
         reported = datetime.fromisoformat(response.json()["expires_at"])
-        created_at = datetime.fromisoformat(SESSIONS[session_key(token)]["created_at"])
         self.assertAlmostEqual((reported - created_at).total_seconds(), 3600, delta=5)
-
-        stored = datetime.fromisoformat(SESSIONS[session_key(token)]["expires_at"])
-        self.assertAlmostEqual((stored - created_at).total_seconds(), auth_service.session_ttl_seconds(), delta=5)
-        self.assertLess(stored, reported)
-
-    def test_web_login_without_explicit_duration_reports_the_default_ceiling(self) -> None:
-        response = self._login(client_type="web")
-        token = response.json()["token"]
-
-        reported = datetime.fromisoformat(response.json()["expires_at"])
-        created_at = datetime.fromisoformat(SESSIONS[session_key(token)]["created_at"])
-        self.assertAlmostEqual(
-            (reported - created_at).total_seconds(), auth_service.web_session_ttl_seconds(), delta=5
-        )
 
     def test_cli_login_reports_the_sliding_window_unchanged(self) -> None:
         response = self._login(client_type="cli")
@@ -341,6 +339,161 @@ class ReportedExpiryTests(AuthApiTestCase):
         reported = datetime.fromisoformat(response.json()["expires_at"])
         stored = datetime.fromisoformat(SESSIONS[session_key(token)]["expires_at"])
         self.assertEqual(reported, stored)
+        self.assertIsNone(response.json()["absolute_expires_at"])
+
+
+class InactivityTimeoutTests(AuthApiTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.now = datetime.now(timezone.utc)
+        clock = patch.object(auth_service, "_now_dt", side_effect=lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+        synchronous = patch.object(
+            auth_service, "_renew_session_in_background", side_effect=lambda token, fields: renew_session(token, fields)
+        )
+        synchronous.start()
+        self.addCleanup(synchronous.stop)
+
+    def _get(self, token: str, *, refresh: bool = False):
+        headers = self._auth_headers(token)
+        if refresh:
+            headers["X-ABR-Refresh"] = "1"
+        return self.client.get("/api/v1/auth/me", headers=headers)
+
+    def _expires_at(self, token: str) -> datetime:
+        return datetime.fromisoformat(SESSIONS[session_key(token)]["expires_at"])
+
+    def test_a_user_who_acts_every_four_minutes_stays_signed_in_past_twelve(self) -> None:
+        token = self._login(client_type="web", duration_seconds=300).json()["token"]
+        for _ in range(4):
+            self.now += timedelta(minutes=4)
+            self.assertEqual(self._get(token).status_code, 200)
+        self.assertGreater(self.now - datetime.fromisoformat(SESSIONS[session_key(token)]["created_at"]), timedelta(minutes=12))
+        self.assertEqual(self._expires_at(token), self.now + timedelta(seconds=300))
+
+    def test_background_refreshes_alone_do_not_keep_a_web_session_alive(self) -> None:
+        token = self._login(client_type="web", duration_seconds=300).json()["token"]
+        ends = self._expires_at(token)
+        for _ in range(33):
+            self.now += timedelta(seconds=9)
+            if self.now >= ends:
+                break
+            self.assertEqual(self._get(token, refresh=True).status_code, 200)
+            self.assertEqual(self._expires_at(token), ends)
+        self.now = ends + timedelta(seconds=1)
+        self.assertEqual(self._get(token, refresh=True).status_code, 401)
+
+    def test_a_cli_session_is_still_extended_by_its_progress_polling(self) -> None:
+        token = self._login(client_type="cli").json()["token"]
+        for _ in range(3):
+            self.now += timedelta(seconds=240)
+            self.assertEqual(self._get(token, refresh=True).status_code, 200)
+        self.assertEqual(self._expires_at(token), self.now + timedelta(seconds=auth_service.session_ttl_seconds()))
+
+    def test_a_web_session_from_before_the_inactivity_timeout_is_still_extended_by_polling(self) -> None:
+        token = self._login(client_type="web").json()["token"]
+        SESSIONS[session_key(token)].pop("idle_timeout_seconds")
+        before = self._expires_at(token)
+        self.now += timedelta(seconds=60)
+        self.assertEqual(self._get(token, refresh=True).status_code, 200)
+        self.assertGreater(self._expires_at(token), before)
+
+    def test_activity_never_carries_a_web_session_past_its_ceiling(self) -> None:
+        with patch.dict("os.environ", {"ABR_WEB_SESSION_LIFETIME_SECONDS": "600"}):
+            token = self._login(client_type="web", duration_seconds=300).json()["token"]
+        ceiling = datetime.fromisoformat(SESSIONS[session_key(token)]["absolute_expires_at"])
+        for _ in range(2):
+            self.now += timedelta(seconds=240)
+            self.assertEqual(self._get(token).status_code, 200)
+            self.assertLessEqual(self._expires_at(token), ceiling)
+        self.now = ceiling + timedelta(seconds=1)
+        self.assertEqual(self._get(token).status_code, 401)
+
+
+class SessionTouchTests(InactivityTimeoutTests):
+    def _touch(self, token: str, *, refresh: bool = False):
+        headers = self._auth_headers(token)
+        if refresh:
+            headers["X-ABR-Refresh"] = "1"
+        return self.client.post("/api/v1/auth/session/touch", headers=headers)
+
+    def test_touch_moves_the_end_to_now_plus_the_inactivity_timeout(self) -> None:
+        token = self._login(client_type="web", duration_seconds=600).json()["token"]
+        self.now += timedelta(seconds=200)
+
+        response = self._touch(token)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(datetime.fromisoformat(response.json()["expires_at"]), self.now + timedelta(seconds=600))
+        self.assertEqual(response.json()["absolute_expires_at"], SESSIONS[session_key(token)]["absolute_expires_at"])
+        self.assertEqual(self._expires_at(token), self.now + timedelta(seconds=600))
+
+    def test_touch_renews_even_when_flagged_as_a_background_refresh(self) -> None:
+        token = self._login(client_type="web", duration_seconds=300).json()["token"]
+        self.now += timedelta(seconds=200)
+        self.assertEqual(self._touch(token, refresh=True).status_code, 200)
+        self.assertEqual(self._expires_at(token), self.now + timedelta(seconds=300))
+
+    def test_touch_does_not_pass_the_ceiling(self) -> None:
+        with patch.dict("os.environ", {"ABR_WEB_SESSION_LIFETIME_SECONDS": "400"}):
+            token = self._login(client_type="web", duration_seconds=300).json()["token"]
+        self.now += timedelta(seconds=200)
+        response = self._touch(token)
+        self.assertEqual(response.json()["expires_at"], response.json()["absolute_expires_at"])
+
+    def test_touch_on_an_expired_session_answers_401(self) -> None:
+        token = self._login(client_type="web", duration_seconds=300).json()["token"]
+        self.now += timedelta(seconds=301)
+        response = self._touch(token)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "unauthorized")
+
+
+class SessionDurationChangeTests(InactivityTimeoutTests):
+    def _put(self, token: str, duration: object):
+        return self.client.put(
+            "/api/v1/auth/session/duration", json={"duration_seconds": duration}, headers=self._auth_headers(token)
+        )
+
+    def test_the_slider_changes_the_inactivity_timeout_and_leaves_the_ceiling(self) -> None:
+        token = self._login(client_type="web", duration_seconds=1800).json()["token"]
+        ceiling = SESSIONS[session_key(token)]["absolute_expires_at"]
+        self.now += timedelta(seconds=120)
+
+        response = self._put(token, 300)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(SESSIONS[session_key(token)]["idle_timeout_seconds"], 300)
+        self.assertEqual(SESSIONS[session_key(token)]["absolute_expires_at"], ceiling)
+        self.assertEqual(datetime.fromisoformat(response.json()["expires_at"]), self.now + timedelta(seconds=300))
+        self.assertEqual(response.json()["absolute_expires_at"], ceiling)
+
+    def test_after_the_slider_activity_keeps_extending_by_the_new_timeout(self) -> None:
+        token = self._login(client_type="web").json()["token"]
+        self._put(token, 300)
+        for _ in range(4):
+            self.now += timedelta(minutes=4)
+            self.assertEqual(self._get(token).status_code, 200)
+        self.assertEqual(self._expires_at(token), self.now + timedelta(seconds=300))
+
+    def test_the_slider_cannot_carry_a_session_past_its_ceiling(self) -> None:
+        with patch.dict("os.environ", {"ABR_WEB_SESSION_LIFETIME_SECONDS": "900"}):
+            token = self._login(client_type="web", duration_seconds=300).json()["token"]
+        response = self._put(token, 7200)
+        self.assertEqual(response.json()["expires_at"], response.json()["absolute_expires_at"])
+
+    def test_out_of_range_or_cli_is_refused_and_changes_nothing(self) -> None:
+        token = self._login(client_type="web", duration_seconds=600).json()["token"]
+        before = dict(SESSIONS[session_key(token)])
+        for value in (10, 10_000_000):
+            response = self._put(token, value)
+            self.assertEqual((response.status_code, response.json()["error"]["code"]), (422, "invalid_session_duration"))
+        self.assertEqual(SESSIONS[session_key(token)], before)
+
+        cli = self._login(client_type="cli").json()["token"]
+        response = self._put(cli, 600)
+        self.assertEqual((response.status_code, response.json()["error"]["code"]), (400, "session_not_extendable"))
 
 
 class LoginLockoutTests(AuthApiTestCase):

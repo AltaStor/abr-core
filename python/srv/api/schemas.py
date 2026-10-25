@@ -347,6 +347,7 @@ class JobDTO(_LenientModel):
     next_incremental_run_at: str | None = None
     last_run_at: str | None = None
     clock_anomalies: DocObjectArray = None
+    vm_reassignments: DocObjectArray = None
     last_session_id: str | None = None
     last_run: JobRunDTO | None = None
     active_sessions: DocObjectArray = None
@@ -424,6 +425,7 @@ class RepositoryCatalogSummaryDTO(_LenientModel):
 class RestorePointReconcileDTO(_LenientModel):
     checked: DocInt = None
     marked_missing: DocInt = None
+    marked_chain_broken: DocInt = None
     restored: DocInt = None
     unreadable: DocInt = None
 
@@ -1506,9 +1508,20 @@ class HealthDTO(_LenientModel):
     status: DocStr = None
 
 
+SESSION_EXPIRES_AT = (
+    "When the session ends if it stays idle; for a web session every request the user causes moves it to now plus "
+    "its inactivity timeout, a background refresh (X-ABR-Refresh) does not"
+)
+SESSION_ABSOLUTE_EXPIRES_AT = (
+    "When a web session ends whatever the activity (ABR_WEB_SESSION_LIFETIME_SECONDS after sign-in); null when "
+    "there is no such limit, and always for CLI sessions"
+)
+
+
 class LoginResult(_LenientModel):
     token: DocStr = None
-    expires_at: DocStr = None
+    expires_at: DocStr = Field(default=None, description=SESSION_EXPIRES_AT)
+    absolute_expires_at: DocStrOrNull = Field(default=None, description=SESSION_ABSOLUTE_EXPIRES_AT)
     user: PublicUserDTO | DocObject = None
     permissions: DocStrArray = None
 
@@ -1589,4 +1602,5 @@ class LogoutResult(_LenientModel):
 
 
 class ExtendSessionResult(_LenientModel):
-    expires_at: DocStr = None
+    expires_at: DocStr = Field(default=None, description=SESSION_EXPIRES_AT)
+    absolute_expires_at: DocStrOrNull = Field(default=None, description=SESSION_ABSOLUTE_EXPIRES_AT)

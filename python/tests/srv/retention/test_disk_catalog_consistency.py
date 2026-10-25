@@ -326,13 +326,14 @@ class RescanMarksRestorePointsWithoutDataTests(unittest.TestCase):
         BACKUPS.clear()
         REPOSITORIES.clear()
 
-    def _store(self, point_id: str, session: str, *, status: str = "available") -> None:
+    def _store(self, point_id: str, session: str, *, status: str = "available", parent: str | None = None) -> None:
         BACKUPS[point_id] = {
             "id": point_id,
             "repository_id": "repo-1",
             "vm_id": "vm-1",
             "job_id": "job-1",
-            "execution_type": "Incremental",
+            "execution_type": "Incremental" if parent else "ActiveFull",
+            "parent_point_id": parent,
             "status": status,
             "created_at": "2026-01-01T00:00:00+00:00",
             "artifact": {
@@ -384,6 +385,131 @@ class RescanMarksRestorePointsWithoutDataTests(unittest.TestCase):
 
         self.assertEqual(summary["restored"], 1)
         self.assertEqual(BACKUPS["point-back"]["status"], "available")
+
+
+class RescanMarksPointsBuiltOnMissingDataTests(RescanMarksRestorePointsWithoutDataTests):
+    def _chain(self, *, stored: tuple[str, ...]) -> None:
+        for session in stored:
+            (self.repo_path / "vm-1" / session).mkdir(parents=True, exist_ok=True)
+        self._store("full", "s-full")
+        self._store("i1", "s-i1", parent="full")
+        self._store("i2", "s-i2", parent="i1")
+        self._store("i3", "s-i3", parent="i2")
+        self._store("sibling", "s-sibling", parent="full")
+
+    def _rescan(self, unreadable: tuple[str, ...] = ()) -> dict:
+        def listing(_repository, abr_path, timeout):
+            if Path(abr_path).name in unreadable:
+                raise StorageToolError("cannot list")
+            return {"01-disk.vmdk"}
+
+        with patch("python.srv.services.abr_v41.list_disk_tool_backups", side_effect=listing):
+            return abr_v41.reconcile_repository_points(self.repository)
+
+    def _statuses(self) -> dict:
+        return {point_id: (point["status"], point.get("missing_ancestor_id")) for point_id, point in BACKUPS.items()}
+
+    def test_every_point_built_on_a_point_without_data_is_marked_chain_broken(self) -> None:
+        self._chain(stored=("s-full", "s-i2", "s-i3", "s-sibling"))
+
+        summary = self._rescan()
+
+        self.assertEqual((summary["marked_missing"], summary["marked_chain_broken"]), (1, 2))
+        self.assertEqual(
+            self._statuses(),
+            {
+                "full": ("available", None),
+                "i1": ("missing", None),
+                "i2": ("chain_broken", "i1"),
+                "i3": ("chain_broken", "i1"),
+                "sibling": ("available", None),
+            },
+        )
+
+    def test_a_point_marked_missing_by_an_earlier_rescan_still_breaks_its_children(self) -> None:
+        self._chain(stored=("s-full", "s-i2", "s-i3", "s-sibling"))
+        BACKUPS["i1"]["status"] = "missing"
+
+        summary = self._rescan()
+
+        self.assertEqual((summary["marked_missing"], summary["marked_chain_broken"]), (0, 2))
+        self.assertEqual(BACKUPS["i3"]["status"], "chain_broken")
+
+    def test_a_second_rescan_changes_nothing(self) -> None:
+        self._chain(stored=("s-full", "s-i2", "s-i3", "s-sibling"))
+        self._rescan()
+        before = self._statuses()
+
+        summary = self._rescan()
+
+        self.assertEqual((summary["marked_missing"], summary["marked_chain_broken"], summary["restored"]), (0, 0, 0))
+        self.assertEqual(self._statuses(), before)
+
+    def test_the_chain_is_whole_again_once_the_data_is_back(self) -> None:
+        self._chain(stored=("s-full", "s-i2", "s-i3", "s-sibling"))
+        self._rescan()
+        (self.repo_path / "vm-1" / "s-i1").mkdir()
+
+        summary = self._rescan()
+
+        self.assertEqual(summary["restored"], 3)
+        self.assertEqual({status for status, _ancestor in self._statuses().values()}, {"available"})
+        self.assertFalse(any(ancestor for _status, ancestor in self._statuses().values()))
+
+    def test_a_point_whose_own_data_goes_too_turns_from_chain_broken_to_missing(self) -> None:
+        self._chain(stored=("s-full", "s-i2", "s-i3", "s-sibling"))
+        self._rescan()
+        (self.repo_path / "vm-1" / "s-i2").rmdir()
+
+        summary = self._rescan()
+
+        self.assertEqual(summary["marked_missing"], 1)
+        self.assertEqual(self._statuses()["i2"], ("missing", None))
+        self.assertEqual(self._statuses()["i3"], ("chain_broken", "i2"))
+
+    def test_a_parent_that_cannot_be_read_leaves_its_children_as_they_are(self) -> None:
+        self._chain(stored=("s-full", "s-i1", "s-i2", "s-i3", "s-sibling"))
+
+        summary = self._rescan(unreadable=("s-i1",))
+
+        self.assertEqual((summary["unreadable"], summary["marked_chain_broken"]), (1, 0))
+        self.assertEqual(BACKUPS["i2"]["status"], "available")
+
+
+class RestoreStartRefusesAPointThatCannotBeRestoredTests(unittest.TestCase):
+    def setUp(self) -> None:
+        BACKUPS.clear()
+        self.addCleanup(BACKUPS.clear)
+        for point_id, parent, status in (("full", None, "available"), ("i1", "full", "missing"), ("i2", "i1", "chain_broken")):
+            BACKUPS[point_id] = {
+                "id": point_id,
+                "repository_id": "repo-1",
+                "vm_id": "vm-1",
+                "job_id": "job-1",
+                "execution_type": "Incremental" if parent else "ActiveFull",
+                "parent_point_id": parent,
+                "status": status,
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+        BACKUPS["i2"]["missing_ancestor_id"] = "i1"
+
+    def test_a_point_on_a_broken_chain_is_refused_naming_the_missing_point(self) -> None:
+        with self.assertRaises(ApiError) as caught:
+            abr_v41.restore_start({"point_id": "i2"})
+
+        self.assertEqual((caught.exception.status_code, caught.exception.code), (409, "restore_point_unavailable"))
+        self.assertIn("builds on restore point i1", caught.exception.message)
+        self.assertIn("repo rescan", caught.exception.message)
+        self.assertEqual(caught.exception.details["missing_point_id"], "i1")
+        self.assertEqual(caught.exception.details["status"], "chain_broken")
+
+    def test_the_missing_point_itself_is_refused_as_before(self) -> None:
+        with self.assertRaises(ApiError) as caught:
+            abr_v41.restore_start({"point_id": "i1"})
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(caught.exception.message, "Restore point is not available for restore")
+        self.assertNotIn("missing_point_id", caught.exception.details)
 
 
 class BackupChainStatusFollowsItsWeakestPointTests(unittest.TestCase):

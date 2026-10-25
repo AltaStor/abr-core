@@ -36,6 +36,13 @@ def _clock_anomalies(job: object) -> list[dict[str, Any]]:
     return [anomaly for anomaly in anomalies if isinstance(anomaly, dict)] if isinstance(anomalies, list) else []
 
 
+def _vm_reassignment_messages(job: object) -> list[str]:
+    entries = job.get("vm_reassignments") if isinstance(job, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [str(entry.get("message")) for entry in entries if isinstance(entry, dict) and entry.get("message")]
+
+
 def _last_run_text(run: object) -> str:
     if not isinstance(run, dict) or not run.get("result"):
         return ""
@@ -497,12 +504,17 @@ class JobCommands:
         deps = CommandDependencies(args)
         payload = self._decorate_job(deps.context.api_client.get(f"api/v1/jobs/{self._resolve_id(deps, args)}"))
         anomalies = _clock_anomalies(payload)
-        warnings = [str(anomaly.get("message") or anomaly.get("kind")) for anomaly in anomalies]
+        clock_warnings = [str(anomaly.get("message") or anomaly.get("kind")) for anomaly in anomalies]
+        reassignments = _vm_reassignment_messages(payload)
+        warnings = [*clock_warnings, *reassignments]
         if deps.context.output == "table":
             shown: dict[str, Any] = {}
             for key, value in payload.items():
-                if key == "clock_anomalies" and warnings:
-                    shown["clock_warning"] = " ".join(warnings)
+                if key == "clock_anomalies" and clock_warnings:
+                    shown["clock_warning"] = " ".join(clock_warnings)
+                elif key == "vm_reassignments":
+                    if reassignments:
+                        shown["vm_reassignment_warning"] = " ".join(reassignments)
                 elif key == "last_run" and isinstance(value, dict):
                     shown["last_run_id"] = value.get("id")
                     issues = _last_run_issues(value)

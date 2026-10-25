@@ -1017,6 +1017,28 @@ def schedule_next_run(schedule: dict[str, Any], *, after: datetime) -> datetime:
     raise api_error(422, "invalid_schedule", "Unsupported schedule kind", kind=kind)
 
 
+def schedule_latest_next_run(schedule: dict[str, Any], *, until: datetime) -> datetime:
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    latest = schedule_next_run(schedule, after=until)
+    repeat_start = _repeated_hour_start(until, schedule)
+    if repeat_start is None:
+        return latest
+    return max(latest, schedule_next_run(schedule, after=repeat_start - timedelta(microseconds=1)))
+
+
+def _repeated_hour_start(moment: datetime, schedule: dict[str, Any]) -> datetime | None:
+    if _localize(moment, schedule).fold == 0:
+        return None
+    start = moment.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    for _ in range(24 * 60):
+        earlier = start - timedelta(minutes=1)
+        if _localize(earlier, schedule).fold == 0:
+            return start
+        start = earlier
+    return None
+
+
 def schedule_today_matches_days(job: dict[str, Any], days: list[str], *, now: datetime) -> bool:
     if not days:
         return False
@@ -1843,38 +1865,102 @@ def test_inventory(record_id: str) -> dict[str, Any]:
     }
 
 
+VM_REASSIGNMENTS_KEPT = 10
+
+
+def _vm_reassignment_message(entry: dict[str, Any]) -> str:
+    return (
+        f"Inventory rescan at {entry.get('reassigned_at')} moved this job from VM {entry.get('previous_vm_id')}, "
+        f"which is no longer in the inventory, to VM {entry.get('vm_id')}, which now carries its name "
+        f"'{entry.get('vm_name')}'. The job backs up that VM from now on, starting with a full backup"
+    )
+
+
 def _reconcile_jobs_after_vm_identity_change(
     inventory_id: str,
     previous_vm_ids_by_name: dict[str, str],
     discovered_items: list[dict[str, Any]],
 ) -> None:
-    renamed_ids: dict[str, str] = {}
-    for entry in discovered_items:
-        if str(entry.get("resource_type") or "") != "virtual_machine":
-            continue
+    discovered_vms = [entry for entry in discovered_items if str(entry.get("resource_type") or "") == "virtual_machine"]
+    present_ids = {str(entry.get("external_id") or "") for entry in discovered_vms}
+    replaced: dict[str, tuple[str, str]] = {}
+    for entry in discovered_vms:
         name = str(entry.get("name") or "")
         new_id = str(entry.get("external_id") or "")
         old_id = previous_vm_ids_by_name.get(name)
-        if name and old_id and new_id and old_id != new_id:
-            renamed_ids[old_id] = new_id
-    if not renamed_ids:
+        if name and old_id and new_id and old_id != new_id and old_id not in present_ids:
+            replaced[old_id] = (new_id, name)
+    if not replaced:
         return
+    reassigned_at = utc_now()
     for job in catalog_records(JOBS):
         if str(job.get("inventory_id") or job.get("hypervisor_id") or "") != inventory_id:
             continue
         vm_ids = job.get("vm_ids")
         if not isinstance(vm_ids, list) or not vm_ids:
             continue
-        updated_ids = [renamed_ids.get(str(vm_id), vm_id) for vm_id in vm_ids]
-        if updated_ids == vm_ids:
+        entries = [
+            {"vm_name": replaced[str(vm_id)][1], "previous_vm_id": str(vm_id), "vm_id": replaced[str(vm_id)][0], "reassigned_at": reassigned_at}
+            for vm_id in vm_ids
+            if str(vm_id) in replaced
+        ]
+        if not entries:
             continue
-        LOGGER.info(
-            "Job %r: one or more protected VMs kept their name but got a new id since the last "
-            "scan (typically an in-place restore); updating the job to track the new id(s) so "
-            "its next backup resumes automatically instead of failing.",
-            job.get("name") or job.get("id"),
+        for entry in entries:
+            LOGGER.warning("Job %r: %s", job.get("name") or job.get("id"), _vm_reassignment_message(entry))
+        kept = [entry for entry in job.get("vm_reassignments") or [] if isinstance(entry, dict)]
+        _persist_canonical_job(
+            {
+                **job,
+                "vm_ids": [replaced[str(vm_id)][0] if str(vm_id) in replaced else vm_id for vm_id in vm_ids],
+                "vm_reassignments": [*kept, *entries][-VM_REASSIGNMENTS_KEPT:],
+                "updated_at": utc_now(),
+            }
         )
-        _persist_canonical_job({**job, "vm_ids": updated_ids, "updated_at": utc_now()})
+
+
+def _job_vm_reassignments(job: dict[str, Any]) -> list[dict[str, Any]]:
+    current = {str(vm_id) for vm_id in job.get("vm_ids") or []}
+    return [
+        {**entry, "message": _vm_reassignment_message(entry)}
+        for entry in job.get("vm_reassignments") or []
+        if isinstance(entry, dict) and str(entry.get("vm_id") or "") in current
+    ]
+
+
+def note_vm_reassignment(task: dict[str, Any]) -> dict[str, Any]:
+    if str(task.get("task_type") or "") != "backup":
+        return task
+    job_id = str(task.get("job_id") or "")
+    if not job_id or job_id not in JOBS:
+        return task
+    vm_id = str(task.get("resource_external_id") or "")
+    entry = next(
+        (item for item in reversed(_job_vm_reassignments(JOBS[job_id])) if str(item.get("vm_id") or "") == vm_id),
+        None,
+    )
+    warnings = task.get("warnings") if isinstance(task.get("warnings"), list) else []
+    if entry is None or any(isinstance(item, dict) and item.get("code") == "vm_reassigned" for item in warnings):
+        return task
+    reassigned_at = str(entry.get("reassigned_at") or "")
+    created_at = str(task.get("created_at") or "")
+    if any(
+        str(other.get("task_type") or "") == "backup"
+        and str(other.get("job_id") or "") == job_id
+        and str(other.get("resource_external_id") or "") == vm_id
+        and str(other.get("id") or "") != str(task.get("id") or "")
+        and reassigned_at < str(other.get("created_at") or "") < created_at
+        for other in catalog_records(TASKS)
+    ):
+        return task
+    task["warnings"] = [
+        *warnings,
+        {"code": "vm_reassigned", "message": entry["message"], "previous_vm_id": entry.get("previous_vm_id"), "vm_id": vm_id},
+    ]
+    _append_task_log(task, level="warn", message=entry["message"], component="session")
+    LOGGER.warning("Backup session %s of job %s: %s", task.get("id"), job_id, entry["message"])
+    persist_task(task)
+    return task
 
 
 def rescan_inventory(record_id: str) -> dict[str, Any]:
@@ -4289,6 +4375,7 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "next_incremental_run_at": normalized.get("next_incremental_run_at"),
         "last_run_at": normalized.get("last_run_at"),
         "clock_anomalies": job_clock_anomalies(normalized),
+        "vm_reassignments": _job_vm_reassignments(normalized),
         "last_session_id": normalized.get("last_session_id"),
         "last_run": job_run_summary(normalized),
         "active_sessions": active_sessions,
@@ -4830,6 +4917,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             _ensure_unique_vms(vm_ids, vm_names)
             updated["vm_ids"] = vm_ids
             updated["vm_names"] = vm_names
+            updated["vm_reassignments"] = []
             changed = True
     else:
         if "repo" in payload or "repo_id" in payload:
@@ -5460,16 +5548,42 @@ def _point_artifact_locations(point: dict[str, Any]) -> list[tuple[str, str]]:
     return locations
 
 
+POINT_MISSING = "missing"
+POINT_CHAIN_BROKEN = "chain_broken"
+
+
+def _missing_ancestor(point: dict[str, Any], by_id: dict[str, dict[str, Any]], gone: set[str], unknown: set[str]) -> str | None:
+    seen: set[str] = set()
+    parent_id = str(point.get("parent_point_id") or "")
+    while parent_id and parent_id in by_id and parent_id not in seen:
+        if parent_id in gone:
+            return parent_id
+        if parent_id in unknown:
+            return None
+        seen.add(parent_id)
+        parent_id = str(by_id[parent_id].get("parent_point_id") or "")
+    return ""
+
+
 def reconcile_repository_points(repository: dict[str, Any]) -> dict[str, int]:
     repository_id = str(repository.get("id") or "")
     listings: dict[str, set[str] | None] = {}
-    summary = {"checked": 0, "marked_missing": 0, "restored": 0, "unreadable": 0}
-    for record in catalog_records(BACKUPS):
-        point = normalize_backup_point(record)
-        if str(point.get("repository_id") or "") != repository_id:
-            continue
+    summary = {"checked": 0, "marked_missing": 0, "marked_chain_broken": 0, "restored": 0, "unreadable": 0}
+    points = [
+        point
+        for point in (normalize_backup_point(record) for record in catalog_records(BACKUPS))
+        if str(point.get("repository_id") or "") == repository_id
+    ]
+    gone: set[str] = set()
+    unknown: set[str] = set()
+    present: list[dict[str, Any]] = []
+    for point in points:
+        point_id = str(point.get("id") or "")
+        status = str(point.get("status") or "available")
         locations = _point_artifact_locations(point)
         if not locations:
+            if status == POINT_MISSING:
+                gone.add(point_id)
             continue
         summary["checked"] += 1
         absent = False
@@ -5482,21 +5596,47 @@ def reconcile_repository_points(repository: dict[str, Any]) -> dict[str, int]:
                 unreadable = True
             elif backup_name not in names:
                 absent = True
-        status = str(point.get("status") or "available")
         if unreadable:
             summary["unreadable"] += 1
+            unknown.add(point_id)
             continue
-        if absent and status != "missing":
-            point["status"] = "missing"
+        if not absent:
+            present.append(point)
+            continue
+        gone.add(point_id)
+        if status != POINT_MISSING:
+            point["status"] = POINT_MISSING
+            point.pop("missing_ancestor_id", None)
             persist_backup(point)
             summary["marked_missing"] += 1
             LOGGER.warning(
                 "Restore point has no stored data left; marking it missing: point=%s repository=%s",
-                point.get("id"),
+                point_id,
                 repository_id,
             )
-        elif not absent and status == "missing":
+    by_id = {str(point.get("id") or ""): point for point in points}
+    for point in present:
+        status = str(point.get("status") or "available")
+        ancestor = _missing_ancestor(point, by_id, gone, unknown)
+        if ancestor is None:
+            continue
+        if ancestor:
+            if status == POINT_CHAIN_BROKEN and point.get("missing_ancestor_id") == ancestor:
+                continue
+            point["status"] = POINT_CHAIN_BROKEN
+            point["missing_ancestor_id"] = ancestor
+            persist_backup(point)
+            summary["marked_chain_broken"] += 1
+            LOGGER.warning(
+                "Restore point builds on a restore point with no stored data left; marking its chain broken: "
+                "point=%s missing=%s repository=%s",
+                point.get("id"),
+                ancestor,
+                repository_id,
+            )
+        elif status in {POINT_MISSING, POINT_CHAIN_BROKEN}:
             point["status"] = "available"
+            point.pop("missing_ancestor_id", None)
             persist_backup(point)
             summary["restored"] += 1
     return summary
@@ -6310,7 +6450,7 @@ def _normalize_backup_health(value: Any) -> str:
         return "valid"
     if normalized in {"warning", "degraded"}:
         return "warning"
-    if normalized in {"missing", "deleted", "failed", "corrupt", "invalid", "error", "unavailable"}:
+    if normalized in {"missing", "chain_broken", "deleted", "failed", "corrupt", "invalid", "error", "unavailable"}:
         return "invalid"
     return "unknown"
 
@@ -9244,13 +9384,21 @@ def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
 def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     point = _resolve_restore_source_point(payload)
     point_id = str(point.get("id") or "")
+    missing_ancestor = str(point.get("missing_ancestor_id") or "") if point.get("status") == POINT_CHAIN_BROKEN else ""
     _ensure(
         _restore_point_is_available(point),
         409,
         "restore_point_unavailable",
-        "Restore point is not available for restore",
+        (
+            f"Restore point is not available for restore: it builds on restore point {missing_ancestor}, whose data "
+            "repo rescan found missing from the repository. Bring that data back and run repo rescan again, or "
+            "restore an earlier point"
+        )
+        if missing_ancestor
+        else "Restore point is not available for restore",
         point_id=point_id,
         status=point.get("status"),
+        **({"missing_point_id": missing_ancestor} if missing_ancestor else {}),
     )
 
     request = _normalize_restore_request_payload(payload, point)

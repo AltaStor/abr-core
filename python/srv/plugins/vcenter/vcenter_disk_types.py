@@ -45,6 +45,27 @@ VDDK_DISK_TYPE_ALIASES: dict[str, int] = {
 
 RESTORE_DISK_TYPE_CODES = {VddkDiskType.VMFS_FLAT, VddkDiskType.VMFS_THIN}
 RESTORE_DISK_TYPE_HELP = "original, thin-provisioned, or thick-provisioned"
+DISK_PLACEMENT_FIELDS = ("controller_type", "controller_bus", "unit_number")
+DISK_CONTROLLER_DISPLAY_NAMES = {
+    "paravirtual": "PVSCSI",
+    "lsilogicsas": "LSI Logic SAS",
+    "lsilogic": "LSI Logic",
+    "buslogic": "BusLogic",
+    "sata": "SATA",
+    "nvme": "NVMe",
+    "ide": "IDE",
+}
+
+
+def disk_controller_display_name(type_name: Any) -> str:
+    return DISK_CONTROLLER_DISPLAY_NAMES.get(str(type_name or ""), str(type_name or "unknown"))
+
+
+def describe_disk_placement(placement: dict[str, Any]) -> str:
+    return (
+        f"{disk_controller_display_name(placement.get('controller_type'))} "
+        f"{placement.get('controller_bus')}:{placement.get('unit_number')}"
+    )
 
 
 def disk_type_name_from_code(code: int | None) -> str | None:

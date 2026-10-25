@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -363,3 +364,13 @@ def run_capped(
         raise subprocess.CalledProcessError(proc.returncode, cmd, output=stdout, stderr=stderr)
 
     return CompletedProcess(args=cmd, returncode=proc.returncode, stdout=stdout, stderr=stderr)
+
+
+def describe_process_end(program: str, returncode: int) -> str:
+    if returncode >= 0:
+        return f"{program} exited with code {returncode}"
+    number = -returncode
+    try:
+        return f"{program} was terminated by signal {number} ({signal.Signals(number).name})"
+    except ValueError:
+        return f"{program} was terminated by signal {number}"

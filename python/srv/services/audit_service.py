@@ -44,6 +44,7 @@ ALLOWED = "allowed"
 DENIED = "denied"
 FAILED = "failed"
 RESULTS = (ALLOWED, DENIED, FAILED)
+KEEP_ALIVE_FUNCTIONS = frozenset({"auth.touch_session"})
 
 MASK = "********"
 MAX_TEXT_LENGTH = 256
@@ -300,7 +301,9 @@ def record_request(
         result = DENIED
     else:
         result = FAILED
-    if result == ALLOWED and function.category == rbac.READ and _is_refresh(headers):
+    if result == ALLOWED and function.category == rbac.READ and is_background_refresh(headers):
+        return None
+    if result == ALLOWED and function_id in KEEP_ALIVE_FUNCTIONS:
         return None
 
     target = context.target
@@ -343,7 +346,7 @@ def _user_named(name: str) -> dict[str, Any] | None:
     return next((user for user in catalog_records(USERS) if str(user.get("name") or "").lower() == lowered), None)
 
 
-def _is_refresh(headers: Any) -> bool:
+def is_background_refresh(headers: Any) -> bool:
     """A read the client repeats on its own (the Web UI's background refresh,
     the CLI's progress polling) rather than one a user asked for."""
     return str(headers.get("x-abr-refresh") or "").strip().lower() in {"1", "true", "yes"}
