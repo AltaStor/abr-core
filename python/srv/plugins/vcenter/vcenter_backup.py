@@ -66,6 +66,7 @@ class VCenterBackupError(RuntimeError):
 ProgressCallback = Callable[[dict[str, object]], None] | None
 
 _SAFE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+_DELTA_STORE_MODES = frozenset({"incremental", "metadata-fallback"})
 
 
 def _disk_placement_fields(*sources: dict[str, Any]) -> dict[str, Any]:
@@ -1419,6 +1420,14 @@ def _is_cbt_invalid_fault(exc: BaseException) -> bool:
     return False
 
 
+def _cbt_fault_text(exc: BaseException) -> str:
+    for message in getattr(exc, "faultMessage", None) or []:
+        text = str(getattr(message, "message", "") or "").strip()
+        if text:
+            return text
+    return str(getattr(exc, "msg", "") or "").strip() or type(exc).__name__
+
+
 def _resolve_parent_disk_entry(
     parent_manifest: dict[str, Any],
     *,
@@ -1490,6 +1499,54 @@ def _vm_config_changed_since_parent(
             continue
 
     return False, ""
+
+
+def _disks_without_cbt_baseline(
+    node: Any,
+    vm_name: str,
+    snapshot_name: str,
+    disks: list[dict[str, Any]],
+    parent_manifest: dict[str, Any],
+    change_entries: tuple[dict[str, Any], dict[str, Any], dict[int, Any]],
+) -> tuple[list[str], dict[int, list[dict[str, int]]]]:
+    change_id_by_uuid, change_id_by_datastore_path, change_id_by_index = change_entries
+    problems: list[str] = []
+    changed_areas_by_index: dict[int, list[dict[str, int]]] = {}
+    for index, disk in enumerate(disks, start=1):
+        payload = disk.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        datastore_path = str(payload.get("datastore_path") or disk.get("datastore_path") or "")
+        uuid = str(payload.get("uuid") or disk.get("uuid") or "")
+        label = datastore_path or uuid or str(index)
+
+        parent_disk = _resolve_parent_disk_entry(parent_manifest, datastore_path=datastore_path, uuid=uuid, index=index)
+        if parent_disk is None:
+            problems.append(f"disk {label} is not in the parent backup")
+            continue
+        parent_change_id = str(parent_disk.get("change_id") or parent_disk.get("next_change_id") or "")
+        if not parent_change_id:
+            problems.append(f"the parent backup records no CBT change ID for disk {label}")
+            continue
+
+        change_entry = (
+            change_id_by_uuid.get(uuid)
+            or change_id_by_datastore_path.get(datastore_path)
+            or change_id_by_index.get(index)
+        )
+        disk_key = int(change_entry.get("key") or 0) if change_entry is not None else 0
+        if not disk_key:
+            problems.append(f"the snapshot does not report disk {label}")
+            continue
+
+        try:
+            changed_areas_by_index[index] = node.query_changed_disk_areas(vm_name, snapshot_name, disk_key, parent_change_id)
+        except Exception as exc:
+            if not _is_cbt_invalid_fault(exc):
+                raise
+            problems.append(f"CBT cannot tell what changed on disk {label} since the parent backup ({_cbt_fault_text(exc)})")
+
+    return problems, changed_areas_by_index
 
 
 def _resolve_incremental_flag(parameters: dict[str, Any]) -> bool:
@@ -2148,6 +2205,40 @@ def run_vcenter_backup(
                         vm_config_changed=True,
                     )
 
+            planned_changed_areas: dict[int, list[dict[str, int]]] = {}
+            if use_changed_block_backup and not query_changed_areas_only and parent_manifest is not None:
+                cbt_problems, planned_changed_areas = _disks_without_cbt_baseline(
+                    node,
+                    vm_name,
+                    snapshot_name,
+                    disks,
+                    parent_manifest,
+                    (change_id_by_uuid, change_id_by_datastore_path, change_id_by_index),
+                )
+                if cbt_problems:
+                    use_changed_block_backup = False
+                    incremental = False
+                    differential = False
+                    incremental_full_fallback_used = True
+                    full_backup_reason = "; ".join(cbt_problems)
+                    logger.warning(
+                        "No incremental is possible for %s (task %s): %s; backing up every disk in full "
+                        "so the restore point holds the whole VM.",
+                        vm_name,
+                        task.get("id"),
+                        full_backup_reason,
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        "transfer",
+                        20,
+                        f"No incremental is possible for {vm_name}: {full_backup_reason}; "
+                        "backing up every disk in full",
+                        worker_mode="vcenter-abr-vmdk-tool",
+                        vm_name=vm_name,
+                    )
+
+            restart_as_full_reason = ""
             if use_changed_block_backup:
                 for index, disk in enumerate(disks, start=1):
                     free_before_disk = _repository_free_bytes(repository)
@@ -2233,7 +2324,9 @@ def run_vcenter_backup(
                             f"Snapshot did not return a disk key for disk {datastore_path or uuid or index}"
                         )
                     changed_areas: list[dict[str, int]] = []
-                    if disk_key and not missing_cbt_change_id:
+                    if index in planned_changed_areas:
+                        changed_areas = planned_changed_areas[index]
+                    elif disk_key and not missing_cbt_change_id:
                         try:
                             changed_areas = node.query_changed_disk_areas(
                                 vm_name,
@@ -2545,79 +2638,18 @@ def run_vcenter_backup(
                                     )
 
                                 if incremental_fallback_full:
-                                    disk_store_mode = "full-fallback"
-                                    _emit_progress(
-                                        progress_callback,
-                                        "transfer",
-                                        progress,
-                                        (
-                                            f"Incremental utility failed for disk {index}/{len(disks)}; "
-                                            f"falling back to full VMDK store for {datastore_path}"
-                                        ),
-                                        worker_mode="vcenter-abr-vmdk-tool",
-                                        current_disk=datastore_path,
-                                        changed_area_count=len(changed_areas),
-                                        changed_bytes=changed_bytes,
-                                    )
-                                    if repository_abr_path is None:
-                                        raise VCenterBackupError("Repository context is missing for full fallback")
-                                    fallback_command = _build_backup_command(
-                                        tool_path=tool_path,
-                                        backup_name=disk_backup_name,
-                                        repository=repository,
-                                        abr_path=repository_abr_path,
-                                        datastore_path=utility_datastore_path,
-                                        host=host,
-                                        port=port,
-                                        username=username,
-                                        password=password,
-                                        thumbprint=thumbprint,
-                                        vm_moref=_format_vm_spec(vm_moref, service_type),
-                                        snapshot_moref=snapshot_moref,
-                                        transport_mode=transport_mode if is_virtual_center else None,
-                                        compression_level=compression_level,
-                                        encryption_key=encryption_key,
-                                    )
-                                    logger.warning(
-                                        "Incremental utility failed for task %s disk %s; falling back to full store command: %s",
-                                        task.get("id"),
-                                        datastore_path,
-                                        _redact_command_for_logging(fallback_command),
-                                    )
-                                    fallback_completed = _run_watched_disk_tool(
-                                        fallback_command,
-                                        data_host=data_host,
-                                        disk_label=f"disk {index}/{len(disks)}",
-                                        datastore_path=datastore_path,
-                                        progress_callback=progress_callback,
-                                        check=False,
-                                        capture_output=True,
-                                        text=True,
-                                        should_cancel=lambda: cancel_requested(task_id),
-                                        timeout=full_disk_timeout_seconds,
-                                        on_progress=_disk_tool_progress_reporter(
-                                            progress_callback,
-                                            base_progress=progress,
-                                            progress_span=progress_span,
-                                            message_prefix=f"Storing changed blocks for disk {index}/{len(disks)}",
-                                            base_read_bytes=base_read_bytes,
-                                            # Fallback stores the whole disk.
-                                            disk_total_bytes=full_disk_bytes,
-                                            measure_transferred=measure_transferred,
-                                        ),
-                                    )
-                                    disk_tool_stdout = fallback_completed.stdout or ""
-                                    if fallback_completed.returncode != 0:
-                                        fallback_error = _disk_tool_failure(
-                                            fallback_completed,
+                                    restart_as_full_reason = (
+                                        f"the incremental of disk {datastore_path} failed: "
+                                        + _disk_tool_failure(
+                                            completed,
                                             repository,
-                                            needed_bytes=full_disk_bytes,
-                                            needed_is_disk_size=True,
+                                            needed_bytes=changed_bytes,
+                                            needed_is_disk_size=False,
                                             free_before=free_before_disk,
                                             data_host=data_host,
                                         )
-                                    else:
-                                        incremental_full_fallback_used = True
+                                    )
+                                    break
 
                                 if not incremental_full_fallback_used:
                                     if not incremental_fallback_metadata:
@@ -2728,7 +2760,47 @@ def run_vcenter_backup(
                         processed_bytes=total_read_bytes,
                         transferred_bytes=total_transferred_bytes,
                     )
-            else:
+
+            if restart_as_full_reason:
+                diagnostics = {
+                    path.relative_to(task_root): path.read_bytes() for path in task_root.rglob("*.diagnostics.json")
+                }
+                stranded = _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root)
+                if stranded:
+                    raise VCenterBackupError(
+                        f"{restart_as_full_reason}; a full backup could not be taken instead because the disks "
+                        f"this run had already stored could not be removed: {', '.join(stranded)}"
+                    )
+                ensure_private_directory(task_root)
+                for relative_path, content in diagnostics.items():
+                    (task_root / relative_path).parent.mkdir(parents=True, exist_ok=True)
+                    (task_root / relative_path).write_bytes(content)
+                written_backup_names.clear()
+                disk_outputs.clear()
+                total_read_bytes = 0
+                total_transferred_bytes = 0
+                tool_sizes.update({"logical": 0, "stored": 0, "complete": True})
+                use_changed_block_backup = False
+                incremental = False
+                differential = False
+                incremental_full_fallback_used = True
+                logger.warning(
+                    "%s (task %s, VM %s); discarded what this run had stored and backing up every disk in "
+                    "full instead, so the restore point holds the whole VM.",
+                    restart_as_full_reason,
+                    task.get("id"),
+                    vm_name,
+                )
+                _emit_progress(
+                    progress_callback,
+                    "transfer",
+                    25,
+                    f"{restart_as_full_reason}; backing up every disk of {vm_name} in full instead",
+                    worker_mode="vcenter-abr-vmdk-tool",
+                    vm_name=vm_name,
+                )
+
+            if not use_changed_block_backup:
                 for index, disk in enumerate(disks, start=1):
                     disk_start_time = time.time()
                     free_before_disk = _repository_free_bytes(repository)
@@ -3183,6 +3255,18 @@ def run_vcenter_backup(
             if encryption_rotated and not incremental:
                 resolved_backup_type = "ActiveFull"
                 resolved_backup_reason = "EncryptionKeyChanged"
+            if resolved_backup_type != "Incremental":
+                partial_disks = [
+                    str(output.get("disk_label") or output.get("datastore_path") or output.get("index"))
+                    for output in disk_outputs
+                    if str(output.get("store_mode") or "") in _DELTA_STORE_MODES
+                ]
+                if partial_disks:
+                    raise VCenterBackupError(
+                        f"The {resolved_backup_type} restore point of {vm_name} would hold only the changes since "
+                        f"the previous backup for {', '.join(partial_disks)}, so it could not be restored on its "
+                        "own; the backup is failed instead of being recorded as a full backup"
+                    )
             base_point_id = (
                 str(parameters.get("parent_point_id") or "") or None
                 if parent_manifest is not None and resolved_backup_type == "Incremental"

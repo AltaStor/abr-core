@@ -101,6 +101,8 @@ class FakeVCenterNode:
     snapshot_quiesced: bool = True
     tools_status: str = "toolsOk"
     raise_on_query_changed_disk_areas: Exception | None = None
+    raise_on_query_for_disk_keys: dict[int, Exception] | None = None
+    extra_live_disks: list[dict[str, object]] | None = None
     created_vm_firmware: str | None = None
     host_connected: bool = True
     keepalive_windows: int = 0
@@ -204,6 +206,8 @@ class FakeVCenterNode:
         )
         if FakeVCenterNode.raise_on_query_changed_disk_areas is not None:
             raise FakeVCenterNode.raise_on_query_changed_disk_areas
+        if disk_key in (FakeVCenterNode.raise_on_query_for_disk_keys or {}):
+            raise FakeVCenterNode.raise_on_query_for_disk_keys[disk_key]
         return [{"offset": 0, "length": 4096}, {"offset": 8192, "length": 4096}]
 
     def get_thumbprint(self) -> str:
@@ -237,7 +241,8 @@ class FakeVCenterNode:
                 "source_disk_type_code": int(VddkDiskType.VMFS_THIN),
                 "source_disk_type_name": "vmfs_thin",
                 **(FakeVCenterNode.live_disk_placement or {}),
-            }
+            },
+            *(FakeVCenterNode.extra_live_disks or []),
         ]
 
     def get_vm_restore_metadata(self, vm_name: str) -> dict[str, object]:
@@ -470,6 +475,8 @@ class TaskExecutorTests(unittest.TestCase):
         FakeVCenterNode.snapshot_quiesced = True
         FakeVCenterNode.tools_status = "toolsOk"
         FakeVCenterNode.raise_on_query_changed_disk_areas = None
+        FakeVCenterNode.raise_on_query_for_disk_keys = None
+        FakeVCenterNode.extra_live_disks = None
         FakeVCenterNode.created_vm_firmware = None
         FakeVCenterNode.host_connected = True
         FakeVCenterNode.access_lock_held = False
@@ -2230,7 +2237,7 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertNotIn("nbdssl", command)
         self.assertEqual(command[command.index("--vmdk") + 1], "[datastore1] demo-vm/demo-vm.vmdk")
 
-    def test_vcenter_differential_backup_uses_latest_full_manifest(self) -> None:
+    def test_a_differential_is_taken_against_the_latest_full_and_never_recorded_as_a_full(self) -> None:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",
             "kind": "vcenter",
@@ -2336,17 +2343,10 @@ class TaskExecutorTests(unittest.TestCase):
                 with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
                     result = run_task(task)
 
-        self.assertEqual(result["status"], "completed")
-        payload = result["result"]
-        self.assertTrue(payload["differential"])
-        self.assertFalse(payload["incremental"])
-        self.assertEqual(payload["backup_mode"], "differential")
-        self.assertEqual(payload["disks"][0]["previous_change_id"], "full-change-001")
-        # The differential is taken against the latest FULL manifest, so the
-        # resolved parent manifest must be the full one, not the incremental.
-        self.assertEqual(
-            payload["disks"][0]["parent_manifest_path"],
-            str((full_task_root / "manifest.json").resolve()),
+        self.assertEqual(result["status"], "failed")
+        self.assertIn(
+            "would hold only the changes since the previous backup for Hard disk 1",
+            result["result"]["message"],
         )
         command = recorded_commands[0]
         self.assertEqual(command[command.index("--type") + 1], "incremental")
@@ -2576,24 +2576,227 @@ class TaskExecutorTests(unittest.TestCase):
                     return FakeCompletedProcess(returncode=1, stderr="query changed areas failed")
                 return FakeCompletedProcess(returncode=0, stdout="Done")
 
-            with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
-                with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
-                    result = run_task(task)
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run),
+                patch("python.srv.plugins.vcenter.vcenter_backup.remove_disk_tool_backup") as remove,
+            ):
+                result = run_task(task)
+                diagnostics = list(pathlib.Path(temp_dir).rglob("*.diagnostics.json"))
 
         self.assertEqual(result["status"], "completed")
         payload = result["result"]
         self.assertEqual(payload["backup_mode"], "incremental-full-fallback")
         self.assertTrue(payload["incremental_full_fallback_used"])
-        self.assertEqual(payload["disks"][0]["store_mode"], "full-fallback")
-        self.assertTrue(payload["disks"][0]["diagnostic_path"].endswith(".diagnostics.json"))
+        self.assertNotIn("store_mode", payload["disks"][0])
+        self.assertEqual(len(diagnostics), 1)
         self.assertEqual(len(recorded_commands), 2)
         self.assertEqual(recorded_commands[0][recorded_commands[0].index("--type") + 1], "incremental")
         self.assertEqual(recorded_commands[1][1], "backup")
+        self.assertNotIn("--type", recorded_commands[1])
         self._assert_abr_mode_file(recorded_commands[1])
+        self.assertEqual([call.args[2] for call in remove.call_args_list], [payload["disks"][0]["abr_backup_name"]])
         # A full legacy copy was actually written -- the catalog must record
         # this as a full backup, not the scheduler's original "Incremental".
         self.assertEqual(payload["resolved_backup_type"], "ActiveFull")
         self.assertEqual(payload["resolved_backup_reason"], "IncrementalFallbackToFull")
+
+    def _two_disk_incremental(
+        self,
+        *,
+        fail_tool_for: str | None = None,
+        remove_side_effect: Exception | None = None,
+    ) -> tuple[dict[str, object], list[list[str]], object]:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {},
+            }
+        }
+        FakeVCenterNode.extra_live_disks = [
+            {
+                "disk_label": "Hard disk 2",
+                "capacity_gb": 16,
+                "datastore_path": "[datastore1] demo-vm/demo-vm_1.vmdk",
+                "uuid": "disk-uuid-2",
+                "source_disk_type_code": int(VddkDiskType.VMFS_THIN),
+                "source_disk_type_name": "vmfs_thin",
+            }
+        ]
+        FakeVCenterNode.snapshot_change_ids = [
+            {
+                "disk_label": "Hard disk 1",
+                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                "change_id": "disk1-change-002",
+                "uuid": "disk-uuid-1",
+                "controller_key": 1000,
+                "unit_number": 0,
+                "key": 2000,
+            },
+            {
+                "disk_label": "Hard disk 2",
+                "datastore_path": "[datastore1] demo-vm/demo-vm_1.vmdk",
+                "change_id": "disk2-restarted/1",
+                "uuid": "disk-uuid-2",
+                "controller_key": 15000,
+                "unit_number": 0,
+                "key": 16000,
+            },
+        ]
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        recorded_commands: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            previous_task_root = pathlib.Path(temp_dir) / "demo-vm" / "task-full"
+            previous_task_root.mkdir(parents=True, exist_ok=True)
+            parent_manifest = previous_task_root / "manifest.json"
+            parent_manifest.write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "operation": "vm-backup",
+                        "vm_name": "demo-vm",
+                        "vm_external_id": "vm-uuid-1",
+                        "backup_mode": "full",
+                        "created_at": "2026-10-24T09:00:00+00:00",
+                        "disks": [
+                            {
+                                "index": 1,
+                                "disk_label": "Hard disk 1",
+                                "capacity_gb": 40,
+                                "datastore_path": "[datastore1] demo-vm/demo-vm.vmdk",
+                                "uuid": "disk-uuid-1",
+                                "change_id": "disk1-change-001",
+                                "abr_path": str(previous_task_root),
+                                "abr_backup_name": "01-demo-vm.vmdk",
+                                "storage_mode": "local",
+                            },
+                            {
+                                "index": 2,
+                                "disk_label": "Hard disk 2",
+                                "capacity_gb": 16,
+                                "datastore_path": "[datastore1] demo-vm/demo-vm_1.vmdk",
+                                "uuid": "disk-uuid-2",
+                                "change_id": "disk2-change-001",
+                                "abr_path": str(previous_task_root),
+                                "abr_backup_name": "02-demo-vm_1.vmdk",
+                                "storage_mode": "local",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task = {
+                "id": "task-vcenter-two-disks",
+                "status": "queued",
+                "task_type": "backup",
+                "hypervisor_id": "hv-vc",
+                "resource_type": "virtual_machine",
+                "resource_external_id": "vm-uuid-1",
+                "parameters": {
+                    "incremental": True,
+                    "incremental_fallback_full": True,
+                    "destination_dir": temp_dir,
+                    "parent_manifest_path": str(parent_manifest),
+                    "parent_point_id": "point-full",
+                    "tool_path": EXISTING_TOOL_PATH,
+                },
+            }
+
+            def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                recorded_commands.append(command)
+                if fail_tool_for and "--type" in command and any(fail_tool_for in part for part in command):
+                    return FakeCompletedProcess(returncode=1, stderr="Error: failed to open parent backup")
+                return FakeCompletedProcess(returncode=0, stdout="Done")
+
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run),
+                patch(
+                    "python.srv.plugins.vcenter.vcenter_backup.remove_disk_tool_backup",
+                    side_effect=remove_side_effect,
+                ) as remove,
+                patch("python.srv.plugins.vcenter.vcenter_backup._backup_still_stored", return_value=True),
+            ):
+                result = run_task(task)
+        return result, recorded_commands, remove
+
+    def test_a_disk_whose_cbt_restarted_makes_the_run_a_full_of_every_disk(self) -> None:
+        FakeVCenterNode.raise_on_query_for_disk_keys = {
+            16000: FakeVimFault(
+                "Error caused by file /vmfs/volumes/uuid/demo-vm/demo-vm_1.vmdk",
+                fault_message_key="vim.hostd.vmsvc.cbt.cannotGetChanges",
+            )
+        }
+
+        result, commands, _ = self._two_disk_incremental()
+
+        self.assertEqual(result["status"], "completed")
+        payload = result["result"]
+        self.assertEqual((payload["resolved_backup_type"], payload["resolved_backup_reason"]), ("ActiveFull", "IncrementalFallbackToFull"))
+        self.assertIsNone(payload["parent_point_id"])
+        self.assertEqual(len(commands), 2)
+        for command in commands:
+            self.assertEqual(command[1], "backup")
+            self.assertNotIn("--type", command)
+            self.assertNotIn("--change-id", command)
+        self.assertEqual([disk.get("store_mode") for disk in payload["disks"]], [None, None])
+        self.assertEqual([disk["change_id"] for disk in payload["disks"]], ["disk1-change-002", "disk2-restarted/1"])
+
+    def test_a_cbt_fault_is_named_by_its_own_message_not_its_repr(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import _cbt_fault_text
+
+        described = FakeVimFault("Error caused by file /vmfs/x.vmdk", fault_message_key="vim.hostd.vmsvc.cbt.cannotGetChanges")
+        described.faultMessage[0].message = "Cannot compute changes for disk /vmfs/x.vmdk: Nonmatching change UUID."
+
+        self.assertEqual(_cbt_fault_text(described), "Cannot compute changes for disk /vmfs/x.vmdk: Nonmatching change UUID.")
+        self.assertEqual(_cbt_fault_text(FakeVimFault("Error caused by file /vmfs/x.vmdk")), "Error caused by file /vmfs/x.vmdk")
+        self.assertEqual(_cbt_fault_text(RuntimeError()), "RuntimeError")
+
+    def test_an_incremental_of_two_healthy_disks_stays_incremental_and_asks_cbt_once_per_disk(self) -> None:
+        result, commands, _ = self._two_disk_incremental()
+
+        self.assertEqual(result["status"], "completed")
+        payload = result["result"]
+        self.assertEqual(payload["resolved_backup_type"], "Incremental")
+        self.assertEqual(payload["parent_point_id"], "point-full")
+        self.assertEqual([disk["store_mode"] for disk in payload["disks"]], ["incremental", "incremental"])
+        self.assertEqual([c[c.index("--change-id") + 1] for c in commands], ["disk1-change-001", "disk2-change-001"])
+        self.assertEqual([q["disk_key"] for q in FakeVCenterNode.changed_area_queries], [2000, 16000])
+
+    def test_an_incremental_the_tool_cannot_store_is_retaken_as_a_full_of_every_disk(self) -> None:
+        result, commands, remove = self._two_disk_incremental(fail_tool_for="02-demo-vm_1.vmdk")
+
+        self.assertEqual(result["status"], "completed")
+        payload = result["result"]
+        self.assertEqual((payload["resolved_backup_type"], payload["resolved_backup_reason"]), ("ActiveFull", "IncrementalFallbackToFull"))
+        self.assertIsNone(payload["parent_point_id"])
+        self.assertEqual(["--type" in command for command in commands], [True, True, False, False])
+        self.assertEqual(sorted(call.args[2] for call in remove.call_args_list), ["01-demo-vm.vmdk", "02-demo-vm_1.vmdk"])
+        self.assertEqual([disk.get("store_mode") for disk in payload["disks"]], [None, None])
+
+    def test_a_full_that_cannot_be_retaken_fails_and_says_why(self) -> None:
+        result, commands, _ = self._two_disk_incremental(
+            fail_tool_for="02-demo-vm_1.vmdk", remove_side_effect=StorageToolError("object is locked")
+        )
+
+        self.assertEqual(result["status"], "failed")
+        message = result["result"]["message"]
+        self.assertIn("the incremental of disk [datastore1] demo-vm/demo-vm_1.vmdk failed", message)
+        self.assertIn("a full backup could not be taken instead", message)
+        self.assertEqual(len(commands), 2)
 
     def _run_direct_esxi_full_backup(self, stderr: str) -> tuple[dict, list[list[str]]]:
         FakeVCenterNode.service_type = "HostAgent"
@@ -6749,8 +6952,7 @@ class TaskExecutorTests(unittest.TestCase):
 
         self.assertEqual(payload["backup_mode"], "incremental-full-fallback")
         self.assertTrue(payload["incremental_full_fallback_used"])
-        self.assertEqual(payload["disks"][0]["store_mode"], "full-no-cbt-baseline")
-        self.assertEqual(payload["disks"][0]["changed_area_count"], 0)
+        self.assertNotIn("store_mode", payload["disks"][0])
         self.assertEqual(len(recorded_commands), 1)
         self.assertEqual(payload["resolved_backup_type"], "ActiveFull")
         self.assertEqual(payload["resolved_backup_reason"], "IncrementalFallbackToFull")
@@ -8442,8 +8644,7 @@ class TaskExecutorTests(unittest.TestCase):
 
         self.assertEqual(payload["backup_mode"], "incremental-full-fallback")
         self.assertTrue(payload["incremental_full_fallback_used"])
-        self.assertEqual(payload["disks"][0]["store_mode"], "full-no-cbt-baseline")
-        self.assertEqual(payload["disks"][0]["changed_area_count"], 0)
+        self.assertNotIn("store_mode", payload["disks"][0])
         self.assertEqual(len(recorded_commands), 1)
         self.assertEqual(payload["resolved_backup_type"], "ActiveFull")
         self.assertEqual(payload["resolved_backup_reason"], "IncrementalFallbackToFull")
