@@ -615,3 +615,141 @@ class InterruptedOutputLocationTests(SweepTestCase):
             location = backup_catalog._interrupted_task_output_location(task)
         self.assertEqual(location[1], "tenant/web01/task-r4")
 
+
+
+CHAIN_ID = f"backup::job-1::vm-1::{REPO_ID}"
+
+
+def _tool_remove(repository, abr_path, name, timeout=None):
+    for path in pathlib.Path(abr_path).glob(f"{name}.abr*"):
+        path.unlink()
+
+
+def _tool_list(repository, abr_path, timeout=None):
+    return {path.name.split(".abr")[0] for path in pathlib.Path(abr_path).glob("*.abr*")} - {"manifest"}
+
+
+class ChainDeleteLeftoverTests(SweepTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        for target, side_effect in (
+            ("python.srv.services.abr_v41.remove_disk_tool_backup", _tool_remove),
+            ("python.srv.services.abr_v41.list_disk_tool_backups", _tool_list),
+            ("python.srv.services.backup_catalog.remove_disk_tool_backup", _tool_remove),
+            ("python.srv.services.backup_catalog.list_disk_tool_backups", _tool_list),
+        ):
+            patcher = patch(target, side_effect=side_effect)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.chain_folder = pathlib.Path(self._root) / "job-1" / "vm-1"
+
+    def _session_dir(self, task_id: str, *names: str, parent: pathlib.Path | None = None) -> pathlib.Path:
+        folder = (parent or self.chain_folder) / task_id
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (folder / name).write_bytes(b"x")
+        return folder
+
+    def _point(self, point_id: str, task_id: str, execution_type: str = "ActiveFull", parent: str | None = None) -> pathlib.Path:
+        folder = self._session_dir(task_id, "01-disk.vmdk.abrd", "01-disk.vmdk.abri", "manifest.abrm", "manifest.json")
+        BACKUPS[point_id] = {
+            "id": point_id,
+            "job_id": "job-1",
+            "vm_id": "vm-1",
+            "vm_name": "web01",
+            "repository_id": REPO_ID,
+            "execution_type": execution_type,
+            "full_backup": execution_type == "ActiveFull",
+            "parent_point_id": parent,
+            "status": "available",
+            "created_at": f"2026-10-26T10:0{len(BACKUPS)}:00+00:00",
+            "origin": {"task_id": task_id},
+            "artifact": {
+                "backup_root": str(folder),
+                "manifest_path": str(folder / "manifest.json"),
+                "disks": [{"abr_path": str(folder), "abr_backup_name": "01-disk.vmdk"}],
+            },
+        }
+        TASKS[task_id] = dict(_task(task_id, "completed"), result={"backup_root": str(folder)})
+        return folder
+
+    def _abandoned(self, task_id: str, status: str = "failed", **result) -> pathlib.Path:
+        folder = self._session_dir(task_id, "manifest.abrm", "manifest.json")
+        TASKS[task_id] = dict(_task(task_id, status), result={"backup_root": str(folder), **result})
+        return folder
+
+    def _delete(self, **kwargs) -> dict:
+        from python.srv.services import abr_v41
+
+        return abr_v41.delete_backup_chain(CHAIN_ID, **kwargs)
+
+    def test_deleting_a_chain_removes_an_abandoned_sessions_manifest_and_every_folder_under_it(self) -> None:
+        self._point("point-1", "task-full")
+        self._abandoned("task-crashed", failure_kind="interrupted")
+        self._abandoned("task-old")
+
+        result = self._delete()
+
+        self.assertTrue(result["deleted"])
+        self.assertFalse((pathlib.Path(self._root) / "job-1").exists())
+        self.assertTrue(pathlib.Path(self._root).is_dir())
+
+    def test_a_session_still_in_progress_keeps_its_folder(self) -> None:
+        self._point("point-1", "task-full")
+        running = self._abandoned("task-running", status="running")
+        self._abandoned("task-crashed", failure_kind="interrupted")
+
+        self._delete()
+
+        self.assertEqual(sorted(path.name for path in running.iterdir()), ["manifest.abrm", "manifest.json"])
+        self.assertEqual([path.name for path in self.chain_folder.iterdir()], ["task-running"])
+
+    def test_another_jobs_sessions_in_a_shared_vm_folder_are_left_alone(self) -> None:
+        shared = pathlib.Path(self._root) / "web01"
+        self._point("point-1", "task-full")
+        BACKUPS["point-1"]["artifact"]["backup_root"] = str(self._session_dir("task-full", parent=shared))
+        other = self._session_dir("task-other-job", "manifest.abrm", parent=shared)
+        TASKS["task-other-job"] = dict(_task("task-other-job", "failed"), job_id="job-2", result={"backup_root": str(other)})
+
+        self._delete()
+
+        self.assertTrue((other / "manifest.abrm").exists())
+        self.assertTrue(shared.is_dir())
+
+    def test_a_folder_another_restore_point_records_is_kept(self) -> None:
+        self._point("point-1", "task-full")
+        kept = self._abandoned("task-shared")
+        BACKUPS["point-other"] = {
+            "id": "point-other", "job_id": "job-9", "vm_id": "vm-9", "repository_id": REPO_ID, "execution_type": "ActiveFull",
+            "status": "available", "created_at": "2026-10-26T09:00:00+00:00",
+            "artifact": {"backup_root": str(kept), "manifest_path": str(kept / "manifest.json"), "disks": []},
+        }
+
+        self._delete()
+
+        self.assertTrue((kept / "manifest.abrm").exists())
+
+    def test_deleting_one_segment_leaves_the_rest_of_the_folder_alone(self) -> None:
+        self._point("point-1", "task-full")
+        orphan = self._abandoned("task-crashed", failure_kind="interrupted")
+
+        self._delete(segment_id="point-1")
+
+        self.assertTrue((orphan / "manifest.abrm").exists())
+
+    def test_an_s3_chain_only_sweeps_the_sessions_a_crash_abandoned(self) -> None:
+        from python.srv.services import abr_v41
+
+        REPOSITORIES["repo-s3"] = {"id": "repo-s3", "name": "S3", "type": "s3",
+                                   "metadata": {"s3": {"bucket": "b", "prefix": "tenant", "region": "us-east-1"}}}
+        BACKUPS["point-s3"] = {
+            "id": "point-s3", "job_id": "job-1", "vm_id": "vm-1", "repository_id": "repo-s3", "execution_type": "ActiveFull",
+            "status": "available", "created_at": "2026-10-26T09:00:00+00:00", "artifact": {"disks": []},
+        }
+        for task_id, result in (("task-crashed", {"failure_kind": "interrupted"}), ("task-failed", {"failure_kind": "runtime"})):
+            TASKS[task_id] = dict(_task(task_id, "failed", repository_id="repo-s3"), result=result)
+
+        with patch("python.srv.services.backup_catalog.discard_unregistered_output") as discard:
+            abr_v41.delete_backup_chain("backup::job-1::vm-1::repo-s3")
+
+        self.assertEqual([call.args[0]["id"] for call in discard.call_args_list], ["task-crashed"])
