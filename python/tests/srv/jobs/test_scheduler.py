@@ -805,6 +805,108 @@ class SyntheticFullSchedulingTests(unittest.TestCase):
             self.assertEqual(own[1]["parameters"]["requires_task_id"], own[0]["id"])
 
 
+class VanishedVmSchedulingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for store in (HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, BACKUPS, REPOSITORIES):
+            store.clear()
+            self.addCleanup(store.clear)
+        self.scheduler = JobScheduler(poll_interval_seconds=0.1)
+        HYPERVISORS["hv-1"] = {"id": "hv-1", "kind": "vcenter"}
+        RESOURCES_BY_HV["hv-1"] = {}
+        moment = datetime.now(timezone.utc) - timedelta(minutes=1)
+        JOBS["job-1"] = {
+            "id": "job-1",
+            "name": "nightly",
+            "job_type": "backup",
+            "inventory_id": "hv-1",
+            "hypervisor_id": "hv-1",
+            "status": "active",
+            "vm_ids": ["vm-1"],
+            "vm_names": ["gone-vm"],
+            "schedule": {"type": "daily", "time": moment.strftime("%H:%M"), "timezone": "UTC"},
+            "created_at": (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(),
+        }
+
+    def _discover(self, vm_id: str, name: str) -> None:
+        RESOURCES_BY_HV["hv-1"][("virtual_machine", vm_id)] = {
+            "resource_type": "virtual_machine",
+            "external_id": vm_id,
+            "name": name,
+            "payload": {},
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _dispatch(self) -> list[dict]:
+        self.scheduler._dispatch_due_jobs()
+        return sorted(TASKS.values(), key=lambda task: str(task.get("created_at")))
+
+    def _vm_warnings(self, logs: list[str]) -> list[str]:
+        return [line for line in logs if "vm-1" in line]
+
+    def test_a_vm_gone_from_the_inventory_still_gets_its_scheduled_session(self) -> None:
+        tasks = self._dispatch()
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["trigger"], "schedule")
+        self.assertEqual(tasks[0]["resource_external_id"], "vm-1")
+        self.assertEqual(tasks[0]["parameters"]["vm_name"], "gone-vm")
+        job = JOBS["job-1"]
+        self.assertEqual(job["last_session_id"], tasks[0]["id"])
+        self.assertEqual(job["last_run"]["trigger"], "schedule")
+        self.assertGreater(datetime.fromisoformat(job["next_incremental_run_at"]), datetime.now(timezone.utc))
+
+    def test_that_session_fails_saying_the_vm_is_no_longer_in_the_inventory(self) -> None:
+        from python.srv.plugins.vcenter.vcenter_backup import (
+            VCenterBackupError,
+            _get_resource,
+        )
+
+        task = self._dispatch()[0]
+
+        with self.assertRaisesRegex(VCenterBackupError, "virtual_machine vm-1 is no longer in the inventory"):
+            _get_resource(task)
+
+    def test_the_run_is_logged_once_not_on_every_poll(self) -> None:
+        with self.assertLogs("python.srv.core.job_scheduler", level="WARNING") as captured:
+            self._dispatch()
+            for task in TASKS.values():
+                task["status"] = "failed"
+            self._dispatch()
+            self._dispatch()
+
+        self.assertEqual(len(TASKS), 1)
+        warnings = self._vm_warnings(captured.output)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("gone-vm", warnings[0])
+
+    def test_a_vm_still_in_the_inventory_is_backed_up_beside_the_gone_one(self) -> None:
+        self._discover("vm-2", "live-vm")
+        JOBS["job-1"]["vm_ids"] = ["vm-1", "vm-2"]
+        JOBS["job-1"]["vm_names"] = ["gone-vm", "live-vm"]
+
+        tasks = self._dispatch()
+
+        self.assertEqual(sorted(task["resource_external_id"] for task in tasks), ["vm-1", "vm-2"])
+        self.assertEqual(len({task["run_id"] for task in tasks}), 1)
+
+    def test_a_vm_that_is_back_after_a_rescan_runs_under_its_current_name(self) -> None:
+        self._discover("vm-1", "renamed-vm")
+
+        tasks = self._dispatch()
+
+        self.assertEqual(tasks[0]["parameters"]["vm_name"], "renamed-vm")
+
+    def test_a_job_whose_inventory_record_is_gone_moves_its_next_run_on(self) -> None:
+        HYPERVISORS.clear()
+
+        with self.assertLogs("python.srv.core.job_scheduler", level="WARNING") as captured:
+            self.assertEqual(self._dispatch(), [])
+            self._dispatch()
+
+        self.assertGreater(datetime.fromisoformat(JOBS["job-1"]["next_incremental_run_at"]), datetime.now(timezone.utc))
+        self.assertEqual(len([line for line in captured.output if "hypervisor 'hv-1' not found" in line]), 1)
+
+
 class LegacyFullDayMigrationTests(unittest.TestCase):
     @staticmethod
     def _job(schedule: dict, **overrides) -> dict:
