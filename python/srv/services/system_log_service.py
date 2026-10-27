@@ -161,10 +161,12 @@ def _entry_id(timestamp: str, origin: str, message: str, ordinal: int) -> str:
     digest = hashlib.sha1(f"{timestamp}|{origin}|{message}".encode("utf-8")).hexdigest()
     # The ordinal keeps two identical lines logged in the same second distinct,
     # which they legitimately can be (a retry loop logging the same warning).
+    # It counts only such repeats, so a line keeps its ID from one read to the
+    # next while the tail window slides down a growing file.
     return f"{digest[:16]}-{ordinal}"
 
 
-def parse_log_text(text: str, *, ordinal_base: int = 0) -> list[dict[str, Any]]:
+def parse_log_text(text: str) -> list[dict[str, Any]]:
     """Parse a chunk of server log into records, oldest first.
 
     A line that doesn't match the format is a continuation — a traceback body,
@@ -197,10 +199,11 @@ def parse_log_text(text: str, *, ordinal_base: int = 0) -> list[dict[str, Any]]:
             }
         )
 
-    for offset, entry in enumerate(entries):
-        entry["id"] = _entry_id(
-            entry["ts"], entry["logger"], entry["message"], ordinal_base + offset
-        )
+    repeats: dict[tuple[str, str, str], int] = {}
+    for entry in entries:
+        key = (entry["ts"], entry["logger"], entry["message"])
+        repeats[key] = repeats.get(key, -1) + 1
+        entry["id"] = _entry_id(*key, repeats[key])
     return entries
 
 
@@ -231,6 +234,7 @@ def read_system_log(*, limit: int | None = None, level: str | None = None) -> di
     collected: list[dict[str, Any]] = []
     read_files: list[str] = []
     unreadable: list[str] = []
+    seen_ids: set[str] = set()
     more_available = False
 
     for path in files:
@@ -244,7 +248,13 @@ def read_system_log(*, limit: int | None = None, level: str | None = None) -> di
             continue
 
         read_files.append(str(path))
-        entries = parse_log_text(text, ordinal_base=len(collected))
+        entries = parse_log_text(text)
+        for entry in entries:
+            # The same line in two files (logged in the second a file rotated)
+            # still needs its own ID.
+            while entry["id"] in seen_ids:
+                entry["id"] += "r"
+            seen_ids.add(entry["id"])
         if floor:
             entries = [e for e in entries if _LEVEL_RANK.get(e["level"], 1) >= floor]
         # Newest-first overall: within a file, later lines are newer.

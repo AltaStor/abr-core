@@ -4963,11 +4963,16 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 def delete_job_record(job_id: str) -> dict[str, Any]:
     job = _find_by_id(catalog_records(JOBS), job_id, label="Job")
-    for task in catalog_records(TASKS):
-        if str(task.get("job_id") or "") != job_id:
-            continue
-        if str(task.get("status") or "") in {"queued", "running", "stopping"}:
-            raise api_error(409, "job_has_active_sessions", "Job cannot be deleted while sessions are queued or running", session_id=task.get("id"))
+    # The same sessions the job's active_session_count counts, so the console's
+    # disabled Delete and this refusal agree (a "pending" task is queued too).
+    active = _active_sessions_for_job(str(job.get("id") or job_id))
+    if active:
+        raise api_error(
+            409,
+            "job_has_active_sessions",
+            "Job cannot be deleted while sessions are queued or running",
+            session_id=active[0]["id"],
+        )
     delete_job(job_id)
     return {"id": str(job.get("id") or job_id), "deleted": True}
 

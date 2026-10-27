@@ -86,6 +86,13 @@ class SystemLogParsingTests(unittest.TestCase):
 
         self.assertEqual(len({e["id"] for e in entries}), 2)
 
+    def test_a_line_keeps_its_id_when_lines_before_it_drop_out_of_the_window(self) -> None:
+        lines = [_line(f"2026-09-04 18:09:{second:02d}", "INFO", "python.srv", f"line {second}") for second in range(5)]
+        whole = system_log_service.parse_log_text("\n".join(lines))
+        later = system_log_service.parse_log_text("\n".join(lines[2:]))
+
+        self.assertEqual([e["id"] for e in whole[2:]], [e["id"] for e in later])
+
 
 class SystemLogReadTests(unittest.TestCase):
     def setUp(self) -> None:

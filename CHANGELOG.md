@@ -128,6 +128,13 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
 
 ### Fixed
 
+- A job with a pending session can no longer be deleted: the refusal now
+  counts the same queued, running and stopping sessions as the job's
+  `active_session_count`.
+- A server log line keeps its ID from one `GET /api/v1/system/logs` to the
+  next once the log is larger than the 512 KiB read window, so a client can
+  tell the lines it has from new ones.
+
 - Cleanup after interrupted runs:
   - a backup killed with the server leaves no snapshot on the VM; the
     stranded one is removed when the server comes back;
