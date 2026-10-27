@@ -373,15 +373,18 @@ def _take_backup_snapshot(
     )
     message = f"{cause} in VM {vm_name}: the backup is crash-consistent"
     logger.warning("%s (task %s)", message, task.get("id"))
-    _emit_progress(
-        progress_callback,
-        "snapshot",
-        15,
-        message,
-        worker_mode="vcenter-abr-vmdk-tool",
-        vm_name=vm_name,
-        warning={"code": "crash_consistent", "message": message, "vm_name": vm_name},
-    )
+    try:
+        _emit_progress(
+            progress_callback,
+            "snapshot",
+            15,
+            message,
+            worker_mode="vcenter-abr-vmdk-tool",
+            vm_name=vm_name,
+            warning={"code": "crash_consistent", "message": message, "vm_name": vm_name},
+        )
+    except TaskStopRequested:
+        pass
     return snapshot_name, {"consistency": "crash_consistent", "consistency_reason": reason}
 
 
@@ -3490,14 +3493,20 @@ def run_vcenter_backup(
                 )
                 _record_backup_snapshot(progress_callback, vm_name, None)
             except Exception as exc:
-                logger.warning("Snapshot cleanup warning for VM %s: %s", vm_name, exc)
+                reason = str(exc).rstrip(". ") or type(exc).__name__
+                message = (
+                    f"Backup snapshot {snapshot_name} of VM {vm_name} could not be removed: {reason}. "
+                    "The next backup of this VM removes it"
+                )
+                logger.warning("%s (task %s)", message, task.get("id"))
                 try:
                     _emit_progress(
                         progress_callback,
                         "cleanup",
                         96,
-                        f"Snapshot cleanup warning: {exc}",
+                        message,
                         worker_mode="vcenter-abr-vmdk-tool",
+                        warning={"code": "snapshot_left", "message": message, "vm_name": vm_name, "snapshot_name": snapshot_name},
                     )
                 except TaskStopRequested:
                     pass

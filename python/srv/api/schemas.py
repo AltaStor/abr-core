@@ -1230,6 +1230,7 @@ TLS_WARNING_CODES = [
     "expires_soon",
     "no_subject_alternative_names",
     "appliance_names_not_covered",
+    "chain_incomplete",
 ]
 
 DocTlsWarningArray = Annotated[
@@ -1254,6 +1255,10 @@ DocTlsWarningArray = Annotated[
                             'Only on "appliance_names_not_covered": this appliance\'s own host '
                             "names and addresses, none of which the certificate lists."
                         ),
+                    },
+                    "issuer": {
+                        "type": "string",
+                        "description": 'Only on "chain_incomplete": the issuer of the server certificate, which is not installed.',
                     },
                 },
             },

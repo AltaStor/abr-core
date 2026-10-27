@@ -257,8 +257,71 @@ class DescribeCertificateTests(_TlsDirTestCase):
         codes = [w["code"] for w in tls_certificate_service.get_certificate()["warnings"]]
         self.assertEqual(codes, ["expires_soon", "no_subject_alternative_names"])
 
+    def test_warns_when_the_server_certificate_comes_without_its_issuer(self) -> None:
+        pki = _Pki()
+        tls_certificate_service.install_certificate(_pem(pki.leaf), _key_pem(pki.leaf_key))
+
+        warnings = {w["code"]: w for w in tls_certificate_service.get_certificate()["warnings"]}
+        self.assertIn("chain_incomplete", warnings)
+        self.assertIn("Test Issuing CA", warnings["chain_incomplete"]["message"])
+        self.assertEqual(warnings["chain_incomplete"]["issuer"], "CN=Test Issuing CA")
+
+        tls_certificate_service.install_certificate(pki.chain_pem, _key_pem(pki.leaf_key))
+        codes = [w["code"] for w in tls_certificate_service.get_certificate()["warnings"]]
+        self.assertNotIn("chain_incomplete", codes)
+
+    def test_a_self_signed_certificate_alone_is_a_complete_chain(self) -> None:
+        codes = [w["code"] for w in tls_certificate_service.get_certificate()["warnings"]]
+        self.assertNotIn("chain_incomplete", codes)
+
 
 class InstallCertificateTests(_TlsDirTestCase):
+    def test_a_refused_certificate_is_logged_with_the_reason(self) -> None:
+        pki = _Pki()
+        with (
+            self.assertLogs(tls_certificate_service.logger, "WARNING") as logs,
+            self.assertApiError("certificate_key_mismatch"),
+        ):
+            tls_certificate_service.install_certificate(
+                pki.chain_pem, _key_pem(pki.intermediate_key), installed_by="admin"
+            )
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("from admin refused", logs.output[0])
+        self.assertIn("certificate_key_mismatch", logs.output[0])
+        self.assertIn("The private key does not belong to the certificate", logs.output[0])
+
+    def test_a_certificate_that_cannot_be_saved_is_logged(self) -> None:
+        pki = _Pki()
+        real_write = tls_certificate_service._atomic_write
+        failures = [OSError("No space left on device")]
+
+        def fail_on_the_certificate(path, data, mode):
+            if path == self.cert_path and failures:
+                raise failures.pop()
+            real_write(path, data, mode)
+
+        with (
+            patch.object(tls_certificate_service, "_atomic_write", side_effect=fail_on_the_certificate),
+            self.assertLogs(tls_certificate_service.logger, "ERROR") as logs,
+            self.assertApiError("tls_certificate_write_failed", status=500),
+        ):
+            tls_certificate_service.install_certificate(
+                pki.chain_pem, _key_pem(pki.leaf_key), installed_by="admin"
+            )
+
+        self.assertIn("No space left on device", logs.output[0])
+        self.assertIn("current certificate stays in use", logs.output[0])
+
+    def test_an_installed_certificate_logs_its_warnings(self) -> None:
+        pki = _Pki()
+        with self.assertLogs(tls_certificate_service.logger, "WARNING") as logs:
+            tls_certificate_service.install_certificate(_pem(pki.leaf), _key_pem(pki.leaf_key))
+
+        self.assertTrue(
+            any("Only the server certificate is installed" in line for line in logs.output), logs.output
+        )
+
     def test_installs_a_ca_chain_and_serves_it_without_a_restart(self) -> None:
         pki = _Pki()
 
@@ -411,6 +474,23 @@ class RevertCertificateTests(_TlsDirTestCase):
         for version in (ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3):
             served = _served_certificate(self.context, version)
             self.assertTrue(tls_bootstrap.is_appliance_generated(served), version)
+
+    def test_a_failed_revert_is_logged_and_keeps_the_administrator_certificate(self) -> None:
+        pki = _Pki()
+        tls_certificate_service.install_certificate(pki.chain_pem, _key_pem(pki.leaf_key))
+        before = (self.cert_path.read_bytes(), self.key_path.read_bytes())
+
+        with (
+            patch.object(tls_bootstrap, "ensure_self_signed_cert", side_effect=OSError("Read-only file system")),
+            self.assertLogs(tls_certificate_service.logger, "ERROR") as logs,
+            self.assertRaises(ApiError) as caught,
+        ):
+            tls_certificate_service.revert_to_generated_certificate(requested_by="admin")
+
+        self.assertEqual(caught.exception.code, "tls_certificate_write_failed")
+        self.assertIn("Read-only file system", logs.output[0])
+        self.assertEqual((self.cert_path.read_bytes(), self.key_path.read_bytes()), before)
+        self.assertIsNotNone(tls_bootstrap.read_administrator_marker(self.cert_path))
 
     def test_reverting_the_generated_certificate_changes_nothing(self) -> None:
         before = (self.cert_path.read_bytes(), self.key_path.read_bytes())

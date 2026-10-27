@@ -9,7 +9,11 @@ import ssl
 from pathlib import Path
 
 from .server_defaults import env_int
-from .tls_bootstrap import TLS_FILES_LOCK, ensure_self_signed_cert
+from .tls_bootstrap import (
+    TLS_FILES_LOCK,
+    ensure_self_signed_cert,
+    is_administrator_certificate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +63,13 @@ def _check_and_renew_locked(
         return False
 
     if not renewed:
-        logger.info("TLS certificate %s does not need renewal yet.", cert_path)
+        if is_administrator_certificate(cert_path):
+            logger.info(
+                "TLS certificate %s was installed by an administrator and is not renewed automatically.",
+                cert_path,
+            )
+        else:
+            logger.info("TLS certificate %s does not need renewal yet.", cert_path)
         return False
 
     if ssl_context is None:

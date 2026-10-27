@@ -143,6 +143,14 @@ def _is_managed_by_appliance(cert_path: Path, cert: x509.Certificate) -> bool:
     return read_administrator_marker(cert_path) is None and is_appliance_generated(cert)
 
 
+def is_administrator_certificate(cert_path: Path) -> bool:
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    except (OSError, ValueError):
+        return False
+    return not _is_managed_by_appliance(cert_path, cert)
+
+
 def _warn_if_administrator_cert_expiring(cert_path: Path, cert: x509.Certificate) -> None:
     threshold_days = env_int("ABR_TLS_RENEWAL_THRESHOLD_DAYS")
     remaining = cert.not_valid_after_utc - datetime.now(timezone.utc)
@@ -391,6 +399,16 @@ def main() -> None:
     cert_path, key_path = default_cert_paths()
 
     if "--renew" in sys.argv[1:]:
+        if is_administrator_certificate(cert_path):
+            if "--force" not in sys.argv[1:]:
+                logger.error(
+                    "%s is a certificate an administrator installed; --renew would replace it with a "
+                    "self-signed one. Revert it from Settings > Security > HTTPS certificate (or DELETE "
+                    "/api/v1/system/tls-certificate), or add --force to replace it anyway.",
+                    cert_path,
+                )
+                raise SystemExit(1)
+            key_path.unlink(missing_ok=True)
         cert_path.unlink(missing_ok=True)
 
     generated = ensure_self_signed_cert(cert_path, key_path)

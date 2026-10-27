@@ -1459,6 +1459,85 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertLess(created_at, removed_at)
         self.assertEqual(FakeVCenterNode.snapshots_removed, ["demo-vm-snapshot"])
 
+    def _stop_on(self, task_id: str, updates: list[dict[str, object]], matches):
+        TASKS[task_id] = {"id": task_id}
+        self.addCleanup(TASKS.clear)
+
+        def progress(update: dict[str, object]) -> None:
+            updates.append(update)
+            if matches(update):
+                TASKS[task_id]["cancel_requested"] = True
+            if TASKS[task_id].get("cancel_requested"):
+                raise TaskStopRequested("Session stop requested")
+
+        return progress
+
+    def test_a_stop_on_the_crash_consistent_warning_removes_the_new_snapshot(self) -> None:
+        self._register_vcenter_hypervisor()
+        FakeVCenterNode.snapshot_quiesced = False
+        FakeVCenterNode.tools_status = "toolsNotRunning"
+        updates: list[dict[str, object]] = []
+        progress = self._stop_on(
+            "task-stop-crash",
+            updates,
+            lambda update: (update.get("warning") or {}).get("code") == "crash_consistent",
+        )
+
+        result = self._run_backup("task-stop-crash", progress)
+
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(FakeVCenterNode.snapshots_created, ["demo-vm-snapshot"])
+        self.assertEqual(FakeVCenterNode.snapshots_removed, ["demo-vm-snapshot"])
+        recorded = [update["backup_snapshot"] for update in updates if "backup_snapshot" in update]
+        self.assertEqual(recorded, [{"vm_name": "demo-vm", "name": "demo-vm-snapshot"}, None])
+
+    def test_a_stop_that_arrives_while_the_snapshot_is_created_removes_it(self) -> None:
+        self._register_vcenter_hypervisor()
+        updates: list[dict[str, object]] = []
+        progress = self._stop_on("task-stop-create", updates, lambda update: False)
+        real_create = FakeVCenterNode.create_backup_snapshot
+
+        def create_then_stop(node, vm_name: str, *, quiesce: bool = True) -> str:
+            name = real_create(node, vm_name, quiesce=quiesce)
+            TASKS["task-stop-create"]["cancel_requested"] = True
+            return name
+
+        with patch.object(FakeVCenterNode, "create_backup_snapshot", create_then_stop):
+            result = self._run_backup("task-stop-create", progress)
+
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(FakeVCenterNode.snapshots_removed, ["demo-vm-snapshot"])
+
+    def test_a_stopped_backup_says_which_snapshot_it_could_not_remove(self) -> None:
+        self._register_vcenter_hypervisor()
+        FakeVCenterNode.snapshot_quiesced = False
+        FakeVCenterNode.tools_status = "toolsNotRunning"
+        updates: list[dict[str, object]] = []
+        progress = self._stop_on(
+            "task-stop-left",
+            updates,
+            lambda update: (update.get("warning") or {}).get("code") == "crash_consistent",
+        )
+
+        def refuse(node, vm_name: str, snapshot_name: str) -> None:
+            raise RuntimeError("another operation is already in progress.")
+
+        with patch.object(FakeVCenterNode, "remove_snapshot", refuse):
+            result = self._run_backup("task-stop-left", progress)
+
+        self.assertEqual(result["status"], "stopped")
+        left = [update["warning"] for update in updates if (update.get("warning") or {}).get("code") == "snapshot_left"]
+        message = (
+            "Backup snapshot demo-vm-snapshot of VM demo-vm could not be removed: "
+            "another operation is already in progress. The next backup of this VM removes it"
+        )
+        self.assertEqual(
+            left,
+            [{"code": "snapshot_left", "message": message, "vm_name": "demo-vm", "snapshot_name": "demo-vm-snapshot"}],
+        )
+        recorded = [update["backup_snapshot"] for update in updates if "backup_snapshot" in update]
+        self.assertEqual(recorded, [{"vm_name": "demo-vm", "name": "demo-vm-snapshot"}])
+
     def test_a_backup_removes_the_snapshot_an_interrupted_backup_left_on_the_same_vm(self) -> None:
         self._register_vcenter_hypervisor()
         self.addCleanup(TASKS.clear)
@@ -1492,6 +1571,29 @@ class TaskExecutorTests(unittest.TestCase):
             ),
             f"expected the session to report the leftover snapshot, got: {updates}",
         )
+
+    def test_a_backup_removes_the_snapshot_a_stopped_backup_could_not_remove(self) -> None:
+        self._register_vcenter_hypervisor()
+        self.addCleanup(TASKS.clear)
+        TASKS["task-stopped"] = {
+            "id": "task-stopped",
+            "task_type": "backup",
+            "status": "stopped",
+            "hypervisor_id": "hv-vc",
+            "resource_type": "virtual_machine",
+            "resource_external_id": "vm-uuid-1",
+            "parameters": {"vm_name": "demo-vm"},
+            "result": {
+                "message": "Session stop requested",
+                "backup_snapshot": {"vm_name": "demo-vm", "name": "FullBackup_left"},
+            },
+        }
+
+        result = self._run_backup("task-next-backup", lambda update: None)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(FakeVCenterNode.snapshots_removed, ["FullBackup_left", "demo-vm-snapshot"])
+        self.assertNotIn("backup_snapshot", TASKS["task-stopped"]["result"])
 
     def test_a_leftover_snapshot_that_cannot_be_removed_does_not_fail_the_backup(self) -> None:
         self._register_vcenter_hypervisor()

@@ -140,9 +140,11 @@ class JobScheduler:
 
             run_id = str(uuid4())
             tasks = self._create_scheduled_tasks(normalized_job, scheduled_type=due_slots[0][1], run_id=run_id)
-            if not tasks:
-                continue
             self._advance_due_slots(job, due_slots)
+            if not tasks:
+                job["updated_at"] = utc_now()
+                persist_job(dict(job))
+                continue
 
             job["status"] = "active"
             job["last_task_id"] = tasks[-1]["id"]
@@ -476,17 +478,25 @@ class JobScheduler:
             return []
 
         discovered = RESOURCES_BY_HV.get(hypervisor_id, {})
+        stored_names = {
+            str(vm_id): str(vm_name)
+            for vm_id, vm_name in zip(normalized_job.get("vm_ids") or [], normalized_job.get("vm_names") or [])
+        }
         targets: list[tuple[str, str, dict[str, Any]]] = []
         for resource_external_id in resource_external_ids:
             resource = discovered.get((resource_type, resource_external_id))
             if not resource:
+                vm_name = stored_names.get(resource_external_id) or resource_external_id
                 logger.warning(
-                    "Skipping resource for scheduled job '%s': resource '%s:%s' was not discovered.",
+                    "Scheduled job '%s': %s %s (%s) is not in the inventory of hypervisor '%s' since its last "
+                    "rescan; its session of this run will fail and say why.",
                     job["id"],
                     resource_type,
                     resource_external_id,
+                    vm_name,
+                    hypervisor_id,
                 )
-                continue
+                resource = {"name": vm_name}
             targets.append((resource_type, resource_external_id, resource))
 
         return targets

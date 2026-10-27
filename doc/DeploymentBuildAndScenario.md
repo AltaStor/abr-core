@@ -229,9 +229,23 @@ encrypted key). The pair is validated before anything is replaced and loaded
 into the running server without a restart. It is never renewed or regenerated
 by the appliance -- that only happens to the self-signed certificate it created
 itself -- so replace it before it expires; `DELETE` on the same path goes back
-to a freshly generated self-signed one. Because the key changes, a CLI that
-pinned the previous certificate refuses to connect until its entry is removed
-from `~/.altastor-backup/trusted_certs.json`.
+to a freshly generated self-signed one. If the server certificate is
+installed without its intermediate CA certificates, the console and the API
+warn (`chain_incomplete`): clients that do not already have the intermediate
+refuse the connection.
+
+Because the key changes, a CLI that pinned the previous certificate checks the
+new one against the CA certificates the machine trusts (the system store, or
+`SSL_CERT_FILE`): one a trusted CA issued for the host the CLI connects to is
+accepted and becomes the new pin. Any other new key is refused until its entry
+is removed from `~/.altastor-backup/trusted_certs.json`.
+
+The renewal check, at start and on its interval, never touches an installed
+certificate; it logs that the certificate is not renewed automatically, and an
+error once it has expired. `python -m python.srv.core.tls_bootstrap --renew`
+refuses to replace one as well; `--renew --force` replaces it with a
+self-signed certificate and a new key. Every refused or failed install is
+logged with its reason.
 
 Log in. Every `/api/v1` call needs a session, so this comes before anything
 else. The shipped `admin`/`admin` is a bootstrap credential -- change it with

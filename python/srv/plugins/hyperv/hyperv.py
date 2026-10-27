@@ -1117,8 +1117,9 @@ class HyperVNode(Hypervisor):
         info = (self._run_script("tool_info.ps1", {"path": remote}, node) or [{}])[0]
         if not info.get("exists"):
             raise HyperVError(
-                f"abr-vhdx-tool is not installed on {node} at {remote}. Install it there, or set "
-                "ALTASTOR_VHDX_TOOL_PATH on this appliance to the .exe so it is copied to every host"
+                f"abr-vhdx-tool is not installed on {node} at {remote}. Install the altastor-backup-vhdx-tools "
+                "package on this appliance so the tool is copied to every host, set ALTASTOR_VHDX_TOOL_PATH "
+                "to the .exe, or install it on the host there"
             )
         logger.info("abr-vhdx-tool %s is ready on Hyper-V node %s at %s", info.get("version") or "", node, remote)
         with self._lock:

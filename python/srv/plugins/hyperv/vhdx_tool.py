@@ -31,6 +31,7 @@ from typing import Any, Iterable
 from ...core.storage_tool import APP_ROOT, REPO_ROOT, disk_tool_storage_args, is_s3_repository
 
 TOOL_NAME = "abr-vhdx-tool.exe"
+HOST_ARCHITECTURE = "x64"
 DEFAULT_REMOTE_TOOL_PATH = r"C:\Program Files\AltaStor\abr-vhdx-tool.exe"
 DEFAULT_REMOTE_WORK_DIR = r"C:\ProgramData\AltaStor\abr-hyperv"
 
@@ -58,7 +59,9 @@ def local_tool_path() -> Path | None:
     hosts; None when there is none, and the hosts must have it already."""
     configured = os.environ.get("ALTASTOR_VHDX_TOOL_PATH", "").strip()
     candidates = [Path(configured).expanduser()] if configured else []
-    candidates += [APP_ROOT / "tools" / "abr-vhdx-tool" / TOOL_NAME, REPO_ROOT / "tools" / "abr-vhdx-tool" / TOOL_NAME]
+    for root in (APP_ROOT, REPO_ROOT):
+        folder = root / "tools" / "abr-vhdx-tool"
+        candidates += [folder / HOST_ARCHITECTURE / TOOL_NAME, folder / TOOL_NAME]
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()

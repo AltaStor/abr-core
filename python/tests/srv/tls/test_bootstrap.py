@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import socket
 import struct
 import tempfile
@@ -228,3 +230,51 @@ class EnsureSelfSignedCertTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenewCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cert_path, self.key_path = Path(tmp.name) / "server.crt", Path(tmp.name) / "server.key"
+        environment = patch.dict(
+            "os.environ", {"ABR_TLS_CERT_FILE": str(self.cert_path), "ABR_TLS_KEY_FILE": str(self.key_path)}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        ensure_self_signed_cert(self.cert_path, self.key_path)
+
+    def _run(self, *arguments: str) -> None:
+        with patch("sys.argv", ["tls_bootstrap", *arguments]), contextlib.redirect_stdout(io.StringIO()):
+            tls_bootstrap.main()
+
+    def test_renew_refuses_to_replace_an_administrator_certificate(self) -> None:
+        tls_bootstrap.write_administrator_marker(self.cert_path, {"installed_by": "admin"})
+        before = (self.cert_path.read_bytes(), self.key_path.read_bytes())
+
+        with self.assertLogs(tls_bootstrap.logger, "ERROR") as logs, self.assertRaises(SystemExit) as caught:
+            self._run("--renew")
+
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("--force", logs.output[0])
+        self.assertEqual((self.cert_path.read_bytes(), self.key_path.read_bytes()), before)
+        self.assertIsNotNone(tls_bootstrap.read_administrator_marker(self.cert_path))
+
+    def test_renew_with_force_replaces_an_administrator_certificate_and_its_key(self) -> None:
+        tls_bootstrap.write_administrator_marker(self.cert_path, {"installed_by": "admin"})
+        administrator_key = self.key_path.read_bytes()
+
+        self._run("--renew", "--force")
+
+        self.assertIsNone(tls_bootstrap.read_administrator_marker(self.cert_path))
+        self.assertNotEqual(self.key_path.read_bytes(), administrator_key)
+        cert = x509.load_pem_x509_certificate(self.cert_path.read_bytes())
+        self.assertTrue(tls_bootstrap.is_appliance_generated(cert))
+
+    def test_renew_of_the_generated_certificate_keeps_its_key(self) -> None:
+        before = (self.cert_path.read_bytes(), self.key_path.read_bytes())
+
+        self._run("--renew")
+
+        self.assertNotEqual(self.cert_path.read_bytes(), before[0])
+        self.assertEqual(self.key_path.read_bytes(), before[1])

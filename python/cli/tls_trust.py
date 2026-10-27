@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import socket
 import ssl
@@ -18,6 +19,8 @@ from cryptography.hazmat.primitives import serialization
 from .errors import CliStructuredError
 from .exit_codes import GENERAL_ERROR
 from .token_store import CONFIG_DIR_ENV_VAR
+
+logger = logging.getLogger(__name__)
 
 
 def _config_dir() -> Path:
@@ -49,13 +52,27 @@ def _save_all(data: dict[str, str]) -> None:
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
 
 
+def _presented_certificate(context: ssl.SSLContext, host: str, port: int, timeout: float) -> bytes:
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        with context.wrap_socket(sock, server_hostname=host) as tls_sock:
+            return tls_sock.getpeercert(binary_form=True)
+
+
 def _fetch_fingerprint(host: str, port: int, timeout: float = 5.0) -> str:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        with context.wrap_socket(sock, server_hostname=host) as tls_sock:
-            der_cert = tls_sock.getpeercert(binary_form=True)
+    return _spki_fingerprint(_presented_certificate(context, host, port, timeout))
+
+
+def _ca_verified_fingerprint(host: str, port: int, timeout: float = 5.0) -> str | None:
+    try:
+        return _spki_fingerprint(_presented_certificate(ssl.create_default_context(), host, port, timeout))
+    except OSError:
+        return None
+
+
+def _spki_fingerprint(der_cert: bytes) -> str:
     cert = x509.load_der_x509_certificate(der_cert)
     spki = cert.public_key().public_bytes(
         encoding=serialization.Encoding.DER,
@@ -86,6 +103,15 @@ def ensure_trusted(base_url: str) -> None:
         return
     
     if stored != fingerprint:
+        if _ca_verified_fingerprint(host, port) == fingerprint:
+            logger.info(
+                "%s now presents a certificate that a CA this machine trusts issued for %s; trusting its new key.",
+                key,
+                host,
+            )
+            known[key] = fingerprint
+            _save_all(known)
+            return
         raise CliStructuredError(
             code="tls_server_key_changed",
             message=(
@@ -94,8 +120,10 @@ def ensure_trusted(base_url: str) -> None:
                 f"is reused across renewals, see python/srv/core/tls_bootstrap.py) -- this means the "
                 f"server's private key itself changed, which could be a legitimate key rotation, or "
                 f"traffic to it being intercepted. Refusing to connect.\n"
-                f"If this change is expected, remove the \"{key}\" entry from {_trust_store_path()} "
-                f"to trust the new key."
+                f"If the server now uses a certificate issued by your organisation's CA, add that CA to this "
+                f"machine's trusted certificates (or point SSL_CERT_FILE at it) and the CLI accepts the new "
+                f"certificate. Otherwise, if this change is expected, remove the \"{key}\" entry from "
+                f"{_trust_store_path()} to trust the new key."
             ),
             exit_code=GENERAL_ERROR,
         )

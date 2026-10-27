@@ -7216,6 +7216,90 @@ def _point_repository_holds_immutable_backups(point: dict[str, Any]) -> bool:
     return immutability_is_enabled(extract_s3_config(repository).get("immutability"))
 
 
+_ACTIVE_SESSION_STATES = {"queued", "running", "stopping"}
+
+
+def _chain_leftover_sessions(job_id: str, vm_id: str, repository: dict[str, Any]) -> list[dict[str, Any]]:
+    from python.srv.services.backup_catalog import (
+        _interrupted_task_output_location,
+        _task_output_is_registered,
+    )
+
+    leftovers: list[dict[str, Any]] = []
+    for task in catalog_records(TASKS):
+        parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+        result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        if (
+            str(task.get("task_type") or "") != "backup"
+            or str(task.get("job_id") or "") != job_id
+            or str(task.get("resource_external_id") or "") != vm_id
+            or str(parameters.get("repository_id") or "") != str(repository.get("id") or "")
+            or str(task.get("status") or "") in _ACTIVE_SESSION_STATES
+        ):
+            continue
+        if is_s3_repository(repository):
+            if result.get("failure_kind") != "interrupted":
+                continue
+        else:
+            location = _interrupted_task_output_location(task)
+            if location is None or not Path(location[1]).exists():
+                continue
+        if not _task_output_is_registered(str(task.get("id") or "")):
+            leftovers.append(task)
+    return leftovers
+
+
+def _remove_empty_chain_folders(folders: set[Path], repository: dict[str, Any]) -> None:
+    roots = _repository_storage_roots(repository)
+    for folder in sorted(folders, key=lambda item: len(item.parts), reverse=True):
+        current = folder
+        while any(root in current.parents for root in roots):
+            try:
+                if not current.is_dir() or any(current.iterdir()):
+                    break
+                current.rmdir()
+            except OSError:
+                break
+            LOGGER.info("Removed the empty folder %s that the deleted backup chain left in the repository.", current)
+            current = current.parent
+
+
+def _discard_chain_leftovers(points: list[dict[str, Any]]) -> None:
+    from python.srv.services.backup_catalog import (
+        _interrupted_task_output_location,
+        discard_unregistered_output,
+    )
+
+    first = points[0] if points else {}
+    repository = REPOSITORIES.get(str(first.get("repository_id") or ""))
+    job_id, vm_id = str(first.get("job_id") or ""), str(first.get("vm_id") or "")
+    if not isinstance(repository, dict) or not job_id or not vm_id:
+        return
+
+    folders: set[Path] = set()
+    for point in points:
+        artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+        backup_root = str(artifact.get("backup_root") or "").strip()
+        if backup_root:
+            folders.add(Path(backup_root).resolve().parent)
+
+    for task in _chain_leftover_sessions(job_id, vm_id, repository):
+        location = _interrupted_task_output_location(task)
+        if location is not None and not is_s3_repository(repository):
+            folders.add(Path(location[1]).resolve().parent)
+        LOGGER.info(
+            "Discarding what session %s left in the repository: no restore point of the deleted chain records it.",
+            task.get("id"),
+        )
+        try:
+            discard_unregistered_output(task)
+        except Exception:
+            LOGGER.warning("Could not discard what session %s left in the repository.", task.get("id"), exc_info=True)
+
+    if not is_s3_repository(repository):
+        _remove_empty_chain_folders(folders, repository)
+
+
 def delete_backup_chain(
     backup_id: str,
     *,
@@ -7301,6 +7385,9 @@ def delete_backup_chain(
                 continue
             _delete_local_point_cache(point)
             delete_backup(point["id"])
+
+    if segment_id is None:
+        _discard_chain_leftovers(points)
 
     kept_points = len(retained_points) + len(kept_for_chain)
     _emit(100, f"Deleted {total_points - kept_points} of {total_points} restore point(s)")

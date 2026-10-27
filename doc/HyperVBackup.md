@@ -23,8 +23,10 @@ are checked, and are moved into place. Another build of the appliance gets a
 folder of its own, so several appliances can share a host without replacing
 each other's files. For the rest of the run the scripts are read from that
 folder instead of being sent with every command. `ALTASTOR_VHDX_TOOL_PATH` names
-the appliance's copy of `abr-vhdx-tool.exe` (by default
-`tools/abr-vhdx-tool/abr-vhdx-tool.exe` under the install root). With no copy on
+the appliance's copy of `abr-vhdx-tool.exe`. Unset, the server takes the one the
+`altastor-backup-vhdx-tools` package installs,
+`/opt/altastor-backup/tools/abr-vhdx-tool/x64/abr-vhdx-tool.exe`, or a copy placed
+in `tools/abr-vhdx-tool/` without the `x64/` folder. With no copy on
 the appliance, each host must have the tool installed at
 `ALTASTOR_HYPERV_TOOL_PATH` (by default `C:\Program Files\AltaStor\abr-vhdx-tool.exe`).
 
@@ -225,7 +227,7 @@ Lock validation. Credentials and encryption keys are never written to either.
 | `did not answer WinRM over HTTPS on port ...` | No HTTPS listener on that port of the host: set one up, or set the inventory to HTTP (`abr inventory edit --protocol http`) |
 | `the port answers without TLS` | The port is an HTTP listener: give the HTTPS listener's port, or set the inventory to HTTP |
 | `The TLS certificate of Hyper-V host ... was not trusted` | Give the host a certificate the server trusts, or accept it with `--insecure` (*Skip TLS verification*) |
-| `abr-vhdx-tool is not installed on ...` | Set `ALTASTOR_VHDX_TOOL_PATH` on the appliance, or install the tool on the host at `ALTASTOR_HYPERV_TOOL_PATH` |
+| `abr-vhdx-tool is not installed on ...` | Install the `altastor-backup-vhdx-tools` package on the appliance, set `ALTASTOR_VHDX_TOOL_PATH`, or install the tool on the host at `ALTASTOR_HYPERV_TOOL_PATH` |
 | `needs an elevated (administrator) process` | The registered account is not a local administrator of that node |
 | `is in the OffCritical state` | The host lost the VM's storage or configuration |
 | `is busy (MergingDisks)` | A checkpoint merge from an earlier operation is still running; retry later |
