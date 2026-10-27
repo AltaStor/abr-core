@@ -172,6 +172,7 @@ class OpenApiContractTests(unittest.TestCase):
                 *tls_certificate_service._warnings([], [], 5),
                 *tls_certificate_service._warnings(["other.example.com"], [], -1),
                 *tls_certificate_service._warnings(["other.example.com"], [], 5),
+                *tls_certificate_service._chain_warnings([_Pki().leaf]),
             ]
 
         self.assertEqual({warning["code"] for warning in produced}, set(TLS_WARNING_CODES))

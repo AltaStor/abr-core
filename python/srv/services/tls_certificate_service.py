@@ -36,7 +36,7 @@ from python.srv.core import tls_bootstrap
 from python.srv.core.tls_renewal import load_into_live_context
 from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
-from python.srv.services.api_errors import api_error
+from python.srv.services.api_errors import ApiError, api_error
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +193,24 @@ def _warnings(dns_names: list[str], ip_addresses: list[str], days_remaining: int
     return warnings
 
 
+def _chain_warnings(chain: list[x509.Certificate]) -> list[dict[str, Any]]:
+    leaf = chain[0]
+    if len(chain) > 1 or _is_self_signed(leaf):
+        return []
+    issuer = _common_name(leaf.issuer) or leaf.issuer.rfc4514_string()
+    return [
+        {
+            "code": "chain_incomplete",
+            "message": (
+                f"Only the server certificate is installed, without the certificate of {issuer}, which "
+                "issued it. If that is an intermediate CA, install the server certificate followed by the "
+                "intermediate certificate(s); clients that do not already have them refuse the connection."
+            ),
+            "issuer": leaf.issuer.rfc4514_string(),
+        }
+    ]
+
+
 def _describe(tls: _LiveTls) -> dict[str, Any]:
     try:
         chain = x509.load_pem_x509_certificates(tls.cert_path.read_bytes())
@@ -231,7 +249,7 @@ def _describe(tls: _LiveTls) -> dict[str, Any]:
         "installed_at": (marker or {}).get("installed_at"),
         "installed_by": (marker or {}).get("installed_by"),
         "live_reload": tls.ssl_context is not None,
-        "warnings": _warnings(dns_names, ip_addresses, days_remaining),
+        "warnings": [*_chain_warnings(chain), *_warnings(dns_names, ip_addresses, days_remaining)],
     }
 
 
@@ -567,19 +585,28 @@ def install_certificate(
     *,
     installed_by: str | None = None,
 ) -> dict[str, Any]:
-    chain = _parse_chain(certificate_pem)
-    key = _parse_private_key(private_key_pem, passphrase)
-    _validate_pair(chain, key)
+    try:
+        chain = _parse_chain(certificate_pem)
+        key = _parse_private_key(private_key_pem, passphrase)
+        _validate_pair(chain, key)
 
-    cert_bytes = b"".join(cert.public_bytes(serialization.Encoding.PEM) for cert in chain)
-    # Stored unencrypted, like the generated key: the server has to load it
-    # unattended at every start. The 0600 mode is what protects it.
-    key_bytes = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    )
-    _check_tls_accepts(cert_bytes, key_bytes)
+        cert_bytes = b"".join(cert.public_bytes(serialization.Encoding.PEM) for cert in chain)
+        # Stored unencrypted, like the generated key: the server has to load it
+        # unattended at every start. The 0600 mode is what protects it.
+        key_bytes = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        _check_tls_accepts(cert_bytes, key_bytes)
+    except ApiError as exc:
+        logger.warning(
+            "TLS certificate from %s refused, the current one stays in use (%s): %s",
+            installed_by or "an unknown user",
+            exc.code,
+            exc.message,
+        )
+        raise
 
     with tls_bootstrap.TLS_FILES_LOCK:
         tls = _active_tls()
@@ -592,6 +619,12 @@ def install_certificate(
             )
         except OSError as exc:
             _restore(tls, snapshot)
+            logger.error(
+                "TLS certificate from %s could not be saved to %s: %s. The current certificate stays in use.",
+                installed_by or "an unknown user",
+                tls.cert_path.parent,
+                exc,
+            )
             raise api_error(
                 500,
                 "tls_certificate_write_failed",
@@ -610,6 +643,8 @@ def install_certificate(
         result["not_after"],
         "loaded into the running server" if reloaded else "used from the next start",
     )
+    for warning in result["warnings"]:
+        logger.warning("The installed TLS certificate: %s", warning["message"])
     return {**result, "reloaded": reloaded}
 
 
@@ -630,6 +665,11 @@ def revert_to_generated_certificate(*, requested_by: str | None = None) -> dict[
             tls_bootstrap.ensure_self_signed_cert(tls.cert_path, tls.key_path)
         except OSError as exc:
             _restore(tls, snapshot)
+            logger.error(
+                "Reverting to a self-signed TLS certificate failed for %s: %s. The current certificate stays in use.",
+                requested_by or "an unknown user",
+                exc,
+            )
             raise api_error(
                 500,
                 "tls_certificate_write_failed",

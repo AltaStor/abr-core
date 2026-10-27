@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 from cryptography import x509
 
-from python.srv.core import tls_renewal
+from python.srv.core import tls_bootstrap, tls_renewal
 from python.srv.core.tls_bootstrap import ensure_self_signed_cert
 
 
@@ -98,6 +98,34 @@ class CheckAndRenewTests(unittest.TestCase):
             self.assertNotEqual(cert_path.read_bytes(), original_cert_bytes)
             cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
             self.assertIsNotNone(cert)
+
+    def test_an_administrator_certificate_is_logged_as_not_renewed_not_as_not_due(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cert_path, key_path = Path(tmp) / "server.crt", Path(tmp) / "server.key"
+            ensure_self_signed_cert(cert_path, key_path)
+            tls_bootstrap.write_administrator_marker(cert_path, {"installed_by": "admin"})
+            before = cert_path.read_bytes()
+
+            with (
+                patch("python.srv.core.tls_bootstrap.env_int", return_value=100_000),
+                self.assertLogs(tls_renewal.logger, "INFO") as logs,
+            ):
+                result = tls_renewal.check_and_renew(cert_path, key_path, MagicMock())
+
+            self.assertFalse(result)
+            self.assertEqual(cert_path.read_bytes(), before)
+            self.assertTrue(any("installed by an administrator" in line for line in logs.output), logs.output)
+            self.assertFalse(any("does not need renewal yet" in line for line in logs.output), logs.output)
+
+    def test_a_generated_certificate_that_is_not_due_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cert_path, key_path = Path(tmp) / "server.crt", Path(tmp) / "server.key"
+            ensure_self_signed_cert(cert_path, key_path)
+
+            with self.assertLogs(tls_renewal.logger, "INFO") as logs:
+                self.assertFalse(tls_renewal.check_and_renew(cert_path, key_path, MagicMock()))
+
+            self.assertTrue(any("does not need renewal yet" in line for line in logs.output), logs.output)
 
 
 class PeriodicRenewalLoopTests(unittest.IsolatedAsyncioTestCase):
