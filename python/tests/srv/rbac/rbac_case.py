@@ -12,7 +12,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from python.srv.backup_server import app
-from python.srv.core.mongo_db_wrapper import AUDIT_RECORDS, JOBS, SESSIONS, USERS
+from python.srv.core.mongo_db_wrapper import AUDIT_RECORDS, CUSTOM_ROLES, JOBS, SESSIONS, USERS
 from python.srv.services import auth_service, rbac
 
 ADMIN_PASSWORD = "Sup3rSecretPW"
@@ -29,6 +29,7 @@ ROLE_USERS = {
 
 def reset_catalog() -> None:
     USERS.clear()
+    CUSTOM_ROLES.clear()
     SESSIONS.clear()
     JOBS.clear()
     AUDIT_RECORDS.clear()

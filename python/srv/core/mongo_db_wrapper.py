@@ -16,7 +16,6 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from python.srv.db.db_manager import Database
 from python.srv.services.api_errors import api_error
-from python.srv.services.rbac import with_default_role
 
 from .credential_encryption import (
     KEY_REPAIR_HINT,
@@ -40,6 +39,8 @@ TASKS: dict[str, dict[str, Any]] = {}
 REPOSITORIES: dict[str, dict[str, Any]] = {}
 BACKUPS: dict[str, dict[str, Any]] = {}
 USERS: dict[str, dict[str, Any]] = {}
+# Custom roles by ID; the built-in ones live in services/rbac.py.
+CUSTOM_ROLES: dict[str, dict[str, Any]] = {}
 SESSIONS: dict[str, dict[str, Any]] = {}
 # Audit records when there is no catalog database, newest last.
 AUDIT_RECORDS: deque[dict[str, Any]] = deque(maxlen=10_000)
@@ -426,6 +427,38 @@ def delete_user(user_id: str) -> bool:
         return deleted
 
 
+def load_custom_roles() -> dict[str, dict[str, Any]]:
+    db = get_database()
+    if db is None:
+        return {}
+
+    return {
+        item["id"]: _normalize_record(item)
+        for item in db.find("roles", {})
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+
+
+def persist_custom_role(record: dict[str, Any]) -> None:
+    normalized = _normalize_record(record)
+    with CATALOG_LOCK:
+        db = get_database()
+        if db is not None:
+            _run_db_write(lambda: db.upsert("roles", "id", normalized))
+        CUSTOM_ROLES[record["id"]] = normalized
+
+
+def delete_custom_role(role_id: str) -> bool:
+    with CATALOG_LOCK:
+        db = get_database()
+        if db is not None:
+            deleted = _run_db_write(lambda: db.delete("roles", "id", role_id))
+        else:
+            deleted = True
+        CUSTOM_ROLES.pop(role_id, None)
+        return deleted
+
+
 def session_key(token: str) -> str:
     return token_digest(token)
 
@@ -661,6 +694,7 @@ def snapshot_catalog() -> dict[str, Any]:
             "backups": _copy.deepcopy(BACKUPS),
             "tasks": _copy.deepcopy(TASKS),
             "users": _copy.deepcopy(USERS),
+            "roles": _copy.deepcopy(CUSTOM_ROLES),
             "resources": {
                 hypervisor_id: [dict(resource) for resource in bucket.values()]
                 for hypervisor_id, bucket in RESOURCES_BY_HV.items()
@@ -683,20 +717,60 @@ def users_replaced_by_import(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _role_name_key(record: dict[str, Any]) -> str:
+    return re.sub(r"[\s_-]+", "_", str(record.get("name") or "").strip().lower())
+
+
+def roles_replaced_by_import(snapshot: dict[str, Any]) -> dict[str, str]:
+    """Current custom roles an import replaces with a same-named one of another
+    ID, as {current ID: imported ID}; their users move to the imported role."""
+    incoming = {
+        _role_name_key(role): str(role.get("id"))
+        for role in (snapshot.get("roles") or {}).values()
+        if isinstance(role, dict) and role.get("id")
+    }
+    return {
+        str(existing["id"]): incoming[_role_name_key(existing)]
+        for existing in CUSTOM_ROLES.values()
+        if _role_name_key(existing) in incoming and incoming[_role_name_key(existing)] != existing.get("id")
+    }
+
+
 def restore_catalog(snapshot: dict[str, Any]) -> dict[str, int]:
+    from python.srv.services.rbac import ROLES_BY_ID, with_default_role
+
     counts: dict[str, int] = {}
     with CATALOG_LOCK:
         replaced = users_replaced_by_import(snapshot)
+        replaced_roles = roles_replaced_by_import(snapshot)
         if get_database() is not None:
             for hypervisor in (snapshot.get("hypervisors") or {}).values():
                 _hypervisor_for_storage(_normalize_record(hypervisor), HYPERVISORS.get(hypervisor.get("id")))
+
+        # A custom role can never stand in for a built-in one, whatever the
+        # export says.
+        roles = [
+            role for role in (snapshot.get("roles") or {}).values()
+            if isinstance(role, dict) and isinstance(role.get("id"), str) and role["id"] not in ROLES_BY_ID
+        ]
+        for role in roles:
+            persist_custom_role(role)
+        for current_id in replaced_roles:
+            delete_custom_role(current_id)
+            LOGGER.info("Import replaces custom role %s with the same-named one from the export.", current_id)
+        counts["roles"] = len(roles)
 
         for existing in replaced:
             delete_sessions_for_user(str(existing["id"]))
             delete_user(str(existing["id"]))
             LOGGER.info("Import replaces user %s with the one from the export.", existing.get("name"))
+        for existing in list(USERS.values()):
+            if existing.get("role") in replaced_roles:
+                persist_user({**existing, "role": replaced_roles[existing["role"]]})
         for user in (snapshot.get("users") or {}).values():
             with_default_role(user)
+            if user.get("role") in replaced_roles:
+                user["role"] = replaced_roles[user["role"]]
             persist_user(user)
         counts["users"] = len(snapshot.get("users") or {})
 

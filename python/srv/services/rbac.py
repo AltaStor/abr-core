@@ -10,10 +10,15 @@ A *function* is one thing the product does, named by a stable ID such as
 disabled, for each function; a pair that is missing is disabled, so access is
 denied unless a role grants it. Every user holds exactly one role.
 
-The roles are built in and immutable: they live here, not in the catalog, so no
+The built-in roles are immutable: they live here, not in the catalog, so no
 interface can edit or delete them. A new product function is added by appending
 it to ``FUNCTIONS`` and, unless only the Administrator should have it, to the
 grant list of the roles that need it.
+
+Custom roles live in the catalog (``CUSTOM_ROLES``, managed by
+``role_service``) and hold an explicit list of allowed functions. They are read
+on every check, so a change to one applies to its users' next request. Every
+role, custom ones included, allows ``BASELINE_FUNCTIONS``.
 """
 
 from __future__ import annotations
@@ -22,7 +27,9 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, NoReturn
+
+from python.srv.core.mongo_db_wrapper import CUSTOM_ROLES
 
 from .api_errors import api_error
 
@@ -86,6 +93,9 @@ FUNCTIONS: tuple[Function, ...] = (
     _f("user.edit", "Change a user's name, role or enabled state", ADMINISTER),
     _f("user.delete", "Delete a user", ADMINISTER),
     _f("role.view", "List roles, their permissions and the product functions", READ),
+    _f("role.create", "Create a custom role, or clone a role into one", ADMINISTER),
+    _f("role.edit", "Change a custom role's name, description or permissions", ADMINISTER),
+    _f("role.delete", "Delete a custom role no user holds", ADMINISTER),
     _f("audit.view", "Read the audit log", READ),
     _f("repository.view", "List and view repositories", READ),
     _f("repository.create", "Add a repository, or test its connection before adding it", CONFIGURE),
@@ -148,6 +158,20 @@ ROLES: tuple[Role, ...] = (
 )
 
 ROLES_BY_ID: Mapping[str, Role] = MappingProxyType({role.id: role for role in ROLES})
+
+CUSTOM_ROLE_ID_PREFIX = "custom-"
+
+# What any signed-in user does to their own session and password. Every role
+# allows these, a custom role too: without them a user could not sign out, keep
+# a session or change a password the console insists on changing.
+BASELINE_FUNCTIONS = frozenset({
+    "auth.login",
+    "auth.logout",
+    "auth.whoami",
+    "auth.change_password",
+    "auth.extend_session",
+    "auth.touch_session",
+})
 
 _EVERY_ROLE = (
     "auth.login",
@@ -242,6 +266,8 @@ def _build_permissions() -> Mapping[tuple[str, str], Permission]:
             raise ValueError(f"Function {function.id} has an unknown category {function.category!r}")
     if len(FUNCTIONS_BY_ID) != len(FUNCTIONS):
         raise ValueError("Function IDs are not unique")
+    if BASELINE_FUNCTIONS - set(FUNCTIONS_BY_ID):
+        raise ValueError(f"Unknown baseline functions: {sorted(BASELINE_FUNCTIONS - set(FUNCTIONS_BY_ID))}")
     for role_id, granted in _GRANTS.items():
         unknown = granted - set(FUNCTIONS_BY_ID)
         if unknown:
@@ -265,18 +291,56 @@ class Decision:
     reason: str
 
 
+def role_key(value: str) -> str:
+    """What two role IDs or names that mean the same role have in common: any
+    case, spaces, hyphens or underscores between the words."""
+    return re.sub(r"[\s_-]+", "_", value.strip().lower())
+
+
+def _custom_record(role_id: Any) -> Mapping[str, Any] | None:
+    if not isinstance(role_id, str) or role_id in ROLES_BY_ID:
+        return None
+    return CUSTOM_ROLES.get(role_id)
+
+
+def _custom_role(record: Mapping[str, Any]) -> Role:
+    return Role(str(record["id"]), str(record.get("name") or record["id"]), str(record.get("description") or ""), False)
+
+
+def get_role(role_id: Any) -> Role | None:
+    """A built-in or custom role by its exact ID."""
+    if isinstance(role_id, str) and role_id in ROLES_BY_ID:
+        return ROLES_BY_ID[role_id]
+    record = _custom_record(role_id)
+    return _custom_role(record) if record is not None else None
+
+
+def custom_roles() -> list[Role]:
+    return sorted(
+        (_custom_role(record) for record in list(CUSTOM_ROLES.values()) if _custom_record(record.get("id"))),
+        key=lambda role: (role.name.lower(), role.id),
+    )
+
+
+def all_roles() -> list[Role]:
+    """The built-in roles in their fixed order, then the custom ones by name."""
+    return [*ROLES, *custom_roles()]
+
+
 def resolve_role(value: Any) -> Role | None:
     """A role from its ID or its name, in any case, with spaces or hyphens for
-    underscores ("backup-operator", "Backup Operator")."""
-    if not isinstance(value, str):
+    underscores ("backup-operator", "Backup Operator", "night shift")."""
+    if not isinstance(value, str) or not value.strip():
         return None
-    key = re.sub(r"[\s-]+", "_", value.strip().lower())
-    return ROLES_BY_ID.get(key)
+    key = role_key(value)
+    if key in ROLES_BY_ID:
+        return ROLES_BY_ID[key]
+    return next((role for role in custom_roles() if key in (role_key(role.id), role_key(role.name))), None)
 
 
 def role_id_of(user: Mapping[str, Any] | None) -> str | None:
     role = (user or {}).get("role")
-    return role if isinstance(role, str) and role in ROLES_BY_ID else None
+    return role if get_role(role) is not None else None
 
 
 def is_enabled(user: Mapping[str, Any] | None) -> bool:
@@ -287,9 +351,21 @@ def is_active_administrator(user: Mapping[str, Any] | None) -> bool:
     return is_enabled(user) and role_id_of(user) == ADMINISTRATOR
 
 
+def _custom_grants(role_id: str | None) -> frozenset[str] | None:
+    record = _custom_record(role_id)
+    if record is None:
+        return None
+    listed = record.get("allowed_functions")
+    granted = {item for item in listed if item in FUNCTIONS_BY_ID} if isinstance(listed, list) else set()
+    return frozenset(granted | BASELINE_FUNCTIONS)
+
+
 def role_allows(role_id: str | None, function_id: str) -> bool:
     permission = PERMISSIONS.get((role_id or "", function_id))
-    return permission is not None and permission.allowed
+    if permission is not None:
+        return permission.allowed
+    granted = _custom_grants(role_id)
+    return granted is not None and function_id in granted
 
 
 def check(user: Mapping[str, Any] | None, function_id: str) -> Decision:
@@ -329,7 +405,7 @@ def require(user: Mapping[str, Any] | None, function_id: str) -> Decision:
     if decision.allowed:
         return decision
     function = FUNCTIONS_BY_ID.get(function_id)
-    role = ROLES_BY_ID.get(decision.role or "")
+    role = get_role(decision.role)
     if decision.reason == "not_permitted":
         reason = f"The {role.name if role else decision.role} role does not allow {function_id}"
         reason += f" ({function.name.lower()})." if function else "."
@@ -345,12 +421,27 @@ def require(user: Mapping[str, Any] | None, function_id: str) -> Decision:
     )
 
 
+def deny(reason: str, message: str, *, function_id: str, role: str | None, **details: Any) -> NoReturn:
+    """Raise the ``permission_denied`` error for a request the role allows but
+    a rule refuses, such as changing one's own role."""
+    raise api_error(
+        403, "permission_denied", f"Permission denied: {message}",
+        function_id=function_id, role=role, reason=reason, **details,
+    )
+
+
 def allowed_functions(role_id: str | None) -> list[str]:
     return [function.id for function in FUNCTIONS if role_allows(role_id, function.id)]
 
 
+def beyond(functions: Iterable[str], role_id: str | None) -> list[str]:
+    """Those of ``functions`` that ``role_id`` does not allow, in catalog order."""
+    wanted = set(functions)
+    return [function.id for function in FUNCTIONS if function.id in wanted and not role_allows(role_id, function.id)]
+
+
 def permissions_for(role_id: str) -> list[Permission]:
-    return [PERMISSIONS[(role_id, function.id)] for function in FUNCTIONS]
+    return [Permission(role_id, function.id, role_allows(role_id, function.id)) for function in FUNCTIONS]
 
 
 def function_to_dto(function: Function) -> dict[str, Any]:
@@ -359,6 +450,7 @@ def function_to_dto(function: Function) -> dict[str, Any]:
         "name": function.name,
         "category": function.category,
         "starts_session": function.starts_session,
+        "always_allowed": function.id in BASELINE_FUNCTIONS,
     }
 
 

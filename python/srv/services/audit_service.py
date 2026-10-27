@@ -132,7 +132,7 @@ def target_from_path(path_params: dict[str, Any]) -> dict[str, Any] | None:
             continue
         target = {"type": kind, "id": str(value)}
         if kind == "role":
-            role = rbac.ROLES_BY_ID.get(str(value))
+            role = rbac.resolve_role(str(value))
             target["name"] = role.name if role else None
         elif records is not None:
             record = records.get(str(value))

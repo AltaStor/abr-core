@@ -22,9 +22,10 @@ password, which every role may do).
 
 ## Roles
 
-The five roles are built in. They live in the server's code
+Five roles are built in. They live in the server's code
 (`python/srv/services/rbac.py`), not in the catalog, so no interface can
-create, change or delete them.
+change, rename or delete them. Next to them, an Administrator can make
+[custom roles](#custom-roles).
 
 | Role | ID | For |
 |---|---|---|
@@ -63,6 +64,9 @@ other role is allowed exactly what it lists.
 | `user.edit` | administer | ✓ | – | – | – | – |
 | `user.delete` | administer | ✓ | – | – | – | – |
 | `role.view` | read | ✓ | – | – | – | ✓ |
+| `role.create` | administer | ✓ | – | – | – | – |
+| `role.edit` | administer | ✓ | – | – | – | – |
+| `role.delete` | administer | ✓ | – | – | – | – |
 | `audit.view` | read | ✓ | – | – | – | ✓ |
 | `repository.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `repository.create` | configure | ✓ | ✓ | – | – | – |
@@ -95,6 +99,65 @@ other role is allowed exactly what it lists.
 The automated test `python/tests/srv/rbac/test_permission_matrix.py` holds the
 same matrix written out, so any change to a role has to be made in both places.
 
+## Custom roles
+
+A custom role has a unique name, an optional description, and the list of
+functions it allows, chosen from the same functions as the built-in roles.
+Every function the list leaves out is disabled. A user holds a custom role
+exactly as they hold a built-in one: one role per user, given with
+`abr user add/edit --role` or `role` in `POST`/`PATCH /api/v1/users`, by the
+role's ID or its name.
+
+| | CLI | API | Function |
+|---|---|---|---|
+| List, show | `abr role list`, `abr role info --name "Night Operator"` | `GET /api/v1/roles`, `GET /api/v1/roles/{id or name}` | `role.view` |
+| Create | `abr role create --name "Night Operator" --allow "job.view,job.start,session.*"` | `POST /api/v1/roles` `{"name", "description", "allowed_functions": [...]}` | `role.create` |
+| Clone | `abr role clone --id backup_operator --new-name "Night Operator"` | `POST /api/v1/roles` `{"clone_from": "backup_operator", "name": ...}` | `role.create` |
+| Change | `abr role edit --name "Night Operator" --allow backup.verify --deny job.start` (or `--set` for the whole list, `--new-name`, `--description`) | `PATCH /api/v1/roles/{id}` `{"name", "description", "allowed_functions"}` (the whole list) | `role.edit` |
+| Delete | `abr role delete --name "Night Operator"` | `DELETE /api/v1/roles/{id}` | `role.delete` |
+
+- A custom role's ID is `custom-` and eight hex digits, and stays the same when
+  the role is renamed. Its name is unique among all roles, built-in ones
+  included, in any case and with spaces, hyphens or underscores alike.
+- A clone starts with the source role's functions and description (a built-in
+  or custom role); without a name it is called "<source> (copy)". It is a
+  separate role from then on.
+- A change to a custom role applies to every user holding it on their next
+  request; nobody signs in again.
+- Every role allows the self-service functions (`always_allowed` in
+  `GET /api/v1/functions`): `auth.login`, `auth.logout`, `auth.whoami`,
+  `auth.change_password`, `auth.extend_session` and `auth.touch_session`. A
+  custom role lists them whatever it was given, so its users can always sign
+  out, keep their session and change their password.
+- A built-in role cannot be changed or deleted (`409 built_in_role`); clone it
+  instead. A custom role that users hold cannot be deleted
+  (`409 role_in_use`, naming them): give them another role first.
+- Custom roles are part of the catalog (the `roles` collection) and of a
+  catalog export. An import adds or replaces custom roles by ID; one with the
+  same name as a current role of another ID replaces it, and that role's users
+  get the imported one. A record claiming a built-in role's ID is ignored.
+
+### No way up through a role
+
+Only a role that allows `role.create`, `role.edit` or `role.delete` (the
+Administrator, or a custom role given them) manages custom roles, and nobody
+can use a role to gain access their own role does not give them:
+
+- A role can only be created, cloned or changed to allow functions the
+  caller's own role allows, and only a role whose functions all lie within the
+  caller's can be changed or deleted.
+- Nobody changes or deletes the role they hold, and nobody changes their own
+  role (`PATCH /users` with their own ID and a new `role`), the Administrator
+  included.
+- A role can only be given to a user (on create or edit) if the caller's role
+  allows all of its functions, and a user whose role allows more than the
+  caller's cannot be changed or deleted at all, so their password cannot be
+  reset to sign in as them.
+
+These refusals answer `403 permission_denied` with `reason`
+`exceeds_own_permissions` (and `functions`, the ones in question) or
+`own_role`, are audited as denied, and change nothing.
+
 ## How a request is authorized
 
 1. The session token is checked (`401 unauthorized` without a valid one). A
@@ -113,7 +176,9 @@ A denied request answers `403` with one error shape on every route:
 ```
 
 `reason` is `not_permitted`, `no_role` (the user's role is missing or unknown),
-`account_disabled`, or `unknown_function`. The CLI exits with code 7 and, with
+`account_disabled`, or `unknown_function`; a request the role allows but a rule
+refuses answers the same error with `own_role` or `exceeds_own_permissions`
+(see [No way up through a role](#no-way-up-through-a-role)). The CLI exits with code 7 and, with
 `--output json`, prints this error on stderr. A disabled user, or one without a
 valid role, cannot sign in: `403` with code `account_disabled` or
 `role_invalid`.
@@ -134,9 +199,13 @@ the server refuses the request either way.
   keeps the password; a new password (`--reset-password`, `password`) ends the
   user's sessions, and is refused with `409 own_password` for the caller's own,
   which `abr auth change-password` changes with the current one.
+- Nobody changes their own role, and nobody assigns a role or changes a user
+  allowing functions their own role does not.
 - At least one enabled Administrator always remains. Demoting, disabling or
   deleting the last one is refused with `409 last_administrator`, and so is a
-  catalog import (`system import`) that would leave none.
+  catalog import (`system import`) that would leave none. Only the built-in
+  Administrator role counts: a custom role that allows every function does not
+  stand in for it.
 - Users from before roles existed become enabled Administrators when the
   server starts, which is what they could do before, and so do such users in an
   imported catalog.
@@ -159,7 +228,7 @@ was allowed, denied, or failed, from every interface. Each record holds:
 | `interface` | `web`, `cli` or `api`; `command` names the CLI command |
 | `status`, `error` | The HTTP status, and the error code and message when not allowed |
 | `parameters` | The request, for functions that change something |
-| `details` | For a user change, what changed: `{"role": {"from": "auditor", "to": "backup_operator"}}` |
+| `details` | For a user change, what changed: `{"changes": {"role": {"from": "auditor", "to": "custom-1a2b3c4d"}}, "roles": {"from": {"id", "name", "built_in"}, "to": {...}}}`; for a new user, its `role`; for a role change, `{"changes": {"name": {...}, "permissions": {"granted": [...], "revoked": [...]}}}`; for a new role, its `allowed_functions` and, for a clone, `cloned_from` |
 
 Passwords, tokens, secret and access keys, encryption keys, passphrases and
 other credentials are masked (`********`) before a record is written: by key
@@ -181,7 +250,7 @@ UI's Logs page; the `audit.view` function (Administrator, Auditor) is needed.
 1. Add it to `FUNCTIONS` in `python/srv/services/rbac.py` with its category
    (and `starts_session=True` if it starts a session).
 2. Grant it to the roles that need it in `_GRANTS`; the Administrator has it
-   already.
+   already. Custom roles do not get it until someone gives it to them.
 3. Register the route with the function ID (`register(router, [(path,
    handler, methods, "area.action")])`).
 4. Map the CLI command to it in `python/cli/command_functions.py`.

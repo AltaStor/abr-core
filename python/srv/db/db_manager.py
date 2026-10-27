@@ -165,6 +165,7 @@ class Database:
             "backups": "id",
             "tasks": "id",
             "users": "id",
+            "roles": "id",
             "sessions": "token",
             "hypervisors": "id",
             "resources": "resource_key",

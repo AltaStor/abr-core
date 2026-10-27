@@ -103,7 +103,7 @@ class ImportOntoAFreshHostTests(unittest.TestCase):
         self.assertEqual(self.db.collections["users"]["old-admin"]["passwd"], "old-server-hash")
         self.assertEqual(SESSIONS, {})
         self.assertEqual(self.db.collections.get("sessions", {}), {})
-        self.assertEqual(counts, {"users": 2, "hypervisors": 1, "repositories": 1, "jobs": 1, "backups": 1, "tasks": 1, "resources": 1})
+        self.assertEqual(counts, {"roles": 0, "users": 2, "hypervisors": 1, "repositories": 1, "jobs": 1, "backups": 1, "tasks": 1, "resources": 1})
         self.assertIn("hv1", self.db.collections["resources"])
         stored = self.db.collections["hypervisors"]["hv1"]["metadata"]["credentials"]["password"]
         self.assertTrue(credential_encryption.is_encrypted(stored))

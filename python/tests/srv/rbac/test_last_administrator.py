@@ -9,14 +9,24 @@ from python.srv.core.mongo_db_wrapper import USERS
 from python.srv.services import auth_service, rbac
 from python.srv.services.api_errors import ApiError
 
-from .rbac_case import ADMIN_PASSWORD, RbacApiCase
+from .rbac_case import ADMIN_PASSWORD, USER_PASSWORD, RbacApiCase
 
 
 class LastAdministratorTests(RbacApiCase):
-    def _patch_admin(self, body: dict, *, user: str = "admin"):
+    def _patch_admin(self, body: dict, *, user: str = "admin", headers: dict | None = None):
         return self.client.patch(
-            f"/api/v1/users/{self.user_id(user)}", json=body, headers=self.headers(rbac.ADMINISTRATOR)
+            f"/api/v1/users/{self.user_id(user)}", json=body, headers=headers or self.headers(rbac.ADMINISTRATOR)
         )
+
+    def _deputy(self) -> dict:
+        """A user whose custom role allows everything the Administrator does
+        (nobody may change their own role, so the admin is demoted by them)."""
+        clone = self.client.post(
+            "/api/v1/roles", json={"clone_from": rbac.ADMINISTRATOR, "name": "Deputy"}, headers=self.headers(rbac.ADMINISTRATOR)
+        )
+        self.assertEqual(clone.status_code, 200, clone.text)
+        self.create_user("deputy", clone.json()["id"])
+        return {"Authorization": f"Bearer {self.login('deputy', USER_PASSWORD)}"}
 
     def assert_refused(self, response) -> None:
         self.assertEqual(response.status_code, 409, response.text)
@@ -25,9 +35,11 @@ class LastAdministratorTests(RbacApiCase):
         self.assertEqual((admin["role"], admin["enabled"]), (rbac.ADMINISTRATOR, True))
 
     def test_the_last_administrator_cannot_be_demoted(self) -> None:
-        for role in (rbac.BACKUP_ADMINISTRATOR, rbac.AUDITOR):
+        deputy = self._deputy()
+        deputy_role = USERS[self.user_id("deputy")]["role"]
+        for role in (rbac.BACKUP_ADMINISTRATOR, rbac.AUDITOR, deputy_role):
             with self.subTest(role=role):
-                self.assert_refused(self._patch_admin({"role": role}))
+                self.assert_refused(self._patch_admin({"role": role}, headers=deputy))
 
     def test_the_last_administrator_cannot_be_disabled(self) -> None:
         self.assert_refused(self._patch_admin({"enabled": False}))
@@ -39,13 +51,15 @@ class LastAdministratorTests(RbacApiCase):
         self.assert_refused(response)
 
     def test_a_disabled_administrator_does_not_count(self) -> None:
+        deputy = self._deputy()
         self.create_user("second", rbac.ADMINISTRATOR)
         self.assertEqual(self._patch_admin({"enabled": False}, user="second").status_code, 200)
-        self.assert_refused(self._patch_admin({"role": rbac.AUDITOR}))
+        self.assert_refused(self._patch_admin({"role": rbac.AUDITOR}, headers=deputy))
 
     def test_an_administrator_can_be_demoted_disabled_or_deleted_while_another_remains(self) -> None:
         self.create_user("second", rbac.ADMINISTRATOR)
-        self.assertEqual(self._patch_admin({"role": rbac.AUDITOR}).status_code, 200)
+        second = {"Authorization": f"Bearer {self.login('second', USER_PASSWORD)}"}
+        self.assertEqual(self._patch_admin({"role": rbac.AUDITOR}, headers=second).status_code, 200)
         self.assertEqual(USERS[self.user_id("admin")]["role"], rbac.AUDITOR)
         # The demotion holds at once: the former Administrator's session can
         # no longer manage users.
@@ -90,13 +104,22 @@ class LastAdministratorTests(RbacApiCase):
 
 
 class RoleImmutabilityApiTests(RbacApiCase):
-    def test_no_interface_changes_or_deletes_a_role(self) -> None:
-        for method in ("POST", "PUT", "PATCH", "DELETE"):
+    def test_no_interface_changes_or_deletes_a_built_in_role(self) -> None:
+        before = self.client.get("/api/v1/roles/auditor", headers=self.headers(rbac.ADMINISTRATOR)).json()
+        for method, status in (("POST", 405), ("PUT", 405), ("PATCH", 409), ("DELETE", 409)):
             with self.subTest(method=method):
                 response = self.client.request(
-                    method, "/api/v1/roles/auditor", json={"name": "x"}, headers=self.headers(rbac.ADMINISTRATOR)
+                    method,
+                    "/api/v1/roles/auditor",
+                    json={"name": "x", "allowed_functions": ["job.delete"]},
+                    headers=self.headers(rbac.ADMINISTRATOR),
                 )
-                self.assertEqual(response.status_code, 405)
+                self.assertEqual(response.status_code, status, response.text)
+                if status == 409:
+                    self.assertEqual(response.json()["error"]["code"], "built_in_role")
+        after = self.client.get("/api/v1/roles/auditor", headers=self.headers(rbac.ADMINISTRATOR)).json()
+        self.assertEqual(after, before)
+        self.assertFalse(rbac.role_allows(rbac.AUDITOR, "job.delete"))
 
     def test_a_user_needs_a_known_role(self) -> None:
         for body, code in (({}, "invalid_user"), ({"role": "superuser"}, "invalid_role")):

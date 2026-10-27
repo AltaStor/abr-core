@@ -31,7 +31,7 @@ from python.srv.core.mongo_db_wrapper import (
 from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
 
-from . import rbac
+from . import rbac, role_service
 from .api_errors import api_error
 
 LOGGER = logging.getLogger(__name__)
@@ -165,7 +165,7 @@ def _user_or_404(user_id: str) -> dict[str, Any]:
 def _role_or_422(value: Any) -> str:
     role = rbac.resolve_role(value)
     if role is None:
-        known = ", ".join(role.id for role in rbac.ROLES)
+        known = ", ".join(role.id for role in rbac.ROLES) + ", or a custom role's ID or name"
         if value is None or value == "":
             raise api_error(422, "invalid_user", f"A role is required: one of {known}.")
         raise api_error(422, "invalid_role", f"Unknown role {value!r}: use one of {known}.", role=value)
@@ -220,7 +220,9 @@ def _refuse_taken_name(name: str, *, user_id: str | None = None) -> None:
         raise api_error(409, "user_exists", f"A user named {name!r} already exists.")
 
 
-def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True) -> dict[str, Any]:
+def create_user(
+    payload: dict[str, Any], *, enforce_password_policy: bool = True, acting_user_id: str | None = None
+) -> dict[str, Any]:
     name = _user_name_or_422(payload.get("name"))
     full_name = str(payload.get("fullName") or "").strip()
     password = payload.get("password")
@@ -229,6 +231,7 @@ def create_user(payload: dict[str, Any], *, enforce_password_policy: bool = True
     if problem and enforce_password_policy:
         raise api_error(422, "invalid_user", problem)
     role = _role_or_422(payload.get("role"))
+    role_service.ensure_can_manage_user(acting_user_id, function_id="user.create", new_role=role)
     _refuse_taken_name(name)
 
     now = utc_now()
@@ -256,8 +259,16 @@ def update_user(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Change a user's name, full name, role, enabled state or password.
     Answers the user and what changed, as ``{field: {"from": old, "to": new}}``
-    (a new password only as its field, without values)."""
+    (a new password only as its field, without values). Nobody changes their
+    own role, nor a user whose role allows more than the caller's."""
     user = _user_or_404(user_id)
+    new_role = _role_or_422(payload["role"]) if payload.get("role") is not None else None
+    role_service.ensure_can_manage_user(
+        acting_user_id,
+        function_id="user.edit",
+        target=user,
+        new_role=new_role if new_role != user.get("role") else None,
+    )
     updated = dict(user)
     if "name" in payload and payload["name"] is not None:
         updated["name"] = _user_name_or_422(payload["name"])
@@ -282,8 +293,8 @@ def update_user(
         updated["passwd_name"] = _hash_name(user, user["name"])
     if "fullName" in payload and payload["fullName"] is not None:
         updated["fullName"] = str(payload["fullName"]).strip()
-    if "role" in payload and payload["role"] is not None:
-        updated["role"] = _role_or_422(payload["role"])
+    if new_role is not None:
+        updated["role"] = new_role
     if "enabled" in payload and payload["enabled"] is not None:
         if not isinstance(payload["enabled"], bool):
             raise api_error(422, "invalid_user", "enabled must be true or false.")
@@ -310,8 +321,9 @@ def update_user(
     return _public_user(updated), changes
 
 
-def remove_user(user_id: str) -> dict[str, Any]:
+def remove_user(user_id: str, *, acting_user_id: str | None = None) -> dict[str, Any]:
     user = _user_or_404(user_id)
+    role_service.ensure_can_manage_user(acting_user_id, function_id="user.delete", target=user)
     _refuse_losing_the_last_administrator(user, "delete")
     if len(USERS) <= 1:
         raise api_error(
@@ -417,7 +429,7 @@ def login(
 
 def whoami(user_id: str) -> dict[str, Any]:
     user = _user_or_404(user_id)
-    role = rbac.ROLES_BY_ID.get(rbac.role_id_of(user) or "")
+    role = rbac.get_role(rbac.role_id_of(user))
     return {
         "user": _public_user(user),
         "role": rbac.role_to_dto(role, with_permissions=False) if role else None,

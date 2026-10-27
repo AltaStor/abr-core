@@ -22,7 +22,7 @@ from python.cli.abr_cli import main
 from python.cli.cli_context import TOKEN_ENV_VAR
 from python.cli.command_functions import COMMAND_FUNCTIONS
 from python.cli.exit_codes import PERMISSION_DENIED
-from python.srv.core.mongo_db_wrapper import JOBS
+from python.srv.core.mongo_db_wrapper import CUSTOM_ROLES, JOBS, USERS
 from python.srv.services import rbac
 from python.tests.srv.rbac.rbac_case import RbacApiCase
 
@@ -103,6 +103,48 @@ class CliPermissionTests(RbacApiCase):
         code, _out, err = self.run_cli(rbac.ADMINISTRATOR, "user", "edit", "--name", "admin", "--disable")
         self.assertEqual(code, 4, err)
         self.assertIn("last active Administrator", err)
+
+    def test_custom_roles_are_created_cloned_changed_and_deleted_from_the_cli(self) -> None:
+        code, out, err = self.run_cli(
+            rbac.ADMINISTRATOR, "--output", "json", "role", "create", "--name", "Night Operator",
+            "--allow", "job.view,session.*",
+        )
+        self.assertEqual(code, 0, err)
+        role = json.loads(out)
+        self.assertEqual(
+            set(role["allowed_functions"]), {"job.view", "session.view", "session.stop", *rbac.BASELINE_FUNCTIONS}
+        )
+
+        code, out, err = self.run_cli(
+            rbac.ADMINISTRATOR, "--output", "json", "role", "clone", "--name", "Night Operator", "--new-name", "Night Copy"
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["cloned_from"]["id"], role["id"])
+
+        code, _out, err = self.run_cli(
+            rbac.ADMINISTRATOR, "role", "edit", "--name", "night operator", "--allow", "job.start", "--deny", "session.stop"
+        )
+        self.assertEqual(code, 0, err)
+        self.assertTrue(rbac.role_allows(role["id"], "job.start"))
+        self.assertFalse(rbac.role_allows(role["id"], "session.stop"))
+
+        code, _out, err = self.run_cli(rbac.ADMINISTRATOR, "user", "edit", "--name", "olga", "--role", "Night Operator")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(USERS[self.user_id("olga")]["role"], role["id"])
+        code, _out, err = self.run_cli(rbac.ADMINISTRATOR, "role", "delete", "--name", "Night Operator")
+        self.assertEqual(code, 4, err)
+        self.assertIn("olga", err)
+        code, _out, err = self.run_cli(rbac.ADMINISTRATOR, "role", "delete", "--name", "Night Copy")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([item["name"] for item in CUSTOM_ROLES.values()], ["Night Operator"])
+
+    def test_role_management_is_refused_without_the_permission_or_for_a_built_in_role(self) -> None:
+        code, _out, err = self.run_cli(rbac.AUDITOR, "role", "create", "--name", "Mine", "--allow", "job.view")
+        self.assertEqual(code, PERMISSION_DENIED, err)
+        self.assertEqual(CUSTOM_ROLES, {})
+        code, _out, err = self.run_cli(rbac.ADMINISTRATOR, "role", "edit", "--id", "auditor", "--allow", "job.delete")
+        self.assertEqual(code, 4, err)
+        self.assertIn("built-in role", err)
 
     def test_every_command_names_a_server_function(self) -> None:
         for command, function_id in COMMAND_FUNCTIONS.items():

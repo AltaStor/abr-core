@@ -12,8 +12,8 @@ from ..parsing.common_arguments import add_name_or_id_selector
 from .base import CommandDependencies
 
 ROLE_HELP = (
-    "Role: administrator, backup_administrator, backup_operator, restore_operator or auditor "
-    "(abr role list describes them)"
+    "Role: administrator, backup_administrator, backup_operator, restore_operator, auditor, "
+    "or a custom role's ID or name (abr role list describes them)"
 )
 USER_COLUMNS = [
     ("id", "ID"),
@@ -54,7 +54,8 @@ class UserCommands:
                 "Change a user's login name, full name, role, enabled state, or password. A new login "
                 "name keeps the password. Disabling a user or setting a new password ends their "
                 "sessions; your own password is changed with abr auth change-password, which asks for "
-                "the current one. The last enabled Administrator cannot be demoted or disabled.\n\n"
+                "the current one. Nobody changes their own role, nor a user whose role allows more than "
+                "theirs. The last enabled Administrator cannot be demoted or disabled.\n\n"
                 "Examples:\n"
                 "  abr user edit --name jdoe --role restore_operator\n"
                 "  abr user edit --name jdoe --new-name jane.doe\n"

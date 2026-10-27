@@ -19,6 +19,14 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   `abr user edit`, `abr user info`, `abr role list|info|functions`,
   `abr auth whoami`, `PATCH /api/v1/users/{id}`, `GET /api/v1/roles`,
   `GET /api/v1/functions` and `GET /api/v1/auth/me`. See `doc/RBAC.md`.
+- Custom roles. An Administrator creates, clones (from a built-in or custom
+  role), changes and deletes roles that allow an explicit list of functions,
+  and gives them to users like the built-in ones; a change applies to the
+  role's users on their next request. Nobody can grant, assign or take over
+  more than their own role allows, nor change their own role, a built-in role
+  can't be changed and a role users hold can't be deleted. `abr role
+  create|clone|edit|delete`, `POST /api/v1/roles`, `PATCH|DELETE
+  /api/v1/roles/{id}`, functions `role.create`, `role.edit`, `role.delete`.
 - An audit log of every command and every user or role change, from every
   interface: time (UTC), user, the role they held, function, target, result
   (allowed, denied or failed) and the session the command started, with

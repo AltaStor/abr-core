@@ -55,6 +55,7 @@ from .core import tls_renewal
 from .core.job_scheduler import JobScheduler
 from .core.mongo_db_wrapper import (
     BACKUPS,
+    CUSTOM_ROLES,
     HYPERVISORS,
     JOBS,
     REPOSITORIES,
@@ -64,6 +65,7 @@ from .core.mongo_db_wrapper import (
     USERS,
     close_database,
     load_backups,
+    load_custom_roles,
     load_jobs,
     load_registered_hypervisors,
     load_repositories,
@@ -274,6 +276,8 @@ async def lifespan(_: FastAPI):
             logger.exception("Could not reconcile tasks left running by an earlier run; continuing startup.")
         RESOURCES_BY_HV.clear()
         RESOURCES_BY_HV.update(load_resources())
+        CUSTOM_ROLES.clear()
+        CUSTOM_ROLES.update(load_custom_roles())
         USERS.clear()
         USERS.update(load_users())
         try:
@@ -288,13 +292,15 @@ async def lifespan(_: FastAPI):
         for hypervisor_id in HYPERVISORS:
             RESOURCES_BY_HV.setdefault(hypervisor_id, {})
         logger.info(
-            "Loaded %d hypervisors, %d repositories, %d backups, %d jobs, %d tasks, %d users from database.",
+            "Loaded %d hypervisors, %d repositories, %d backups, %d jobs, %d tasks, %d users, %d custom roles "
+            "from database.",
             len(HYPERVISORS),
             len(REPOSITORIES),
             len(BACKUPS),
             len(JOBS),
             len(TASKS),
             len(USERS),
+            len(CUSTOM_ROLES),
         )
 
         auth_service.bootstrap_admin_if_needed()

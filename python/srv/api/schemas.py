@@ -742,7 +742,7 @@ RESTORE_TARGET_DATASTORE = (
     "Datastore to place the VM on: its ID or its name (case-insensitive); target_datastore and target_datastore_id are "
     "the same field"
 )
-ROLE = "Role ID or name in any case, with spaces or hyphens for underscores: backup_operator, Backup Operator, backup-operator"
+ROLE = "Role ID or name in any case, with spaces or hyphens for underscores: backup_operator, Backup Operator, backup-operator; a custom role by its ID (custom-…) or name"
 SCHEDULE_TYPE = "daily, weekly, monthly, periodic (interval) or cron; type, schedule_type and kind are the same field"
 
 
@@ -971,6 +971,19 @@ class CreateUserRequest(_LenientModel):
     password: LaxStr | None = None
     fullName: LaxStr | None = None
     role: LaxStr | None = Field(default=None, description=ROLE)
+
+
+class CreateRoleRequest(_LenientModel):
+    name: LaxStr | None = Field(default=None, description="Unique among all roles, in any case; a clone without one is named \"<source> (copy)\"")
+    description: LaxStr | None = None
+    allowed_functions: SkipValidation[list[str]] | None = Field(default=None, description="The function IDs the role allows (GET /functions); every other one is disabled. Required unless clone_from is given")
+    clone_from: LaxStr | None = Field(default=None, description="A built-in or custom role, by ID or name, whose functions and description the new role starts from")
+
+
+class UpdateRoleRequest(_LenientModel):
+    name: LaxStr | None = Field(default=None, description=f"A new unique name; {OMITTED_KEEPS}")
+    description: LaxStr | None = Field(default=None, description=f"An empty text clears it; {OMITTED_KEEPS}")
+    allowed_functions: SkipValidation[list[str]] | None = Field(default=None, description=f"The whole new list of allowed function IDs; {OMITTED_KEEPS}")
 
 
 class UpdateUserRequest(_LenientModel):
@@ -1544,9 +1557,18 @@ class RolePermissionDTO(_LenientModel):
     allowed: DocBool = None
 
 
+class RoleSourceDTO(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+
+
 class RoleDTO(RoleSummaryDTO):
     permissions: list[RolePermissionDTO] | DocArray = None
     allowed_functions: DocStrArray = None
+    user_count: DocInt = Field(default=None, description="How many users hold the role")
+    created_at: DocStr = None
+    updated_at: DocStr = None
+    cloned_from: RoleSourceDTO | None = Field(default=None, description="The role a custom role was cloned from")
 
 
 class RoleList(_LenientModel):
@@ -1558,6 +1580,7 @@ class FunctionDTO(_LenientModel):
     name: DocStr = None
     category: DocStr = None
     starts_session: DocBool = None
+    always_allowed: DocBool = Field(default=None, description="Every role allows it, a custom one too")
 
 
 class FunctionList(_LenientModel):
