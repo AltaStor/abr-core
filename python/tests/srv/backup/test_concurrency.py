@@ -255,6 +255,52 @@ class TaskCompletionProgressTest(unittest.TestCase):
         self.assertEqual(tp_mod.TASKS[self.task_id]["result"]["progress"], 61)
 
 
+
+class TaskCompletionSnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.pool = tp_mod.TaskProcessPool(worker_count=1)
+        self.task_id = "t-snapshot"
+        self.snapshot = {"vm_name": "demo-vm", "name": "FullBackup_left"}
+        self.addCleanup(tp_mod.TASKS.pop, self.task_id, None)
+
+    def _start(self, backup_snapshot):
+        tp_mod.TASKS[self.task_id] = {
+            "id": self.task_id,
+            "task_type": "backup",
+            "status": "running",
+            "result": {"progress": 40, "backup_snapshot": backup_snapshot},
+        }
+
+    def _resolve(self, status):
+        future: Future = Future()
+        future.set_result({"task_id": self.task_id, "status": status, "result": {"message": status}, "updated_at": "now"})
+        self.pool._futures[future] = (self.task_id, "backup", None)
+        self.pool._complete_task(future)
+
+    def test_a_finished_session_keeps_the_snapshot_it_could_not_remove(self):
+        for status in ("stopped", "failed", "completed"):
+            with self.subTest(status=status):
+                self._start(dict(self.snapshot))
+                self._resolve(status)
+                self.assertEqual(tp_mod.TASKS[self.task_id]["result"]["backup_snapshot"], self.snapshot)
+                self.assertEqual(tp_mod.TASKS[self.task_id]["result"]["message"], status)
+
+    def test_a_removed_snapshot_is_not_brought_back(self):
+        for status in ("stopped", "failed", "completed"):
+            with self.subTest(status=status):
+                self._start(None)
+                self._resolve(status)
+                self.assertNotIn("backup_snapshot", tp_mod.TASKS[self.task_id]["result"])
+
+    def test_a_crashed_session_keeps_the_snapshot_it_could_not_remove(self):
+        self._start(dict(self.snapshot))
+        future: Future = Future()
+        future.set_exception(RuntimeError("worker crashed"))
+        self.pool._futures[future] = (self.task_id, "backup", None)
+        self.pool._complete_task(future)
+        self.assertEqual(tp_mod.TASKS[self.task_id]["result"]["backup_snapshot"], self.snapshot)
+        self.assertEqual(tp_mod.TASKS[self.task_id]["result"]["message"], "worker crashed")
+
 class ProgressTickLoggingTest(unittest.TestCase):
     def setUp(self):
         self.pool = tp_mod.TaskProcessPool(worker_count=1)

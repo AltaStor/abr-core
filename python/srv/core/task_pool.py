@@ -63,6 +63,11 @@ def vm_key_for_task(task: dict[str, object]) -> tuple[str, str] | None:
     return (str(task.get("hypervisor_id") or ""), external_id)
 
 
+def _keep_backup_snapshot(result: dict[str, object], previous_result: dict[str, object]) -> None:
+    if "backup_snapshot" not in result and isinstance(previous_result.get("backup_snapshot"), dict):
+        result["backup_snapshot"] = previous_result["backup_snapshot"]
+
+
 class TaskProcessPool:
     def __init__(
         self,
@@ -308,6 +313,7 @@ class TaskProcessPool:
                 previous_result = task.get("result") if isinstance(task.get("result"), dict) else {}
                 task["status"] = "failed"
                 task["result"] = {"message": str(exc), "finished_at": utc_now(), "progress": previous_result.get("progress")}
+                _keep_backup_snapshot(task["result"], previous_result)
                 task["updated_at"] = utc_now()
                 try:
                     persist_task(dict(task))
@@ -325,9 +331,10 @@ class TaskProcessPool:
                 return
             final_status = str(outcome["status"])
             result = dict(outcome["result"]) if isinstance(outcome.get("result"), dict) else {}
+            previous_result = task.get("result") if isinstance(task.get("result"), dict) else {}
             if result.get("progress") is None:
-                previous_result = task.get("result") if isinstance(task.get("result"), dict) else {}
                 result["progress"] = 100 if final_status == "completed" else previous_result.get("progress")
+            _keep_backup_snapshot(result, previous_result)
             finished = dict(task)
             finished["status"] = final_status
             finished["result"] = result
