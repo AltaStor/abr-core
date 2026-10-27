@@ -196,3 +196,64 @@ class ScriptSourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalToolPathTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.app_root = pathlib.Path(tmp.name) / "opt"
+        self.repo_root = pathlib.Path(tmp.name) / "checkout"
+        for patcher in (
+            patch.object(vhdx_tool, "APP_ROOT", self.app_root),
+            patch.object(vhdx_tool, "REPO_ROOT", self.repo_root),
+            patch.dict("os.environ", {"ALTASTOR_VHDX_TOOL_PATH": ""}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _put(self, root: pathlib.Path, *folders: str) -> pathlib.Path:
+        folder = root.joinpath("tools", "abr-vhdx-tool", *folders)
+        folder.mkdir(parents=True, exist_ok=True)
+        tool = folder / vhdx_tool.TOOL_NAME
+        tool.write_bytes(b"MZ")
+        return tool.resolve()
+
+    def test_finds_the_tool_where_the_vhdx_tools_package_installs_it(self) -> None:
+        installed = self._put(self.app_root, "x64")
+
+        self.assertEqual(vhdx_tool.local_tool_path(), installed)
+
+    def test_still_finds_a_copy_placed_without_the_architecture_folder(self) -> None:
+        copied = self._put(self.app_root)
+
+        self.assertEqual(vhdx_tool.local_tool_path(), copied)
+
+    def test_the_package_copy_wins_over_one_placed_without_the_architecture_folder(self) -> None:
+        installed = self._put(self.app_root, "x64")
+        self._put(self.app_root)
+
+        self.assertEqual(vhdx_tool.local_tool_path(), installed)
+
+    def test_the_installed_copy_wins_over_the_checkout(self) -> None:
+        installed = self._put(self.app_root, "x64")
+        self._put(self.repo_root)
+
+        self.assertEqual(vhdx_tool.local_tool_path(), installed)
+
+    def test_a_checkout_finds_its_own_copy(self) -> None:
+        for folders in ((), ("x64",)):
+            with self.subTest(folders=folders):
+                built = self._put(self.repo_root, *folders)
+                self.assertEqual(vhdx_tool.local_tool_path(), built)
+                built.unlink()
+
+    def test_the_configured_path_wins_over_every_other_copy(self) -> None:
+        self._put(self.app_root, "x64")
+        configured = self._put(self.app_root.parent / "elsewhere")
+
+        with patch.dict("os.environ", {"ALTASTOR_VHDX_TOOL_PATH": str(configured)}):
+            self.assertEqual(vhdx_tool.local_tool_path(), configured)
+
+    def test_no_copy_anywhere_means_the_hosts_must_have_it(self) -> None:
+        self.assertIsNone(vhdx_tool.local_tool_path())
