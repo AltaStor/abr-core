@@ -12,6 +12,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -46,6 +47,8 @@ IMMUTABILITY_PROBE_NAME_PREFIX = "immutability-probe-"
 _IMMUTABILITY_PROBE_CLOCK_MARGIN_SECONDS = 3600
 _IMMUTABILITY_PROBE_UNDATED_SWEEP_LIMIT = 3
 IMMUTABILITY_PROBE_RETENTION_DAYS = 1
+RETENTION_TILL_OPTION = "--retention-till"
+RETENTION_TILL_KEY = "immutability_retention_till"
 STORAGE_LAYOUT_BY_NAME = "by_name"
 STORAGE_LAYOUT_BY_ID = "by_id"
 
@@ -424,13 +427,66 @@ def disk_tool_storage_args(
     return args
 
 
-def disk_tool_immutability_args(repository: dict[str, Any]) -> list[str]:
+def disk_tool_immutability_args(
+    repository: dict[str, Any], *, takes_retention_till: Callable[[], bool] | None = None
+) -> list[str]:
     if not is_s3_repository(repository):
         return []
     config = normalize_immutability_config(extract_s3_config(repository).get("immutability"))
     if not immutability_is_enabled(config):
         return []
+    retention_till = str(repository.get(RETENTION_TILL_KEY) or "")
+    if retention_till and takes_retention_till is not None and takes_retention_till():
+        return ["--immutable", config["mode"], RETENTION_TILL_OPTION, retention_till]
     return ["--immutable", config["mode"], "--retention", str(config["retention_days"])]
+
+
+def retention_till_text(moment: datetime) -> str:
+    utc = moment.astimezone(timezone.utc)
+    whole = utc.replace(microsecond=0)
+    if whole < utc:
+        whole += timedelta(seconds=1)
+    return whole.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def chain_retention_till(repository: dict[str, Any], expires_at: Any) -> str | None:
+    if not is_s3_repository(repository):
+        return None
+    config = normalize_immutability_config(extract_s3_config(repository).get("immutability"))
+    if not immutability_is_enabled(config) or config["retention_scope"] != "job_retention":
+        return None
+    text = str(expires_at or "").strip()
+    if not text:
+        return None
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return retention_till_text(moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc))
+
+
+_retention_till_support: dict[tuple[str, int, int], bool] = {}
+
+
+def disk_tool_supports_retention_till(tool_path: Path | None = None) -> bool:
+    launcher = (tool_path or default_disk_tool_path()).expanduser()
+    try:
+        stat = launcher.stat()
+    except OSError:
+        return False
+    binary = launcher.with_suffix("")
+    binary_stat = binary.stat() if binary != launcher and binary.is_file() else stat
+    key = (str(launcher), binary_stat.st_size, binary_stat.st_mtime_ns)
+    if key not in _retention_till_support:
+        try:
+            completed = subprocess.run(
+                [str(launcher), "retention", "--help"], capture_output=True, text=True, timeout=60, check=False
+            )
+            _retention_till_support[key] = RETENTION_TILL_OPTION in f"{completed.stdout}{completed.stderr}"
+        except (OSError, subprocess.SubprocessError):
+            logger.warning("Could not ask %s whether it takes %s", launcher, RETENTION_TILL_OPTION, exc_info=True)
+            return False
+    return _retention_till_support[key]
 
 
 _SOURCE_STORAGE_FLAGS = {
@@ -478,6 +534,7 @@ def copy_disk_tool_chain(
     encryption_key: str = "",
     source_encryption_key: str = "",
     retention_days: int | None = None,
+    retention_till: str | None = None,
     timeout: int | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
@@ -505,7 +562,9 @@ def copy_disk_tool_chain(
     if source_encryption_key:
         command.extend(["--source-key", source_encryption_key])
     immutability = disk_tool_immutability_args(destination_repository)
-    if immutability and retention_days is not None:
+    if immutability and retention_till and disk_tool_supports_retention_till():
+        immutability = [immutability[0], immutability[1], RETENTION_TILL_OPTION, retention_till]
+    elif immutability and retention_days is not None:
         immutability = [immutability[0], immutability[1], "--retention", str(int(retention_days))]
     command.extend(immutability)
 
@@ -825,6 +884,7 @@ def set_disk_tool_backup_retention(
     *,
     mode: str,
     retention_days: int,
+    retention_till: str | None = None,
     timeout: int = 120,
 ) -> dict[str, Any]:
     normalized_mode = normalize_immutability_mode(mode)
@@ -832,6 +892,7 @@ def set_disk_tool_backup_retention(
         raise StorageToolError("Object Lock cannot release a backup that is already held")
     if int(retention_days) < 1:
         raise StorageToolError("Object Lock retention must be at least 1 day")
+    period = [RETENTION_TILL_OPTION, retention_till] if retention_till else ["--retention", str(int(retention_days))]
     return run_disk_tool_json(
         [
             "retention",
@@ -840,8 +901,7 @@ def set_disk_tool_backup_retention(
             *disk_tool_storage_args(repository, abr_path=abr_path),
             "--immutable",
             normalized_mode,
-            "--retention",
-            str(int(retention_days)),
+            *period,
         ],
         timeout=timeout,
     )
@@ -852,7 +912,9 @@ def _is_absent_data_object_error(message: str, backup_name: str) -> bool:
     return "nosuchkey" in lowered and f"{backup_name}.abrd" in lowered
 
 
-def with_immutability_retention_days(repository: dict[str, Any], retention_days: int) -> dict[str, Any]:
+def with_immutability_retention_days(
+    repository: dict[str, Any], retention_days: int, *, retention_till: str | None = None
+) -> dict[str, Any]:
     if not is_s3_repository(repository):
         return repository
     config = extract_s3_config(repository)
@@ -861,6 +923,8 @@ def with_immutability_retention_days(repository: dict[str, Any], retention_days:
     effective = dict(repository)
     config["immutability"] = dict(config["immutability"], retention_days=max(int(retention_days), 1))
     effective["s3"] = config
+    if retention_till:
+        effective[RETENTION_TILL_KEY] = retention_till
     return effective
 
 
@@ -870,11 +934,16 @@ def apply_repository_immutability(
     backup_name: str,
     *,
     retention_days: int | None = None,
+    retention_till: str | None = None,
     timeout: int = 120,
 ) -> dict[str, Any] | None:
     config = normalize_immutability_config(extract_s3_config(repository).get("immutability"))
     if not immutability_is_enabled(config):
         return None
+    if retention_till is None and retention_days is None:
+        retention_till = str(repository.get(RETENTION_TILL_KEY) or "") or None
+    if retention_till and not disk_tool_supports_retention_till():
+        retention_till = None
     try:
         return set_disk_tool_backup_retention(
             repository,
@@ -882,6 +951,7 @@ def apply_repository_immutability(
             backup_name,
             mode=config["mode"],
             retention_days=config["retention_days"] if retention_days is None else retention_days,
+            retention_till=retention_till,
             timeout=timeout,
         )
     except StorageToolError as exc:
@@ -1056,7 +1126,8 @@ def _storage_operation_label(args: list[str]) -> str:
     path = option("--path")
     where = f"s3 bucket {folder}, path {path}" if mode == "s3" else f"folder {folder}"
     immutable = option("--immutable")
-    lock = f", Object Lock {immutable} {option('--retention')} day(s)" if immutable and immutable != "none" else ""
+    period = f"until {option(RETENTION_TILL_OPTION)}" if option(RETENTION_TILL_OPTION) else f"{option('--retention')} day(s)"
+    lock = f", Object Lock {immutable} {period}" if immutable and immutable != "none" else ""
     return f"{subcommand}{f' {target}' if target else ''} on {where}{lock}"
 
 

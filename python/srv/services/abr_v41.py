@@ -70,6 +70,8 @@ from python.srv.core.storage_tool import (
     StorageToolError,
     apply_repository_immutability,
     build_s3_location,
+    chain_retention_till,
+    disk_tool_supports_retention_till,
     condense_disk_tool_message,
     extract_s3_config,
     hydrate_manifest_via_disk_tool,
@@ -114,7 +116,7 @@ from python.srv.services.inventory_management import (
     inventory_type_from_record,
     normalize_inventory_type,
 )
-from python.srv.services.backup_mode import object_lock_actual_retention_days
+from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
@@ -3527,6 +3529,7 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
                     abr_path,
                     backup_name,
                     retention_days=remaining_days,
+                    retention_till=chain_retention_till(repository, expires_at),
                     timeout=_s3_immutability_probe_timeout(),
                 )
             except StorageToolError as exc:
@@ -3576,11 +3579,24 @@ def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
     failures: list[dict[str, Any]] = []
     applied_days: set[int] = set()
     attempted_days: set[int] = set()
+    started_at = _now_utc()
+    holds_chain_dates = config["retention_scope"] == "job_retention" and disk_tool_supports_retention_till()
+    chain_dates: dict[str, datetime | None] = {}
     for point in points:
         point_failed = False
-        job = JOBS.get(str(point.get("job_id") or ""))
+        job_id = str(point.get("job_id") or "")
+        job = JOBS.get(job_id)
         actual_days = repository_actual_retention_days(job if isinstance(job, dict) else None, config)
         attempted_days.add(actual_days)
+        if holds_chain_dates and job_id not in chain_dates:
+            chain_dates[job_id] = object_lock_expiry(
+                job if isinstance(job, dict) else None,
+                config,
+                block_generation_days=s3_block_generation_days(),
+                now=started_at,
+            )
+        chain_date = chain_dates.get(job_id)
+        retention_till = chain_retention_till(repository, chain_date.isoformat()) if chain_date else None
         for abr_path, backup_name in _restore_point_abr_targets(point):
             try:
                 apply_repository_immutability(
@@ -3588,6 +3604,7 @@ def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
                     abr_path,
                     backup_name,
                     retention_days=actual_days,
+                    retention_till=retention_till,
                     timeout=_s3_immutability_probe_timeout(),
                 )
             except StorageToolError as exc:
@@ -3605,7 +3622,9 @@ def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
             stored = BACKUPS.get(str(point.get("id") or ""))
             if isinstance(stored, dict) and actual_days > 0:
                 stored = dict(stored)
-                stored["immutability_expires_at"] = (_now_utc() + timedelta(days=actual_days)).isoformat()
+                stored["immutability_expires_at"] = (
+                    chain_date.isoformat() if retention_till else (_now_utc() + timedelta(days=actual_days)).isoformat()
+                )
                 persist_backup(stored)
 
     result = {

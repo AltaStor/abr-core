@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from ...core.storage_tool import APP_ROOT, REPO_ROOT, disk_tool_storage_args, is_s3_repository
+from ...core.storage_tool import APP_ROOT, REPO_ROOT, RETENTION_TILL_OPTION, disk_tool_storage_args, is_s3_repository
 
 TOOL_NAME = "abr-vhdx-tool.exe"
 HOST_ARCHITECTURE = "x64"
@@ -86,6 +86,29 @@ def file_sha256(path: Path) -> str:
                 digest.update(block)
         _hashes[key] = digest.hexdigest().upper()
     return _hashes[key]
+
+
+_retention_till_support: dict[tuple[str, int, int], bool] = {}
+
+
+def supports_retention_till() -> bool:
+    tool = local_tool_path()
+    if tool is None:
+        return False
+    stat = tool.stat()
+    key = (str(tool), stat.st_size, stat.st_mtime_ns)
+    if key not in _retention_till_support:
+        needle = RETENTION_TILL_OPTION.encode("ascii")
+        found = False
+        tail = b""
+        with open(tool, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                if needle in tail + block:
+                    found = True
+                    break
+                tail = block[-len(needle):]
+        _retention_till_support[key] = found
+    return _retention_till_support[key]
 
 
 def remote_work_dir() -> str:

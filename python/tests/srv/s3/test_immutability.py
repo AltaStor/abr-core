@@ -948,9 +948,10 @@ class S3RetroactiveImmutabilityTests(unittest.TestCase):
             }
         return repository["id"]
 
+    @patch("python.srv.services.abr_v41.disk_tool_supports_retention_till", return_value=False)
     @patch("python.srv.services.abr_v41.s3_endpoint_connect_error", return_value=None)
     @patch("python.srv.core.storage_tool.run_disk_tool")
-    def test_existing_backups_are_placed_under_the_current_setting(self, run_mock, _connect) -> None:
+    def test_existing_backups_are_placed_under_the_current_setting(self, run_mock, _connect, _takes_date) -> None:
         repository_id = self._repository_with_points(run_mock, {"mode": "governance", "retention_days": 30})
         stub = _disk_tool_stub()
         run_mock.side_effect = stub

@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from python.srv.core.mongo_db_wrapper import BACKUPS, JOBS, REPOSITORIES
-from python.srv.plugins.hyperv import hyperv_backup
+from python.srv.core.storage_tool import RETENTION_TILL_KEY
+from python.srv.plugins.hyperv import hyperv_backup, vhdx_tool
 from python.srv.services import abr_v41
 
 
@@ -92,6 +95,53 @@ class HyperVDiskLockTests(unittest.TestCase):
 
         self.assertNotIn("--immutable", command)
         self.assertNotIn("--retention", command)
+
+    def test_every_disk_is_held_to_the_chain_date_when_the_host_tool_takes_one(self) -> None:
+        repository = dict(_s3_repository({"mode": "governance", "retention_days": 6}))
+        repository[RETENTION_TILL_KEY] = "2026-10-25T00:00:00Z"
+        with patch.object(vhdx_tool, "supports_retention_till", return_value=True):
+            command = self._command(repository)
+
+        index = command.index("--immutable")
+        self.assertEqual(
+            command[index : index + 4], ["--immutable", "governance", "--retention-till", "2026-10-25T00:00:00Z"]
+        )
+
+    def test_an_older_host_tool_gets_whole_days(self) -> None:
+        repository = dict(_s3_repository({"mode": "governance", "retention_days": 6}))
+        repository[RETENTION_TILL_KEY] = "2026-10-25T00:00:00Z"
+        with patch.object(vhdx_tool, "supports_retention_till", return_value=False):
+            command = self._command(repository)
+
+        index = command.index("--immutable")
+        self.assertEqual(command[index : index + 4], ["--immutable", "governance", "--retention", "6"])
+
+
+class HostToolRetentionTillTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tool = Path(tmp.name) / "abr-vhdx-tool.exe"
+        vhdx_tool._retention_till_support.clear()
+        self.addCleanup(vhdx_tool._retention_till_support.clear)
+
+    def _supports(self, content: bytes) -> bool:
+        self.tool.write_bytes(content)
+        with patch.object(vhdx_tool, "local_tool_path", return_value=self.tool):
+            return vhdx_tool.supports_retention_till()
+
+    def test_a_tool_that_names_the_option_takes_a_date(self) -> None:
+        self.assertTrue(self._supports(b"MZ" + b"\0" * 100 + b"--retention-till DATE"))
+
+    def test_the_option_split_across_two_reads_is_still_found(self) -> None:
+        self.assertTrue(self._supports(b"\0" * ((1 << 20) - 5) + b"--retention-till" + b"\0" * 10))
+
+    def test_a_tool_without_it_gets_days(self) -> None:
+        self.assertFalse(self._supports(b"MZ" + b"\0" * 100 + b"--retention DAYS"))
+
+    def test_without_an_appliance_copy_the_hosts_get_days(self) -> None:
+        with patch.object(vhdx_tool, "local_tool_path", return_value=None):
+            self.assertFalse(vhdx_tool.supports_retention_till())
 
 
 class HyperVRetentionUnderObjectLockTests(unittest.TestCase):

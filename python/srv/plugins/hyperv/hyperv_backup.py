@@ -801,7 +801,7 @@ def _back_up_disks(
             "--name",
             backup_name,
             *storage_args,
-            *disk_tool_immutability_args(repository),
+            *disk_tool_immutability_args(repository, takes_retention_till=vhdx_tool.supports_retention_till),
             "--compression",
             str(compression_level),
             "--vhdx",

@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from python.srv.core.mongo_db_wrapper import BACKUPS, JOBS, REPOSITORIES, TASKS
-from python.srv.core.storage_tool import StorageToolError
+from python.srv.core.storage_tool import StorageToolError, retention_till_text
 from python.srv.core.subprocess_util import ProcessCancelled
 from python.srv.core.task_executor import TaskStopRequested
 from python.srv.services import abr_v41, synthetic_full
@@ -626,6 +626,39 @@ class SyntheticFullRunTests(unittest.TestCase):
 
         self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 40)
         self.assertEqual(lock_mock.call_args.kwargs["retention_days"], 40)
+
+    @patch("python.srv.services.synthetic_full.apply_repository_immutability")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_the_data_and_the_manifest_are_held_to_the_chain_date(self, copy_mock, lock_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
+        REPOSITORIES[REPO_ID] = {
+            "id": REPO_ID, "name": "S3", "type": "s3",
+            "metadata": {"s3": {"bucket": "b", "region": "us-east-1",
+                                "immutability": {"mode": "governance", "retention_days": 30}}},
+        }
+
+        result = synthetic_full.run_synthetic_full(self._task())
+
+        expected = retention_till_text(datetime.fromisoformat(result["immutability_generation"]["expires_at"]))
+        self.assertEqual(copy_mock.call_args.kwargs["retention_till"], expected)
+        self.assertEqual(lock_mock.call_args.kwargs["retention_till"], expected)
+
+    @patch("python.srv.services.synthetic_full.apply_repository_immutability")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_the_minimum_scope_keeps_whole_days_for_a_synthetic_full(self, copy_mock, lock_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 3}
+        REPOSITORIES[REPO_ID] = {
+            "id": REPO_ID, "name": "S3", "type": "s3",
+            "metadata": {"s3": {"bucket": "b", "region": "us-east-1",
+                                "immutability": {"mode": "governance", "retention_days": 30,
+                                                 "retention_scope": "minimum_only"}}},
+        }
+
+        synthetic_full.run_synthetic_full(self._task())
+
+        self.assertIsNone(copy_mock.call_args.kwargs["retention_till"])
+        self.assertIsNone(lock_mock.call_args.kwargs["retention_till"])
+        self.assertEqual(copy_mock.call_args.kwargs["retention_days"], 30)
 
     @patch("python.srv.services.synthetic_full.apply_repository_immutability")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
