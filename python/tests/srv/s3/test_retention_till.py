@@ -277,8 +277,8 @@ class ToolSupportTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.folder = Path(tmp.name)
-        storage_tool._retention_till_support.clear()
-        self.addCleanup(storage_tool._retention_till_support.clear)
+        storage_tool._tool_help_answers.clear()
+        self.addCleanup(storage_tool._tool_help_answers.clear)
 
     def _launcher(self, help_text: str) -> Path:
         launcher = self.folder / "abr-vmdk-tool.sh"

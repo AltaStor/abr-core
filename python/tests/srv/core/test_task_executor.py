@@ -5971,7 +5971,7 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertIn("--stdin-keys", command)
         self.assertIn("key=hunter2\n", recorded_stdin[0])
 
-    def test_restore_disk_replays_full_then_incremental_abr_layers(self) -> None:
+    def _restore_disk_chain(self, *, chains: bool) -> tuple[list[list[str]], str]:
         HYPERVISORS["hv-vc"] = {
             "id": "hv-vc",
             "kind": "vcenter",
@@ -6084,10 +6084,16 @@ class TaskExecutorTests(unittest.TestCase):
                 return FakeCompletedProcess(returncode=0, stdout="ok")
 
             with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
-                with patch("python.srv.plugins.vcenter.vcenter_restore.run_capped", side_effect=fake_run):
+                with patch("python.srv.plugins.vcenter.vcenter_restore.run_capped", side_effect=fake_run), patch(
+                    "python.srv.plugins.vcenter.vcenter_restore.disk_tool_restores_chains", return_value=chains
+                ):
                     result = run_task(task)
 
         self.assertEqual(result["status"], "completed")
+        return recorded_commands, temp_dir
+
+    def test_restore_disk_replays_full_then_incremental_abr_layers(self) -> None:
+        recorded_commands, _temp_dir = self._restore_disk_chain(chains=False)
         # The incremental chain replays the full layer first, then the
         # incremental layer, each via a single restore command onto the
         # same restore target.
@@ -6104,6 +6110,19 @@ class TaskExecutorTests(unittest.TestCase):
             "01-demo-vm-inc.vmdk",
         )
         self.assertEqual(recorded_commands[0][recorded_commands[0].index("--vmdk") + 1], recorded_commands[1][recorded_commands[1].index("--vmdk") + 1])
+
+    def test_restore_disk_applies_a_chain_in_one_run_when_the_tool_takes_a_list(self) -> None:
+        recorded_commands, temp_dir = self._restore_disk_chain(chains=True)
+
+        self.assertEqual(len(recorded_commands), 1)
+        command = recorded_commands[0]
+        self.assertEqual(command[1], "restore")
+        self.assertNotIn("--name", command)
+        self.assertNotIn("--force", command)
+        self.assertEqual(
+            command[command.index("--source-names") + 1], "task-full/01-demo-vm.vmdk,task-inc/01-demo-vm-inc.vmdk"
+        )
+        self.assertEqual(command[command.index("--folder") + 1], str(pathlib.Path(temp_dir)))
 
     def test_vm_restore_rejects_query_only_backup_manifest(self) -> None:
         HYPERVISORS["hv-vc"] = {

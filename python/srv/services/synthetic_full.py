@@ -20,6 +20,7 @@ from python.srv.core.storage_tool import (
     remove_disk_tool_backup,
     apply_repository_immutability,
     chain_retention_till,
+    chain_source_names,
     copy_disk_tool_chain,
     disk_tool_storage_args,
     ensure_private_directory,
@@ -65,28 +66,6 @@ def _disk_identity(disk: dict[str, Any], position: int) -> str:
 def _artifact_disks(point: dict[str, Any]) -> list[dict[str, Any]]:
     artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
     return [disk for disk in artifact.get("disks", []) if isinstance(disk, dict)]
-
-
-def _common_prefix(paths: list[str]) -> str:
-    if not paths:
-        return ""
-    absolute = all(path.startswith("/") for path in paths)
-    split = [path.strip("/").split("/") for path in paths]
-    common: list[str] = []
-    for segments in zip(*split):
-        if len(set(segments)) != 1:
-            break
-        common.append(segments[0])
-    joined = "/".join(common)
-    return f"/{joined}" if absolute and joined else joined
-
-
-def _relative_to(path: str, prefix: str) -> str:
-    stripped = path.strip("/")
-    base = prefix.strip("/")
-    if base and stripped.startswith(base):
-        stripped = stripped[len(base):]
-    return stripped.strip("/")
 
 
 def resolve_source_chain(job_id: str, vm_id: str, repository_id: str | None) -> list[dict[str, Any]]:
@@ -155,11 +134,7 @@ def build_disk_merges(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
             raise SyntheticFullValidationError(
                 f"Disk {identity} is missing stored backup locations, so its chain cannot be merged"
             )
-        source_path = _common_prefix(paths)
-        qualified: list[str] = []
-        for path, name in zip(paths, names):
-            relative = _relative_to(path, source_path)
-            qualified.append(f"{relative}/{name}" if relative else name)
+        source_path, qualified = chain_source_names(paths, names)
         merges.append(
             {
                 "identity": identity,

@@ -88,17 +88,18 @@ def file_sha256(path: Path) -> str:
     return _hashes[key]
 
 
-_retention_till_support: dict[tuple[str, int, int], bool] = {}
+_tool_mentions: dict[tuple[str, int, int, str], bool] = {}
+_RESTORES_CHAINS_TEXT = "restore takes either --name or --source-names"
 
 
-def supports_retention_till() -> bool:
+def _local_tool_mentions(text: str) -> bool:
     tool = local_tool_path()
     if tool is None:
         return False
     stat = tool.stat()
-    key = (str(tool), stat.st_size, stat.st_mtime_ns)
-    if key not in _retention_till_support:
-        needle = RETENTION_TILL_OPTION.encode("ascii")
+    key = (str(tool), stat.st_size, stat.st_mtime_ns, text)
+    if key not in _tool_mentions:
+        needle = text.encode("ascii")
         found = False
         tail = b""
         with open(tool, "rb") as handle:
@@ -107,8 +108,16 @@ def supports_retention_till() -> bool:
                     found = True
                     break
                 tail = block[-len(needle):]
-        _retention_till_support[key] = found
-    return _retention_till_support[key]
+        _tool_mentions[key] = found
+    return _tool_mentions[key]
+
+
+def supports_retention_till() -> bool:
+    return _local_tool_mentions(RETENTION_TILL_OPTION)
+
+
+def restores_chains() -> bool:
+    return _local_tool_mentions(_RESTORES_CHAINS_TEXT)
 
 
 def remote_work_dir() -> str:

@@ -15,8 +15,11 @@ from ...core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES, catalog
 from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...core.storage_tool import (
     build_s3_location,
+    chain_source_names,
+    disk_tool_restores_chains,
     disk_tool_storage_args,
     extract_s3_config,
+    is_s3_repository,
     redact_disk_tool_command,
     run_disk_tool_process,
 )
@@ -487,6 +490,26 @@ def _resolve_abr_restore_layers(
     return layers
 
 
+def _abr_restore_runs(
+    abr_layers: list[dict[str, Any]], *, tool_path: Path, repository: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    names = [str(layer["abr_backup_name"]) for layer in abr_layers]
+    if len(abr_layers) < 2 or any("," in name for name in names) or not disk_tool_restores_chains(tool_path):
+        return abr_layers
+    source_path, source_names = chain_source_names([str(layer["abr_path"]) for layer in abr_layers], names)
+    if not source_path and not is_s3_repository(repository or {}):
+        return abr_layers
+    return [
+        {
+            "abr_path": source_path,
+            "abr_backup_name": "",
+            "source_names": source_names,
+            "store_mode": abr_layers[0]["store_mode"],
+            "source": f"{abr_layers[0]['source']} and {len(abr_layers) - 1} incremental(s) on it",
+        }
+    ]
+
+
 def _build_abr_restore_command(
     *,
     tool_path: Path,
@@ -503,12 +526,12 @@ def _build_abr_restore_command(
     transport_mode: str | None,
     encryption_key: str = "",
     force: bool = False,
+    source_names: list[str] | None = None,
 ) -> list[str]:
     command = [
         str(tool_path),
         "restore",
-        "--name",
-        backup_name,
+        *(["--source-names", ",".join(source_names)] if source_names else ["--name", backup_name]),
         *disk_tool_storage_args(repository, abr_path=abr_path),
     ]
     if force:
@@ -1076,8 +1099,9 @@ def run_vcenter_restore(
                         transferred_bytes=base_sent_bytes,
                     )
                     if abr_layers:
-                        layer_count = len(abr_layers)
-                        for layer_index, layer in enumerate(abr_layers, start=1):
+                        restore_runs = _abr_restore_runs(abr_layers, tool_path=tool_path, repository=repository)
+                        layer_count = len(restore_runs)
+                        for layer_index, layer in enumerate(restore_runs, start=1):
                             # A disk's .abr chain restores as several sequential
                             # subprocess runs (one per full/incremental layer),
                             # each reporting its own independent 0-100%. Map
@@ -1120,6 +1144,7 @@ def run_vcenter_restore(
                                 transport_mode=transport_mode if is_virtual_center else None,
                                 encryption_key=encryption_key,
                                 force=str(layer.get("store_mode") or "").strip().lower() != "full",
+                                source_names=layer.get("source_names"),
                             )
                             logger.info(
                                 ".abr restore command preview for task %s disk %d/%d layer %d/%d: %s",
@@ -1127,7 +1152,7 @@ def run_vcenter_restore(
                                 index,
                                 len(disk_entries),
                                 layer_index,
-                                len(abr_layers),
+                                layer_count,
                                 _redact_restore_command(command),
                             )
                             completed = _run_restore_layer(
@@ -1503,8 +1528,9 @@ def run_vcenter_restore(
                 # the [30, 80) band instead of remapping every layer onto the
                 # whole band, which snaps the bar back to 30% each time a layer
                 # finishes and the next one starts.
-                layer_count = len(abr_layers)
-                for layer_index, layer in enumerate(abr_layers, start=1):
+                restore_runs = _abr_restore_runs(abr_layers, tool_path=tool_path, repository=repository)
+                layer_count = len(restore_runs)
+                for layer_index, layer in enumerate(restore_runs, start=1):
                     layer_base = 30 + int((layer_index - 1) * 50 / layer_count)
                     layer_span = max(1, 30 + int(layer_index * 50 / layer_count) - layer_base)
                     # Byte budget split across layers the same way the progress band
@@ -1528,12 +1554,13 @@ def run_vcenter_restore(
                         transport_mode=transport_mode if is_virtual_center else None,
                         encryption_key=encryption_key,
                         force=str(layer.get("store_mode") or "").strip().lower() != "full",
+                        source_names=layer.get("source_names"),
                     )
                     logger.info(
                         ".abr disk restore command preview for task %s layer %d/%d: %s",
                         task.get("id"),
                         layer_index,
-                        len(abr_layers),
+                        layer_count,
                         _redact_restore_command(command),
                     )
                     completed = _run_restore_layer(

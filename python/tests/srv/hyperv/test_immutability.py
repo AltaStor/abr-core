@@ -122,8 +122,8 @@ class HostToolRetentionTillTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tool = Path(tmp.name) / "abr-vhdx-tool.exe"
-        vhdx_tool._retention_till_support.clear()
-        self.addCleanup(vhdx_tool._retention_till_support.clear)
+        vhdx_tool._tool_mentions.clear()
+        self.addCleanup(vhdx_tool._tool_mentions.clear)
 
     def _supports(self, content: bytes) -> bool:
         self.tool.write_bytes(content)

@@ -49,6 +49,7 @@ _IMMUTABILITY_PROBE_UNDATED_SWEEP_LIMIT = 3
 IMMUTABILITY_PROBE_RETENTION_DAYS = 1
 RETENTION_TILL_OPTION = "--retention-till"
 RETENTION_TILL_KEY = "immutability_retention_till"
+SOURCE_NAMES_OPTION = "--source-names"
 MANIFEST_BACKUP_NAME = "manifest"
 _ABSENT_DATA_OBJECT_EXTENSIONS = (".abrd", ".abri")
 _RETENTION_REFUSAL = re.compile(r"^(?:error:\s*)?putObjectRetention: '(?P<key>[^']*)': (?P<code>[A-Za-z]+):", re.IGNORECASE)
@@ -469,10 +470,10 @@ def chain_retention_till(repository: dict[str, Any], expires_at: Any) -> str | N
     return retention_till_text(moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc))
 
 
-_retention_till_support: dict[tuple[str, int, int], bool] = {}
+_tool_help_answers: dict[tuple[str, int, int, str, str], bool] = {}
 
 
-def disk_tool_supports_retention_till(tool_path: Path | None = None) -> bool:
+def _disk_tool_help_mentions(tool_path: Path | None, subcommand: str, option: str) -> bool:
     launcher = (tool_path or default_disk_tool_path()).expanduser()
     try:
         stat = launcher.stat()
@@ -480,17 +481,52 @@ def disk_tool_supports_retention_till(tool_path: Path | None = None) -> bool:
         return False
     binary = launcher.with_suffix("")
     binary_stat = binary.stat() if binary != launcher and binary.is_file() else stat
-    key = (str(launcher), binary_stat.st_size, binary_stat.st_mtime_ns)
-    if key not in _retention_till_support:
+    key = (str(launcher), binary_stat.st_size, binary_stat.st_mtime_ns, subcommand, option)
+    if key not in _tool_help_answers:
         try:
             completed = subprocess.run(
-                [str(launcher), "retention", "--help"], capture_output=True, text=True, timeout=60, check=False
+                [str(launcher), subcommand, "--help"], capture_output=True, text=True, timeout=60, check=False
             )
-            _retention_till_support[key] = RETENTION_TILL_OPTION in f"{completed.stdout}{completed.stderr}"
+            _tool_help_answers[key] = option in f"{completed.stdout}{completed.stderr}"
         except (OSError, subprocess.SubprocessError):
-            logger.warning("Could not ask %s whether it takes %s", launcher, RETENTION_TILL_OPTION, exc_info=True)
+            logger.warning("Could not ask %s whether %s takes %s", launcher, subcommand, option, exc_info=True)
             return False
-    return _retention_till_support[key]
+    return _tool_help_answers[key]
+
+
+def disk_tool_supports_retention_till(tool_path: Path | None = None) -> bool:
+    return _disk_tool_help_mentions(tool_path, "retention", RETENTION_TILL_OPTION)
+
+
+def disk_tool_restores_chains(tool_path: Path | None = None) -> bool:
+    return _disk_tool_help_mentions(tool_path, "restore", SOURCE_NAMES_OPTION)
+
+
+def common_storage_path(paths: list[str]) -> str:
+    if not paths:
+        return ""
+    absolute = all(path.startswith("/") for path in paths)
+    split = [path.strip("/").split("/") for path in paths]
+    common: list[str] = []
+    for segments in zip(*split):
+        if len(set(segments)) != 1:
+            break
+        common.append(segments[0])
+    joined = "/".join(common)
+    return f"/{joined}" if absolute and joined else joined
+
+
+def chain_source_names(paths: list[str], names: list[str]) -> tuple[str, list[str]]:
+    source_path = common_storage_path(paths)
+    base = source_path.strip("/")
+    qualified: list[str] = []
+    for path, name in zip(paths, names):
+        relative = path.strip("/")
+        if base and relative.startswith(base):
+            relative = relative[len(base):]
+        relative = relative.strip("/")
+        qualified.append(f"{relative}/{name}" if relative else name)
+    return source_path, qualified
 
 
 _SOURCE_STORAGE_FLAGS = {
