@@ -3502,6 +3502,15 @@ def _restore_point_abr_targets(point: dict[str, Any]) -> list[tuple[str, str]]:
     return targets
 
 
+def _lock_end_held(asked: str, results: list[dict[str, Any] | None]) -> str:
+    floor = _parse_dt(asked)
+    ends = [
+        max(_parse_dt(result["held_until"]), floor) if isinstance(result, dict) and result.get("relocked") else floor
+        for result in results
+    ]
+    return min(ends or [floor]).isoformat()
+
+
 def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_ids: set[str] | None = None) -> dict[str, Any]:
     target = _parse_dt(expires_at)
     remaining_days = max(int(-(-(target - _now_utc()).total_seconds() // 86400)), 1)
@@ -3522,15 +3531,18 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
         if stored_expiry and _parse_dt(stored_expiry) >= target:
             continue
         point_failed = False
+        results: list[dict[str, Any] | None] = []
         for abr_path, backup_name in _restore_point_abr_targets(point):
             try:
-                apply_repository_immutability(
-                    repository,
-                    abr_path,
-                    backup_name,
-                    retention_days=remaining_days,
-                    retention_till=chain_retention_till(repository, expires_at),
-                    timeout=_s3_immutability_probe_timeout(),
+                results.append(
+                    apply_repository_immutability(
+                        repository,
+                        abr_path,
+                        backup_name,
+                        retention_days=remaining_days,
+                        retention_till=chain_retention_till(repository, expires_at),
+                        timeout=_s3_immutability_probe_timeout(),
+                    )
                 )
             except StorageToolError as exc:
                 point_failed = True
@@ -3546,7 +3558,7 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
         stored = BACKUPS.get(str(point.get("id") or ""))
         if isinstance(stored, dict):
             stored = dict(stored)
-            stored["immutability_expires_at"] = expires_at
+            stored["immutability_expires_at"] = _lock_end_held(expires_at, results)
             persist_backup(stored)
         extended.append(str(point.get("id") or ""))
 
@@ -3596,16 +3608,22 @@ def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
                 now=started_at,
             )
         chain_date = chain_dates.get(job_id)
+        stored_expiry = str(point.get("immutability_expires_at") or "").strip()
+        if chain_date and stored_expiry and _parse_dt(stored_expiry) > chain_date:
+            chain_date = _parse_dt(stored_expiry)
         retention_till = chain_retention_till(repository, chain_date.isoformat()) if chain_date else None
+        results: list[dict[str, Any] | None] = []
         for abr_path, backup_name in _restore_point_abr_targets(point):
             try:
-                apply_repository_immutability(
-                    repository,
-                    abr_path,
-                    backup_name,
-                    retention_days=actual_days,
-                    retention_till=retention_till,
-                    timeout=_s3_immutability_probe_timeout(),
+                results.append(
+                    apply_repository_immutability(
+                        repository,
+                        abr_path,
+                        backup_name,
+                        retention_days=actual_days,
+                        retention_till=retention_till,
+                        timeout=_s3_immutability_probe_timeout(),
+                    )
                 )
             except StorageToolError as exc:
                 point_failed = True
@@ -3622,8 +3640,9 @@ def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
             stored = BACKUPS.get(str(point.get("id") or ""))
             if isinstance(stored, dict) and actual_days > 0:
                 stored = dict(stored)
-                stored["immutability_expires_at"] = (
-                    chain_date.isoformat() if retention_till else (_now_utc() + timedelta(days=actual_days)).isoformat()
+                stored["immutability_expires_at"] = _lock_end_held(
+                    chain_date.isoformat() if retention_till else (_now_utc() + timedelta(days=actual_days)).isoformat(),
+                    results,
                 )
                 persist_backup(stored)
 
