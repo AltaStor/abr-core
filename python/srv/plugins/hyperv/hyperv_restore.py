@@ -253,6 +253,7 @@ def run_hyperv_restore(
         raise HyperVRestoreError("The restore point records no disks to restore")
     repository = REPOSITORIES.get(str(parameters.get("repository_id") or "")) or {"type": "local", "id": ""}
     try:
+        repository = vhdx_tool.for_hyperv_host(repository, connection["host"])
         vhdx_tool.ensure_hyperv_repository(repository)
     except vhdx_tool.VhdxToolError as exc:
         raise HyperVRestoreError(str(exc)) from exc

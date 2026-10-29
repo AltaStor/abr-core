@@ -62,6 +62,15 @@ New-Item -Path WSMan:\localhost\Listener -Transport HTTPS -Address * -Certificat
 New-NetFirewallRule -DisplayName 'WinRM HTTPS' -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow
 ```
 
+### The Default Repo
+
+The quickest repository for Hyper-V is the Default Repo the server creates
+itself, with its Hyper-V switch on: `POST /api/v1/repositories/default` with
+`{"support_hyperv": true}`. The appliance then shares that folder as a hidden
+SMB share with a generated account, and gives the hosts its address and the
+account on every run; nothing is set up on the hosts. Every host needs TCP 445
+to the appliance. `DeploymentBuildAndScenario.md` covers how the share is made.
+
 ### An SMB repository
 
 A local repository is a folder of the appliance, which Windows cannot see. For

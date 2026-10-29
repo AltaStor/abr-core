@@ -5,11 +5,13 @@ from __future__ import annotations
 
 from fastapi import Body
 
-from python.srv.services import abr_v41
+from python.srv.services import abr_v41, default_repository
 
 from ._routing import build_router, register
 from .schemas import (
     CreateRepositoryRequest,
+    DefaultRepositoryRequest,
+    DefaultRepositoryResult,
     RemovedResult,
     RepositoryDTO,
     RepositoryImmutabilityApplyResult,
@@ -40,6 +42,20 @@ def test_s3_immutability(
     payload: CreateRepositoryRequest = Body(default_factory=CreateRepositoryRequest),
 ) -> S3TestResult:
     return abr_v41.test_s3_immutability(unset_excluded(payload))
+
+
+def get_default_repository() -> RepositoryDTO:
+    return default_repository.get_default_repository()
+
+
+def create_default_repository(
+    payload: DefaultRepositoryRequest = Body(default_factory=DefaultRepositoryRequest),
+) -> DefaultRepositoryResult:
+    repository, created = default_repository.ensure_default_repository()
+    changed = False
+    if payload.support_hyperv is not None:
+        repository, changed = default_repository.set_hyperv_support(payload.support_hyperv)
+    return {"created": created, "changed": changed, "repository": repository}
 
 
 def list_repositories() -> RepositoryList:
@@ -81,6 +97,8 @@ register(router, [
     ("/test-s3", test_s3_connection, ["POST"], "repository.create"),
     ("/test-immutability", test_s3_immutability, ["POST"], "repository.create"),
     ("", list_repositories, ["GET"], "repository.view"),
+    ("/default", get_default_repository, ["GET"], "repository.view"),
+    ("/default", create_default_repository, ["POST"], "repository.create"),
     ("/{repository_id}", get_repository, ["GET"], "repository.view"),
     ("/{repository_id}", patch_repository, ["PATCH"], "repository.edit"),
     ("/{repository_id}", delete_repository, ["DELETE"], "repository.delete"),

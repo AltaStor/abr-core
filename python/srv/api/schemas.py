@@ -494,6 +494,8 @@ class RepositoryDTO(_LenientModel):
     catalog: RepositoryCatalogDTO | DocObject = {}
     referenced_jobs: DocObjectArray = None
     jobs_count: int = 0
+    default: bool = False
+    support_hyperv: bool = False
     backup_chain_count: int = 0
     restore_point_count: int = 0
     can_delete: bool = True
@@ -503,6 +505,22 @@ class RepositoryDTO(_LenientModel):
 
 class RepositoryList(_LenientModel):
     items: list[RepositoryDTO]
+
+
+class DefaultRepositoryRequest(_LenientModel):
+    support_hyperv: bool | None = Field(
+        default=None,
+        description=(
+            "Turn the hidden SMB share Hyper-V hosts write through on (true) or off (false); "
+            "leave it out to keep the current setting."
+        ),
+    )
+
+
+class DefaultRepositoryResult(_LenientModel):
+    created: bool
+    changed: bool = False
+    repository: RepositoryDTO
 
 
 class RestorePointDTO(_LenientModel):

@@ -2076,6 +2076,8 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         item["username"] = metadata.get("username")
     if metadata.get("description") is not None:
         item["description"] = metadata.get("description")
+    item["default"] = bool(metadata.get("default_repository"))
+    item["support_hyperv"] = bool(metadata.get("support_hyperv"))
     if repo_type == "s3":
         s3_config = sanitize_s3_config(extract_s3_config(item))
         item["s3"] = s3_config
@@ -2539,7 +2541,7 @@ def _ensure_appliance_folder(repo_type: str, path: str) -> None:
     )
 
 
-def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
+def create_repository_record(payload: dict[str, Any], *, metadata_flags: dict[str, Any] | None = None) -> dict[str, Any]:
     name = str(payload.get("name") or "")
     repo_type = str(payload.get("type") or "").strip().lower()
     path = str(payload.get("path") or "").strip() or None
@@ -2639,6 +2641,7 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
                 "description": description,
                 "address": path,
                 "last_scan_at": None,
+                **(metadata_flags or {}),
             }
         ),
     }
@@ -2685,6 +2688,9 @@ def _reject_storage_location_change_if_repository_has_backups(
 
 def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     record = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    from python.srv.services.default_repository import refuse_managed_share_edit
+
+    refuse_managed_share_edit(record, payload)
     original_path = str(record.get("path") or "")
     _validate_text_fields(payload, REPOSITORY_TEXT_FIELDS, code="invalid_repository")
     updated = _json_clone(record)
@@ -3864,6 +3870,9 @@ def remove_repository_record(record_id: str) -> dict[str, Any]:
     repo_points = [point for point in normalized_backup_points() if str(point.get("repository_id") or "") == record_id]
     if repo_points:
         raise api_error(409, "repository_has_backups", "Repository cannot be removed while backup chains still reference it", restore_point_count=len(repo_points))
+    from python.srv.services.default_repository import remove_managed_share
+
+    remove_managed_share(repository)
     delete_repository(record_id)
     return {"id": str(repository.get("id") or record_id), "removed": True}
 

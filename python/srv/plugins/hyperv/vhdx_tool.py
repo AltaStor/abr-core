@@ -24,10 +24,12 @@ import hashlib
 import json
 import os
 import re
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from ...core.credential_encryption import decrypt_secret, is_encrypted
 from ...core.storage_tool import APP_ROOT, REPO_ROOT, RETENTION_TILL_OPTION, disk_tool_storage_args, is_s3_repository
 
 TOOL_NAME = "abr-vhdx-tool.exe"
@@ -169,6 +171,26 @@ def windows_share(repository: dict[str, Any] | None) -> str | None:
     return f"\\\\{server}\\{share}"
 
 
+def appliance_address_toward(host: str) -> str:
+    try:
+        family, kind, proto, _name, address = socket.getaddrinfo(host, 445, type=socket.SOCK_DGRAM)[0]
+        with socket.socket(family, kind, proto) as probe:
+            probe.connect(address)
+            return str(probe.getsockname()[0])
+    except OSError as exc:
+        raise VhdxToolError(
+            f"This appliance has no route to Hyper-V host {host}, so it cannot tell the host where its share is: {exc}"
+        ) from exc
+
+
+def for_hyperv_host(repository: dict[str, Any] | None, host: str) -> dict[str, Any] | None:
+    metadata = repository.get("metadata") if isinstance(repository, dict) and isinstance(repository.get("metadata"), dict) else {}
+    if not metadata.get("support_hyperv"):
+        return repository
+    address = appliance_address_toward(host)
+    return {**repository, "server": address, "metadata": {**metadata, "server": address}}
+
+
 def ensure_hyperv_repository(repository: dict[str, Any] | None) -> None:
     if not is_s3_repository(repository) and windows_share(repository) is None:
         raise VhdxToolError(HYPERV_REPOSITORY_MESSAGE)
@@ -198,8 +220,14 @@ def _share_invocation(
     env = {"ABR_SMB_SHARE": f"\\\\{server}\\{share_name}"}
     username = _repository_field(repository, "username").strip()
     if username:
+        password = decrypt_secret(_repository_field(repository, "password"))
+        if is_encrypted(password):
+            raise VhdxToolError(
+                f"The stored password of the share of repository {repository.get('name')} cannot be decrypted with "
+                "this appliance's credential key"
+            )
         env["ABR_SMB_USER"] = username
-        env["ABR_SMB_PASSWORD"] = _repository_field(repository, "password")
+        env["ABR_SMB_PASSWORD"] = password
     return args, env
 
 

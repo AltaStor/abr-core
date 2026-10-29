@@ -74,7 +74,7 @@ from .core.mongo_db_wrapper import (
     load_tasks,
     load_users,
 )
-from .services import auth_service, backup_catalog, clock_guard, tls_certificate_service
+from .services import auth_service, backup_catalog, clock_guard, default_repository, tls_certificate_service
 from .services.abr_v41 import PRODUCT_NAME, product_version
 from .core.server_defaults import env_int
 from .core.task_pool import TaskProcessPool
@@ -304,6 +304,11 @@ async def lifespan(_: FastAPI):
         )
 
         auth_service.bootstrap_admin_if_needed()
+
+        try:
+            default_repository.create_default_repository_at_startup()
+        except Exception:
+            logger.exception("Could not check the default repository; continuing startup.")
 
         try:
             clock_guard.load()

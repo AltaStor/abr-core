@@ -336,6 +336,7 @@ def run_hyperv_backup(
 
     repository = _resolve_repository(task)
     try:
+        repository = vhdx_tool.for_hyperv_host(repository, connection["host"])
         vhdx_tool.ensure_hyperv_repository(repository)
     except vhdx_tool.VhdxToolError as exc:
         raise HyperVBackupError(str(exc)) from exc
