@@ -20,6 +20,7 @@ from ..progress_watch import run_with_elapsed_indicator
 from .base import CommandDependencies
 
 IMMUTABILITY_MODES = ("none", "governance", "compliance")
+DEFAULT_REPOSITORY_TIMEOUT_SECONDS = 300
 IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS = 21600
 STORAGE_VALIDATION_TIMEOUT_SECONDS = 900
 
@@ -315,6 +316,39 @@ class RepositoryCommands:
         )
         add.set_defaults(handler=self.create)
 
+        default = commands.add_parser(
+            "default",
+            help="Create the Default Repo when it is missing, and turn its Hyper-V share on or off.",
+            description=(
+                "Create the Default Repo when it is missing, and turn its Hyper-V share on or off.\n\n"
+                "The Default Repo is a local repository the server keeps in /var/lib/altastor-backup/repository "
+                "(ABR_DEFAULT_REPOSITORY_PATH). Without an option the command creates it when it is missing and "
+                "otherwise only reports it. --support-hyperv shares its folder with Hyper-V hosts through a hidden "
+                "SMB share and an account the server generates, whose password is kept encrypted and never shown; "
+                "--no-support-hyperv removes the share and the account and keeps the backups.\n\n"
+                "Examples:\n"
+                "  abr repo default\n"
+                "  abr repo default --support-hyperv\n"
+                "  abr repo default --no-support-hyperv"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        hyperv = default.add_mutually_exclusive_group()
+        hyperv.add_argument(
+            "--support-hyperv",
+            dest="support_hyperv",
+            action="store_true",
+            default=None,
+            help="Share the Default Repo with Hyper-V hosts (creates it first when it is missing)",
+        )
+        hyperv.add_argument(
+            "--no-support-hyperv",
+            dest="support_hyperv",
+            action="store_false",
+            help="Remove the Hyper-V share and its account; the backups stay",
+        )
+        default.set_defaults(handler=self.default)
+
         list_parser = commands.add_parser(
             "list",
             help="List backup repositories.",
@@ -521,6 +555,45 @@ class RepositoryCommands:
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("path", "PATH"), ("status", "STATUS")])
         _print_repository_warnings(result)
         _print_immutability_effect(result)
+        return 0
+
+    def default(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        payload = {} if args.support_hyperv is None else {"support_hyperv": args.support_hyperv}
+        result = deps.context.api_client.post(
+            "api/v1/repositories/default", json=payload, timeout=DEFAULT_REPOSITORY_TIMEOUT_SECONDS
+        )
+        repository = result.get("repository") if isinstance(result.get("repository"), dict) else {}
+        hyperv = bool(repository.get("support_hyperv"))
+        summary = {
+            "id": repository.get("id"),
+            "name": repository.get("name"),
+            "path": repository.get("path"),
+            "status": repository.get("status"),
+            "support_hyperv": hyperv,
+            "share": repository.get("share") if hyperv else None,
+            "share_user": repository.get("username") if hyperv else None,
+            "created": bool(result.get("created")),
+            "changed": bool(result.get("changed")),
+        }
+        deps.context.print_output(
+            summary,
+            [
+                ("name", "NAME"),
+                ("path", "PATH"),
+                ("support_hyperv", "HYPER-V"),
+                ("share", "SHARE"),
+                ("share_user", "SHARE USER"),
+                ("status", "STATUS"),
+            ],
+        )
+        if summary["created"]:
+            print(f"Created {summary['name']}.", file=sys.stderr)
+        elif not summary["changed"]:
+            print(f"{summary['name']} already exists; nothing changed.", file=sys.stderr)
+        if summary["changed"]:
+            state = "on" if hyperv else "off"
+            print(f"Hyper-V support of {summary['name']} turned {state}.", file=sys.stderr)
         return 0
 
     def list(self, args: argparse.Namespace) -> int:

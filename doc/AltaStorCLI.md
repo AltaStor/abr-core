@@ -321,6 +321,12 @@ lock under job, and a 7-day lock under minimum.
 
 The period runs from each backup's own creation, and stored restore points keep the lock they were written with - repo apply-immutability puts them under the current setting. Retention can be lengthened, never shortened or removed. An --immutability-days longer than the job's --retention-days locks data past the point the job still needs it and is paid for either way; repo add/edit warn when that happens. 
 
+abr repo default 
+
+Description: Create the Default Repo when it is missing, and turn its Hyper-V share on or off. The Default Repo is the local repository the server keeps in /var/lib/altastor-backup/repository (ABR_DEFAULT_REPOSITORY_PATH) and also creates at startup. Without an option the command creates it when it is missing and otherwise reports it without changing anything. --support-hyperv (creating it first when needed) shares its folder with Hyper-V hosts through a hidden SMB share (abr-xxxxxxxx$) open only to an account the server generates; the account's password is kept encrypted and is never printed. --no-support-hyperv removes the share and the account and keeps the backups. The output shows the path, whether Hyper-V support is on, and the share and its account when it is. Turning the share on needs Samba and the root helper the altastor-backup-server package installs; when either is missing, or the folder cannot be created, the command prints the server's reason and exits non-zero. 
+
+abr repo default [--support-hyperv | --no-support-hyperv] [--output json] 
+
 abr repo list 
 
 Description: Show all configured repositories. 
