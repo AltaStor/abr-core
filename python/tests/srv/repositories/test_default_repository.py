@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from python.srv.backup_server import app
 from python.srv.core import credential_encryption
-from python.srv.core.mongo_db_wrapper import REPOSITORIES, SESSIONS, USERS
+from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, SESSIONS, USERS
 from python.srv.plugins.hyperv import vhdx_tool
 from python.srv.services import abr_v41, auth_service, default_repository
 from python.srv.services.api_errors import ApiError
@@ -301,6 +301,36 @@ class HyperVSwitchTests(_HyperVCase):
         self.assertEqual(self._stored()["type"], "local")
         self.assertTrue(all(self._stored()["metadata"][field] is None for field in default_repository.SHARE_FIELDS))
         self.assertFalse(repository["support_hyperv"])
+
+    def _job_on_the_default_repo(self, name: str, kind: str) -> None:
+        for store in (HYPERVISORS, JOBS):
+            self.addCleanup(store.clear)
+        inventory_id = f"inv-{kind}"
+        HYPERVISORS[inventory_id] = {"id": inventory_id, "name": kind, "type": kind}
+        JOBS[name] = {"id": name, "name": name, "job_type": "backup", "inventory_id": inventory_id, "repo_id": self.repository["id"]}
+
+    def test_turning_it_off_is_refused_while_hyperv_jobs_back_up_into_it(self) -> None:
+        default_repository.set_hyperv_support(True)
+        self._job_on_the_default_repo("hv-nightly", "hyper-v")
+        calls = len(self.helper.calls)
+
+        with self.assertRaises(ApiError) as caught:
+            default_repository.set_hyperv_support(False)
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(caught.exception.code, "default_repository_used_by_hyperv_jobs")
+        self.assertIn("hv-nightly", caught.exception.message)
+        self.assertEqual(len(self.helper.calls), calls)
+        self.assertEqual(self._stored()["type"], "smb")
+
+    def test_vcenter_jobs_on_it_do_not_keep_the_share_on(self) -> None:
+        default_repository.set_hyperv_support(True)
+        self._job_on_the_default_repo("vc-nightly", "vsphere")
+
+        _repository, changed = default_repository.set_hyperv_support(False)
+
+        self.assertTrue(changed)
+        self.assertEqual(self._stored()["type"], "local")
 
     def test_turning_it_off_when_it_is_off_runs_nothing(self) -> None:
         _repository, changed = default_repository.set_hyperv_support(False)

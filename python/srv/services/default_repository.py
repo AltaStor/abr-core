@@ -18,6 +18,7 @@ from python.srv.core.credential_encryption import (
     encrypt_secret,
 )
 from python.srv.core.mongo_db_wrapper import (
+    JOBS,
     REPOSITORIES,
     catalog_records,
     get_database,
@@ -285,8 +286,28 @@ def set_hyperv_support(enabled: bool) -> tuple[dict[str, Any], bool]:
             raise api_error(404, "default_repository_missing", f"There is no {DEFAULT_REPOSITORY_NAME} to change")
         if bool(_share_metadata(record).get(HYPERV_MARK)) == enabled:
             return abr_v41.normalize_repository_record(record), False
+        if not enabled:
+            _refuse_while_hyperv_jobs_use(record)
         updated = _enable_hyperv(record) if enabled else _disable_hyperv(record)
         return abr_v41.normalize_repository_record(updated), True
+
+
+def _refuse_while_hyperv_jobs_use(record: dict[str, Any]) -> None:
+    repository_id = str(record.get("id") or "")
+    jobs = sorted(
+        str(job.get("name") or job.get("id"))
+        for job in catalog_records(JOBS)
+        if str(job.get("repo_id") or "") == repository_id and abr_v41._inventory_is_hyperv(job.get("inventory_id"))
+    )
+    if jobs:
+        raise api_error(
+            409,
+            "default_repository_used_by_hyperv_jobs",
+            f"Hyper-V job(s) {', '.join(jobs)} back up into the {DEFAULT_REPOSITORY_NAME}, and their hosts reach it only "
+            f"through its share. Move them to an S3 or SMB repository (abr job edit --repository), or delete them, then "
+            f"turn Hyper-V support off",
+            jobs=jobs,
+        )
 
 
 def refuse_managed_share_edit(record: dict[str, Any], payload: dict[str, Any]) -> None:

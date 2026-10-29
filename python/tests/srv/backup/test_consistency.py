@@ -106,7 +106,7 @@ class QuiesceFailureOptionTests(_Stores):
             self.addCleanup(patcher.stop)
 
     def _job(self, **task_parameters: object) -> dict:
-        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Repo One", "type": "local", "path": "/tmp/repo-1"}
+        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Repo One", "type": "smb", "metadata": {"server": "nas.example", "share": "backups"}, "path": "/tmp/repo-1"}
         inventory = abr_v41.create_inventory_record(
             {"name": "hv", "type": "hyper-v", "address": "192.168.10.10", "username": "administrator", "password": "secret"}
         )

@@ -499,7 +499,7 @@ class AbrV41EngineTests(unittest.TestCase):
         RESOURCES_BY_HV.clear()
         TASKS.clear()
         BACKUPS.clear()
-        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Repo", "type": "local", "path": "/tmp", "metadata": {"supports_synthetic_full": True}}
+        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Repo", "type": "smb", "path": "/tmp", "metadata": {"supports_synthetic_full": True, "server": "nas.example", "share": "backups"}}
         REPOSITORIES["repo-2"] = {"id": "repo-2", "name": "NoSynth", "type": "nfs", "path": "host:/export", "metadata": {"supports_synthetic_full": False}}
 
     def _job(self, **overrides):

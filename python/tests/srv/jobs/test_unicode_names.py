@@ -66,7 +66,7 @@ class UnicodeJobNameServiceLayerTests(unittest.TestCase):
         REPOSITORIES.clear()
         RESOURCES_BY_HV.clear()
         TASKS.clear()
-        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Repo One", "type": "local", "path": "/tmp/repo-1"}
+        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Repo One", "type": "smb", "metadata": {"server": "nas.example", "share": "backups"}, "path": "/tmp/repo-1"}
         self.inventory = abr_v41.create_inventory_record(
             {
                 "name": "vcenter-main",

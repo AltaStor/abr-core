@@ -93,7 +93,7 @@ class JobFieldTests(_Api):
         registrable = patch.object(abr_v41, "assert_inventory_registrable", return_value={})
         registrable.start()
         self.addCleanup(registrable.stop)
-        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Repo One", "type": "local", "path": "/tmp/repo-1"}
+        REPOSITORIES["repo-1"] = {"id": "repo-1", "name": "Repo One", "type": "smb", "metadata": {"server": "nas.example", "share": "backups"}, "path": "/tmp/repo-1"}
         self.inventory = abr_v41.create_inventory_record(
             {"name": "hv", "type": "hyper-v", "address": "192.168.10.10", "username": "administrator", "password": "secret"}
         )

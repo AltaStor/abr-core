@@ -119,6 +119,7 @@ from python.srv.services.inventory_management import (
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
+from python.srv.plugins.hyperv.vhdx_tool import VhdxToolError, ensure_hyperv_repository
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
 
 from .api_errors import ApiError, api_error
@@ -1310,6 +1311,30 @@ def _resource_label(resource: dict[str, Any] | None, fallback: str | None = None
 def _inventory_is_hyperv(inventory_id: Any) -> bool:
     record = HYPERVISORS.get(str(inventory_id or ""))
     return isinstance(record, dict) and inventory_type_from_record(record) == "hyper-v"
+
+
+def _ensure_hyperv_reaches_repository(inventory_id: Any, repository: dict[str, Any]) -> None:
+    if not _inventory_is_hyperv(inventory_id):
+        return
+    stored = REPOSITORIES.get(str(repository.get("id") or "")) or repository
+    try:
+        ensure_hyperv_repository(stored)
+    except VhdxToolError:
+        metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
+        switch = (
+            ", or turn on the Hyper-V switch of the Default Repo (abr repo default --support-hyperv)"
+            if metadata.get("default_repository")
+            else ""
+        )
+        raise api_error(
+            422,
+            "hyperv_repository_unreachable",
+            f"Hyper-V VMs need an S3 or SMB repository: abr-vhdx-tool writes their disks from the Hyper-V host, "
+            f"which cannot reach {repository.get('name')}, a folder of this appliance. Use an S3 repository, or an "
+            f"SMB repository (abr repo add --type smb --path --server --share){switch}",
+            repository=repository.get("name"),
+            repository_id=repository.get("id"),
+        ) from None
 
 
 def _hyperv_vm_parts(
@@ -4679,6 +4704,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
             vm_tokens=tokens,
         )
         inventory = candidate_inventories[0]
+    _ensure_hyperv_reaches_repository(inventory["id"], repository)
     vm_ids, vm_names = _resolve_vm_selection(str(inventory["id"]), tokens, auto_discover=True)
     _ensure_unique_vms(vm_ids, vm_names)
     job = {
@@ -4966,6 +4992,8 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             updated["vm_names"] = vm_names
             updated["vm_reassignments"] = []
             changed = True
+        if any(key in payload for key in ("repo", "repo_id", "inventory", "inventory_id")):
+            _ensure_hyperv_reaches_repository(updated["inventory_id"], resolve_repository(record_id=updated["repo_id"]))
     else:
         if "repo" in payload or "repo_id" in payload:
             repository = resolve_repository(name=payload.get("repo"), record_id=payload.get("repo_id"))
@@ -9374,6 +9402,7 @@ def start_job_record(
             "A target repository is only used by a synthetic full",
         )
         target_repository = _find_by_id(catalog_records(REPOSITORIES), target_repository_id, label="Repository")
+        _ensure_hyperv_reaches_repository(job.get("inventory_id"), target_repository)
         _ensure(
             repository_supports_synthetic(normalize_repository_record(target_repository)),
             422,
