@@ -427,13 +427,15 @@ def login(
     }
 
 
-def whoami(user_id: str) -> dict[str, Any]:
+def whoami(user_id: str, token: str | None = None) -> dict[str, Any]:
     user = _user_or_404(user_id)
     role = rbac.get_role(rbac.role_id_of(user))
+    session = get_session(token) if token else None
     return {
         "user": _public_user(user),
         "role": rbac.role_to_dto(role, with_permissions=False) if role else None,
         "permissions": rbac.allowed_functions(role.id if role else None),
+        **(_session_expiry(session) if session else {}),
     }
 
 

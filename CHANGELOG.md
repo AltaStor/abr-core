@@ -50,6 +50,11 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   in `PATCH /api/v1/users/{id}`: an Administrator renames a user, who keeps
   their password, or gives them a new password, which ends their sessions.
 - Hyper-V job option `--guest-consistency`.
+- `GET /api/v1/auth/me` reports the session's `expires_at` and
+  `absolute_expires_at`; sent with `X-ABR-Refresh` it renews nothing, so the
+  Web UI reads the expiry without moving it.
+- `GET /api/v1/system/clock` and `/system/info` report the server's time zone
+  (`timezone`, `utc_offset`).
 - `abr job retention [--dry-run]` and `POST /api/v1/jobs/{id}/retention`
   apply (or preview) a job's retention across all of its chains and report,
   per chain, what was removed, what Object Lock still holds and what could not
@@ -71,6 +76,10 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
 
 ### Enhanced
 
+- A schedule's `timezone` in the job DTO is the zone it actually runs on: the
+  server's zone for one saved without a zone or with an abbreviation of the
+  server's zone, and UTC for a name the server does not know, instead of the
+  stored name. The API reference describes it.
 - Retention no longer tries to delete a restore point still under S3 Object
   Lock: it is reported as held, with the older points it depends on, instead
   of as a failure. Deleting a chain goes newest point first and stops at the

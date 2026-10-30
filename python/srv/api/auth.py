@@ -66,8 +66,10 @@ def touch_session(session: dict = Depends(require_session)) -> ExtendSessionResu
 
 
 def whoami(session: dict = Depends(require_session)) -> WhoAmIResult:
-    """The signed-in user, their role, and the function IDs that role allows."""
-    return auth_service.whoami(session["user_id"])
+    """The signed-in user, their role, the function IDs that role allows, and when the session ends.
+
+    Sent with X-ABR-Refresh it does not renew the session, so a client can read the expiry without moving it."""
+    return auth_service.whoami(session["user_id"], session["token"])
 
 
 register(router, [

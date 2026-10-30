@@ -450,6 +450,20 @@ class SessionTouchTests(InactivityTimeoutTests):
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
 
 
+class SessionExpiryReadTests(InactivityTimeoutTests):
+    def test_a_background_whoami_reports_the_end_without_moving_it(self) -> None:
+        token = self._login(client_type="web", duration_seconds=600).json()["token"]
+        before = self._expires_at(token)
+        self.now += timedelta(seconds=200)
+
+        response = self.client.get("/api/v1/auth/me", headers={**self._auth_headers(token), "X-ABR-Refresh": "1"})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(datetime.fromisoformat(response.json()["expires_at"]), before)
+        self.assertEqual(response.json()["absolute_expires_at"], SESSIONS[session_key(token)]["absolute_expires_at"])
+        self.assertEqual(self._expires_at(token), before)
+
+
 class SessionDurationChangeTests(InactivityTimeoutTests):
     def _put(self, token: str, duration: object):
         return self.client.put(

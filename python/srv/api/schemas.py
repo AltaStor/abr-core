@@ -45,7 +45,16 @@ class ScheduleDTO(_LenientModel):
     every: DocStr = None
     interval_minutes: DocInt = None
     enabled: DocBool = None
-    timezone: DocStr = None
+    timezone: DocStr = Field(
+        default=None,
+        description="IANA zone the schedule's time (or cron expression) is read in; never empty: the zone it "
+        "actually runs on, which is the server's zone for a schedule saved without one or with an abbreviation "
+        "of the server's zone (EDT), and UTC for a name the server does not know",
+    )
+
+
+SERVER_TIMEZONE = "The server's own time zone (IANA name), set on its operating system; read-only"
+SERVER_UTC_OFFSET = "The server zone's current offset from UTC, +HH:MM or -HH:MM"
 
 
 class GfsDTO(_LenientModel):
@@ -182,6 +191,8 @@ class SystemClockDTO(_LenientModel):
     confirmed_by: DocStrOrNull = None
     message: DocStrOrNull = None
     was_blocked: DocBool = None
+    timezone: DocStr = Field(default=None, description=SERVER_TIMEZONE)
+    utc_offset: DocStr = Field(default=None, description=SERVER_UTC_OFFSET)
 
 
 class SystemCountsDTO(_LenientModel):
@@ -776,7 +787,11 @@ class ScheduleRequest(_LenientModel):
     every: LaxStr | None = Field(default=None, description="Periodic schedules: 15m, 1h, 6h, 1d and the like; or interval_minutes")
     interval_minutes: LaxInt = Field(default=None, description="Periodic schedules: the interval in minutes; or every")
     expression: LaxStr | None = None
-    timezone: LaxStr | None = Field(default=None, description="IANA time zone such as Europe/Kyiv or UTC; null or omitted, the server's own")
+    timezone: LaxStr | None = Field(
+        default=None,
+        description="IANA time zone such as Europe/Kyiv or UTC; null, empty or omitted, the server's own; a name the "
+        "server does not know is refused (422 invalid_job)",
+    )
     enabled: LaxBool | None = Field(default=None, description="false keeps the schedule without running it; true, null or omitted runs it")
 
 
@@ -1226,6 +1241,8 @@ class SystemInfoDTO(_LenientModel):
     uptime_sec: DocNum = None
     cpu_cores: DocInt = None
     memory_gb: DocNum = None
+    timezone: DocStr = Field(default=None, description=SERVER_TIMEZONE)
+    utc_offset: DocStr = Field(default=None, description=SERVER_UTC_OFFSET)
 
 
 
@@ -1573,6 +1590,8 @@ class WhoAmIResult(_LenientModel):
     user: PublicUserDTO | DocObject = None
     role: RoleSummaryDTO | None = None
     permissions: DocStrArray = None
+    expires_at: DocStr = Field(default=None, description=SESSION_EXPIRES_AT)
+    absolute_expires_at: DocStrOrNull = Field(default=None, description=SESSION_ABSOLUTE_EXPIRES_AT)
 
 
 class RolePermissionDTO(_LenientModel):
