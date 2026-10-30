@@ -22,10 +22,12 @@ from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...core.storage_tool import (
     StorageToolError,
     apply_repository_immutability,
+    chain_retention_till,
     default_disk_tool_path,
     describe_bytes,
     disk_tool_immutability_args,
     disk_tool_storage_args,
+    disk_tool_supports_retention_till,
     ensure_private_directory,
     extract_s3_config,
     filesystem_free_bytes,
@@ -195,7 +197,11 @@ def _resolve_repository(task: dict[str, Any]) -> dict[str, Any] | None:
         plan = _resolve_immutability_plan(task, repository)
         if int(plan.get("lock_days") or 0) < 1:
             return repository
-        return with_immutability_retention_days(repository, int(plan["lock_days"]))
+        return with_immutability_retention_days(
+            repository,
+            int(plan["lock_days"]),
+            retention_till=chain_retention_till(repository, plan.get("expires_at")),
+        )
     return None
 
 
@@ -996,7 +1002,9 @@ def _build_backup_command(
         *disk_tool_storage_args(
             repository, abr_path=abr_path, create_folder=not is_s3_repository(repository)
         ),
-        *disk_tool_immutability_args(repository),
+        *disk_tool_immutability_args(
+            repository, takes_retention_till=lambda: disk_tool_supports_retention_till(tool_path)
+        ),
         "--compression",
         str(compression_level),
     ]

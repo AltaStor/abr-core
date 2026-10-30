@@ -19,6 +19,8 @@ from python.srv.core.storage_tool import (
     filesystem_free_bytes,
     remove_disk_tool_backup,
     apply_repository_immutability,
+    chain_retention_till,
+    chain_source_names,
     copy_disk_tool_chain,
     disk_tool_storage_args,
     ensure_private_directory,
@@ -64,28 +66,6 @@ def _disk_identity(disk: dict[str, Any], position: int) -> str:
 def _artifact_disks(point: dict[str, Any]) -> list[dict[str, Any]]:
     artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
     return [disk for disk in artifact.get("disks", []) if isinstance(disk, dict)]
-
-
-def _common_prefix(paths: list[str]) -> str:
-    if not paths:
-        return ""
-    absolute = all(path.startswith("/") for path in paths)
-    split = [path.strip("/").split("/") for path in paths]
-    common: list[str] = []
-    for segments in zip(*split):
-        if len(set(segments)) != 1:
-            break
-        common.append(segments[0])
-    joined = "/".join(common)
-    return f"/{joined}" if absolute and joined else joined
-
-
-def _relative_to(path: str, prefix: str) -> str:
-    stripped = path.strip("/")
-    base = prefix.strip("/")
-    if base and stripped.startswith(base):
-        stripped = stripped[len(base):]
-    return stripped.strip("/")
 
 
 def resolve_source_chain(job_id: str, vm_id: str, repository_id: str | None) -> list[dict[str, Any]]:
@@ -154,11 +134,7 @@ def build_disk_merges(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
             raise SyntheticFullValidationError(
                 f"Disk {identity} is missing stored backup locations, so its chain cannot be merged"
             )
-        source_path = _common_prefix(paths)
-        qualified: list[str] = []
-        for path, name in zip(paths, names):
-            relative = _relative_to(path, source_path)
-            qualified.append(f"{relative}/{name}" if relative else name)
+        source_path, qualified = chain_source_names(paths, names)
         merges.append(
             {
                 "identity": identity,
@@ -286,6 +262,7 @@ def _write_synthetic_manifest(
     destination_path: str | None,
     payload: dict[str, Any],
     retention_days: int | None = None,
+    retention_till: str | None = None,
 ) -> Path:
     manifest_path = task_root / "manifest.json"
     try:
@@ -310,7 +287,12 @@ def _write_synthetic_manifest(
             timeout=60,
         )
         apply_repository_immutability(
-            repository, destination_path, "manifest", retention_days=retention_days, timeout=120
+            repository,
+            destination_path,
+            "manifest",
+            retention_days=retention_days,
+            retention_till=retention_till,
+            timeout=120,
         )
     except StorageToolError:
         logger.debug("Ignoring manifest metadata mirror failure for %s", manifest_path, exc_info=True)
@@ -410,6 +392,7 @@ def run_synthetic_full(
     timeout_seconds = _resolve_tool_timeout_seconds(parameters)
     job = JOBS.get(job_id) if job_id else None
     retention_days = None
+    retention_till = None
     generation: dict[str, Any] | None = None
     if is_s3_repository(repository):
         immutability = extract_s3_config(repository).get("immutability") or {}
@@ -431,6 +414,7 @@ def run_synthetic_full(
                 ),
             )
             retention_days = int(generation["lock_days"])
+            retention_till = chain_retention_till(repository, generation.get("expires_at"))
 
     total = len(merges)
     disk_outputs: list[dict[str, Any]] = []
@@ -480,6 +464,7 @@ def run_synthetic_full(
                 encryption_key=encryption_key,
                 source_encryption_key=encryption_key,
                 retention_days=retention_days,
+                retention_till=retention_till,
                 timeout=timeout_seconds,
                 on_progress=_on_progress,
                 should_cancel=lambda: cancel_requested(task_id),
@@ -577,7 +562,12 @@ def run_synthetic_full(
         }
     )
     manifest_path = _write_synthetic_manifest(
-        repository, task_root, destination_path, manifest_payload, retention_days=retention_days
+        repository,
+        task_root,
+        destination_path,
+        manifest_payload,
+        retention_days=retention_days,
+        retention_till=retention_till,
     )
     try:
         make_durable(task_root, up_to=destination_root)

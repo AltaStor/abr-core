@@ -70,6 +70,8 @@ from python.srv.core.storage_tool import (
     StorageToolError,
     apply_repository_immutability,
     build_s3_location,
+    chain_retention_till,
+    disk_tool_supports_retention_till,
     condense_disk_tool_message,
     extract_s3_config,
     hydrate_manifest_via_disk_tool,
@@ -114,9 +116,10 @@ from python.srv.services.inventory_management import (
     inventory_type_from_record,
     normalize_inventory_type,
 )
-from python.srv.services.backup_mode import object_lock_actual_retention_days
+from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
+from python.srv.plugins.hyperv.vhdx_tool import VhdxToolError, ensure_hyperv_repository
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
 
 from .api_errors import ApiError, api_error
@@ -1310,6 +1313,30 @@ def _inventory_is_hyperv(inventory_id: Any) -> bool:
     return isinstance(record, dict) and inventory_type_from_record(record) == "hyper-v"
 
 
+def _ensure_hyperv_reaches_repository(inventory_id: Any, repository: dict[str, Any]) -> None:
+    if not _inventory_is_hyperv(inventory_id):
+        return
+    stored = REPOSITORIES.get(str(repository.get("id") or "")) or repository
+    try:
+        ensure_hyperv_repository(stored)
+    except VhdxToolError:
+        metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
+        switch = (
+            ", or turn on the Hyper-V switch of the Default Repo (abr repo default --support-hyperv)"
+            if metadata.get("default_repository")
+            else ""
+        )
+        raise api_error(
+            422,
+            "hyperv_repository_unreachable",
+            f"Hyper-V VMs need an S3 or SMB repository: abr-vhdx-tool writes their disks from the Hyper-V host, "
+            f"which cannot reach {repository.get('name')}, a folder of this appliance. Use an S3 repository, or an "
+            f"SMB repository (abr repo add --type smb --path --server --share){switch}",
+            repository=repository.get("name"),
+            repository_id=repository.get("id"),
+        ) from None
+
+
 def _hyperv_vm_parts(
     resources: list[dict[str, Any]],
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
@@ -2074,6 +2101,8 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         item["username"] = metadata.get("username")
     if metadata.get("description") is not None:
         item["description"] = metadata.get("description")
+    item["default"] = bool(metadata.get("default_repository"))
+    item["support_hyperv"] = bool(metadata.get("support_hyperv"))
     if repo_type == "s3":
         s3_config = sanitize_s3_config(extract_s3_config(item))
         item["s3"] = s3_config
@@ -2537,7 +2566,7 @@ def _ensure_appliance_folder(repo_type: str, path: str) -> None:
     )
 
 
-def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
+def create_repository_record(payload: dict[str, Any], *, metadata_flags: dict[str, Any] | None = None) -> dict[str, Any]:
     name = str(payload.get("name") or "")
     repo_type = str(payload.get("type") or "").strip().lower()
     path = str(payload.get("path") or "").strip() or None
@@ -2637,6 +2666,7 @@ def create_repository_record(payload: dict[str, Any]) -> dict[str, Any]:
                 "description": description,
                 "address": path,
                 "last_scan_at": None,
+                **(metadata_flags or {}),
             }
         ),
     }
@@ -2683,6 +2713,9 @@ def _reject_storage_location_change_if_repository_has_backups(
 
 def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     record = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    from python.srv.services.default_repository import refuse_managed_share_edit
+
+    refuse_managed_share_edit(record, payload)
     original_path = str(record.get("path") or "")
     _validate_text_fields(payload, REPOSITORY_TEXT_FIELDS, code="invalid_repository")
     updated = _json_clone(record)
@@ -3500,6 +3533,15 @@ def _restore_point_abr_targets(point: dict[str, Any]) -> list[tuple[str, str]]:
     return targets
 
 
+def _lock_end_held(asked: str, results: list[dict[str, Any] | None]) -> str:
+    floor = _parse_dt(asked)
+    ends = [
+        max(_parse_dt(result["held_until"]), floor) if isinstance(result, dict) and result.get("relocked") else floor
+        for result in results
+    ]
+    return min(ends or [floor]).isoformat()
+
+
 def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_ids: set[str] | None = None) -> dict[str, Any]:
     target = _parse_dt(expires_at)
     remaining_days = max(int(-(-(target - _now_utc()).total_seconds() // 86400)), 1)
@@ -3520,14 +3562,18 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
         if stored_expiry and _parse_dt(stored_expiry) >= target:
             continue
         point_failed = False
+        results: list[dict[str, Any] | None] = []
         for abr_path, backup_name in _restore_point_abr_targets(point):
             try:
-                apply_repository_immutability(
-                    repository,
-                    abr_path,
-                    backup_name,
-                    retention_days=remaining_days,
-                    timeout=_s3_immutability_probe_timeout(),
+                results.append(
+                    apply_repository_immutability(
+                        repository,
+                        abr_path,
+                        backup_name,
+                        retention_days=remaining_days,
+                        retention_till=chain_retention_till(repository, expires_at),
+                        timeout=_s3_immutability_probe_timeout(),
+                    )
                 )
             except StorageToolError as exc:
                 point_failed = True
@@ -3543,7 +3589,7 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
         stored = BACKUPS.get(str(point.get("id") or ""))
         if isinstance(stored, dict):
             stored = dict(stored)
-            stored["immutability_expires_at"] = expires_at
+            stored["immutability_expires_at"] = _lock_end_held(expires_at, results)
             persist_backup(stored)
         extended.append(str(point.get("id") or ""))
 
@@ -3576,19 +3622,39 @@ def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
     failures: list[dict[str, Any]] = []
     applied_days: set[int] = set()
     attempted_days: set[int] = set()
+    started_at = _now_utc()
+    holds_chain_dates = config["retention_scope"] == "job_retention" and disk_tool_supports_retention_till()
+    chain_dates: dict[str, datetime | None] = {}
     for point in points:
         point_failed = False
-        job = JOBS.get(str(point.get("job_id") or ""))
+        job_id = str(point.get("job_id") or "")
+        job = JOBS.get(job_id)
         actual_days = repository_actual_retention_days(job if isinstance(job, dict) else None, config)
         attempted_days.add(actual_days)
+        if holds_chain_dates and job_id not in chain_dates:
+            chain_dates[job_id] = object_lock_expiry(
+                job if isinstance(job, dict) else None,
+                config,
+                block_generation_days=s3_block_generation_days(),
+                now=started_at,
+            )
+        chain_date = chain_dates.get(job_id)
+        stored_expiry = str(point.get("immutability_expires_at") or "").strip()
+        if chain_date and stored_expiry and _parse_dt(stored_expiry) > chain_date:
+            chain_date = _parse_dt(stored_expiry)
+        retention_till = chain_retention_till(repository, chain_date.isoformat()) if chain_date else None
+        results: list[dict[str, Any] | None] = []
         for abr_path, backup_name in _restore_point_abr_targets(point):
             try:
-                apply_repository_immutability(
-                    repository,
-                    abr_path,
-                    backup_name,
-                    retention_days=actual_days,
-                    timeout=_s3_immutability_probe_timeout(),
+                results.append(
+                    apply_repository_immutability(
+                        repository,
+                        abr_path,
+                        backup_name,
+                        retention_days=actual_days,
+                        retention_till=retention_till,
+                        timeout=_s3_immutability_probe_timeout(),
+                    )
                 )
             except StorageToolError as exc:
                 point_failed = True
@@ -3605,7 +3671,10 @@ def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
             stored = BACKUPS.get(str(point.get("id") or ""))
             if isinstance(stored, dict) and actual_days > 0:
                 stored = dict(stored)
-                stored["immutability_expires_at"] = (_now_utc() + timedelta(days=actual_days)).isoformat()
+                stored["immutability_expires_at"] = _lock_end_held(
+                    chain_date.isoformat() if retention_till else (_now_utc() + timedelta(days=actual_days)).isoformat(),
+                    results,
+                )
                 persist_backup(stored)
 
     result = {
@@ -3826,6 +3895,9 @@ def remove_repository_record(record_id: str) -> dict[str, Any]:
     repo_points = [point for point in normalized_backup_points() if str(point.get("repository_id") or "") == record_id]
     if repo_points:
         raise api_error(409, "repository_has_backups", "Repository cannot be removed while backup chains still reference it", restore_point_count=len(repo_points))
+    from python.srv.services.default_repository import remove_managed_share
+
+    remove_managed_share(repository)
     delete_repository(record_id)
     return {"id": str(repository.get("id") or record_id), "removed": True}
 
@@ -4632,6 +4704,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
             vm_tokens=tokens,
         )
         inventory = candidate_inventories[0]
+    _ensure_hyperv_reaches_repository(inventory["id"], repository)
     vm_ids, vm_names = _resolve_vm_selection(str(inventory["id"]), tokens, auto_discover=True)
     _ensure_unique_vms(vm_ids, vm_names)
     job = {
@@ -4919,6 +4992,8 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             updated["vm_names"] = vm_names
             updated["vm_reassignments"] = []
             changed = True
+        if any(key in payload for key in ("repo", "repo_id", "inventory", "inventory_id")):
+            _ensure_hyperv_reaches_repository(updated["inventory_id"], resolve_repository(record_id=updated["repo_id"]))
     else:
         if "repo" in payload or "repo_id" in payload:
             repository = resolve_repository(name=payload.get("repo"), record_id=payload.get("repo_id"))
@@ -9327,6 +9402,7 @@ def start_job_record(
             "A target repository is only used by a synthetic full",
         )
         target_repository = _find_by_id(catalog_records(REPOSITORIES), target_repository_id, label="Repository")
+        _ensure_hyperv_reaches_repository(job.get("inventory_id"), target_repository)
         _ensure(
             repository_supports_synthetic(normalize_repository_record(target_repository)),
             422,

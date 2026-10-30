@@ -50,7 +50,8 @@ class NameWhitespaceValidationTests(unittest.TestCase):
         REPOSITORIES["repo-1"] = {
             "id": "repo-1",
             "name": "Repo One",
-            "type": "local",
+            "type": "smb",
+            "metadata": {"server": "nas.example", "share": "backups"},
             "path": tempfile.mkdtemp(),
         }
         self.inventory = abr_v41.create_inventory_record(

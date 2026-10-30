@@ -24,11 +24,13 @@ import hashlib
 import json
 import os
 import re
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from ...core.storage_tool import APP_ROOT, REPO_ROOT, disk_tool_storage_args, is_s3_repository
+from ...core.credential_encryption import decrypt_secret, is_encrypted
+from ...core.storage_tool import APP_ROOT, REPO_ROOT, RETENTION_TILL_OPTION, disk_tool_storage_args, is_s3_repository
 
 TOOL_NAME = "abr-vhdx-tool.exe"
 HOST_ARCHITECTURE = "x64"
@@ -88,6 +90,38 @@ def file_sha256(path: Path) -> str:
     return _hashes[key]
 
 
+_tool_mentions: dict[tuple[str, int, int, str], bool] = {}
+_RESTORES_CHAINS_TEXT = "restore takes either --name or --source-names"
+
+
+def _local_tool_mentions(text: str) -> bool:
+    tool = local_tool_path()
+    if tool is None:
+        return False
+    stat = tool.stat()
+    key = (str(tool), stat.st_size, stat.st_mtime_ns, text)
+    if key not in _tool_mentions:
+        needle = text.encode("ascii")
+        found = False
+        tail = b""
+        with open(tool, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                if needle in tail + block:
+                    found = True
+                    break
+                tail = block[-len(needle):]
+        _tool_mentions[key] = found
+    return _tool_mentions[key]
+
+
+def supports_retention_till() -> bool:
+    return _local_tool_mentions(RETENTION_TILL_OPTION)
+
+
+def restores_chains() -> bool:
+    return _local_tool_mentions(_RESTORES_CHAINS_TEXT)
+
+
 def remote_work_dir() -> str:
     return (os.environ.get("ALTASTOR_HYPERV_WORK_DIR", "").strip() or DEFAULT_REMOTE_WORK_DIR).rstrip("\\")
 
@@ -137,6 +171,26 @@ def windows_share(repository: dict[str, Any] | None) -> str | None:
     return f"\\\\{server}\\{share}"
 
 
+def appliance_address_toward(host: str) -> str:
+    try:
+        family, kind, proto, _name, address = socket.getaddrinfo(host, 445, type=socket.SOCK_DGRAM)[0]
+        with socket.socket(family, kind, proto) as probe:
+            probe.connect(address)
+            return str(probe.getsockname()[0])
+    except OSError as exc:
+        raise VhdxToolError(
+            f"This appliance has no route to Hyper-V host {host}, so it cannot tell the host where its share is: {exc}"
+        ) from exc
+
+
+def for_hyperv_host(repository: dict[str, Any] | None, host: str) -> dict[str, Any] | None:
+    metadata = repository.get("metadata") if isinstance(repository, dict) and isinstance(repository.get("metadata"), dict) else {}
+    if not metadata.get("support_hyperv"):
+        return repository
+    address = appliance_address_toward(host)
+    return {**repository, "server": address, "metadata": {**metadata, "server": address}}
+
+
 def ensure_hyperv_repository(repository: dict[str, Any] | None) -> None:
     if not is_s3_repository(repository) and windows_share(repository) is None:
         raise VhdxToolError(HYPERV_REPOSITORY_MESSAGE)
@@ -166,8 +220,14 @@ def _share_invocation(
     env = {"ABR_SMB_SHARE": f"\\\\{server}\\{share_name}"}
     username = _repository_field(repository, "username").strip()
     if username:
+        password = decrypt_secret(_repository_field(repository, "password"))
+        if is_encrypted(password):
+            raise VhdxToolError(
+                f"The stored password of the share of repository {repository.get('name')} cannot be decrypted with "
+                "this appliance's credential key"
+            )
         env["ABR_SMB_USER"] = username
-        env["ABR_SMB_PASSWORD"] = _repository_field(repository, "password")
+        env["ABR_SMB_PASSWORD"] = password
     return args, env
 
 

@@ -247,6 +247,68 @@ refuses to replace one as well; `--renew --force` replaces it with a
 self-signed certificate and a new key. Every refused or failed install is
 logged with its reason.
 
+At startup the server creates the **Default Repo** when there is none: a local
+repository in `ABR_DEFAULT_REPOSITORY_PATH` (`/var/lib/altastor-backup/repository`),
+whose folder it creates with mode 0750. The repository is recognised by a mark,
+not by its name, so renaming it keeps it the default one, and deleting it brings
+it back at the next start. A repository already named Default Repo at that
+folder becomes the default one; one of that name anywhere else is left alone,
+and the server logs why it created none. When the folder cannot be created, or
+the catalog database is down, the server logs that and starts without it. A
+server run from a source checkout by a user who cannot create the folder puts
+the Default Repo in `backups/default-repo` of the checkout instead (git-ignored,
+created when missing), the way it keeps its TLS certificate and credential key
+in `python/tls/`; a server installed in `/opt/altastor-backup` never falls back
+next to its program files.
+`GET /api/v1/repositories/default` shows it, `POST /api/v1/repositories/default`
+creates it when it is missing and answers `created: false` when it is there.
+Every repository reports `default` and `support_hyperv`.
+
+Hyper-V hosts cannot reach a folder of the appliance, so the Default Repo has a
+Hyper-V switch, off by default: `POST /api/v1/repositories/default` with
+`{"support_hyperv": true}` turns it on, `false` turns it off, and the answer says
+whether anything `changed`. Turning it on shares the repository's folder through
+Samba as a hidden share with a generated name (`abr-xxxxxxxx$`), open only to a
+generated system account (`abr-smb-xxxxxxxx`, no login, no home) with a generated
+40-character password, encrypted with the credential key in the catalog and
+never logged or shown. Backups and restores give each Hyper-V host the share at
+the address this appliance reaches that host from, with that account. Turning
+it off, or removing the Default Repo, removes the share and the account and
+keeps the backups. While it is on, the share, account and password of the
+repository cannot be edited by hand.
+
+The share is made by `python/srv/plugins/hyperv/smb_share/abr-samba-helper.sh`,
+which ships with the server and needs root. The server runs it as
+`sudo -n $ABR_SAMBA_HELPER` (empty by default: the shipped copy,
+`/opt/altastor-backup/python/srv/plugins/hyperv/smb_share/abr-samba-helper.sh`
+on an install), so a package that offers the switch needs a sudo rule that lets
+the service user run that file, and depends on Samba. The script only shares a folder that belongs
+to the user who asked for it, adds a single `include` line to `smb.conf`, keeps
+that file's owner and mode, refuses an Active Directory domain controller, a
+registry configuration, a passdb other than tdbsam or a share name already
+taken, and puts the previous configuration back, and removes the account it
+made, when Samba rejects the result or smbd does not stay up after reloading it;
+removing the share leaves `smb.conf` as it was. It also refuses when a Samba
+program it needs (`smbd`, `testparm`, `smbpasswd`, `pdbedit`, `smbcontrol`) is
+missing, and when smbd is installed but not running: it never starts smbd
+itself, since another SMB server may hold port 445 on purpose.
+
+On a development machine the server runs as your own user from the checkout,
+so the switch needs the two things a package would bring, Samba and a way to run
+the helper as root. `scripts/setup_samba_dev.sh` sets both up once:
+
+```bash
+scripts/setup_samba_dev.sh            # installs Samba, adds /etc/sudoers.d/abr-samba-helper-dev
+scripts/setup_samba_dev.sh --remove   # takes the sudo rule away again; Samba stays
+```
+
+Run it as your own user; it asks for sudo where it needs root and can be run
+again. The rule lets your user run the checkout's helper as root; the script is
+yours to edit, so the rule amounts to root for your user and belongs on a
+development machine only. Without Samba or the rule the Default Repo still works
+as a local repository, and turning the switch on answers why the share could not
+be made. Hyper-V hosts reach the share at this machine's address on port 445.
+
 Log in. Every `/api/v1` call needs a session, so this comes before anything
 else. The shipped `admin`/`admin` is a bootstrap credential -- change it with
 `abr auth change-password` once the environment is up:

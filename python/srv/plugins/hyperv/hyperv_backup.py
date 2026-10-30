@@ -336,6 +336,7 @@ def run_hyperv_backup(
 
     repository = _resolve_repository(task)
     try:
+        repository = vhdx_tool.for_hyperv_host(repository, connection["host"])
         vhdx_tool.ensure_hyperv_repository(repository)
     except vhdx_tool.VhdxToolError as exc:
         raise HyperVBackupError(str(exc)) from exc
@@ -801,7 +802,7 @@ def _back_up_disks(
             "--name",
             backup_name,
             *storage_args,
-            *disk_tool_immutability_args(repository),
+            *disk_tool_immutability_args(repository, takes_retention_till=vhdx_tool.supports_retention_till),
             "--compression",
             str(compression_level),
             "--vhdx",

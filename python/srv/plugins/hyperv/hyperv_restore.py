@@ -39,6 +39,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
 from ...core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES
+from ...core.storage_tool import chain_source_names, is_s3_repository
 from ...core.subprocess_util import ProcessCancelled
 from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...core.utils import utc_now
@@ -148,6 +149,24 @@ def _layer_logical_bytes(layer: dict[str, Any]) -> int:
     return 0
 
 
+def _restore_runs(layers: list[dict[str, Any]], repository: dict[str, Any]) -> list[dict[str, Any]]:
+    names = [str(layer["abr_backup_name"]) for layer in layers]
+    if len(layers) < 2 or any("," in name for name in names) or not vhdx_tool.restores_chains():
+        return layers
+    source_path, source_names = chain_source_names([str(layer["abr_path"]) for layer in layers], names)
+    if not is_s3_repository(repository):
+        if not source_path:
+            return layers
+        source_names = [name.replace("/", "\\") for name in source_names]
+    return [
+        {
+            "abr_path": source_path,
+            "abr_backup_name": f"{names[0]} and {len(layers) - 1} incremental(s) on it",
+            "source_names": source_names,
+        }
+    ]
+
+
 def _source_datastore(path: str) -> str:
     from ...services.abr_v41 import _parse_datastore_path_parts
 
@@ -234,6 +253,7 @@ def run_hyperv_restore(
         raise HyperVRestoreError("The restore point records no disks to restore")
     repository = REPOSITORIES.get(str(parameters.get("repository_id") or "")) or {"type": "local", "id": ""}
     try:
+        repository = vhdx_tool.for_hyperv_host(repository, connection["host"])
         vhdx_tool.ensure_hyperv_repository(repository)
     except vhdx_tool.VhdxToolError as exc:
         raise HyperVRestoreError(str(exc)) from exc
@@ -489,13 +509,17 @@ def run_hyperv_restore(
                     processed_bytes=total_read,
                 )
                 written_files.append(target)
-                for position, layer in enumerate(layers):
+                runs = _restore_runs(layers, repository)
+                for position, layer in enumerate(runs):
                     storage_args, storage_env = vhdx_tool.storage_invocation(repository, abr_path=layer["abr_path"])
                     command = [
                         "restore",
                         "--json",
-                        "--name",
-                        layer["abr_backup_name"],
+                        *(
+                            ["--source-names", ",".join(layer["source_names"])]
+                            if layer.get("source_names")
+                            else ["--name", layer["abr_backup_name"]]
+                        ),
                         *storage_args,
                         "--vhdx",
                         target,
@@ -505,12 +529,16 @@ def run_hyperv_restore(
                         command.append("--force")
                     if encryption_key:
                         command.extend(["--key", encryption_key])
-                    layer_base = progress + int(position * span / len(layers))
+                    layer_base = progress + int(position * span / len(runs))
                     report = _disk_tool_progress_reporter(
                         progress_callback,
                         base_progress=layer_base,
-                        progress_span=max(1, int(span / len(layers))),
-                        message_prefix=f"Restoring disk {index}/{len(plan)}, backup {position + 1}/{len(layers)}",
+                        progress_span=max(1, int(span / len(runs))),
+                        message_prefix=(
+                            f"Restoring disk {index}/{len(plan)}"
+                            if layer.get("source_names")
+                            else f"Restoring disk {index}/{len(plan)}, backup {position + 1}/{len(runs)}"
+                        ),
                         worker_mode=WORKER_MODE,
                     )
                     run = node.run_disk_tool(
