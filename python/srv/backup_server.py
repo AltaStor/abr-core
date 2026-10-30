@@ -42,6 +42,7 @@ from .api import audit as audit_api
 from .api import auth as auth_api
 from .api import backups as backups_api
 from .api import inventories as inventories_api
+from .api import notifications as notifications_api
 from .api import jobs as jobs_api
 from .api import repositories as repositories_api
 from .api import restore as restore_api
@@ -74,7 +75,14 @@ from .core.mongo_db_wrapper import (
     load_tasks,
     load_users,
 )
-from .services import auth_service, backup_catalog, clock_guard, default_repository, tls_certificate_service
+from .services import (
+    auth_service,
+    backup_catalog,
+    clock_guard,
+    default_repository,
+    notification_detectors,
+    tls_certificate_service,
+)
 from .services.abr_v41 import PRODUCT_NAME, product_version
 from .core.server_defaults import env_int
 from .core.task_pool import TaskProcessPool
@@ -340,6 +348,7 @@ async def lifespan(_: FastAPI):
                 )
             )
             logger.info("Background TLS certificate renewal check started.")
+            notification_detectors.start_periodic_checks()
 
         # Discover VMs in the background as soon as an inventory is added, so VM
         # names are usable in `job create` without a manual `inventory rescan`.
@@ -368,6 +377,7 @@ async def lifespan(_: FastAPI):
             with suppress(asyncio.CancelledError):
                 await CERT_RENEWAL_TASK
             CERT_RENEWAL_TASK = None
+        notification_detectors.stop_periodic_checks()
         tls_certificate_service.clear_live_tls()
         if JOB_SCHEDULER:
             logger.debug("Stopping job scheduler...")
@@ -517,6 +527,7 @@ for domain in (
     backups_api,
     restore_api,
     system_api,
+    notifications_api,
 ):
     app.include_router(domain.router)
 app.include_router(dashboard_router)

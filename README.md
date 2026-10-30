@@ -102,6 +102,9 @@ VDDK, or a vCenter or Hyper-V endpoint.
   recovery need from the host, how they run, and what to check when they fail.
 - [Roles, permissions and the audit log](doc/RBAC.md) - the built-in roles,
   the permission matrix, how requests are authorized, and the audit log.
+- [E-mail notifications](doc/Notifications.md) - the notification service,
+  its events, SMTP with TLS, password and OAuth 2.0 sign-in, delivery
+  failures and retries, API and CLI.
 
 Note: the environment and service setup in the deployment runbook and the ESXi
 sample is current, but their scenario commands still use the pre-v4.1 CLI

@@ -76,4 +76,10 @@ COMMAND_FUNCTIONS: dict[str, str] = {
     "system export": "system.export",
     "system import": "system.import",
     "system get-support-bundle": "system.support_bundle",
+    "notification show": "notification.view",
+    "notification set": "notification.edit",
+    "notification test": "notification.test",
+    "notification history": "notification.view",
+    "notification events list": "notification.view",
+    "notification events set": "notification.edit",
 }

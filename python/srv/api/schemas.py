@@ -1669,3 +1669,100 @@ class LogoutResult(_LenientModel):
 class ExtendSessionResult(_LenientModel):
     expires_at: DocStr = Field(default=None, description=SESSION_EXPIRES_AT)
     absolute_expires_at: DocStrOrNull = Field(default=None, description=SESSION_ABSOLUTE_EXPIRES_AT)
+
+
+# ------------------------------------------------------- e-mail notifications --
+
+SECRET_KEPT = "Write-only: omitted or null keeps the stored one, an empty text clears it"
+
+
+class EmailOAuth2Request(_LenientModel):
+    provider: SkipValidation[str] | None = Field(default=None, description="microsoft (Microsoft 365 / Exchange Online), google (Google Workspace) or custom")
+    tenant_id: SkipValidation[str] | None = Field(default=None, description="Microsoft only: the directory (tenant) ID or domain")
+    client_id: SkipValidation[str] | None = Field(default=None, description="The application (client) ID registered with the provider")
+    client_secret: SkipValidation[str] | None = Field(default=None, description=f"The client secret. {SECRET_KEPT}")
+    grant: SkipValidation[str] | None = Field(default=None, description="client_credentials (an app sends as the mailbox; Microsoft) or refresh_token (a user consented once; Microsoft, Google, custom)")
+    refresh_token: SkipValidation[str] | None = Field(default=None, description=f"refresh_token grant: the token from the user's consent. {SECRET_KEPT}")
+    token_url: SkipValidation[str] | None = Field(default=None, description="custom only: the token endpoint, https://")
+    scope: SkipValidation[str] | None = Field(default=None, description="Overrides the provider's scope for SMTP; required for custom when the provider needs one")
+
+
+class EmailSmtpRequest(_LenientModel):
+    host: SkipValidation[str] | None = Field(default=None, description="SMTP server host name or IP address")
+    port: SkipValidation[int] | None = Field(default=None, description="1-65535; usually 587 for starttls, 465 for ssl, 25 for none")
+    security: SkipValidation[str] | None = Field(default=None, description="starttls (upgrade to TLS after connecting), ssl (TLS from the start) or none (no encryption)")
+    verify_tls: SkipValidation[bool] | None = Field(default=None, description="Check the server certificate against the system trust store (default true)")
+    auth: SkipValidation[str] | None = Field(default=None, description="password (user name and password), oauth2 (OAuth 2.0, SASL XOAUTH2) or none")
+    username: SkipValidation[str] | None = Field(default=None, description="password: the account to sign in as; oauth2: the mailbox the token sends as")
+    password: SkipValidation[str] | None = Field(default=None, description=f"password: the account's password. {SECRET_KEPT}")
+    timeout_seconds: SkipValidation[int] | None = Field(default=None, description="5-300 (default 30)")
+    oauth2: SkipValidation[EmailOAuth2Request] | None = None
+
+
+class EmailSenderRequest(_LenientModel):
+    address: SkipValidation[str] | None = Field(default=None, description="The From address")
+    name: SkipValidation[str] | None = Field(default=None, description="The From display name")
+
+
+class EmailNotificationSettingsRequest(_LenientModel):
+    enabled: SkipValidation[bool] | None = Field(default=None, description="Send notifications; true requires every setting delivery needs")
+    smtp: SkipValidation[EmailSmtpRequest] | None = None
+    sender: SkipValidation[EmailSenderRequest] | None = None
+    recipients: SkipValidation[list[str]] | None = Field(default=None, description="The whole list of recipient addresses (at most 50)")
+    events: SkipValidation[dict[str, bool]] | None = Field(default=None, description="Event ID to true or false; events left out keep their setting (GET /notifications/events lists them)")
+    repository_space_threshold_percent: SkipValidation[int] | None = Field(default=None, description="repository.low_space fires at this much used space, 50-99 (default 85)")
+
+
+class EmailTestRequest(_LenientModel):
+    settings: SkipValidation[EmailNotificationSettingsRequest] | None = Field(default=None, description="Unsaved changes to test with, over the stored settings; nothing is saved")
+    to: SkipValidation[list[str]] | None = Field(default=None, description="Send to these addresses instead of the configured recipients")
+
+
+class NotificationEventDTO(_LenientModel):
+    id: DocStr = None
+    name: DocStr = None
+    description: DocStr = None
+    default: DocBool = None
+    enabled: DocBool = None
+
+
+class EmailDeliveryDTO(_LenientModel):
+    id: DocStr = None
+    event: DocStr = Field(default=None, description="The event ID, or test")
+    subject: DocStr = None
+    severity: DocStr = None
+    recipients: DocStrArray = None
+    queued_at: DocStr = None
+    sent_at: DocStrOrNull = None
+    status: DocStr = Field(default=None, description="queued, retrying, sent, failed or cancelled")
+    attempts: DocInt = None
+    next_attempt_at: DocStrOrNull = None
+    refused: DocStrArray = Field(default=None, description="Recipients the server refused while taking the message for the others")
+    error: DocObject = Field(default=None, description="code, message, stage (connect, tls, auth, oauth, send, queue) and retryable")
+
+
+class EmailNotificationSettingsDTO(_LenientModel):
+    enabled: DocBool = None
+    smtp: DocObject = Field(default=None, description="As in the request, with password_set, oauth2.client_secret_set and oauth2.refresh_token_set in place of the secrets, and the token URL and scope the provider resolves to")
+    sender: DocObject = None
+    recipients: DocStrArray = None
+    repository_space_threshold_percent: DocInt = None
+    updated_at: DocStrOrNull = None
+    updated_by: DocStrOrNull = None
+    events: list[NotificationEventDTO] | DocObjectArray = None
+    deliveries: list[EmailDeliveryDTO] | DocObjectArray = Field(default=None, description="The latest deliveries, newest first")
+
+
+class NotificationEventList(_LenientModel):
+    items: list[NotificationEventDTO] | DocObjectArray = None
+
+
+class EmailDeliveryList(_LenientModel):
+    items: list[EmailDeliveryDTO] | DocObjectArray = None
+
+
+class EmailTestResult(_LenientModel):
+    status: DocStr = None
+    recipients: DocStrArray = None
+    refused: DocStrArray = None
+    duration_ms: DocInt = None

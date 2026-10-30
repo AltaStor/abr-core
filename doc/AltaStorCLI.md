@@ -18,6 +18,8 @@ role = built-in roles and the functions each allows
 
 audit = the record of every command and user or role change 
 
+notification = e-mail notifications: SMTP server, sign-in, recipients, the events that send e-mail, deliveries 
+
 repo = backup storage targets 
 
 inventory = virtualization discovery sources 
@@ -250,6 +252,46 @@ Examples:
 abr audit list --result denied 
 abr audit list --user alice --since 2026-10-01 
 abr --output json audit list --function job. --limit 500 
+
+NOTIFICATION COMMANDS 
+
+E-mail notifications: the SMTP server, how the appliance signs in to it (user name and password, or OAuth 2.0), the sender and recipients, and the events that send e-mail. The Web UI's Settings > Notifications changes the same settings. See doc/Notifications.md. 
+
+abr notification show 
+
+Description: Show the settings (secrets only as set or not set), every event with whether it sends e-mail, and the last delivery. 
+
+abr notification show [--output json] 
+
+abr notification set 
+
+Description: Change the settings; options left out keep their value. The server refuses the whole change, naming every problem by field, when a value is invalid or when notifications are on and a setting delivery needs is missing (exit 2). A secret flag without a value reads ABR_SMTP_PASSWORD, ABR_SMTP_OAUTH_CLIENT_SECRET or ABR_SMTP_OAUTH_REFRESH_TOKEN, or prompts; an empty value removes the stored secret. 
+
+abr notification set [--enable | --disable] [--smtp-host <host>] [--smtp-port <port>] [--security starttls|ssl|none] [--verify-tls | --no-verify-tls] [--timeout <seconds>] [--auth password|oauth2|none] [--username <user-or-mailbox>] [--password [<pass>]] [--oauth-provider microsoft|google|custom] [--oauth-tenant <tenant>] [--oauth-client-id <id>] [--oauth-client-secret [<secret>]] [--oauth-grant client_credentials|refresh_token] [--oauth-refresh-token [<token>]] [--oauth-token-url <url>] [--oauth-scope <scope>] [--from <address>] [--from-name <name>] [--recipients <a,b> | --add-recipient <a> --remove-recipient <b>] [--space-threshold <percent>] 
+
+Examples: 
+abr notification set --smtp-host smtp.example.com --smtp-port 587 --security starttls --auth password --username backup@example.com --password --from backup@example.com --recipients ops@example.com --enable 
+abr notification set --auth oauth2 --oauth-provider microsoft --oauth-tenant contoso.onmicrosoft.com --oauth-client-id 0f1e... --oauth-client-secret --username backup@contoso.com 
+abr notification set --disable 
+
+abr notification test 
+
+Description: Send a test e-mail now and report whether the SMTP server took it, or why not: smtp_connection_failed, smtp_tls_failed, smtp_auth_failed, oauth_token_failed, smtp_sender_refused, smtp_recipients_refused or smtp_error, with the stage it reached (exit 1). The set options test a change without saving it. 
+
+abr notification test [--to <addresses>] [any abr notification set option except --enable, --disable and the recipient options] 
+
+abr notification history 
+
+Description: The latest 50 deliveries, newest first: event, status (queued, retrying, sent, failed, cancelled), attempts, recipients and the error. Times are UTC. 
+
+abr notification events list 
+
+Description: The events that can send e-mail (job.failed, job.warning, job.succeeded, restore.failed, restore.succeeded, repository.low_space, system.clock_jump, tls.certificate_expiring), whether each does, and its default. 
+
+abr notification events set --enable <ids> --disable <ids> 
+
+Examples: 
+abr notification events set --enable job.succeeded,restore.succeeded --disable repository.low_space 
 
 REPOSITORY COMMANDS 
 

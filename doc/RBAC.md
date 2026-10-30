@@ -29,7 +29,7 @@ change, rename or delete them. Next to them, an Administrator can make
 
 | Role | ID | For |
 |---|---|---|
-| Administrator | `administrator` | Everything, including users, roles, the HTTPS certificate, catalog export and import, and support bundles. |
+| Administrator | `administrator` | Everything, including users, roles, the HTTPS certificate, e-mail notifications, catalog export and import, and support bundles. |
 | Backup Administrator | `backup_administrator` | Repositories, inventories, backup jobs and backups. |
 | Backup Operator | `backup_operator` | Running and monitoring backup jobs, and verifying backups. |
 | Restore Operator | `restore_operator` | Restoring VMs, with the inventory operations a recovery needs (rescan, test). |
@@ -59,6 +59,9 @@ other role is allowed exactly what it lists.
 | `system.clock_confirm` | administer | ✓ | – | – | – | – |
 | `tls.view` | read | ✓ | – | – | – | ✓ |
 | `tls.edit` | administer | ✓ | – | – | – | – |
+| `notification.view` | read | ✓ | – | – | – | ✓ |
+| `notification.edit` | administer | ✓ | – | – | – | – |
+| `notification.test` | administer | ✓ | – | – | – | – |
 | `user.view` | read | ✓ | – | – | – | ✓ |
 | `user.create` | administer | ✓ | – | – | – | – |
 | `user.edit` | administer | ✓ | – | – | – | – |

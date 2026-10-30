@@ -17,6 +17,7 @@ abr
   session
   backup
   restore
+  notification
   system
 ```
 

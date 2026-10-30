@@ -9,6 +9,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from .mongo_db_wrapper import TASKS, TASK_LOCK, claim_task, load_queued_tasks, persist_task
+from ..services import notification_detectors
 from ..services.backup_catalog import discard_unregistered_output, register_backup_from_completed_task
 from .task_executor import TaskStopRequested, run_task
 from .utils import utc_now
@@ -323,6 +324,8 @@ class TaskProcessPool:
                         task_id,
                         persist_exc,
                     )
+                crashed = dict(task)
+            notification_detectors.task_finished(crashed)
             return
 
         with TASK_LOCK:
@@ -369,6 +372,8 @@ class TaskProcessPool:
                 TASKS[task_id] = finished
         if unrecorded_backup is not None:
             self._fail_unrecorded_backup(task_id, unrecorded_backup)
+        else:
+            notification_detectors.task_finished(dict(finished))
 
     def _fail_unrecorded_backup(self, task_id: str, snapshot: dict[str, object]) -> None:
         removed = False

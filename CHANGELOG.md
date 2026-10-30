@@ -50,6 +50,26 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   in `PATCH /api/v1/users/{id}`: an Administrator renames a user, who keeps
   their password, or gives them a new password, which ends their sessions.
 - Hyper-V job option `--guest-consistency`.
+- E-mail notifications through the organisation's SMTP server: a central
+  notification service every component hands its notifications to, which
+  sends them in the background, retries a delivery that can still succeed
+  (three attempts) and records every outcome in a delivery history and the
+  server log. STARTTLS, SSL/TLS or plain connections with certificate
+  verification; sign-in with a user name and password, OAuth 2.0 (Microsoft
+  365 client credentials or refresh token, Google Workspace refresh token, or
+  any provider's token endpoint; SASL XOAUTH2) or none. Events: job failed,
+  finished with warnings or succeeded (one e-mail per run, listing every VM),
+  restore failed or finished, repository running out of space, server clock
+  jump, and an installed HTTPS certificate about to expire. Settings are
+  checked as a whole and refused with every problem by field; secrets are
+  stored encrypted and never returned. A test e-mail reports why it was not
+  sent (connection, TLS, sign-in, OAuth token, sender or recipients refused).
+  `abr notification show|set|test|history|events list|events set`,
+  `GET|PUT /api/v1/notifications/email`, `POST
+  /api/v1/notifications/email/test`, `GET
+  /api/v1/notifications/email/deliveries`, `GET /api/v1/notifications/events`,
+  functions `notification.view`, `notification.edit`, `notification.test`. See
+  `doc/Notifications.md`.
 - `GET /api/v1/auth/me` reports the session's `expires_at` and
   `absolute_expires_at`; sent with `X-ABR-Refresh` it renews nothing, so the
   Web UI reads the expiry without moving it.
