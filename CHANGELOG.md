@@ -70,6 +70,20 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   /api/v1/notifications/email/deliveries`, `GET /api/v1/notifications/events`,
   functions `notification.view`, `notification.edit`, `notification.test`. See
   `doc/Notifications.md`.
+- A notification script: an Administrator uploads a script the appliance runs
+  on chosen events, to reach what e-mail does not. It gets the event as JSON on
+  standard input, in a file and in `ABR_*` variables, with the facts of the
+  event in `details`. It runs as the service user, so uploading one takes the
+  new function `notification.script` (Administrator only), and
+  `ABR_NOTIFICATION_SCRIPTS=0` switches the feature off. It is kept encrypted,
+  checked on upload (text, at most 256 KiB, a `#!` line with an interpreter the
+  appliance has), run with a minimal environment and a time limit that also
+  ends what it started, and audited by name and SHA-256, never by content. A
+  run's exit code and the end of its output are kept; a run that fails is not
+  repeated. `abr notification script show|upload|content|set|remove|test`,
+  `GET|PUT /api/v1/notifications/script`, `GET|PUT|DELETE
+  /api/v1/notifications/script/file`, `POST
+  /api/v1/notifications/script/test`.
 - `GET /api/v1/auth/me` reports the session's `expires_at` and
   `absolute_expires_at`; sent with `X-ABR-Refresh` it renews nothing, so the
   Web UI reads the expiry without moving it.

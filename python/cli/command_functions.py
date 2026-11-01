@@ -82,4 +82,10 @@ COMMAND_FUNCTIONS: dict[str, str] = {
     "notification history": "notification.view",
     "notification events list": "notification.view",
     "notification events set": "notification.edit",
+    "notification script show": "notification.view",
+    "notification script upload": "notification.script",
+    "notification script content": "notification.script",
+    "notification script set": "notification.script",
+    "notification script remove": "notification.script",
+    "notification script test": "notification.script",
 }

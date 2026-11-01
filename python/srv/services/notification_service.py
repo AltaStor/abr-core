@@ -4,12 +4,13 @@
 """The notification service: one place every component hands a notification
 to, whatever it is about and however it goes out.
 
-A component calls ``notify(event_id, subject, body)``. Each channel (e-mail, so
-far) says whether it wants the notification; for those that do, the service
-queues it, and a background worker per channel delivers it, retrying what the
-channel calls retryable and recording every outcome in that channel's history
-and the server log. A component is never held up by a slow mail server, and a
-failed delivery never fails the operation it reports on.
+A component calls ``notify(event_id, subject, body)``. Each channel (e-mail,
+and the administrator's script) says whether it wants the notification; for
+those that do, the service queues it, and a background worker per channel
+delivers it, retrying what the channel calls retryable and recording every
+outcome in that channel's history and the server log. A component is never held
+up by a slow mail server or a slow script, and a failed delivery never fails the
+operation it reports on. One channel's delays do not hold up the other.
 
 A channel is a module offering ``ID``, ``LABEL``, ``RETRY_DELAYS_SECONDS``,
 ``wants(notification)``, ``describe(notification)`` for the history entry, and
@@ -33,7 +34,7 @@ from typing import Any
 from python.srv.core.mongo_db_wrapper import load_system_state, persist_system_state
 from python.srv.core.utils import utc_now
 
-from . import email_channel
+from . import email_channel, script_channel
 from .api_errors import api_error
 from .notification_events import EVENTS_BY_ID, TEST_EVENT, DeliveryError, Notification
 
@@ -190,7 +191,8 @@ class _Channel:
 
 
 EMAIL = _Channel(email_channel, "email_notification_deliveries")
-CHANNELS = (EMAIL,)
+SCRIPT = _Channel(script_channel, "notification_script_runs")
+CHANNELS = (EMAIL, SCRIPT)
 
 
 def new_entry(notification: Notification, described: dict[str, Any], **fields: Any) -> dict[str, Any]:
@@ -211,7 +213,7 @@ def notify(
     """Hand a notification about `event_id` to the service: queued for each
     channel that wants it, dropped otherwise. Never raises and never waits for
     a delivery, so a caller can report from anywhere. True when any channel
-    took it. `body` is plain text, `details` the same facts for a program."""
+    took it. `body` is plain text, `details` the same facts for a script."""
     try:
         if event_id not in EVENTS_BY_ID:
             LOGGER.error("Notification for unknown event %r dropped: %s", event_id, subject)
@@ -253,3 +255,20 @@ def send_test(patch: dict[str, Any] | None, to: list[str] | None) -> dict[str, A
         "refused": refused,
         "duration_ms": round((time.monotonic() - started) * 1000),
     }
+
+
+def run_script_test() -> dict[str, Any]:
+    """Run the uploaded script now on a sample event and answer how it went: a
+    script that fails is a result to show, not an error of this request."""
+    notification = script_channel.test_notification()
+    entry = new_entry(notification, script_channel.describe(notification), attempts=1)
+    try:
+        outcome = script_channel.send(notification, entry)
+    except DeliveryError as exc:
+        entry.update(status="failed", error=exc.to_dict(), **exc.extra)
+        LOGGER.warning("Test run of the notification script failed (%s): %s", exc.code, exc)
+    else:
+        entry.update(status="sent", sent_at=utc_now(), **outcome)
+        LOGGER.info("Test run of the notification script succeeded.")
+    SCRIPT.history.record(entry)
+    return entry

@@ -91,6 +91,11 @@ FUNCTIONS: tuple[Function, ...] = (
     _f("notification.view", "View the notification settings, events and delivery history", READ),
     _f("notification.edit", "Change the e-mail notification settings and the events that send e-mail", ADMINISTER),
     _f("notification.test", "Send a test e-mail with the stored or unsaved notification settings", ADMINISTER),
+    _f(
+        "notification.script",
+        "Upload, read, change, run or delete the notification script, which runs on the appliance as the service user",
+        ADMINISTER,
+    ),
     _f("user.view", "List and view users", READ),
     _f("user.create", "Create a user", ADMINISTER),
     _f("user.edit", "Change a user's name, role or enabled state", ADMINISTER),

@@ -1766,3 +1766,54 @@ class EmailTestResult(_LenientModel):
     recipients: DocStrArray = None
     refused: DocStrArray = None
     duration_ms: DocInt = None
+
+
+class NotificationScriptSettingsRequest(_LenientModel):
+    enabled: SkipValidation[bool] | None = Field(default=None, description="Run the script on the chosen events; needs an uploaded script")
+    events: SkipValidation[dict[str, bool]] | None = Field(default=None, description="Event ID to true or false; events left out keep their setting. Separate from the events that send e-mail")
+    timeout_seconds: SkipValidation[int] | None = Field(default=None, description="Stop a run after this long, with whatever it started, 5-600 (default 60)")
+
+
+class NotificationScriptUploadRequest(_LenientModel):
+    name: SkipValidation[str] | None = Field(default=None, description="The file name, to tell scripts apart")
+    script_content: SkipValidation[str] | None = Field(default=None, description="The script as text, at most 256 KiB, starting with a #! line. Windows line ends are converted. Not stored in the audit log")
+
+
+class NotificationScriptFileDTO(_LenientModel):
+    name: DocStr = None
+    size: DocInt = None
+    sha256: DocStr = Field(default=None, description="Of the script as stored and run")
+    uploaded_at: DocStr = None
+    uploaded_by: DocStrOrNull = None
+
+
+class NotificationScriptRunDTO(_LenientModel):
+    id: DocStr = None
+    event: DocStr = Field(default=None, description="The event ID, or test")
+    subject: DocStr = None
+    severity: DocStr = None
+    script: DocStrOrNull = None
+    sha256: DocStrOrNull = None
+    queued_at: DocStr = None
+    sent_at: DocStrOrNull = None
+    status: DocStr = Field(default=None, description="queued, sent (it exited 0), failed or cancelled")
+    attempts: DocInt = None
+    exit_code: DocIntOrNull = None
+    duration_ms: DocInt = None
+    output: DocStrOrNull = Field(default=None, description="The end of what it printed, with credentials masked; for those allowed notification.script")
+    error: DocObject = Field(default=None, description="code (script_failed, script_timed_out, script_not_started, script_unreadable), message, stage and retryable")
+
+
+class NotificationScriptDTO(_LenientModel):
+    available: DocBool = Field(default=None, description="false: switched off on this appliance with ABR_NOTIFICATION_SCRIPTS=0")
+    enabled: DocBool = None
+    timeout_seconds: DocInt = None
+    file: NotificationScriptFileDTO | DocObject = Field(default=None, description="The uploaded script, without its content; null when there is none")
+    updated_at: DocStrOrNull = None
+    updated_by: DocStrOrNull = None
+    events: list[NotificationEventDTO] | DocObjectArray = None
+    runs: list[NotificationScriptRunDTO] | DocObjectArray = Field(default=None, description="The latest runs, newest first")
+
+
+class NotificationScriptContentDTO(NotificationScriptFileDTO):
+    script_content: DocStr = None

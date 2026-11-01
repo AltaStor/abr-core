@@ -62,6 +62,7 @@ other role is allowed exactly what it lists.
 | `notification.view` | read | ✓ | – | – | – | ✓ |
 | `notification.edit` | administer | ✓ | – | – | – | – |
 | `notification.test` | administer | ✓ | – | – | – | – |
+| `notification.script` | administer | ✓ | – | – | – | – |
 | `user.view` | read | ✓ | – | – | – | ✓ |
 | `user.create` | administer | ✓ | – | – | – | – |
 | `user.edit` | administer | ✓ | – | – | – | – |

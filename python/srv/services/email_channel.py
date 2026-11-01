@@ -21,7 +21,7 @@ stage they happened at, so the test e-mail, the delivery history and the
 server log all say the same thing.
 
 As a channel of the notification service this module offers ``wants``,
-``describe`` and ``send``.
+``describe`` and ``send``; ``script_channel`` offers the same three.
 """
 
 from __future__ import annotations
