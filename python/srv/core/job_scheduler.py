@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .mongo_db_wrapper import HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, catalog_records, persist_job, persist_task
 from .server_defaults import env_int
 from .utils import utc_now
-from python.srv.services import clock_guard
+from python.srv.services import clock_guard, notification_detectors
 from python.srv.services.abr_v41 import (
     execution_phases,
     job_clock_anomalies,
@@ -407,6 +407,7 @@ class JobScheduler:
         task["updated_at"] = now.isoformat()
         persist_task(dict(task))
         logger.warning("Marked stale task '%s' from job '%s' as failed: %s", task.get("id"), job.get("id"), reason)
+        notification_detectors.task_finished(dict(task))
 
     def _has_pending_task(self, job: dict[str, Any], now: datetime) -> bool:
         job_id = str(job["id"])

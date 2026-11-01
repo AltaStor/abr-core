@@ -148,6 +148,23 @@ class JobFieldTests(_Api):
         job = abr_v41.create_backup_job(self._payload(schedule={"type": "daily", "time": "03:00", "timezone": "Europe/Kyiv"}))
         self.assertEqual(job["schedule"]["timezone"], "Europe/Kyiv")
 
+    @patch.object(abr_v41, "_server_timezone_name", return_value="Europe/Berlin")
+    def test_a_schedule_reports_the_zone_it_runs_on(self, _server_zone: object) -> None:
+        job = abr_v41.create_backup_job(self._payload(schedule={"type": "daily", "time": "03:00"}))
+        self.assertEqual(job["schedule"]["timezone"], "Europe/Berlin")
+        self.assertEqual(job["active_full_schedule"]["timezone"], "Europe/Berlin")
+        stored = {"kind": "daily", "time": "03:00", "enabled": True}
+        self.assertEqual(abr_v41._schedule_dto({**stored, "timezone": None})["timezone"], "Europe/Berlin")
+        self.assertEqual(abr_v41._schedule_dto({**stored, "timezone": "CEST"})["timezone"], "Europe/Berlin")
+        self.assertEqual(abr_v41._schedule_dto({**stored, "timezone": "Mars/Phobos"})["timezone"], "UTC")
+
+    @patch.object(abr_v41, "_server_timezone_name", return_value="Asia/Kolkata")
+    def test_the_server_reports_its_own_zone(self, _server_zone: object) -> None:
+        for path in ("/api/v1/system/clock", "/api/v1/system/info"):
+            with self.subTest(path=path):
+                body = self.client.get(path).json()
+                self.assertEqual((body["timezone"], body["utc_offset"]), ("Asia/Kolkata", "+05:30"))
+
     def test_job_edit_checks_the_same_fields(self) -> None:
         job = abr_v41.create_backup_job(self._payload())
         for change, expected in (

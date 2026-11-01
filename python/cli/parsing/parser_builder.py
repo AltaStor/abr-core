@@ -15,6 +15,7 @@ from ..commands import (
     BackupCommands,
     InventoryCommands,
     JobCommands,
+    NotificationCommands,
     RepositoryCommands,
     RestoreCommands,
     RoleCommands,
@@ -48,6 +49,7 @@ class AltaStorParserBuilder:
         SessionCommands().register(registry)
         BackupCommands().register(registry)
         RestoreCommands().register(registry)
+        NotificationCommands().register(registry)
         SystemCommands(product_name=PRODUCT_NAME, cli_version=CLI_VERSION, default_base_url=DEFAULT_BASE_URL).register(registry)
         _bind_command_functions(parser)
         return parser

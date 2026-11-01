@@ -32,6 +32,7 @@ Limits are configurable via environment variables (defaults in defaults.env):
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -41,7 +42,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import IO, Any, Callable, Mapping, Sequence
 
 from .server_defaults import env_int
 
@@ -292,6 +293,10 @@ def run_capped(
     stall_seconds: float | None = None,
     on_stall: Callable[[float], None] | None = None,
     stdin_text: str | None = None,
+    stdin: IO[bytes] | int | None = None,
+    env: Mapping[str, str] | None = None,
+    cwd: str | None = None,
+    own_process_group: bool = False,
     **_ignored,
 ) -> CompletedProcess:
     """Run ``command`` capturing only a bounded tail of stdout/stderr.
@@ -305,6 +310,10 @@ def run_capped(
     each time the tool prints a new "NN% (block)" line, so callers can surface
     the tool's own progress instead of just the two-line
     started/finished milestones ``proc.wait()`` alone allows for.
+
+    ``own_process_group`` starts the command in a process group of its own, and
+    a timeout then kills the whole group, not only the command: for programs
+    that start others, such as a shell script.
     """
     cap = max_capture_bytes if max_capture_bytes is not None else _max_capture_bytes()
     cmd = list(command)
@@ -312,11 +321,16 @@ def run_capped(
     if on_progress is not None:
         full_cmd = _progress_prefix() + full_cmd
 
+    spawn: dict[str, Any] = {key: value for key, value in (("env", env), ("cwd", cwd)) if value is not None}
+    if own_process_group:
+        spawn["start_new_session"] = True
+    if stdin is not None and stdin_text is None:
+        spawn["stdin"] = stdin
     with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
         if stdin_text is None:
-            proc = subprocess.Popen(full_cmd, stdout=out_f, stderr=err_f)
+            proc = subprocess.Popen(full_cmd, stdout=out_f, stderr=err_f, **spawn)
         else:
-            proc = subprocess.Popen(full_cmd, stdin=subprocess.PIPE, stdout=out_f, stderr=err_f)
+            proc = subprocess.Popen(full_cmd, stdin=subprocess.PIPE, stdout=out_f, stderr=err_f, **spawn)
             _send_stdin(proc, stdin_text)
         stall_watch = _StallWatch(proc.pid, stall_seconds, on_stall) if stall_seconds else None
         try:
@@ -349,7 +363,11 @@ def run_capped(
                 stderr=_read_tail(err_f, cap, text),
             ) from None
         except subprocess.TimeoutExpired:
-            proc.kill()
+            if own_process_group:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
             proc.wait()
             raise subprocess.TimeoutExpired(
                 cmd,

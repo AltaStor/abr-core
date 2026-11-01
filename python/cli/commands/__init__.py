@@ -6,6 +6,7 @@ from .auth_commands import AuthCommands
 from .backup_commands import BackupCommands
 from .inventory_commands import InventoryCommands
 from .job_commands import JobCommands
+from .notification_commands import NotificationCommands
 from .repository_commands import RepositoryCommands
 from .restore_commands import RestoreCommands
 from .role_commands import RoleCommands
@@ -19,6 +20,7 @@ __all__ = [
     "BackupCommands",
     "InventoryCommands",
     "JobCommands",
+    "NotificationCommands",
     "RepositoryCommands",
     "RestoreCommands",
     "RoleCommands",

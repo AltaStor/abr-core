@@ -458,6 +458,22 @@ def _load_timezone(name: str | None) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 
+def _effective_timezone_name(name: str | None) -> str:
+    """The zone a schedule naming `name` actually runs on: the name itself, the
+    server's zone for none or for one of its abbreviations (EDT), UTC for a
+    name this server does not know (a record from before names were checked)."""
+    return _load_timezone(name).key
+
+
+def server_timezone() -> dict[str, Any]:
+    """The appliance's own time zone, which schedules saved without one run on
+    and which clients print the appliance's clock in. Read-only: it is the
+    operating system's setting."""
+    name = _server_timezone_name()
+    offset = datetime.now(_load_timezone(name)).strftime("%z")
+    return {"timezone": name, "utc_offset": f"{offset[:3]}:{offset[3:]}"}
+
+
 def _title_day(value: str) -> str:
     normalized = DAY_ALIASES.get(str(value or "").strip().lower())
     if normalized is None:
@@ -808,7 +824,7 @@ def _schedule_dto(schedule: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     kind = str(schedule.get("kind") or "")
     enabled = bool(schedule.get("enabled", True))
-    timezone_name = str(schedule.get("timezone") or _server_timezone_name())
+    timezone_name = _effective_timezone_name(schedule.get("timezone"))
     if kind == "cron":
         return {
             "type": "cron",
@@ -854,7 +870,7 @@ def _schedule_dto(schedule: dict[str, Any] | None) -> dict[str, Any] | None:
 def _render_schedule_summary(schedule: dict[str, Any] | None) -> str | None:
     if not schedule:
         return None
-    timezone_name = str(schedule.get("timezone") or _server_timezone_name())
+    timezone_name = _effective_timezone_name(schedule.get("timezone"))
     kind = str(schedule.get("kind") or "")
     if kind == "cron":
         return f"Cron {schedule['expression']} ({timezone_name})"
@@ -9963,6 +9979,7 @@ def system_info() -> dict[str, Any]:
         "uptime_sec": _system_uptime_seconds(),
         "cpu_cores": os.cpu_count(),
         "memory_gb": _system_memory_gb(),
+        **server_timezone(),
     }
 
 

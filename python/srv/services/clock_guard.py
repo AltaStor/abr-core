@@ -12,6 +12,8 @@ from typing import Any
 from python.srv.core.mongo_db_wrapper import load_system_state, persist_system_state
 from python.srv.core.server_defaults import env_int
 
+from . import notification_detectors
+
 LOGGER = logging.getLogger(__name__)
 
 STATE_ID = "clock"
@@ -81,7 +83,9 @@ def _block(*, trusted: datetime, current: datetime, source: str) -> None:
             "confirmed_by": None,
         }
     )
-    LOGGER.error("%s", _message_locked())
+    message = _message_locked()
+    LOGGER.error("%s", message)
+    notification_detectors.clock_jumped(message, detected_at=_state["detected_at"], last_trusted_at=_state["last_trusted_at"])
 
 
 def _message_locked() -> str | None:

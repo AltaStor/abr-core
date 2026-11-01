@@ -55,7 +55,7 @@ def system_health() -> SystemHealthDTO:
 
 
 def system_clock() -> SystemClockDTO:
-    return clock_guard.status()
+    return {**clock_guard.status(), **abr_v41.server_timezone()}
 
 
 def confirm_system_clock(request: Request) -> SystemClockDTO:
@@ -64,7 +64,7 @@ def confirm_system_clock(request: Request) -> SystemClockDTO:
     if audit is not None:
         audit.details["was_blocked"] = result["was_blocked"]
         audit.details["confirmed_time"] = result["server_time"]
-    return result
+    return {**result, **abr_v41.server_timezone()}
 
 
 def system_logs(

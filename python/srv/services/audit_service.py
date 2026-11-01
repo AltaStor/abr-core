@@ -55,7 +55,7 @@ LIST_LIMIT_MAX = 1000
 
 _SENSITIVE_KEY = re.compile(
     r"password|passwd|passphrase|secret|token|accesskey|privatekey|encryptionkey|apikey|credential|"
-    r"authorization|cookie"
+    r"authorization|cookie|scriptcontent"
 )
 _URL_CREDENTIALS = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@")
 _COMMAND_PATTERN = re.compile(r"^[a-z][a-z -]{0,63}$")
