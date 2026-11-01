@@ -280,17 +280,120 @@ def delete_hypervisor(hypervisor_id: str) -> bool:
         return deleted
 
 
+ENCRYPTION_KEY_FIELDS = ("encryption_key", "source_encryption_key")
+ENCRYPTION_KEY_LISTS = ("encryption_keys",)
+
+
+def _encryption_key_holders(value: Any) -> list[tuple[dict[str, Any], str]]:
+    holders: list[tuple[dict[str, Any], str]] = []
+    if isinstance(value, dict):
+        for name, item in value.items():
+            if name in ENCRYPTION_KEY_FIELDS and isinstance(item, str):
+                holders.append((value, name))
+            elif name in ENCRYPTION_KEY_LISTS and isinstance(item, list):
+                holders.extend(
+                    (entry, "key") for entry in item if isinstance(entry, dict) and isinstance(entry.get("key"), str)
+                )
+            else:
+                holders.extend(_encryption_key_holders(item))
+    elif isinstance(value, list):
+        for item in value:
+            holders.extend(_encryption_key_holders(item))
+    return holders
+
+
+def _with_encryption_keys(record: dict[str, Any], convert: Callable[[Any], Any]) -> dict[str, Any]:
+    converted = _normalize_record(record)
+    for holder, key in _encryption_key_holders(converted):
+        holder[key] = convert(holder[key])
+    return converted
+
+
+def _clear_encryption_keys(record: dict[str, Any] | None) -> set[str]:
+    return {
+        holder[key]
+        for holder, key in _encryption_key_holders(record or {})
+        if holder[key] and not is_encrypted(holder[key])
+    }
+
+
+def _encryption_keys_for_storage(normalized: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _with_encryption_keys(normalized, encrypt_secret)
+    except CredentialKeyUnavailable:
+        return normalized
+
+
+def _job_for_storage(normalized: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
+    try:
+        return _with_encryption_keys(normalized, encrypt_secret)
+    except CredentialKeyUnavailable as exc:
+        if _clear_encryption_keys(normalized) - _clear_encryption_keys(previous):
+            raise api_error(
+                503,
+                "credential_key_unavailable",
+                f"{exc}. The new encryption key is not stored. {KEY_REPAIR_HINT}, then give the key again.",
+                job_id=normalized.get("id"),
+            ) from exc
+        return normalized
+
+
+def _load_with_encryption_keys(db: Database, collection: str, label: str) -> dict[str, dict[str, Any]]:
+    key_problem = credential_key_problem()
+    loaded: dict[str, dict[str, Any]] = {}
+    encrypted = 0
+    left_clear = 0
+    unreadable: list[str] = []
+    for item in db.find(collection, {}):
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        record = _normalize_record(item)
+        if _clear_encryption_keys(record):
+            if key_problem is None:
+                stored = _with_encryption_keys(record, encrypt_secret)
+                _run_db_write(lambda stored=stored: db.upsert(collection, "id", stored))
+                encrypted += 1
+            else:
+                left_clear += 1
+        loaded[record["id"]] = _with_encryption_keys(record, decrypt_secret)
+        if any(is_encrypted(holder[key]) for holder, key in _encryption_key_holders(loaded[record["id"]])):
+            unreadable.append(str(record.get("name") or record["id"]))
+    if encrypted:
+        LOGGER.info("Encrypted the stored encryption keys of %d %s.", encrypted, label)
+    if left_clear:
+        LOGGER.error(
+            "%s. The stored encryption keys of %d %s stay as they are until it is fixed: none is encrypted. %s.",
+            key_problem,
+            left_clear,
+            label,
+            KEY_REPAIR_HINT,
+        )
+    if unreadable and collection == "jobs":
+        LOGGER.error(
+            "The stored encryption keys of jobs %s cannot be decrypted with the credential key at %s%s. Their "
+            "backups are refused, and so is a restore that needs those keys, until it is fixed: %s, or give the key "
+            "again with abr job edit --set-encryption, and abr restore start --encryption-key for a restore.",
+            ", ".join(unreadable),
+            credential_key_path(),
+            f" ({key_problem})" if key_problem else ": they were encrypted with another key",
+            KEY_REPAIR_HINT,
+        )
+    elif unreadable:
+        LOGGER.warning(
+            "The stored encryption keys of %d %s cannot be decrypted with the credential key at %s.",
+            len(unreadable),
+            label,
+            credential_key_path(),
+        )
+    return loaded
+
+
 def load_jobs() -> dict[str, dict[str, Any]]:
     db = get_database()
     if db is None:
         return {}
 
-    records = db.find("jobs", {})
-    return {
-        item["id"]: _normalize_record(item)
-        for item in records
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
+    return _load_with_encryption_keys(db, "jobs", "jobs")
 
 
 def persist_job(record: dict[str, Any]) -> None:
@@ -298,7 +401,8 @@ def persist_job(record: dict[str, Any]) -> None:
     with CATALOG_LOCK:
         db = get_database()
         if db is not None:
-            _run_db_write(lambda: db.upsert("jobs", "id", normalized))
+            stored = _job_for_storage(normalized, JOBS.get(record["id"]))
+            _run_db_write(lambda: db.upsert("jobs", "id", stored))
         JOBS[record["id"]] = normalized
 
 
@@ -350,11 +454,7 @@ def load_backups() -> dict[str, dict[str, Any]]:
     if db is None:
         return {}
 
-    return {
-        item["id"]: _normalize_record(item)
-        for item in db.find("backups", {})
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
+    return _load_with_encryption_keys(db, "backups", "restore points")
 
 
 def persist_backup(record: dict[str, Any]) -> None:
@@ -362,7 +462,8 @@ def persist_backup(record: dict[str, Any]) -> None:
     with CATALOG_LOCK:
         db = get_database()
         if db is not None:
-            _run_db_write(lambda: db.upsert("backups", "id", normalized))
+            stored = _encryption_keys_for_storage(normalized)
+            _run_db_write(lambda: db.upsert("backups", "id", stored))
         BACKUPS[record["id"]] = normalized
 
 
@@ -588,12 +689,7 @@ def load_tasks() -> dict[str, dict[str, Any]]:
     if db is None:
         return {}
 
-    records = db.find("tasks", {})
-    return {
-        item["id"]: _normalize_record(item)
-        for item in records
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
+    return _load_with_encryption_keys(db, "tasks", "sessions")
 
 
 def persist_task(record: dict[str, Any]) -> None:
@@ -601,7 +697,8 @@ def persist_task(record: dict[str, Any]) -> None:
     with CATALOG_LOCK:
         db = get_database()
         if db is not None:
-            _run_db_write(lambda: db.upsert("tasks", "id", normalized))
+            stored = _encryption_keys_for_storage(normalized)
+            _run_db_write(lambda: db.upsert("tasks", "id", stored))
         TASKS[record["id"]] = normalized
 
 
@@ -612,7 +709,7 @@ def load_queued_tasks(limit: int | None = None) -> list[dict[str, Any]]:
         queued: list[dict[str, Any]] = []
         for item in records:
             if isinstance(item, dict) and isinstance(item.get("id"), str):
-                normalized = _normalize_record(item)
+                normalized = _with_encryption_keys(item, decrypt_secret)
                 TASKS[normalized["id"]] = normalized
                 queued.append(normalized)
         return queued
@@ -633,7 +730,7 @@ def claim_task(task_id: str) -> dict[str, Any] | None:
         claimed = db.claim_task(task_id)
         if not isinstance(claimed, dict):
             return None
-        normalized = _normalize_record(claimed)
+        normalized = _with_encryption_keys(claimed, decrypt_secret)
         TASKS[task_id] = normalized
         return normalized
 

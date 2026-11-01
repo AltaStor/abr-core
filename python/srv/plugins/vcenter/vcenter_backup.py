@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from ...core.subprocess_util import DataPathStalled, ProcessCancelled, describe_process_end, run_capped
 from ...core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV
+from ...core.credential_encryption import is_encrypted, unreadable_encryption_key_message
 from ...core.server_defaults import env_int
 from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...core.storage_tool import (
@@ -1064,6 +1065,8 @@ def _resolve_encryption_settings(parameters: dict[str, Any]) -> tuple[int, str]:
     key = str(parameters.get("encryption_key") or "").strip()
     if not key:
         raise VCenterBackupError("parameters.encryption_key is required when parameters.encryption_enabled is true")
+    if is_encrypted(key):
+        raise VCenterBackupError(unreadable_encryption_key_message("of this job"))
     return ENCRYPTION_ALGORITHM_AES_256, key
 
 

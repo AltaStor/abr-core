@@ -154,6 +154,22 @@ def unreadable_credential_message(subject: str) -> str:
     )
 
 
+def unreadable_encryption_key_message(subject: str) -> str:
+    problem = credential_key_problem()
+    reason = (
+        f"{problem}. {KEY_REPAIR_HINT}"
+        if problem
+        else (
+            f"It was encrypted with another credential key than the one at {credential_key_path()}. Put back the "
+            "key file it was encrypted with and restart the server"
+        )
+    )
+    return (
+        f"The stored encryption key {subject} cannot be decrypted. {reason}, or give the key again: "
+        "abr job edit --set-encryption for new backups, abr restore start --encryption-key for a restore."
+    )
+
+
 def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 

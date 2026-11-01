@@ -54,6 +54,12 @@ from python.srv.core.mongo_db_wrapper import (
     update_hypervisor_fields,
     users_replaced_by_import,
 )
+from python.srv.core.credential_encryption import (
+    KEY_REPAIR_HINT,
+    credential_key_problem,
+    is_encrypted,
+    unreadable_encryption_key_message,
+)
 from python.srv.core.server_defaults import env_int
 from python.srv.core.subprocess_util import run_capped
 from python.srv.core.secure_archive import (
@@ -9548,14 +9554,7 @@ def _job_key_by_id(job_id: str, key_id: Any) -> str | None:
     return None
 
 
-def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
-    job_id = str(point.get("job_id") or "")
-    by_id = _job_key_by_id(job_id, point.get("encryption_key_id"))
-    if by_id:
-        return by_id
-    own_key = str(point.get("encryption_key") or "").strip()
-    if own_key:
-        return own_key
+def _job_current_key(job_id: str) -> str | None:
     if not job_id or job_id not in JOBS:
         return None
     source_job = resolve_job(record_id=job_id)
@@ -9563,6 +9562,22 @@ def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
     if not task_parameters.get("encryption_enabled"):
         return None
     return str(task_parameters.get("encryption_key") or "").strip() or None
+
+
+def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
+    job_id = str(point.get("job_id") or "")
+    found = []
+    for lookup in (
+        lambda: _job_key_by_id(job_id, point.get("encryption_key_id")),
+        lambda: str(point.get("encryption_key") or "").strip() or None,
+        lambda: _job_current_key(job_id),
+    ):
+        key = lookup()
+        if key and not is_encrypted(key):
+            return key
+        if key:
+            found.append(key)
+    return found[0] if found else None
 
 
 def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
@@ -9810,13 +9825,30 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     scenario = "backup_copy" if repo is not None and str(repo.get("id") or "") != str(point.get("repository_id") or "") else "out_of_place"
     power_on = bool(request.get("power_on_after_restore"))
     connect_nics = bool(request.get("connect_nics"))
-    encryption_key = str(payload.get("encryption_key") or "").strip() or _resolve_restore_encryption_key(point)
+    given_key = str(payload.get("encryption_key") or "").strip()
+    key_problem = credential_key_problem() if given_key else None
+    _ensure(
+        key_problem is None,
+        503,
+        "credential_key_unavailable",
+        f"{key_problem}. The encryption key given for this restore is not stored. {KEY_REPAIR_HINT}, then repeat "
+        "the restore.",
+        point_id=point_id,
+    )
+    encryption_key = given_key or _resolve_restore_encryption_key(point)
     _ensure(
         bool(encryption_key) or not _point_is_encrypted(point),
         409,
         "encryption_key_unavailable",
         "This restore point is encrypted and no decryption key is stored for it. Repeat the restore with an "
         "explicit encryption key.",
+        point_id=point_id,
+    )
+    _ensure(
+        not is_encrypted(encryption_key),
+        409,
+        "encryption_key_unreadable",
+        unreadable_encryption_key_message("of this restore point"),
         point_id=point_id,
     )
     task = {

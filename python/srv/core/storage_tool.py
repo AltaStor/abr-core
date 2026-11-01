@@ -18,6 +18,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from .credential_encryption import is_encrypted, unreadable_encryption_key_message
 from .server_defaults import env_int
 from .subprocess_util import CompletedProcess, DataPathStalled, ProcessCancelled, run_capped
 
@@ -810,6 +811,12 @@ def split_disk_tool_secrets(command: list[str]) -> tuple[list[str], list[tuple[s
             continue
         if "\n" in value or "\r" in value:
             raise StorageToolError(f"The {name} given to the backup tool must not contain a line break")
+        if is_encrypted(value):
+            raise StorageToolError(
+                unreadable_encryption_key_message("for this run")
+                if name in ("key", "source-key")
+                else f"The stored {name} for this run cannot be decrypted with this server's credential key"
+            )
         secrets.append((name, value))
         index += 2
     return ([*argv, STDIN_KEYS_FLAG] if secrets else argv), secrets

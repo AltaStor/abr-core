@@ -46,10 +46,63 @@ empty, or not a key) is never replaced. The server still starts, logs the path
 and the reason, leaves every stored credential as it is and refuses to store a
 new password until the file is put back and the server restarted.
 
+### Backup encryption keys
+
+The keys of encrypted jobs are stored encrypted with the same key file: on the
+job, on each restore point written with them, and on the sessions that used
+them. Keys a server version before this change stored in clear are encrypted
+the next time the server starts. The export above carries them inside its own
+password-protected file, like the inventory credentials.
+
+Here the key file matters more than for inventory passwords: if you copy the raw
+database files without it, the server cannot read any stored encryption key.
+The backups of those jobs are refused, and so is a restore that needs a stored
+key, each naming the reason, until the key file is put back. A restore can
+still be done by giving the key (`--encryption-key` reads `ABR_ENCRYPTION_KEY`
+or prompts for it):
+
+```bash
+abr restore start --restore-point <id> --encryption-key ...
+```
+
+and new backups of a job start with a key given again:
+
+```bash
+abr job edit --name <job> --set-encryption --encryption-key
+```
+
+Without the key file, the export and anyone who knows the keys, encrypted
+backups cannot be restored. Keep the key file with the database backups, or
+export the catalog regularly.
+
+While the key file is there but cannot be used, keys already stored are left as
+they are, and a new key -- an encryption key given to a job or to a restore --
+is refused rather than stored in clear.
+
 Session tokens are stored only as SHA-256 digests, so they need no key. Server
 versions before this change wrote inventory passwords and session tokens in
 clear, and MongoDB's slow-query log may still hold copies from that time in
 `/var/log/mongodb/mongod.log*`; remove or rotate those files after upgrading.
+The same goes for backup encryption keys written by versions before they were
+encrypted.
+
+### Going back to an older version
+
+An older server version cannot use the catalog of a newer one. After an upgrade
+the stored encryption keys are encrypted, and an older server would hand the
+encrypted value to the backup tool as the key: its restores of encrypted
+backups fail, and its backups of encrypted jobs are written with the wrong key.
+Do not start an older version on the upgraded catalog. To go back:
+
+1. Export the catalog, before upgrading or on the newer version:
+   `abr system export --file <path>`.
+2. Install the older version with an empty catalog.
+3. Import the export there: `abr system import --file <path>`.
+
+The export carries the keys inside its own password-protected file, and the
+older server stores them the way it expects. Restore points written after the
+export are not in it: their files stay in the repository, but the older
+server's catalog does not list them.
 
 ## 2. Provision the replacement host
 

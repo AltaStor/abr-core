@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from python.srv.core.mongo_db_wrapper import JOBS, REPOSITORIES, TASKS
+from python.srv.core.mongo_db_wrapper import JOBS, REPOSITORIES, TASKS, catalog_entries
 
 from . import email_channel
 from .notification_events import CERTIFICATE_WARNING_DAYS
@@ -85,7 +85,7 @@ def _backup_finished(task: dict[str, Any]) -> None:
     if not isinstance(job, dict):
         return
     run_id = str(task.get("run_id") or task.get("id"))
-    session_ids = [task_id for task_id, item in list(TASKS.items()) if str(item.get("run_id") or "") == run_id] if task.get("run_id") else [str(task["id"])]
+    session_ids = [task_id for task_id, item in catalog_entries(TASKS) if str(item.get("run_id") or "") == run_id] if task.get("run_id") else [str(task["id"])]
     first = min((TASKS.get(task_id) or {}).get("created_at") or "" for task_id in session_ids) if session_ids else task.get("created_at")
     summary = abr_v41.job_run_summary(
         {"last_run": {"id": run_id, "trigger": task.get("trigger") or "manual", "started_at": first, "session_ids": session_ids}}
