@@ -9,6 +9,7 @@ from python.srv.services import abr_v41
 
 from ._routing import build_router, register
 from .schemas import (
+    CreateBackupCopyJobRequest,
     CreateCopyJobRequest,
     CreateJobRequest,
     DeletedResult,
@@ -31,6 +32,12 @@ def create_job(payload: CreateJobRequest = Body(default_factory=CreateJobRequest
 
 def create_copy_job(payload: CreateCopyJobRequest = Body(default_factory=CreateCopyJobRequest)) -> JobDTO:
     return abr_v41.create_copy_job(unset_excluded(payload))
+
+
+def create_backup_copy_job(
+    payload: CreateBackupCopyJobRequest = Body(default_factory=CreateBackupCopyJobRequest),
+) -> JobDTO:
+    return abr_v41.create_backup_copy_job(unset_excluded(payload))
 
 
 def list_jobs() -> JobList:
@@ -67,6 +74,7 @@ def run_retention(job_id: str, payload: RunRetentionRequest = Body(default_facto
 register(router, [
     ("", create_job, ["POST"], "job.create"),
     ("/copy", create_copy_job, ["POST"], "job.create"),
+    ("/backup-copy", create_backup_copy_job, ["POST"], "job.create"),
     ("", list_jobs, ["GET"], "job.view"),
     ("/{job_id}", get_job, ["GET"], "job.view"),
     ("/{job_id}", patch_job, ["PATCH"], "job.edit"),

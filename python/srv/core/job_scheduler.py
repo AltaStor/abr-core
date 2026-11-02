@@ -16,6 +16,7 @@ from .mongo_db_wrapper import HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, catalog
 from .server_defaults import env_int
 from .utils import utc_now
 from python.srv.services import clock_guard, notification_detectors
+from python.srv.services.backup_copy import create_copy_sessions
 from python.srv.services.abr_v41 import (
     execution_phases,
     job_clock_anomalies,
@@ -139,7 +140,12 @@ class JobScheduler:
                 continue
 
             run_id = str(uuid4())
-            tasks = self._create_scheduled_tasks(normalized_job, scheduled_type=due_slots[0][1], run_id=run_id)
+            if normalized_job.get("job_type") == "backup-copy":
+                tasks = create_copy_sessions(
+                    normalized_job, trigger="schedule", run_id=run_id, scheduled_type=due_slots[0][1]
+                )
+            else:
+                tasks = self._create_scheduled_tasks(normalized_job, scheduled_type=due_slots[0][1], run_id=run_id)
             self._advance_due_slots(job, due_slots)
             if not tasks:
                 job["updated_at"] = utc_now()
@@ -271,9 +277,9 @@ class JobScheduler:
 
     def _is_supported_backup_job(self, job: dict[str, Any]) -> bool:
         normalized_job = normalize_job_record(job)
-        if normalized_job.get("job_type") != "backup":
+        if normalized_job.get("job_type") not in ("backup", "backup-copy"):
             return False
-        if not normalized_job.get("inventory_id"):
+        if normalized_job.get("job_type") == "backup" and not normalized_job.get("inventory_id"):
             return False
         if not normalized_job.get("enabled"):
             return False

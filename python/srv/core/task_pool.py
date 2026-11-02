@@ -9,7 +9,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from .mongo_db_wrapper import TASKS, TASK_LOCK, claim_task, load_queued_tasks, persist_task
-from ..services import notification_detectors
+from ..services import backup_copy, notification_detectors
 from ..services.backup_catalog import discard_unregistered_output, register_backup_from_completed_task
 from .task_executor import TaskStopRequested, run_task
 from .utils import utc_now
@@ -374,6 +374,10 @@ class TaskProcessPool:
             self._fail_unrecorded_backup(task_id, unrecorded_backup)
         else:
             notification_detectors.task_finished(dict(finished))
+            try:
+                backup_copy.on_session_finished(dict(finished))
+            except Exception:
+                logger.exception("Could not start the backup copies that follow task '%s'", task_id)
 
     def _fail_unrecorded_backup(self, task_id: str, snapshot: dict[str, object]) -> None:
         removed = False

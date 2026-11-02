@@ -64,6 +64,11 @@ def run_task(
         logger.error("Task '%s' rejected: status is '%s', not 'queued'.", task_id, task.get("status"))
         raise TaskExecutionError("Only queued tasks can be executed")
 
+    from python.srv.services.backup_copy import (
+        BackupCopyValidationError,
+        is_backup_copy_task,
+        run_backup_copy,
+    )
     from python.srv.services.synthetic_full import (
         SyntheticFullValidationError,
         is_synthetic_full_task,
@@ -74,13 +79,17 @@ def run_task(
     hypervisor_id = str(task.get("hypervisor_id", ""))
     hypervisor = HYPERVISORS.get(hypervisor_id, {})
     hypervisor_kind = str(hypervisor.get("kind", ""))
-    synthetic_full = task_type == "backup" and is_synthetic_full_task(task)
-    plugin = None if synthetic_full else build_hypervisor_plugin(hypervisor)
+    backup_copy = is_backup_copy_task(task)
+    synthetic_full = task_type == "backup" and not backup_copy and is_synthetic_full_task(task)
+    plugin = None if synthetic_full or backup_copy else build_hypervisor_plugin(hypervisor)
+    worker_mode = "backup-copy" if backup_copy else "synthetic-full" if synthetic_full else worker_mode_for_kind(hypervisor_kind)
 
     logger.info("Task '%s': Type='%s', HypervisorKind='%s'", task_id, task_type, hypervisor_kind)
 
     try:
-        if synthetic_full:
+        if backup_copy:
+            result = run_backup_copy(task, progress_callback=progress_callback)
+        elif synthetic_full:
             result = run_synthetic_full(task, progress_callback=progress_callback)
         elif task_type == "backup":
             result = plugin.backup(task, progress_callback=progress_callback)
@@ -99,7 +108,7 @@ def run_task(
                 "finished_at": utc_now(),
                 "resolved_backup_type": _task_resolved_execution_field(task, "resolved_backup_type"),
                 "resolved_backup_reason": _task_resolved_execution_field(task, "resolved_backup_reason"),
-                "worker_mode": "synthetic-full" if synthetic_full else worker_mode_for_kind(hypervisor_kind),
+                "worker_mode": worker_mode,
             },
             "updated_at": utc_now(),
         }
@@ -111,18 +120,20 @@ def run_task(
             "result": {
                 "message": str(exc),
                 "error_type": type(exc).__name__,
-                "failure_kind": "validation" if isinstance(exc, SyntheticFullValidationError) else "runtime",
+                "failure_kind": (
+                    "validation" if isinstance(exc, (SyntheticFullValidationError, BackupCopyValidationError)) else "runtime"
+                ),
                 "traceback": traceback.format_exc(),
                 "finished_at": utc_now(),
                 "resolved_backup_type": _task_resolved_execution_field(task, "resolved_backup_type"),
                 "resolved_backup_reason": _task_resolved_execution_field(task, "resolved_backup_reason"),
-                "worker_mode": "synthetic-full" if synthetic_full else worker_mode_for_kind(hypervisor_kind),
+                "worker_mode": worker_mode,
             },
             "updated_at": utc_now(),
         }
 
     result.setdefault("finished_at", utc_now())
-    result.setdefault("worker_mode", worker_mode_for_kind(hypervisor_kind))
+    result.setdefault("worker_mode", worker_mode)
 
     logger.debug("Task '%s' execution completed inside run_task.", task_id)
     
