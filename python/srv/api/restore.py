@@ -42,8 +42,12 @@ def list_restore_point_catalog(
         default=None,
         description="Only restore points from this inventory: its ID, or its name matched whole and case-insensitively",
     ),
+    job: str | None = Query(
+        default=None,
+        description="Only restore points this job wrote, a backup or a backup copy job: its ID, or its name matched whole and case-insensitively",
+    ),
 ) -> RestorePointList:
-    return {"items": abr_v41.list_restore_points(vm=vm, backup_id=backup, inventory=inventory)}
+    return {"items": abr_v41.list_restore_points(vm=vm, backup_id=backup, inventory=inventory, job=job)}
 
 
 def list_restore_points(vm_id: str) -> RestorePointList:

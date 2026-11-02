@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import errno
 import logging
+import re
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -60,6 +61,8 @@ MAX_RETRY_COUNT = 20
 MAX_RETRY_INTERVAL_MINUTES = 24 * 60
 AVAILABLE_STATUSES = frozenset({"available", "completed", "healthy"})
 FINISHED_STATUSES = frozenset({"completed", "failed", "stopped", "canceled", "cancelled"})
+WINDOW_TIME = re.compile(r"^([01]\d|2[0-4]):([0-5]\d)$")
+WINDOW_STOP_REASON = "copy_window"
 
 
 class BackupCopyError(RuntimeError):
@@ -335,6 +338,17 @@ def create_copy_sessions(
             }
 
             what = "synthetic full of the copied chain" if synthetic else "backup copy"
+            window = copy_window_state(normalized)
+            if not window["open"]:
+                _append_task_log(
+                    task,
+                    level="info",
+                    message=(
+                        f"Waits for the copy window ({describe_copy_window(normalized.get('copy_window') or [])}): "
+                        f"it opens {_local_text(window['opens_at'], normalized)}"
+                    ),
+                    component="session",
+                )
             _append_task_log(
                 task,
                 level="info",
@@ -413,10 +427,17 @@ def on_session_finished(task: dict[str, Any]) -> None:
         if copy_job.get("enabled") and copy_job.get("copy_mode") == "immediate" and pending_copy(copy_job, vm_id):
             _start_and_record(copy_job, trigger="copy-backlog", vm_ids=[vm_id])
         return
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    if is_backup_copy_task(task) and status == "stopped" and result.get("stop_reason") == WINDOW_STOP_REASON:
+        from python.srv.services.abr_v41 import normalize_job_record
+
+        copy_job = normalize_job_record(finished_job) if finished_job else {}
+        if copy_job and vm_id:
+            _start_and_record(copy_job, trigger="copy-window", vm_ids=[vm_id])
+        return
     if is_backup_copy_task(task):
         return
 
-    result = task.get("result") if isinstance(task.get("result"), dict) else {}
     for copy_job in _copy_jobs():
         if str(copy_job.get("id") or "") == job_id:
             continue
@@ -625,10 +646,12 @@ def _copy_once(
                 retention_till=retention_till,
                 timeout=timeout_seconds,
                 on_progress=_on_progress,
-                should_cancel=lambda: cancel_requested(task_id),
+                should_cancel=lambda: cancel_requested(task_id) or _window_closed(job),
             )
         except ProcessCancelled as exc:
             _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name)
+            if not cancel_requested(task_id) and _window_closed(job):
+                raise _stop_for_window(job, "while it copied; what it had written was discarded") from exc
             raise TaskStopRequested("Backup copy cancelled; what it had written was discarded") from exc
         except StorageToolError as exc:
             _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name)
@@ -769,13 +792,15 @@ def _identity_of(disk: dict[str, Any], position: int) -> str:
     return _disk_identity(disk, position)
 
 
-def _wait_before_retry(task_id: str, minutes: int) -> None:
+def _wait_before_retry(task_id: str, minutes: int, job: dict[str, Any]) -> None:
     from python.srv.core.task_executor import TaskStopRequested, cancel_requested
 
     deadline = time.monotonic() + minutes * 60
     while time.monotonic() < deadline:
         if cancel_requested(task_id):
             raise TaskStopRequested("Backup copy cancelled while it waited to retry")
+        if _window_closed(job):
+            raise _stop_for_window(job, "while the copy waited to retry")
         time.sleep(min(5.0, max(0.0, deadline - time.monotonic())))
 
 
@@ -814,6 +839,9 @@ def run_backup_copy(
             "vm_external_id": vm_id,
         }
 
+    if _window_closed(job):
+        raise _stop_for_window(job, "before the copy could start")
+
     target = plan["target"]
     emit(
         0,
@@ -841,7 +869,7 @@ def run_backup_copy(
                 log_level="warn",
             )
             if wait:
-                _wait_before_retry(task_id, wait)
+                _wait_before_retry(task_id, wait, job)
 
     duration = time.time() - started
     message = (
@@ -984,15 +1012,18 @@ def _hyperv_sources(jobs: list[dict[str, Any]], repositories: list[dict[str, Any
     )
 
 
-def _encrypted_sources(jobs: list[dict[str, Any]], repositories: list[dict[str, Any]]) -> bool:
+def _encrypted_sources(jobs: list[dict[str, Any]], repositories: list[dict[str, Any]], vm_ids: list[str]) -> bool:
     from python.srv.services.abr_v41 import normalized_backup_points
 
     if any((job.get("task_parameters") or {}).get("encryption_enabled") for job in jobs):
         return True
 
     repository_ids = {str(repo["id"]) for repo in repositories}
+    wanted = set(vm_ids)
     return any(
-        str(point.get("repository_id") or "") in repository_ids and point.get("encryption_enabled")
+        str(point.get("repository_id") or "") in repository_ids
+        and (not wanted or str(point.get("vm_id") or "") in wanted)
+        and point.get("encryption_enabled")
         for point in normalized_backup_points()
     )
 
@@ -1076,6 +1107,10 @@ def apply_copy_settings(job: dict[str, Any], payload: dict[str, Any], *, creatin
             job["run_after_job_name"] = ""
         changed = True
 
+    if creating or "copy_window" in payload:
+        job["copy_window"] = parse_copy_window(payload.get("copy_window"))
+        changed = True
+
     if creating or "retry_count" in payload or "retry_interval_minutes" in payload:
         job["retry_count"], job["retry_interval_minutes"] = _validate_retries(payload, current)
         changed = True
@@ -1147,7 +1182,7 @@ def validate_copy_job(job: dict[str, Any], jobs: list[dict[str, Any]], repositor
     parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else {}
     keyed = bool(parameters.get("encryption_enabled")) and bool(str(parameters.get("encryption_key") or "").strip())
     _ensure(
-        keyed or not _encrypted_sources(jobs, repositories),
+        keyed or not _encrypted_sources(jobs, repositories, list(job.get("vm_ids") or [])),
         422,
         "invalid_job",
         "The source restore points are encrypted; give the backup copy job an encryption key of its own "
@@ -1177,4 +1212,179 @@ def copy_job_view(job: dict[str, Any]) -> dict[str, Any]:
         ),
         "run_after_job": _named([run_after_id], [job.get("run_after_job_name")], JOBS)[0] if run_after_id else None,
         "retry": {"count": count, "interval_minutes": interval},
+        "copy_window": list(job.get("copy_window") or []),
+        "copy_window_summary": describe_copy_window(list(job.get("copy_window") or [])),
     }
+
+
+def _window_error(message: str, **details: Any) -> Exception:
+    return api_error(422, "invalid_copy_window", message, **details)
+
+
+def _window_days(tokens: list[str], rule: str) -> list[str]:
+    from python.srv.services.abr_v41 import DAY_ORDER, _title_day
+
+    days: list[str] = []
+    for token in tokens:
+        if "-" in token:
+            first, _, last = token.partition("-")
+            begin = DAY_ORDER.index(_title_day(first))
+            span = (DAY_ORDER.index(_title_day(last)) - begin) % len(DAY_ORDER)
+            covered = sorted((begin + step) % len(DAY_ORDER) for step in range(span + 1))
+            listed = ",".join(DAY_ORDER[position].lower() for position in covered)
+            raise _window_error(
+                f"Copy window rule '{rule}' gives days as a range ({token}); list them separated by commas, as in {listed}",
+                rule=rule,
+            )
+        day = _title_day(token)
+        if day in days:
+            raise _window_error(f"{day} is given more than once in copy window rule '{rule}'", rule=rule, day=day)
+        if days and DAY_ORDER.index(day) < DAY_ORDER.index(days[-1]):
+            in_order = ",".join(item.lower() for item in sorted([*days, day], key=DAY_ORDER.index))
+            raise _window_error(
+                f"Days in copy window rule '{rule}' must go in week order, Monday to Sunday, as in {in_order}",
+                rule=rule,
+            )
+        days.append(day)
+
+    return days or list(DAY_ORDER)
+
+
+def _days_label(days: list[str]) -> str:
+    from python.srv.services.abr_v41 import DAY_ORDER
+
+    return "every day" if len(days) == len(DAY_ORDER) else ", ".join(days)
+
+
+def _window_minutes(value: str, rule: str) -> int:
+    match = WINDOW_TIME.match(value.strip())
+    if not match or (match.group(1) == "24" and match.group(2) != "00"):
+        raise _window_error(f"'{value}' in copy window rule '{rule}' is not a time from 00:00 to 24:00", rule=rule)
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _window_rule(rule: Any) -> dict[str, Any]:
+    from python.srv.services.abr_v41 import _server_timezone_name
+
+    if isinstance(rule, dict):
+        raw_days = rule.get("days")
+        tokens = raw_days if isinstance(raw_days, list) else _tokens(raw_days)
+        start_text, end_text = str(rule.get("start") or ""), str(rule.get("end") or "")
+        text = f"{','.join(str(token) for token in tokens)} {start_text}-{end_text}".strip()
+    else:
+        text = str(rule or "").strip()
+        parts = text.split()
+        if len(parts) not in (1, 2) or parts[-1].count("-") != 1:
+            raise _window_error(
+                f"Copy window rule '{text}' is not '[days] HH:MM-HH:MM', for example 'mon-fri 22:00-06:00'", rule=text
+            )
+        tokens = [token for token in parts[0].split(",") if token] if len(parts) == 2 else []
+        start_text, end_text = parts[-1].split("-")
+
+    start, end = _window_minutes(start_text, text), _window_minutes(end_text, text)
+    if start == 24 * 60 or start == end:
+        raise _window_error(
+            f"Copy window rule '{text}' must start before 24:00 and end at another time; use 00:00-24:00 for a whole day",
+            rule=text,
+        )
+
+    days = _window_days([str(token).strip() for token in tokens], text)
+    return {
+        "days": days,
+        "label": _days_label(days),
+        "start": start_text.strip(),
+        "end": end_text.strip(),
+        "timezone": str(rule.get("timezone") or "") if isinstance(rule, dict) and rule.get("timezone") else _server_timezone_name(),
+    }
+
+
+def parse_copy_window(value: Any) -> list[dict[str, Any]]:
+    rules = value if isinstance(value, list) else [value]
+    rules = [rule for rule in rules if rule not in (None, "")]
+    if len(rules) == 1 and isinstance(rules[0], str) and rules[0].strip().lower() == "none":
+        return []
+    return [_window_rule(rule) for rule in rules]
+
+
+def _window_intervals(rules: list[dict[str, Any]], around: datetime) -> list[tuple[datetime, datetime]]:
+    from python.srv.services.abr_v41 import DAY_ORDER, _load_timezone
+
+    intervals = []
+    for rule in rules:
+        zone = _load_timezone(rule.get("timezone"))
+        local = around.astimezone(zone)
+        start = _window_minutes(str(rule["start"]), "")
+        end = _window_minutes(str(rule["end"]), "")
+        for offset in range(-1, 9):
+            day = (local + timedelta(days=offset)).date()
+            if DAY_ORDER[day.weekday()] not in rule["days"]:
+                continue
+            midnight = datetime(day.year, day.month, day.day, tzinfo=zone)
+            opens = midnight + timedelta(minutes=start)
+            closes = midnight + timedelta(minutes=end if end > start else end + 24 * 60)
+            intervals.append((opens.astimezone(timezone.utc), closes.astimezone(timezone.utc)))
+    return sorted(intervals)
+
+
+def copy_window_state(job: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    rules = [rule for rule in job.get("copy_window") or [] if isinstance(rule, dict)]
+    moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if not rules:
+        return {"open": True, "closes_at": None, "opens_at": None}
+
+    intervals = _window_intervals(rules, moment)
+    current = [interval for interval in intervals if interval[0] <= moment < interval[1]]
+    if not current:
+        upcoming = [opens for opens, _closes in intervals if opens > moment]
+        return {"open": False, "closes_at": None, "opens_at": min(upcoming) if upcoming else None}
+
+    closes = max(closes for _opens, closes in current)
+    extended = True
+    while extended:
+        extended = False
+        for opens, ends in intervals:
+            if opens <= closes < ends:
+                closes, extended = ends, True
+    return {"open": True, "closes_at": closes, "opens_at": None}
+
+
+def describe_copy_window(rules: list[dict[str, Any]]) -> str:
+    if not rules:
+        return "any time"
+    return "; ".join(f"{rule.get('label') or ', '.join(rule.get('days') or [])} {rule.get('start')}-{rule.get('end')}" for rule in rules)
+
+
+def _local_text(moment: datetime | None, job: dict[str, Any]) -> str:
+    from python.srv.services.abr_v41 import _load_timezone
+
+    if moment is None:
+        return "never"
+    rules = job.get("copy_window") or [{}]
+    zone = _load_timezone(rules[0].get("timezone"))
+    return moment.astimezone(zone).strftime("%a %Y-%m-%d %H:%M %Z")
+
+
+def waits_for_window(task: dict[str, Any]) -> bool:
+    from python.srv.services.abr_v41 import normalize_job_record
+
+    stored = JOBS.get(str(task.get("job_id") or ""))
+    if str(task.get("task_type") or "") != "backup" or not isinstance(stored, dict):
+        return False
+    job = normalize_job_record(stored)
+    return job.get("job_type") == "backup-copy" and not copy_window_state(job)["open"]
+
+
+def _window_closed(job: dict[str, Any]) -> bool:
+    return not copy_window_state(job)["open"]
+
+
+def _stop_for_window(job: dict[str, Any], detail: str) -> Exception:
+    from python.srv.core.task_executor import TaskStopRequested
+
+    state = copy_window_state(job)
+    stop = TaskStopRequested(
+        f"The copy window ({describe_copy_window(job.get('copy_window') or [])}) closed {detail}; "
+        f"the copy is taken up again when it opens, {_local_text(state.get('opens_at'), job)}"
+    )
+    stop.reason = WINDOW_STOP_REASON
+    return stop

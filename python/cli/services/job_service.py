@@ -463,6 +463,98 @@ class JobService:
             payload["task_parameters"] = non_null_updates
         return payload
 
+    COPY_OPTION_FLAGS = (
+        ("copy_mode", "--mode"),
+        ("source_jobs", "--source-job"),
+        ("source_job_ids", "--source-job-id"),
+        ("source_repositories", "--source-repo"),
+        ("source_repository_ids", "--source-repo-id"),
+        ("run_after_job", "--run-after-job"),
+        ("run_after_job_id", "--run-after-job-id"),
+        ("copy_window", "--copy-window"),
+        ("retry_count", "--retry-count"),
+        ("retry_interval_minutes", "--retry-interval"),
+        ("all_vms", "--all-vms"),
+    )
+    BACKUP_ONLY_FLAGS = (
+        ("inventory", "--inventory"),
+        ("inventory_id", "--inventory-id"),
+        ("on_quiesce_failure", "--on-quiesce-failure"),
+        ("guest_consistency", "--guest-consistency"),
+    )
+
+    @staticmethod
+    def _cleared(values: list[str]) -> list[str] | None:
+        flat = [item for value in values for item in parse_csv_values(value)]
+        return [] if [item.lower() for item in flat] == ["none"] else flat
+
+    def _backup_copy_fields(self, args: Any) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        if getattr(args, "copy_mode", None):
+            fields["copy_mode"] = args.copy_mode
+        for name in ("source_jobs", "source_job_ids", "source_repositories", "source_repository_ids"):
+            values = getattr(args, name, None) or []
+            if values:
+                fields[name] = self._cleared(values)
+        for name in ("run_after_job", "run_after_job_id"):
+            value = getattr(args, name, None)
+            if value is not None:
+                fields[name] = "" if str(value).strip().lower() == "none" else str(value).strip()
+        windows = getattr(args, "copy_window", None) or []
+        if windows:
+            fields["copy_window"] = [] if [str(rule).strip().lower() for rule in windows] == ["none"] else list(windows)
+        for name in ("retry_count", "retry_interval_minutes"):
+            if getattr(args, name, None) is not None:
+                fields[name] = int(getattr(args, name))
+        return fields
+
+    def create_backup_copy_job_payload(self, args: Any) -> dict[str, Any]:
+        name = self._normalize_name(getattr(args, "name", None), label="Job name")
+        repository_name = self._coalesce_string(getattr(args, "repository", None), getattr(args, "repo", None))
+        repository_id = self._coalesce_string(getattr(args, "repository_id", None), getattr(args, "repo_id", None))
+        if not repository_name and not repository_id:
+            raise ValueError("job create-backup-copy requires the repository the copies go to: --repo or --repo-id")
+        fields = self._backup_copy_fields(args)
+        if not any(fields.get(key) for key in ("source_jobs", "source_job_ids", "source_repositories", "source_repository_ids")):
+            raise ValueError("job create-backup-copy requires a source: --source-job, --source-job-id, --source-repo or --source-repo-id")
+
+        payload: dict[str, Any] = {
+            "name": name,
+            "repo": repository_name,
+            "repo_id": repository_id,
+            "retention_days": int(getattr(args, "retention_days", 14)),
+            "gfs": {
+                "weekly": int(getattr(args, "gfs_weekly", 0) or 0),
+                "monthly": int(getattr(args, "gfs_monthly", 0) or 0),
+                "yearly": int(getattr(args, "gfs_yearly", 0) or 0),
+                "enabled": self._gfs_enabled_override(args) is not False,
+            },
+            "active_full_days": getattr(args, "active_full_days", None) or [],
+            "synthetic_full_days": getattr(args, "synthetic_full_days", None) or [],
+            **self.build_execution_schedule_payloads(args),
+            **fields,
+        }
+        vm_tokens = self._raw_vm_tokens(args)
+        if vm_tokens:
+            payload["vms"] = vm_tokens
+        schedule = self.build_schedule_payload(args)
+        if schedule is not None:
+            payload["schedule"] = schedule
+        else:
+            enabled_override = self._schedule_enabled_override(args)
+            if enabled_override is not None:
+                payload["enabled"] = enabled_override
+        description = self._coalesce_string(getattr(args, "description", None))
+        if description:
+            payload["description"] = description
+        if getattr(args, "retention_min_fulls", None) is not None:
+            payload["retention_min_fulls"] = int(args.retention_min_fulls)
+        task_parameter_updates = self._build_task_parameter_updates(args, creating=True)
+        non_null_updates = {key: value for key, value in task_parameter_updates.items() if value is not None}
+        if non_null_updates:
+            payload["task_parameters"] = non_null_updates
+        return payload
+
     def create_copy_job_payload(self, args: Any) -> dict[str, Any]:
         name = self._normalize_name(getattr(args, "name", None), label="Job name")
         source_name = self._coalesce_string(getattr(args, "source", None), getattr(args, "source_job", None))
@@ -497,6 +589,19 @@ class JobService:
 
     def build_edit_payload(self, job: dict[str, Any], args: Any) -> dict[str, Any]:
         payload: dict[str, Any] = {}
+        is_copy = str(job.get("job_type") or "") == "backup-copy"
+        mismatched = [
+            flag
+            for name, flag in (self.BACKUP_ONLY_FLAGS if is_copy else self.COPY_OPTION_FLAGS)
+            if not self._is_empty_value(getattr(args, name, None))
+        ]
+        if mismatched:
+            kind = "backup jobs" if is_copy else "backup copy jobs"
+            raise ValueError(f"{', '.join(mismatched)} apply to {kind} only, and {job.get('name')} is a {'backup copy' if is_copy else 'backup'} job")
+        if is_copy:
+            payload.update(self._backup_copy_fields(args))
+            if getattr(args, "all_vms", False):
+                payload["vms"] = []
 
         if getattr(args, "new_name", None):
             payload["name"] = self._normalize_name(args.new_name, label="Job name")

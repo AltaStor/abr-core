@@ -294,6 +294,14 @@ class CopyJobSettingsTests(_Catalog):
         )
         self.assertTrue(keyed["encryption"]["enabled"])
 
+    def test_encrypted_points_of_vms_the_job_does_not_copy_need_no_key(self) -> None:
+        self._point("f1", "ActiveFull")
+        self._point("x1", "ActiveFull", vm_id="vm-9", vm_name="web-09", encryption_enabled=True)
+
+        job = self._copy_job(source_jobs=None, source_repositories=["Source"], vms=["sql-01"])
+        self.assertEqual(job["vm_ids"], [VM])
+        self.assertIn("encryption key", self._refused(lambda: self._copy_job(name="All", source_jobs=None, source_repositories=["Source"])).message)
+
     def test_hyperv_sources_need_a_destination_their_hosts_reach(self) -> None:
         JOBS["nightly"]["inventory_id"] = "hv"
 

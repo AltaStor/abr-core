@@ -34,6 +34,7 @@ class RestoreCommands:
         list_parser.add_argument("--vm", help="Filter by VM name or ID")
         list_parser.add_argument("--backup", help="Filter by backup chain ID")
         list_parser.add_argument("--inventory", help="Filter by inventory name or ID")
+        list_parser.add_argument("--job", help="Filter by the job that wrote the restore points, a backup or a backup copy job, by name or ID")
         list_parser.set_defaults(handler=self.list)
 
         point = commands.add_parser("point", help="Restore point operations.", description="Restore point commands.", formatter_class=CompactHelpFormatter)
@@ -121,8 +122,8 @@ class RestoreCommands:
                 'context lists. Sends two adapters on one source network to different targets. Repeat as needed.'
             ),
         )
-        start.add_argument("--repo", help="Repository name for backup-copy restore")
-        start.add_argument("--repo-id", help="Repository ID for backup-copy restore")
+        start.add_argument("--repo", help="Repository that must hold the restore point, by name; a check only, never needed")
+        start.add_argument("--repo-id", help="Repository that must hold the restore point, by ID; a check only, never needed")
         start.add_argument("--power-on", action="store_true", help="Power on after restore")
         add_secret_argument(
             start,

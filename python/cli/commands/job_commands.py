@@ -57,6 +57,23 @@ def _last_run_text(run: object) -> str:
     return f"{result.capitalize()} ({int(run.get(result) or 0)} of {total} VMs {result})"
 
 
+def _names(items: Any) -> str:
+    return ", ".join(str(item.get("name") or item.get("id")) for item in items or [] if isinstance(item, dict)) or "-"
+
+
+def _backup_copy_rows(view: dict[str, Any]) -> dict[str, Any]:
+    retry = view.get("retry") if isinstance(view.get("retry"), dict) else {}
+    run_after = view.get("run_after_job") if isinstance(view.get("run_after_job"), dict) else None
+    return {
+        "copy_mode": view.get("copy_mode"),
+        "source_jobs": _names(view.get("source_jobs")),
+        "source_repositories": _names(view.get("source_repositories")),
+        "run_after_job": (run_after or {}).get("name") or "-",
+        "copy_window": view.get("copy_window_summary") or "any time",
+        "retry": f"{retry.get('count')} time(s), {retry.get('interval_minutes')} minute(s) apart",
+    }
+
+
 def _last_run_issues(run: dict[str, Any]) -> str:
     issues = []
     for vm in run.get("vms") or []:
@@ -123,6 +140,32 @@ class JobCommands:
         )
         create_copy.set_defaults(handler=self.create_copy)
 
+        create_backup_copy = commands.add_parser(
+            "create-backup-copy",
+            help="Create a backup copy job: copies restore points into another repository.",
+            description=(
+                "Create a backup copy job.\n\n"
+                "It copies the restore points of its sources (backup jobs or repositories) into another repository, "
+                "where it keeps a chain of its own with its own retention. It reads stored backups only, never the "
+                "VMs. periodic copies on its schedule (or after another job runs) and merges what is new into one "
+                "restore point; immediate copies every new restore point as soon as a backup of a source ends.\n\n"
+                "Examples:\n"
+                '  abr job create-backup-copy --name "SQL-offsite" --source-job "SQL-nightly" --repo "S3-offsite" '
+                "--schedule daily --time 03:00 --retention-days 90 --active-full-schedule monthly "
+                "--active-full-day-of-month 1 --active-full-time 04:00\n"
+                '  abr job create-backup-copy --name "All-to-cloud" --mode immediate --source-repo "Local-Repo-1" '
+                '--repo "S3-offsite" --copy-window "mon,tue,wed,thu,fri 22:00-06:00" --copy-window "sat,sun 00:00-24:00" '
+                "--active-full-schedule weekly --active-full-days sun --active-full-time 04:00\n"
+                '  abr job create-backup-copy --name "SQL-after-nightly" --source-job "SQL-nightly" --vms "sql-01" '
+                '--repo "Archive-SMB" --run-after-job "SQL-nightly" --synthetic-full-schedule weekly '
+                "--synthetic-full-days sat --synthetic-full-time 05:00"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        self._add_common_job_create_arguments(create_backup_copy, for_copy=True, include_capture_flags=False)
+        self._add_backup_copy_arguments(create_backup_copy, creating=True)
+        create_backup_copy.set_defaults(handler=self.create_backup_copy)
+
         list_parser = commands.add_parser(
             "list",
             help="List jobs.",
@@ -159,6 +202,7 @@ class JobCommands:
         add_name_or_id_selector(edit, name_help="Job name", id_help="Job ID")
         edit.add_argument("--new-name", help="Updated job name")
         self._add_common_job_create_arguments(edit, for_copy=False, include_name=False, retention_default=None, gfs_default=None)
+        self._add_backup_copy_arguments(edit, creating=False)
         edit.set_defaults(handler=self.edit)
 
         start = commands.add_parser(
@@ -259,6 +303,7 @@ class JobCommands:
         gfs_default: int | None = 0,
         include_policy_flags: bool = True,
         include_compression_encryption_flags: bool = True,
+        include_capture_flags: bool = True,
     ) -> None:
         if include_name:
             parser.add_argument("--name", required=True, help="Job name")
@@ -301,6 +346,7 @@ class JobCommands:
                 type=parse_compression_level,
                 help="Backup compression level: 0 disables compression, 1-9 select Zstd levels (higher compresses smaller but slower). Default: 3.",
             )
+        if include_compression_encryption_flags and include_capture_flags:
             parser.add_argument(
                 "--on-quiesce-failure",
                 dest="on_quiesce_failure",
@@ -311,6 +357,7 @@ class JobCommands:
                     "crash-consistent takes the snapshot again without quiescing and completes with a warning."
                 ),
             )
+        if include_compression_encryption_flags:
             encryption_state = parser.add_mutually_exclusive_group()
             encryption_state.add_argument(
                 "--set-encryption",
@@ -331,6 +378,7 @@ class JobCommands:
                 env_var=ENCRYPTION_KEY_ENV_VAR,
                 help_text="Encryption key/passphrase, used together with --set-encryption",
             )
+        if include_compression_encryption_flags and include_capture_flags:
             parser.add_argument(
                 "--guest-consistency",
                 choices=("application", "crash"),
@@ -407,6 +455,44 @@ class JobCommands:
                 )
 
     @staticmethod
+    def _add_backup_copy_arguments(parser: argparse.ArgumentParser, *, creating: bool) -> None:
+        only = "" if creating else "Backup copy jobs only: "
+        replaces = "" if creating else "; replaces the job's list, none empties it"
+        if creating:
+            parser.add_argument("--vm", action="append", default=[], help="Copy only this VM of the sources, by name or ID. Repeat as needed")
+            parser.add_argument("--vms", help="Copy only these VMs of the sources, comma-separated; without --vm/--vms every VM the sources back up")
+        else:
+            parser.add_argument("--all-vms", dest="all_vms", action="store_true", help=f"{only}copy every VM the sources back up again")
+        parser.add_argument(
+            "--mode",
+            dest="copy_mode",
+            choices=("periodic", "immediate"),
+            help=(
+                f"{only}periodic (the default) copies on the job's schedule, or after --run-after-job, merging what is "
+                "new into one restore point; immediate copies every new restore point as soon as its backup ends"
+            ),
+        )
+        parser.add_argument("--source-job", dest="source_jobs", action="append", default=[], help=f"{only}a backup job whose restore points are copied, by name. Repeat as needed{replaces}")
+        parser.add_argument("--source-job-id", dest="source_job_ids", action="append", default=[], help=f"{only}a source backup job by ID. Repeat as needed")
+        parser.add_argument("--source-repo", dest="source_repositories", action="append", default=[], help=f"{only}a repository whose restore points are copied, every job's, by name. Repeat as needed{replaces}")
+        parser.add_argument("--source-repo-id", dest="source_repository_ids", action="append", default=[], help=f"{only}a source repository by ID. Repeat as needed")
+        parser.add_argument("--run-after-job", dest="run_after_job", help=f"{only}start the copy each time a run of this job ends (periodic only), by name; none clears it")
+        parser.add_argument("--run-after-job-id", dest="run_after_job_id", help=f"{only}the same job by ID")
+        parser.add_argument(
+            "--copy-window",
+            dest="copy_window",
+            action="append",
+            default=[],
+            help=(
+                f"{only}when copies may move data: '[days] HH:MM-HH:MM', days separated by commas in week order "
+                "(mon,wed,fri; none given: every day), the end may be past midnight (22:00-06:00). Repeat for more "
+                "rules; none means any time. A copy waits outside the window and stops when it closes"
+            ),
+        )
+        parser.add_argument("--retry-count", dest="retry_count", type=int, help=f"{only}retries of a VM whose copy failed, 0-20 (default 5 for periodic, 3 for immediate)")
+        parser.add_argument("--retry-interval", dest="retry_interval_minutes", type=int, help=f"{only}minutes between those retries, 0-1440 (default 0 for periodic, 10 for immediate)")
+
+    @staticmethod
     def _resolve_id(deps: CommandDependencies, args: argparse.Namespace) -> str:
         if getattr(args, "id", None):
             if getattr(args, "name", None):
@@ -432,6 +518,8 @@ class JobCommands:
         vm_ids = decorated.get("vm_ids") if isinstance(decorated.get("vm_ids"), list) else []
         vm_names = decorated.get("vm_names") if isinstance(decorated.get("vm_names"), list) else []
         decorated.setdefault("vm_count", len(vm_ids) or len(vm_names))
+        if decorated.get("job_type") == "backup-copy" and not decorated["vm_count"]:
+            decorated["vm_count"] = "all"
         decorated.setdefault("schedule_state", "enabled" if isinstance(schedule, dict) and bool(schedule.get("enabled", True)) else "disabled" if isinstance(schedule, dict) else "manual")
         if not decorated.get("schedule_summary"):
             decorated["schedule_summary"] = "Manual only"
@@ -443,6 +531,7 @@ class JobCommands:
         return [
             ("id", "ID"),
             ("name", "NAME"),
+            ("job_type", "TYPE"),
             ("inventory.name", "INVENTORY"),
             ("repository.name", "REPOSITORY"),
             ("vm_count", "VMS"),
@@ -467,6 +556,13 @@ class JobCommands:
         deps = CommandDependencies(args)
         payload = deps.jobs.create_backup_job_payload(args)
         result = self._decorate_job(deps.context.api_client.post("api/v1/jobs", json=payload))
+        deps.context.print_output(result, self._columns())
+        return 0
+
+    def create_backup_copy(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        payload = deps.jobs.create_backup_copy_job_payload(args)
+        result = self._decorate_job(deps.context.api_client.post("api/v1/jobs/backup-copy", json=payload))
         deps.context.print_output(result, self._columns())
         return 0
 
@@ -515,6 +611,11 @@ class JobCommands:
                 elif key == "vm_reassignments":
                     if reassignments:
                         shown["vm_reassignment_warning"] = " ".join(reassignments)
+                elif key == "backup_copy":
+                    if isinstance(value, dict):
+                        shown.update(_backup_copy_rows(value))
+                elif key == "source_job" and payload.get("job_type") == "backup-copy":
+                    continue
                 elif key == "last_run" and isinstance(value, dict):
                     shown["last_run_id"] = value.get("id")
                     issues = _last_run_issues(value)

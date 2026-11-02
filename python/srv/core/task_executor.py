@@ -109,6 +109,7 @@ def run_task(
                 "resolved_backup_type": _task_resolved_execution_field(task, "resolved_backup_type"),
                 "resolved_backup_reason": _task_resolved_execution_field(task, "resolved_backup_reason"),
                 "worker_mode": worker_mode,
+                "stop_reason": getattr(exc, "reason", None),
             },
             "updated_at": utc_now(),
         }

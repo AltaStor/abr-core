@@ -537,6 +537,7 @@ class DefaultRepositoryResult(_LenientModel):
 
 class RestorePointDTO(_LenientModel):
     id: str
+    copy_source: DocObject = Field(default=None, description="Copies made by a backup copy job only: the source job, repository and restore points it was copied from")
     created_at: str | None = None
     execution_type: str | None = None
     execution_reason: str | None = None
@@ -961,6 +962,7 @@ COPY_SOURCE_REPOSITORIES = "Repositories whose restore points are copied, every 
 COPY_SOURCE_REPOSITORY_IDS = "Repositories whose restore points are copied, by ID"
 COPY_RUN_AFTER = "Periodic copies only: start the copy each time a run of this job finishes, by name or with run_after_job_id by ID; empty clears it"
 COPY_RETRY_COUNT = "Retries of a VM whose copy failed, 0 to 20, within the same session; null or omitted: 5 for periodic, 3 for immediate"
+COPY_WINDOW = "When copies may move data: rules '[days] HH:MM-HH:MM' (days separated by commas in week order, mon,wed,fri; no days is every day; the end may be past midnight, 22:00-06:00) or objects {days, start, end}, in the server's time zone. A copy waits outside them and stops when they close; empty or none: any time"
 COPY_RETRY_INTERVAL = "Minutes between those retries, 0 to 1440; null or omitted: 0 for periodic, 10 for immediate"
 
 
@@ -975,6 +977,7 @@ class CreateBackupCopyJobRequest(_LenientModel):
     run_after_job_id: LaxStr | None = Field(default=None, description=COPY_RUN_AFTER)
     retry_count: RawInt | None = Field(default=None, description=COPY_RETRY_COUNT)
     retry_interval_minutes: RawInt | None = Field(default=None, description=COPY_RETRY_INTERVAL)
+    copy_window: list[Any] | LaxStr | None = Field(default=None, description=COPY_WINDOW)
     vms: list[LaxStr] | LaxStr | None = Field(default=None, description="Only these VMs of the sources, by name or ID; null or omitted: every VM the sources back up")
     repo: LaxStr | None = Field(default=None, description="Repository the copies go to, by name; it must not be a source")
     repo_id: LaxStr | None = Field(default=None, description="Repository the copies go to, by ID; it must not be a source")
@@ -1025,6 +1028,7 @@ class UpdateJobRequest(_LenientModel):
     run_after_job_id: LaxStr | None = Field(default=None, description=COPY_RUN_AFTER)
     retry_count: RawInt | None = Field(default=None, description=COPY_RETRY_COUNT)
     retry_interval_minutes: RawInt | None = Field(default=None, description=COPY_RETRY_INTERVAL)
+    copy_window: list[Any] | LaxStr | None = Field(default=None, description=COPY_WINDOW)
 
 
 class StartJobRequest(_LenientModel):

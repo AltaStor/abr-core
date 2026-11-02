@@ -252,6 +252,18 @@ EXECUTION_REASONS = (
     "VmConfigurationChanged",
 )
 JOB_TYPES = ("backup", "backup-copy")
+COPY_JOB_FIELDS = (
+    "copy_mode",
+    "source_jobs",
+    "source_job_ids",
+    "source_repositories",
+    "source_repository_ids",
+    "run_after_job",
+    "run_after_job_id",
+    "retry_count",
+    "retry_interval_minutes",
+    "copy_window",
+)
 TASK_TYPES = ("backup", "restore")
 
 VERIFY_ARTIFACT_TIMEOUT_SECONDS = env_int("ALTASTOR_VERIFY_TIMEOUT_SECONDS")
@@ -4083,6 +4095,7 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
         item["run_after_job_name"] = str(item.get("run_after_job_name") or "")
         item["retry_count"] = item.get("retry_count")
         item["retry_interval_minutes"] = item.get("retry_interval_minutes")
+        item["copy_window"] = [rule for rule in item.get("copy_window") or [] if isinstance(rule, dict)]
     raw_schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else None
     if raw_schedule is None and isinstance(metadata.get("schedule"), dict):
         raw_schedule = metadata.get("schedule")
@@ -5119,6 +5132,20 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         merged = _merge_task_parameters(stored_parameters, payload["task_parameters"])
         updated["task_parameters"] = _validate_task_parameters(merged, previous=stored_parameters)
         changed = True
+    copy_only = [key for key in COPY_JOB_FIELDS if payload.get(key) is not None]
+    _ensure(
+        updated["job_type"] == "backup-copy" or not copy_only,
+        422,
+        "invalid_job",
+        f"{', '.join(copy_only)} apply to backup copy jobs only, and {updated.get('name')} is a backup job",
+    )
+    backup_only = [key for key in ("inventory", "inventory_id") if payload.get(key) is not None]
+    _ensure(
+        updated["job_type"] == "backup" or not backup_only,
+        422,
+        "invalid_job",
+        f"{', '.join(backup_only)} apply to backup jobs only: backup copy job {updated.get('name')} reads the VMs of its sources",
+    )
     if updated["job_type"] == "backup":
         if "repo" in payload or "repo_id" in payload:
             repository = resolve_repository(name=payload.get("repo"), record_id=payload.get("repo_id"))
@@ -7892,6 +7919,7 @@ def _restore_point_type(point: dict[str, Any]) -> str:
 
 def restore_point_to_dto(point: dict[str, Any]) -> dict[str, Any]:
     return {
+        "copy_source": point.get("copy_source") if isinstance(point.get("copy_source"), dict) else None,
         "id": point.get("id"),
         "restore_point_id": point.get("id"),
         "backup_id": point.get("chain_id"),
@@ -7943,11 +7971,21 @@ def _restore_point_matches_inventory(point: dict[str, Any], selector: str) -> bo
     return str(point.get("inventory_id") or "") == selector or str(point.get("inventory_name") or "").lower() == lowered
 
 
-def list_restore_points(*, vm: str | None = None, backup_id: str | None = None, inventory: str | None = None) -> list[dict[str, Any]]:
+def list_restore_points(
+    *, vm: str | None = None, backup_id: str | None = None, inventory: str | None = None, job: str | None = None
+) -> list[dict[str, Any]]:
     vm_selector = str(vm or "").strip()
     backup_selector = str(backup_id or "").strip()
     inventory_selector = str(inventory or "").strip()
+    job_selector = str(job or "").strip()
     points = normalized_backup_points()
+    if job_selector:
+        points = [
+            point
+            for point in points
+            if str(point.get("job_id") or "") == job_selector
+            or str(point.get("job_name") or "").lower() == job_selector.lower()
+        ]
     if vm_selector:
         points = [point for point in points if _restore_point_matches_vm(point, vm_selector)]
     if backup_selector:
