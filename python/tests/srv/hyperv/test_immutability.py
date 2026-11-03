@@ -40,7 +40,7 @@ class FakeNode:
     def __init__(self) -> None:
         self.commands: list[list[str]] = []
 
-    def run_disk_tool(self, node, args, *, env=None, on_progress=None, should_cancel=None, timeout=None):
+    def run_disk_tool(self, node, args, *, env=None, on_progress=None, should_cancel=None, timeout=None, on_notice=None):
         self.commands.append(list(args))
         return {
             "exit_code": 0,

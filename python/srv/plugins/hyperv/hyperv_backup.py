@@ -839,6 +839,7 @@ def _back_up_disks(
             on_progress=lambda percent: report(percent, 0),
             should_cancel=lambda: cancel_requested(task_id),
             timeout=_disk_timeout_seconds(tool_timeout_seconds, disk["capacity_gb"]),
+            on_notice=lambda message, progress=progress: _warn(progress_callback, "transfer", progress, message),
         )
         result = run.get("result") or {}
         if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):

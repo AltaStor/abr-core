@@ -52,7 +52,14 @@ from ..vcenter.vcenter_backup import (
 )
 from ..vcenter.vcenter_restore import _resolve_abr_restore_layers
 from . import vhdx_tool
-from .hyperv import HyperVError, HyperVNode, _slot_sort_key
+from .hyperv import (
+    RECONNECT_PAUSE_SECONDS,
+    HyperVError,
+    HyperVNode,
+    HyperVUnreachableError,
+    _slot_sort_key,
+    reconnect_seconds,
+)
 from .hyperv_backup import WORKER_MODE, connection_settings, open_node
 
 logger = logging.getLogger(__name__)
@@ -577,6 +584,7 @@ def run_hyperv_restore(
                         timeout=_disk_timeout_seconds(
                             tool_timeout_seconds, int(disk.get("capacity_bytes") or 0) / 1024**3
                         ),
+                        on_notice=lambda message, layer_base=layer_base: _warn(progress_callback, "transfer", layer_base, message),
                     )
                     result = run.get("result") or {}
                     if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
@@ -784,11 +792,11 @@ def run_hyperv_restore(
             time.time() - start_time,
             exc,
         )
-        _undo(
+        left = _undo(
             connection, node_name, created_vm_id, swapped, written_files, created_folders, target_vm_id, progress_callback
         )
         if isinstance(exc, (HyperVError, vhdx_tool.VhdxToolError, VCenterBackupError)):
-            raise HyperVRestoreError(str(exc)) from exc
+            raise HyperVRestoreError(f"{exc}. {left}" if left else str(exc)) from exc
         raise
 
 
@@ -801,51 +809,120 @@ def _undo(
     created_folders: list[str],
     target_vm_id: str,
     progress_callback: ProgressCallback,
-) -> None:
+) -> str:
     """Leave the host as the restore found it, as far as that can be done."""
-    if not (created_vm_id or swapped or written_files or created_folders):
-        return
-    try:
-        with open_node(connection) as node:
-            if node_name:
-                node_name = node.resolve_node(node_name)
-            if created_vm_id:
-                try:
-                    node.destroy_vm(created_vm_id)
-                    _undo_note(progress_callback, False, "cleanup", 97, f"Removed the VM {created_vm_id} the restore had created")
-                except Exception as exc:
-                    _undo_note(progress_callback, True, "cleanup", 97, f"Could not remove the VM {created_vm_id} the restore had created: {exc}")
-            if swapped:
-                back = [
-                    {
-                        "controller_type": entry.get("controller_type"),
-                        "controller_number": entry.get("controller_number"),
-                        "controller_location": entry.get("controller_location"),
-                        "path": entry.get("previous_path") or "",
-                    }
-                    for entry in swapped
-                ]
-                try:
-                    node.replace_vm_disks(target_vm_id, back)
-                    _undo_note(progress_callback, False, "cleanup", 97, "Pointed the VM back at its original disks")
-                except Exception as exc:
-                    _undo_note(progress_callback, True, "cleanup", 97, f"Could not point the VM back at its original disks: {exc}")
-            if written_files and node_name:
-                failed = node.remove_files(node_name, written_files)
-                if failed:
-                    _undo_note(progress_callback, True, "cleanup", 98, f"Could not remove {', '.join(failed)}; delete by hand")
-                else:
-                    _undo_note(progress_callback, False, "cleanup", 98, f"Removed {len(written_files)} partially restored file(s)")
-            if created_folders and node_name:
-                kept = node.remove_empty_folders(node_name, sorted(created_folders, key=len, reverse=True))
-                if kept:
-                    _undo_note(progress_callback, True, "cleanup", 98, f"Kept {', '.join(kept)}: not empty; delete by hand")
-                else:
-                    _undo_note(progress_callback, False, "cleanup", 98, f"Removed {len(created_folders)} folder(s) the restore had created")
-    except Exception as exc:
-        logger.warning("Undoing the failed Hyper-V restore failed: %s", exc)
-        _undo_note(progress_callback, True, "cleanup", 98, f"Undoing the failed restore failed: {exc}")
+    left = {
+        "vm": created_vm_id or "",
+        "swapped": list(swapped),
+        "files": list(written_files),
+        "tool": list(written_files),
+        "folders": sorted(created_folders, key=len, reverse=True),
+    }
+    if not (left["vm"] or left["swapped"] or left["files"] or left["folders"]):
+        return ""
+    window = reconnect_seconds()
+    deadline = time.monotonic() + window
+    waiting = False
+    while True:
+        try:
+            with open_node(connection) as node:
+                _undo_on(node, node_name, left, target_vm_id, progress_callback)
+            return ""
+        except HyperVUnreachableError as exc:
+            if time.monotonic() >= deadline:
+                message = (
+                    f"Could not reach the Hyper-V host within {window} s to undo the failed restore ({exc}); "
+                    f"left there: {_left_behind(left)}. Remove them by hand"
+                )
+                _undo_note(progress_callback, True, "cleanup", 98, message)
+                return message
+            if not waiting:
+                waiting = True
+                _undo_note(
+                    progress_callback,
+                    True,
+                    "cleanup",
+                    97,
+                    f"The Hyper-V host does not answer ({exc}); trying to undo the restore again for up to {window} s",
+                )
+            time.sleep(RECONNECT_PAUSE_SECONDS)
+        except Exception as exc:
+            logger.warning("Undoing the failed Hyper-V restore failed: %s", exc)
+            message = f"Undoing the failed restore failed: {exc}; left on the host: {_left_behind(left)}"
+            _undo_note(progress_callback, True, "cleanup", 98, message)
+            return message
 
+
+def _undo_on(
+    node: HyperVNode, node_name: str, left: dict[str, Any], target_vm_id: str, progress_callback: ProgressCallback
+) -> None:
+    if node_name:
+        node_name = node.resolve_node(node_name)
+    if left["vm"]:
+        try:
+            node.destroy_vm(left["vm"])
+            _undo_note(progress_callback, False, "cleanup", 97, f"Removed the VM {left['vm']} the restore had created")
+        except HyperVUnreachableError:
+            raise
+        except Exception as exc:
+            _undo_note(progress_callback, True, "cleanup", 97, f"Could not remove the VM {left['vm']} the restore had created: {exc}")
+        left["vm"] = ""
+    if left["swapped"]:
+        back = [
+            {
+                "controller_type": entry.get("controller_type"),
+                "controller_number": entry.get("controller_number"),
+                "controller_location": entry.get("controller_location"),
+                "path": entry.get("previous_path") or "",
+            }
+            for entry in left["swapped"]
+        ]
+        try:
+            node.replace_vm_disks(target_vm_id, back)
+            _undo_note(progress_callback, False, "cleanup", 97, "Pointed the VM back at its original disks")
+        except HyperVUnreachableError:
+            raise
+        except Exception as exc:
+            _undo_note(progress_callback, True, "cleanup", 97, f"Could not point the VM back at its original disks: {exc}")
+        left["swapped"] = []
+    if left["tool"] and node_name:
+        stopped = node.stop_disk_tool(node_name, left["tool"])
+        if stopped:
+            _undo_note(progress_callback, False, "cleanup", 98, f"Stopped {', '.join(stopped)}, still writing what the failed restore had started")
+        left["tool"] = []
+    if left["files"] and node_name:
+        failed = node.remove_files(node_name, left["files"])
+        if failed:
+            _undo_note(progress_callback, True, "cleanup", 98, f"Could not remove {', '.join(failed)}; delete by hand")
+        else:
+            _undo_note(progress_callback, False, "cleanup", 98, f"Removed {len(left['files'])} partially restored file(s)")
+        left["files"] = []
+    if left["folders"] and node_name:
+        kept = node.remove_empty_folders(node_name, left["folders"])
+        if kept:
+            _undo_note(progress_callback, True, "cleanup", 98, f"Kept {', '.join(kept)}: not empty; delete by hand")
+        else:
+            _undo_note(progress_callback, False, "cleanup", 98, f"Removed {len(left['folders'])} folder(s) the restore had created")
+        left["folders"] = []
+
+
+def _left_behind(left: dict[str, Any]) -> str:
+    parts = []
+    if left["vm"]:
+        parts.append(f"the VM {left['vm']} the restore had created")
+    if left["swapped"]:
+        parts.append(
+            "the VM still points at the restored disks "
+            + ", ".join(str(entry.get("path") or "") for entry in left["swapped"])
+            + " instead of "
+            + ", ".join(str(entry.get("previous_path") or "") for entry in left["swapped"])
+        )
+    if left["files"]:
+        tool = " (abr-vhdx-tool may still be writing them)" if left["tool"] else ""
+        parts.append(f"the file(s) {', '.join(left['files'])}{tool}")
+    if left["folders"]:
+        parts.append(f"the folder(s) {', '.join(left['folders'])}")
+    return "; ".join(parts) or "nothing"
 
 
 def _reconnect_adapters(

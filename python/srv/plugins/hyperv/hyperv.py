@@ -16,8 +16,11 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Any, Dict, List, Tuple
 
+import requests
+
 from ...core.credential_encryption import StoredCredentialUnreadable, is_encrypted, unreadable_credential_message
 from ...core.mongo_db_wrapper import HYPERVISORS, update_hypervisor_fields
+from ...core.server_defaults import env_int
 from ...core.storage_tool import mask_secret_values, redact_disk_tool_command, split_disk_tool_secrets
 from ..hypervisor import Hypervisor, ProgressCallback, guest_ip_address
 from . import vhdx_tool
@@ -38,6 +41,8 @@ PROBE_TIMEOUT_SECONDS = 5
 OPERATION_TIMEOUT_SECONDS = 120
 READ_TIMEOUT_SECONDS = 180
 NODE_SNAPSHOT_TIMEOUT_SECONDS = 90
+RECONNECT_PAUSE_SECONDS = 10
+CONNECTION_ERRORS = (requests.ConnectionError, requests.Timeout)
 SCRIPT_DIR = Path(__file__).resolve().parent / "scripts"
 
 
@@ -187,6 +192,23 @@ def _certificate_reason(exc: BaseException) -> str:
 def _answers_without_tls(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "wrong_version_number" in text or "wrong version number" in text or "record layer failure" in text
+
+
+def _stop_pipeline(shell: Any, node: str) -> None:
+    try:
+        shell.stop()
+    except CONNECTION_ERRORS as exc:
+        logger.warning("Could not stop abr-vhdx-tool on %s: %s", node, exc)
+
+
+def _notice(on_notice: Any, message: str) -> None:
+    logger.warning(message)
+    if on_notice is not None:
+        on_notice(message)
+
+
+def reconnect_seconds() -> int:
+    return env_int("ALTASTOR_HYPERV_RECONNECT_SECONDS")
 
 
 def winrm_protocol(value: Any) -> str | None:
@@ -651,7 +673,10 @@ class HyperVNode(Hypervisor):
         if client is None:
             raise HyperVError("Hyper-V connection is not open")
 
-        out, streams, had_errors = client.execute_ps(script)
+        try:
+            out, streams, had_errors = client.execute_ps(script)
+        except CONNECTION_ERRORS as exc:
+            raise self.connection_lost(client, "the connection dropped", exc) from exc
         if had_errors:
             messages = "; ".join(str(record).strip() for record in streams.error)[:400]
             if _is_permission_failure(Exception(messages)):
@@ -1136,6 +1161,7 @@ class HyperVNode(Hypervisor):
         on_progress: Any = None,
         should_cancel: Any = None,
         timeout: float | None = None,
+        on_notice: Any = None,
     ) -> Dict[str, Any]:
         """Run abr-vhdx-tool on a node and wait for it, relaying its
         ``NN%`` lines to ``on_progress``.
@@ -1146,6 +1172,7 @@ class HyperVNode(Hypervisor):
         virtual disk stays attached once it is gone.
         """
         from pypsrp.complex_objects import ObjectMeta, PSInvocationState
+        from pypsrp.exceptions import WinRMError
         from pypsrp.powershell import PowerShell, RunspacePool
 
         from ...core.subprocess_util import ProcessCancelled
@@ -1168,7 +1195,10 @@ class HyperVNode(Hypervisor):
             secure["SharePassword"] = share_password
         started = time.monotonic()
         output = _ToolOutput(on_progress, [value for _, value in secrets] + ([share_password] if share_password else []))
-        with RunspacePool(client.wsman) as pool:
+        window = reconnect_seconds()
+        pool = RunspacePool(client.wsman)
+        pool.open()
+        try:
             shell = PowerShell(pool)
             folder = self._bundle_folder(node)
             if folder:
@@ -1189,14 +1219,30 @@ class HyperVNode(Hypervisor):
                     shell.add_parameter(name, pool.serialize(value, ObjectMeta("SS")))
             shell.begin_invoke()
             seen = 0
+            lost_at: float | None = None
             while shell.state == PSInvocationState.RUNNING:
                 if should_cancel is not None and should_cancel():
-                    shell.stop()
+                    _stop_pipeline(shell, node)
                     raise ProcessCancelled("cancellation requested")
                 if timeout and time.monotonic() - started > timeout:
-                    shell.stop()
+                    _stop_pipeline(shell, node)
                     raise HyperVError(f"abr-vhdx-tool on {node} did not finish within {int(timeout)}s")
-                shell.poll_invoke(timeout=2)
+                try:
+                    shell.poll_invoke(timeout=2)
+                except CONNECTION_ERRORS as exc:
+                    if lost_at is None:
+                        lost_at = time.monotonic()
+                        _notice(on_notice, f"Lost the connection to {node} while abr-vhdx-tool runs there; trying again for up to {window} s")
+                    if time.monotonic() - lost_at >= window:
+                        raise self.connection_lost(
+                            client, f"the connection dropped while abr-vhdx-tool ran there and did not come back within {window} s", exc
+                        ) from exc
+                    pool.connection.transport.encryption = None
+                    time.sleep(RECONNECT_PAUSE_SECONDS)
+                    continue
+                if lost_at is not None:
+                    _notice(on_notice, f"The connection to {node} is back after {int(time.monotonic() - lost_at)} s; abr-vhdx-tool kept running")
+                    lost_at = None
                 for item in shell.output[seen:]:
                     output.feed(str(item))
                 seen = len(shell.output)
@@ -1205,6 +1251,11 @@ class HyperVNode(Hypervisor):
             if shell.had_errors and output.exit_code is None:
                 messages = "; ".join(str(record).strip() for record in shell.streams.error)[:400]
                 raise HyperVError(f"abr-vhdx-tool could not be started on {node}: {messages}")
+        finally:
+            try:
+                pool.close()
+            except (*CONNECTION_ERRORS, WinRMError) as exc:
+                logger.warning("Could not close the WinRM runspace of abr-vhdx-tool on %s: %s", node, exc)
         result = vhdx_tool.parse_result(output.lines)
         logger.info(
             "abr-vhdx-tool %s on %s exited %s after %.1fs",
@@ -1214,6 +1265,18 @@ class HyperVNode(Hypervisor):
             time.monotonic() - started,
         )
         return {"exit_code": output.exit_code, "result": result, "lines": output.lines}
+
+    def connection_lost(self, client: Any, detail: str, exc: BaseException) -> HyperVUnreachableError:
+        transport = client.wsman.transport
+        protocol = "https" if transport.ssl else "http"
+        logger.warning("Lost the WinRM connection to %s:%s (%s): %s", transport.server, transport.port, detail, exc)
+        return HyperVUnreachableError(transport.server, [transport.port], detail, protocol=protocol)
+
+    def stop_disk_tool(self, node: str, paths: list[str]) -> list[str]:
+        if not paths:
+            return []
+        rows = self._run_script("stop_disk_tool.ps1", {"paths": paths}, node)
+        return [str(item) for item in ((rows[0] if rows else {}).get("stopped") or [])]
 
     def _disk_entry(self, row: Dict[str, Any]) -> Dict[str, Any]:
         chain = [item for item in (row.get("chain") or []) if isinstance(item, dict)]

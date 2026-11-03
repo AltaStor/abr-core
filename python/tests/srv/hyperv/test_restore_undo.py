@@ -25,6 +25,10 @@ class FakeNode:
     def replace_vm_disks(self, vm_id, disks):
         self.calls.append(("replace_vm_disks", vm_id, [disk["path"] for disk in disks]))
 
+    def stop_disk_tool(self, node, paths):
+        self.calls.append(("stop_disk_tool", node, list(paths)))
+        return []
+
     def remove_files(self, node, paths):
         self.calls.append(("remove_files", node, list(paths)))
         return []
@@ -62,6 +66,7 @@ class RestoreUndoTests(unittest.TestCase):
             node.calls,
             [
                 ("resolve_node", "hv-node-02"),
+                ("stop_disk_tool", "HV-NODE-02", [r"C:\Hyper-V\vm-r\Virtual Hard Disks\disk1.vhdx"]),
                 ("remove_files", "HV-NODE-02", [r"C:\Hyper-V\vm-r\Virtual Hard Disks\disk1.vhdx"]),
                 (
                     "remove_empty_folders",
@@ -126,7 +131,7 @@ class RestoreUndoAfterStopTests(unittest.TestCase):
 
         self.assertEqual(
             [call[0] for call in node.calls],
-            ["resolve_node", "replace_vm_disks", "remove_files", "remove_empty_folders"],
+            ["resolve_node", "replace_vm_disks", "stop_disk_tool", "remove_files", "remove_empty_folders"],
         )
 
 
