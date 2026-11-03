@@ -189,6 +189,20 @@ def _answers_without_tls(exc: BaseException) -> bool:
     return "wrong_version_number" in text or "wrong version number" in text or "record layer failure" in text
 
 
+def guest_ip_address(values: Any) -> str:
+    addresses = []
+    for value in [values] if isinstance(values, str) else values or []:
+        try:
+            address = ipaddress.ip_address(str(value).split("%")[0].strip())
+        except ValueError:
+            continue
+        if not (address.is_link_local or address.is_loopback or address.is_unspecified):
+            addresses.append(address)
+
+    preferred = [address for address in addresses if address.version == 4] or addresses
+    return str(preferred[0]) if preferred else ""
+
+
 def winrm_protocol(value: Any) -> str | None:
     protocol = str(value or "").strip().lower()
     if not protocol:
@@ -476,6 +490,7 @@ class HyperVNode(Hypervisor):
             "num_cpu": int(raw.get("num_cpu") or 0),
             "memory_mb": int(raw.get("memory_mb") or 0),
             "guest_os": str(raw.get("guest_os") or ""),
+            "ip_address": guest_ip_address(raw.get("ip_addresses")),
             "firmware": "efi" if generation >= 2 else "bios",
             "generation": generation,
             "version": str(raw.get("version") or ""),

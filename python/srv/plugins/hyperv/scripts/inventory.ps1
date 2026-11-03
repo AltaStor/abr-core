@@ -33,11 +33,14 @@ foreach ($vm in Get-VM) {
     $checkpoints = 0
     try { $checkpoints = @(Get-VMSnapshot -VM $vm -ErrorAction SilentlyContinue).Count } catch { }
 
+    $addresses = @()
+    try { $addresses = @(Get-VMNetworkAdapter -VM $vm | % { $_.IPAddresses } | ? { $_ } | % { [string]$_ }) } catch { }
+
     $vms += [pscustomobject]@{
         vm_id = $vm.Id.ToString(); name = $vm.Name; power_state = [string]$vm.State
         num_cpu = [int]$vm.ProcessorCount; memory_mb = [int]($vm.MemoryStartup / 1MB)
         generation = [int]$vm.Generation; guest_os = $os; version = [string]$vm.Version
-        checkpoints = [int]$checkpoints
+        checkpoints = [int]$checkpoints; ip_addresses = $addresses
         config_path = [string]$vm.ConfigurationLocation
         checkpoint_path = [string]$vm.SnapshotFileLocation
     }

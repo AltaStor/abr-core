@@ -373,6 +373,7 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
                     "num_cpu": vm["num_cpu"],
                     "memory_mb": vm["memory_mb"],
                     "guest_os": guest_os,
+                    "ip_address": vm.get("ip_address") or None,
                     "firmware": vm.get("firmware"),
                     "generation": vm.get("generation"),
                     "version": vm.get("version"),
