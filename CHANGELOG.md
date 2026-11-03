@@ -8,6 +8,25 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
 
 ### Added
 
+- Two-factor sign-in with an authenticator app such as Google Authenticator or
+  Microsoft Authenticator (TOTP, RFC 6238), optional and per user, set up and
+  managed in the Web UI. `POST /api/v1/auth/totp/setup|enable|disable` and
+  `POST /api/v1/auth/totp/recovery-codes`; `totp_code` or `recovery_code` on
+  `POST /api/v1/auth/login`, which answers `401 totp_required` without either.
+  Setting it up again keeps the current secret working until the new one is
+  confirmed, then replaces it. Ten one-time recovery codes, made again on
+  request, which invalidates the earlier ones. A code is accepted
+  `ABR_TOTP_VALID_WINDOW` 30-second steps either side of the server's time (1
+  by default) and only once; an expired or used one is refused with its own
+  error. `abr auth login` asks for the code at a prompt that does not echo it
+  and exits with code 5 when it is refused; recovery codes are for the Web UI
+  only. An Administrator resets a user who lost their phone with `totp_reset`
+  on `PATCH /api/v1/users/{id}`. Secrets are encrypted with the credential key
+  and move with a catalog export; secrets, codes and recovery codes reach no
+  log. New self-service functions `auth.totp_setup`, `auth.totp_enable`,
+  `auth.totp_disable` and `auth.totp_recovery_codes`, new settings
+  `ABR_TOTP_ISSUER` and `ABR_TOTP_VALID_WINDOW`, and new Python dependencies
+  `pyotp` and `qrcode`. See `doc/TwoFactorSignIn.md`.
 - Role-based access control. Every user holds one of five built-in roles
   (Administrator, Backup Administrator, Backup Operator, Restore Operator,
   Auditor), and every API operation and `abr` command runs one product function
