@@ -21,6 +21,7 @@ USER_COLUMNS = [
     ("fullName", "FULL NAME"),
     ("role", "ROLE"),
     ("enabled", "ENABLED"),
+    ("totpEnabled", "TWO-FACTOR"),
     ("created_at", "CREATED"),
 ]
 

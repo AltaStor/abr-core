@@ -124,7 +124,7 @@ Every REST API call requires a session token. The token is cached locally per --
 
 abr auth login 
 
-Description: Log in and cache a session token. Prompts for the password (or reads ABR_PASSWORD); --name falls back to ABR_USERNAME. 
+Description: Log in and cache a session token. Prompts for the password (or reads ABR_PASSWORD); --name falls back to ABR_USERNAME. An account with two-factor sign-in is then asked for the 6-digit code from its authenticator app, at a prompt that does not echo it; the code is never taken from a flag or an environment variable, which a shell keeps in its history. An invalid, expired or already used code exits with code 5. Recovery codes, and setting up or turning off two-factor sign-in, are in the Web UI. 
 
 abr auth login [--name <name>] [--print-token] 
 
@@ -151,7 +151,7 @@ Always acts on the current session's account, never another user's. abr auth log
 
 abr auth whoami 
 
-Description: Show the signed-in user, their role, and the function IDs that role allows. 
+Description: Show the signed-in user, their role, whether two-factor sign-in is on, and the function IDs that role allows. 
 
 abr auth whoami [--output json] 
 
