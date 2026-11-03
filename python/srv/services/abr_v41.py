@@ -6647,6 +6647,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "consistency": point.get("consistency"),
             "consistency_reason": point.get("consistency_reason"),
             "skipped_disks": _restore_point_artifact(point).get("skipped_disks") or [],
+            "copy_source": point.get("copy_source") if isinstance(point.get("copy_source"), dict) else None,
         }
         for point in points
     ]
