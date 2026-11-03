@@ -364,7 +364,10 @@ class JobCommands:
                 action="store_true",
                 help=(
                     "Enable AES-256 encryption of backup data blocks. The key is read from "
-                    f"{ENCRYPTION_KEY_ENV_VAR}, or prompted for (twice) when it is not set."
+                    f"{ENCRYPTION_KEY_ENV_VAR}, or prompted for (twice) when it is not set. On job edit of an "
+                    "encrypted job a different key becomes the job's new key for the backups that follow (key "
+                    "rotation); earlier backups keep the key they were written with, and the current key again "
+                    "changes nothing."
                 ),
             )
             encryption_state.add_argument(

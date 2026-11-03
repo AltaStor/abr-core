@@ -641,6 +641,8 @@ abr job edit --name <name> [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--repository
 
 A backup copy job takes the options of job create-backup-copy as well: --mode, --source-job, --source-job-id, --source-repo, --source-repo-id (each replaces that list; none empties it), --run-after-job (none clears it), --copy-window (replaces the rules; none means any time), --retry-count, --retry-interval and --all-vms (copy every VM of the sources again). They are refused on a backup job, and --inventory, --on-quiesce-failure and --guest-consistency on a backup copy job, with the reason. 
 
+--set-encryption takes the key as job create does: from ABR_ENCRYPTION_KEY, or prompted for (twice) when it is not set, or with --encryption-key. On a job without encryption it turns encryption on. On an encrypted job a different key becomes the job's new key for the backups that follow (key rotation): the earlier backups keep the key they were written with and restore with it, and giving the current key again changes nothing. With no key in the environment and no terminal to prompt on, the command fails instead of leaving the key as it was. --reset-encryption turns encryption off and drops the job's keys. 
+
 abr job retention 
 
 Description: Apply the job's retention policy now to every backup chain the job wrote, or preview it with --dry-run. For a backup copy job that is its own chains in its destination; the restore points of its sources are never touched. Retention also runs after each backup, for that backup's own chain; this covers all of them at once, including VMs that have since left the job. 

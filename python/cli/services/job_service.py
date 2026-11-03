@@ -87,7 +87,7 @@ class JobService:
         return deduped
 
     @staticmethod
-    def _build_task_parameter_updates(args: Any, *, creating: bool = False) -> dict[str, Any]:
+    def _build_task_parameter_updates(args: Any) -> dict[str, Any]:
         set_encryption = bool(getattr(args, "set_encryption", False))
         reset_encryption = bool(getattr(args, "reset_encryption", False))
         encryption_key = getattr(args, "encryption_key", None)
@@ -98,12 +98,12 @@ class JobService:
             encryption_key,
             env_var=ENCRYPTION_KEY_ENV_VAR,
             prompt="Encryption key",
-            needed=set_encryption and creating,
+            needed=set_encryption,
             confirm=True,
         )
         has_key = isinstance(encryption_key, str) and bool(encryption_key.strip())
-        if set_encryption and creating and not has_key:
-            raise ValueError("--set-encryption requires --encryption-key when creating a job")
+        if set_encryption and not has_key:
+            raise ValueError(f"--set-encryption requires an encryption key: set {ENCRYPTION_KEY_ENV_VAR} or type it at the prompt")
 
         updates: dict[str, Any] = {}
         compression_level = getattr(args, "compression_level", None)
@@ -456,7 +456,7 @@ class JobService:
             payload["schedule"] = schedule
         if getattr(args, "retention_min_fulls", None) is not None:
             payload["retention_min_fulls"] = int(args.retention_min_fulls)
-        task_parameter_updates = self._build_task_parameter_updates(args, creating=True)
+        task_parameter_updates = self._build_task_parameter_updates(args)
         # Nothing exists yet to clear, so drop any None (reset) markers.
         non_null_updates = {key: value for key, value in task_parameter_updates.items() if value is not None}
         if non_null_updates:
@@ -549,7 +549,7 @@ class JobService:
             payload["description"] = description
         if getattr(args, "retention_min_fulls", None) is not None:
             payload["retention_min_fulls"] = int(args.retention_min_fulls)
-        task_parameter_updates = self._build_task_parameter_updates(args, creating=True)
+        task_parameter_updates = self._build_task_parameter_updates(args)
         non_null_updates = {key: value for key, value in task_parameter_updates.items() if value is not None}
         if non_null_updates:
             payload["task_parameters"] = non_null_updates

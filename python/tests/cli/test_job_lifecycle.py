@@ -880,18 +880,19 @@ class JobPayloadBuilderTests(unittest.TestCase):
 
         self.assertEqual(payload["task_parameters"], {"encryption_enabled": None, "encryption_key": None})
 
-    def test_edit_payload_set_encryption_without_a_key_re_affirms_the_stored_one(self) -> None:
+    def test_edit_payload_set_encryption_takes_the_key_from_the_environment(self) -> None:
         args = self._base_edit_args(set_encryption=True)
 
-        payload = self.service.build_edit_payload({"id": "job-1"}, args)
+        with patch.dict("os.environ", {"ABR_ENCRYPTION_KEY": "placeholder-new-key"}, clear=True):
+            payload = self.service.build_edit_payload({"id": "job-1"}, args)
 
-        self.assertEqual(payload["task_parameters"], {"encryption_enabled": True})
+        self.assertEqual(payload["task_parameters"], {"encryption_enabled": True, "encryption_key": "placeholder-new-key"})
 
     def test_create_payload_still_requires_a_key_with_set_encryption(self) -> None:
         args = self._base_create_args(set_encryption=True)
 
         with patch.dict("os.environ", {"ABR_ENCRYPTION_KEY": "   "}, clear=True):
-            with self.assertRaisesRegex(ValueError, "requires --encryption-key"):
+            with self.assertRaisesRegex(ValueError, "requires an encryption key"):
                 self.service.create_backup_job_payload(args)
 
     def test_edit_payload_passes_through_preparsed_full_days(self) -> None:
