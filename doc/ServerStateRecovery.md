@@ -46,6 +46,15 @@ empty, or not a key) is never replaced. The server still starts, logs the path
 and the reason, leaves every stored credential as it is and refuses to store a
 new password until the file is put back and the server restarted.
 
+### Two-factor sign-in
+
+The secrets of users with two-factor sign-in are stored encrypted with the same
+key file, and an export carries them like the inventory credentials, so the same
+authenticator apps and recovery codes work on the new host. If you copy the raw
+database files without the key file, the server logs each such user and refuses
+codes from their app until the key file is put back; their recovery codes still
+work. See `TwoFactorSignIn.md`.
+
 ### Backup encryption keys
 
 The keys of encrypted jobs are stored encrypted with the same key file: on the

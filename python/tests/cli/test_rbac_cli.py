@@ -29,7 +29,7 @@ from python.tests.srv.rbac.rbac_case import RbacApiCase
 BASE_URL = "http://abr.test"
 
 
-class CliPermissionTests(RbacApiCase):
+class CliApiCase(RbacApiCase):
     def setUp(self) -> None:
         super().setUp()
         config_dir = tempfile.TemporaryDirectory()
@@ -40,7 +40,6 @@ class CliPermissionTests(RbacApiCase):
         bridge = patch("python.cli.api.client.requests.request", side_effect=self._forward)
         bridge.start()
         self.addCleanup(bridge.stop)
-        JOBS["job-1"] = {"id": "job-1", "name": "nightly"}
 
     def _forward(self, method, url, *, json=None, params=None, headers=None, **_kwargs):
         """Send the CLI's request to the in-process API and answer it as
@@ -63,6 +62,12 @@ class CliPermissionTests(RbacApiCase):
                 except SystemExit as exit_:
                     code = int(exit_.code or 0)
         return code, stdout.getvalue(), stderr.getvalue()
+
+
+class CliPermissionTests(CliApiCase):
+    def setUp(self) -> None:
+        super().setUp()
+        JOBS["job-1"] = {"id": "job-1", "name": "nightly"}
 
     def test_a_denied_command_exits_with_permission_denied_and_a_json_error(self) -> None:
         code, _out, err = self.run_cli(rbac.AUDITOR, "--output", "json", "job", "delete", "--id", "job-1")

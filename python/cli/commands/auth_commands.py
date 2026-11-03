@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import getpass
 import os
+import re
 import sys
+
+import requests
 
 from .. import token_store
 from ..cli_context import TOKEN_ENV_VAR
@@ -16,6 +19,7 @@ from .base import CommandDependencies
 
 USERNAME_ENV_VAR = "ABR_USERNAME"
 PASSWORD_ENV_VAR = "ABR_PASSWORD"
+TOTP_CODE_PATTERN = re.compile(r"^[0-9]{6}$")
 
 
 def _prompt(read, prompt: str, *, missing: str) -> str:
@@ -23,6 +27,32 @@ def _prompt(read, prompt: str, *, missing: str) -> str:
         return read(prompt)
     except EOFError as exc:
         raise CliStructuredError(code="invalid_argument", message=missing, exit_code=INVALID_USAGE) from exc
+
+
+def _prompt_totp_code() -> str:
+    """The code from the authenticator app, typed at a prompt that does not
+    echo it: never a flag or an environment variable, which a shell keeps in
+    its history. Recovery codes are for the Web UI only."""
+    while True:
+        code = re.sub(r"\s", "", _prompt(
+            getpass.getpass,
+            "Authentication code: ",
+            missing="This account uses two-factor sign-in: run abr auth login in a terminal to enter the code",
+        ))
+        if TOTP_CODE_PATTERN.fullmatch(code):
+            return code
+        print(
+            "Enter the 6-digit code from your authenticator app. Recovery codes are accepted only in the Web UI.",
+            file=sys.stderr,
+        )
+
+
+def _asks_for_totp_code(exc: requests.HTTPError) -> bool:
+    try:
+        error = exc.response.json().get("error")
+    except (AttributeError, ValueError):
+        return False
+    return isinstance(error, dict) and error.get("code") == "totp_required"
 
 
 class AuthCommands:
@@ -42,7 +72,10 @@ class AuthCommands:
                 "Log in and cache a session token locally, scoped to --base-url.\n\n"
                 "The password is never accepted as a command-line flag; set "
                 f"{PASSWORD_ENV_VAR} to script this non-interactively, or omit it to be "
-                f"prompted. --name falls back to {USERNAME_ENV_VAR} if omitted.\n\n"
+                f"prompted. --name falls back to {USERNAME_ENV_VAR} if omitted. An account "
+                "with two-factor sign-in is then asked for the 6-digit code from its authenticator "
+                "app, at a prompt that does not echo it. Recovery codes, and setting up or "
+                "turning off two-factor sign-in, are in the Web UI.\n\n"
                 "Examples:\n"
                 "  abr auth login --name admin\n"
                 f"  {PASSWORD_ENV_VAR}=secret abr auth login --name admin --print-token"
@@ -112,7 +145,14 @@ class AuthCommands:
             missing=f"No password provided; set {PASSWORD_ENV_VAR} or run interactively",
         )
 
-        result = deps.context.api_client.post("api/v1/auth/login", json={"name": name, "password": password})
+        payload = {"name": name, "password": password}
+        try:
+            result = deps.context.api_client.post("api/v1/auth/login", json=payload)
+        except requests.HTTPError as exc:
+            if not _asks_for_totp_code(exc):
+                raise
+            payload["totp_code"] = _prompt_totp_code()
+            result = deps.context.api_client.post("api/v1/auth/login", json=payload)
         token_store.save_token(deps.context.base_url, result["token"], result["expires_at"])
 
         role = result["user"].get("role")
@@ -155,6 +195,10 @@ class AuthCommands:
         full_name = f" ({user['fullName']})" if user.get("fullName") else ""
         print(f"User:  {user.get('name')}{full_name}")
         print(f"Role:  {role.get('name') or user.get('role') or '-'}")
+        if user.get("totpEnabled"):
+            print(f"Two-factor: on, {payload.get('recovery_codes_left', 0)} recovery codes left (managed in the Web UI)")
+        else:
+            print("Two-factor: off (set it up in the Web UI)")
         print("Allowed functions:")
         for function_id in payload.get("permissions") or []:
             print(f"  {function_id}")

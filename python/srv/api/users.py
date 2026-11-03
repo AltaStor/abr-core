@@ -45,8 +45,9 @@ def create_user(request: Request, payload: CreateUserRequest = Body(default_fact
 def update_user(
     user_id: str, request: Request, payload: UpdateUserRequest = Body(default_factory=UpdateUserRequest)
 ) -> PublicUserDTO:
-    """Change a user's login name, full name, role, enabled state or password.
-    Disabling a user or giving them a new password ends their sessions; a
+    """Change a user's login name, full name, role, enabled state or password,
+    or reset their two-factor sign-in. Disabling a user, giving them a new
+    password or resetting their two-factor sign-in ends their sessions; a
     user's own password needs their current one (POST /auth/change-password).
     Nobody changes their own role, nor a user, or assigns a role, allowing
     functions their own role does not. The last enabled Administrator cannot

@@ -496,16 +496,50 @@ def persist_system_state(record: dict[str, Any]) -> None:
         SYSTEM_STATE[str(record["id"])] = dict(record)
 
 
+# The authenticator secret in use, and one being enrolled.
+USER_SECRET_FIELDS = ("totp_secret", "totp_pending_secret")
+
+
 def load_users() -> dict[str, dict[str, Any]]:
     db = get_database()
     if db is None:
         return {}
 
-    return {
-        item["id"]: _normalize_record(item)
-        for item in db.find("users", {})
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
+    loaded: dict[str, dict[str, Any]] = {}
+    for item in db.find("users", {}):
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        record = _normalize_record(item)
+        for field in USER_SECRET_FIELDS:
+            if record.get(field):
+                record[field] = decrypt_secret(record[field])
+        if is_encrypted(record.get("totp_secret")):
+            LOGGER.error(
+                "The authenticator secret of user %s cannot be decrypted with the credential key at %s. "
+                "The user signs in with a recovery code, or an Administrator resets their two-factor sign-in.",
+                record.get("name"),
+                credential_key_path(),
+            )
+        loaded[record["id"]] = record
+    return loaded
+
+
+def _user_for_storage(normalized: dict[str, Any]) -> dict[str, Any]:
+    """In memory the authenticator secrets are in clear, like an inventory's
+    password, so a catalog export carries them inside its own password-protected
+    file and an import encrypts them again with this server's key."""
+    try:
+        return {
+            **normalized,
+            **{field: encrypt_secret(normalized[field]) for field in USER_SECRET_FIELDS if normalized.get(field)},
+        }
+    except CredentialKeyUnavailable as exc:
+        raise api_error(
+            503,
+            "credential_key_unavailable",
+            f"{exc}. The authenticator secret is not stored. {KEY_REPAIR_HINT}, then set up two-factor sign-in again.",
+            user_id=normalized.get("id"),
+        ) from exc
 
 
 def persist_user(record: dict[str, Any]) -> None:
@@ -513,7 +547,8 @@ def persist_user(record: dict[str, Any]) -> None:
     with CATALOG_LOCK:
         db = get_database()
         if db is not None:
-            _run_db_write(lambda: db.upsert("users", "id", normalized))
+            stored = _user_for_storage(normalized)
+            _run_db_write(lambda: db.upsert("users", "id", stored))
         USERS[record["id"]] = normalized
 
 
@@ -843,6 +878,8 @@ def restore_catalog(snapshot: dict[str, Any]) -> dict[str, int]:
         if get_database() is not None:
             for hypervisor in (snapshot.get("hypervisors") or {}).values():
                 _hypervisor_for_storage(_normalize_record(hypervisor), HYPERVISORS.get(hypervisor.get("id")))
+            for user in (snapshot.get("users") or {}).values():
+                _user_for_storage(_normalize_record(user))
 
         # A custom role can never stand in for a built-in one, whatever the
         # export says.

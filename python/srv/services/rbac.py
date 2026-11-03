@@ -79,6 +79,10 @@ FUNCTIONS: tuple[Function, ...] = (
     _f("auth.change_password", "Change one's own password", SELF_SERVICE),
     _f("auth.extend_session", "Change the current web session's inactivity timeout", SELF_SERVICE),
     _f("auth.touch_session", "Keep the current session alive after a user action", SELF_SERVICE),
+    _f("auth.totp_setup", "Start setting up, or setting up again, one's own two-factor sign-in", SELF_SERVICE),
+    _f("auth.totp_enable", "Turn on one's own two-factor sign-in, or switch it to a new secret", SELF_SERVICE),
+    _f("auth.totp_disable", "Turn off one's own two-factor sign-in", SELF_SERVICE),
+    _f("auth.totp_recovery_codes", "Make new recovery codes for one's own two-factor sign-in", SELF_SERVICE),
     _f("dashboard.view", "View the dashboard summary", READ),
     _f("system.view", "View version, appliance information and health", READ),
     _f("system.logs", "Read the appliance's server log", READ),
@@ -169,9 +173,10 @@ ROLES_BY_ID: Mapping[str, Role] = MappingProxyType({role.id: role for role in RO
 
 CUSTOM_ROLE_ID_PREFIX = "custom-"
 
-# What any signed-in user does to their own session and password. Every role
-# allows these, a custom role too: without them a user could not sign out, keep
-# a session or change a password the console insists on changing.
+# What any signed-in user does to their own session, password and second
+# factor. Every role allows these, a custom role too: without them a user could
+# not sign out, keep a session or change a password the console insists on
+# changing.
 BASELINE_FUNCTIONS = frozenset({
     "auth.login",
     "auth.logout",
@@ -179,6 +184,10 @@ BASELINE_FUNCTIONS = frozenset({
     "auth.change_password",
     "auth.extend_session",
     "auth.touch_session",
+    "auth.totp_setup",
+    "auth.totp_enable",
+    "auth.totp_disable",
+    "auth.totp_recovery_codes",
 })
 
 _EVERY_ROLE = (
@@ -188,6 +197,10 @@ _EVERY_ROLE = (
     "auth.change_password",
     "auth.extend_session",
     "auth.touch_session",
+    "auth.totp_setup",
+    "auth.totp_enable",
+    "auth.totp_disable",
+    "auth.totp_recovery_codes",
     "dashboard.view",
     "system.view",
 )

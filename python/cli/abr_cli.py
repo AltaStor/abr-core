@@ -107,6 +107,8 @@ def main(argv: list[str] | None = None) -> int:
                     message=str(detail.get("message") or message),
                     exit_code=PERMISSION_DENIED
                     if exc.response.status_code == 403
+                    else UNAUTHORIZED
+                    if exc.response.status_code == 401
                     else 4
                     if exc.response.status_code in {409, 503}
                     else 3

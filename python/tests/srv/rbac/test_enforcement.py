@@ -21,7 +21,17 @@ from .rbac_case import ADMIN_PASSWORD, ROLE_USERS, USER_PASSWORD, RbacApiCase
 # Functions the sweep does not run when they are allowed: they change the
 # caller's own session or write files outside the catalog (the HTTPS
 # certificate, a support bundle). Their denials are still checked.
-NOT_RUN_WHEN_ALLOWED = {"auth.logout", "auth.extend_session", "auth.change_password", "tls.edit", "system.support_bundle"}
+NOT_RUN_WHEN_ALLOWED = {
+    "auth.logout",
+    "auth.extend_session",
+    "auth.change_password",
+    "auth.totp_setup",
+    "auth.totp_enable",
+    "auth.totp_disable",
+    "auth.totp_recovery_codes",
+    "tls.edit",
+    "system.support_bundle",
+}
 TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
 
 
