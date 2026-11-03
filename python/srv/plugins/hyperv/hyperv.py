@@ -1235,6 +1235,7 @@ class HyperVNode(Hypervisor):
             "uuid": str(base.get("disk_identifier") or ""),
             "capacity_bytes": capacity,
             "capacity_gb": round(capacity / (1024 ** 3), 2),
+            "allocated_bytes": sum(int(item.get("file_size") or 0) for item in chain),
             "logical_sector_size": int(top.get("logical_sector_size") or 512),
             "physical_sector_size": int(top.get("physical_sector_size") or 4096),
             "block_size": int(base.get("block_size") or 0),

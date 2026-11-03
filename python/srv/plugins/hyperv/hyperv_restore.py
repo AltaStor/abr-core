@@ -137,6 +137,26 @@ def _restore_layers(
     return layers
 
 
+def restored_bytes(disk: dict[str, Any], layers: list[dict[str, Any]], source_allocated: int = 0) -> int:
+    allocated = int(disk.get("allocated_bytes") or source_allocated or 0)
+    if allocated:
+        return allocated
+    bounds = [sum(int(layer.get("logical_bytes") or 0) for layer in layers), int(disk.get("capacity_bytes") or 0)]
+    return min([value for value in bounds if value] or [0])
+
+
+def source_allocated_bytes(disk: dict[str, Any], source_disks: list[dict[str, Any]]) -> int:
+    identifier = str(disk.get("uuid") or "").lower()
+    for live in source_disks:
+        live_identifier = str(live.get("uuid") or "").lower()
+        if identifier and live_identifier:
+            if live_identifier == identifier:
+                return int(live.get("allocated_bytes") or 0)
+        elif str(live.get("slot") or "") == _disk_slot(disk):
+            return int(live.get("allocated_bytes") or 0)
+    return 0
+
+
 def _layer_logical_bytes(layer: dict[str, Any]) -> int:
     """What one backup of the disk holds, from the manifest it was recorded in."""
     try:
@@ -363,6 +383,13 @@ def run_hyperv_restore(
                 f"{len(resources['switches'])} virtual switch(es)",
             )
 
+            source_disks = list(live_disks.values())
+            if not source_disks and source_vm_id and not all(int(disk.get("allocated_bytes") or 0) for disk in disks):
+                try:
+                    source_disks = node.get_vm_disks(source_vm_id)
+                except HyperVError:
+                    source_disks = []
+
             plan = []
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
             for index, disk in enumerate(disks, start=1):
@@ -387,9 +414,8 @@ def run_hyperv_restore(
                     folder = f"{vm_base_folder(target_datastore)}\\{target_vm_name}\\Virtual Hard Disks"
                     target_path = f"{folder}\\{_disk_file_name(disk, index)}"
                     current_path = ""
-                needed = int(disk.get("capacity_bytes") or 0) if provisioning == "fixed" else (
-                    data_bytes or int(disk.get("capacity_bytes") or 0)
-                )
+                written = restored_bytes(disk, layers, source_allocated_bytes(disk, source_disks))
+                needed = int(disk.get("capacity_bytes") or 0) if provisioning == "fixed" else written
                 plan.append(
                     {
                         "index": index,
@@ -397,6 +423,7 @@ def run_hyperv_restore(
                         "disk": disk,
                         "layers": layers,
                         "data_bytes": data_bytes,
+                        "written_bytes": written,
                         "provisioning": provisioning,
                         "datastore": target_datastore,
                         "folder": folder,
@@ -413,7 +440,7 @@ def run_hyperv_restore(
                 needs[item["datastore"]] = needs.get(item["datastore"], 0) + item["needed_bytes"] + (
                     # A fixed disk is written dynamic first and converted, so
                     # both exist for a moment.
-                    item["data_bytes"] if item["provisioning"] == "fixed" else 0
+                    item["written_bytes"] if item["provisioning"] == "fixed" else 0
                 )
             for datastore, needed in needs.items():
                 volume = volumes.get(datastore.lower())
