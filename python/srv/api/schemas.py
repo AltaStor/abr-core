@@ -674,6 +674,7 @@ class PublicUserDTO(_LenientModel):
     enabled: bool = True
     created_at: str | None = None
     passwordPolicyExempt: bool = False
+    totpEnabled: bool = False
 
 
 class UserList(_LenientModel):
@@ -1025,6 +1026,7 @@ class UpdateUserRequest(_LenientModel):
     fullName: LaxStr | None = None
     role: LaxStr | None = Field(default=None, description=f"{ROLE}; {OMITTED_KEEPS}")
     enabled: SkipValidation[bool] | None = Field(default=None, description=f"false stops the user signing in, true lets them again; {OMITTED_KEEPS}")
+    totp_reset: SkipValidation[bool] | None = Field(default=None, description=f"true turns off another user's two-factor sign-in and signs them out everywhere, for a lost authenticator; {OMITTED_KEEPS}")
 
 
 
@@ -1037,6 +1039,7 @@ class UserResult(_LenientModel):
     enabled: DocBool = None
     created_at: DocStr = None
     passwordPolicyExempt: DocBool = None
+    totpEnabled: DocBool = None
 
 
 
@@ -1577,6 +1580,22 @@ class LoginResult(_LenientModel):
     absolute_expires_at: DocStrOrNull = Field(default=None, description=SESSION_ABSOLUTE_EXPIRES_AT)
     user: PublicUserDTO | DocObject = None
     permissions: DocStrArray = None
+    recovery_codes_left: DocInt = Field(default=None, description="Present when a recovery code signed the user in: how many are left")
+
+
+class TotpSetupResult(_LenientModel):
+    secret: DocStr = Field(default=None, description="The secret as text, for an authenticator app that cannot scan")
+    otpauth_uri: DocStr = Field(default=None, description="The otpauth:// URI the QR code holds")
+    qr_code: DocStr = Field(default=None, description="The QR code as an SVG image in a data: URI")
+
+
+class TotpEnableResult(_LenientModel):
+    user: PublicUserDTO | DocObject = None
+    recovery_codes: DocStrArray = Field(default=None, description="One-time codes for signing in without the authenticator app; never shown again")
+
+
+class RecoveryCodesResult(_LenientModel):
+    recovery_codes: DocStrArray = Field(default=None, description="One-time codes for signing in without the authenticator app; never shown again")
 
 
 class RoleSummaryDTO(_LenientModel):
@@ -1590,6 +1609,7 @@ class WhoAmIResult(_LenientModel):
     user: PublicUserDTO | DocObject = None
     role: RoleSummaryDTO | None = None
     permissions: DocStrArray = None
+    recovery_codes_left: DocInt = Field(default=None, description="With two-factor sign-in on: how many recovery codes are unused")
     expires_at: DocStr = Field(default=None, description=SESSION_EXPIRES_AT)
     absolute_expires_at: DocStrOrNull = Field(default=None, description=SESSION_ABSOLUTE_EXPIRES_AT)
 

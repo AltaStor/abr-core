@@ -31,8 +31,8 @@ from python.srv.core.mongo_db_wrapper import (
 from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
 
-from . import rbac, role_service
-from .api_errors import api_error
+from . import rbac, role_service, two_factor
+from .api_errors import ApiError, api_error
 
 LOGGER = logging.getLogger(__name__)
 
@@ -136,6 +136,7 @@ def _public_user(user: dict[str, Any]) -> dict[str, Any]:
         "enabled": rbac.is_enabled(user),
         "created_at": user.get("created_at"),
         "passwordPolicyExempt": bool(user.get("password_policy_exempt", False)),
+        "totpEnabled": bool(user.get("totp_enabled", False)),
     }
 
 
@@ -257,10 +258,11 @@ def create_user(
 def update_user(
     user_id: str, payload: dict[str, Any], *, acting_user_id: str | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Change a user's name, full name, role, enabled state or password.
-    Answers the user and what changed, as ``{field: {"from": old, "to": new}}``
-    (a new password only as its field, without values). Nobody changes their
-    own role, nor a user whose role allows more than the caller's."""
+    """Change a user's name, full name, role, enabled state or password, or
+    reset their two-factor sign-in. Answers the user and what changed, as
+    ``{field: {"from": old, "to": new}}`` (a new password only as its field,
+    without values). Nobody changes their own role, nor a user whose role allows
+    more than the caller's."""
     user = _user_or_404(user_id)
     new_role = _role_or_422(payload["role"]) if payload.get("role") is not None else None
     role_service.ensure_can_manage_user(
@@ -299,6 +301,22 @@ def update_user(
         if not isinstance(payload["enabled"], bool):
             raise api_error(422, "invalid_user", "enabled must be true or false.")
         updated["enabled"] = payload["enabled"]
+    reset_totp = payload.get("totp_reset") is not None
+    if reset_totp:
+        if not isinstance(payload["totp_reset"], bool):
+            raise api_error(422, "invalid_user", "totp_reset must be true or false.")
+        # A stolen session must not be able to shed its own second factor.
+        if user_id == acting_user_id:
+            raise api_error(
+                409,
+                "own_totp",
+                "Turn off your own two-factor sign-in with your password and a code, under Settings -> "
+                "Security in the Web UI.",
+                user_id=user_id,
+            )
+        reset_totp = payload["totp_reset"] and bool(user.get("totp_enabled"))
+        if reset_totp:
+            updated.update(two_factor.CLEARED)
 
     changes = {
         field: {"from": user.get(field), "to": updated.get(field)}
@@ -307,6 +325,8 @@ def update_user(
     }
     if password is not None:
         changes["password"] = {"from": None, "to": None}
+    if reset_totp:
+        changes["totpEnabled"] = {"from": True, "to": False}
     if not changes:
         return _public_user(user), changes
     if not rbac.is_active_administrator(updated):
@@ -315,8 +335,9 @@ def update_user(
     updated["updated_at"] = utc_now()
     persist_user(updated)
     # A new password set by somebody else signs the user out everywhere: who
-    # holds a session now no longer knows the password it was opened with.
-    if not rbac.is_enabled(updated) or password is not None:
+    # holds a session now no longer knows the password it was opened with. A
+    # reset second factor does too: it usually follows a lost phone.
+    if not rbac.is_enabled(updated) or password is not None or reset_totp:
         delete_sessions_for_user(user_id)
     return _public_user(updated), changes
 
@@ -375,8 +396,34 @@ def change_password(user_id: str, current_password: str, new_password: str, *, k
     return _public_user(updated)
 
 
+def _use_second_factor(
+    user: dict[str, Any], totp_code: str | None, recovery_code: str | None, *, status: int
+) -> dict[str, Any]:
+    """Accept the user's second factor, a code from the authenticator app or
+    an unused recovery code, through the shared validation in ``two_factor``,
+    and use it up. A refused one counts against the sign-in lockout."""
+    if totp_code and recovery_code:
+        raise api_error(
+            422, "invalid_argument", "Give a code from the authenticator app or a recovery code, not both."
+        )
+    try:
+        if recovery_code:
+            return two_factor.use_recovery_code(user["id"], recovery_code, status=status)
+        return two_factor.use_totp_code(user["id"], totp_code, status=status)
+    except ApiError as exc:
+        if exc.code in two_factor.REFUSALS:
+            _record_failure(str(user["name"]).strip().lower())
+        raise
+
+
 def login(
-    name: str, password: str, *, client_type: str = "web", duration_seconds: int | None = None
+    name: str,
+    password: str,
+    *,
+    client_type: str = "web",
+    duration_seconds: int | None = None,
+    totp_code: str | None = None,
+    recovery_code: str | None = None,
 ) -> dict[str, Any]:
     key = name.strip().lower()
     if _prune_and_count_failures(key, login_lockout_seconds()) >= login_max_attempts():
@@ -390,7 +437,6 @@ def login(
         _record_failure(key)
         raise api_error(401, "invalid_credentials", "Invalid username or password.")
 
-    _clear_failures(key)
     if not rbac.is_enabled(user):
         raise api_error(403, "account_disabled", "This account is disabled. Ask an Administrator to enable it.")
     if rbac.role_id_of(user) is None:
@@ -403,6 +449,16 @@ def login(
 
     if client == "web" and duration_seconds is not None:
         _ensure_web_session_duration(duration_seconds)
+
+    # Last of the checks, so that nothing refused afterwards wastes the code,
+    # and only then are the failures cleared: a correct password alone must not
+    # reset the count, or whoever holds it could guess codes without limit.
+    used_recovery_code = bool(user.get("totp_enabled") and recovery_code)
+    if user.get("totp_enabled"):
+        if not totp_code and not recovery_code:
+            raise api_error(401, "totp_required", "Enter the code from your authenticator app.")
+        user = _use_second_factor(user, totp_code, recovery_code, status=401)
+    _clear_failures(key)
 
     now = _now_dt()
     token = secrets.token_urlsafe(32)
@@ -424,7 +480,102 @@ def login(
         **_session_expiry(session),
         "user": _public_user(user),
         "permissions": rbac.allowed_functions(user["role"]),
+        **({"recovery_codes_left": len(user.get("totp_recovery") or [])} if used_recovery_code else {}),
     }
+
+
+def _ensure_own_password(user: dict[str, Any], password: str) -> None:
+    """Check the password of a signed-in user, on the lockout counter of login.
+    Refused with 422, because a 401 tells a client its session has ended."""
+    name = str(user["name"])
+    if _prune_and_count_failures(name.strip().lower(), login_lockout_seconds()) >= login_max_attempts():
+        raise api_error(429, "too_many_attempts", "Too many failed attempts. Try again later.")
+    if not _verify_password(_hash_name(user, name), password, user["passwd"]):
+        _record_failure(name.strip().lower())
+        raise api_error(422, "invalid_password", "The password is incorrect.")
+
+
+def _reauthenticate(
+    user: dict[str, Any], password: str, totp_code: str | None, recovery_code: str | None
+) -> dict[str, Any]:
+    """What a change to a user's own second factor takes besides the session:
+    the password and, while two-factor sign-in is on, a code or a recovery
+    code. A stolen session alone must not be able to change or remove it."""
+    _ensure_own_password(user, password)
+    if user.get("totp_enabled"):
+        if not totp_code and not recovery_code:
+            raise api_error(
+                422, "totp_required", "Enter a code from your authenticator app, or a recovery code."
+            )
+        user = _use_second_factor(user, totp_code, recovery_code, status=422)
+    _clear_failures(str(user["name"]).strip().lower())
+    return user
+
+
+def start_totp_setup(
+    user_id: str, password: str, *, totp_code: str | None = None, recovery_code: str | None = None
+) -> dict[str, Any]:
+    """Give the user a new secret to scan: enrollment, or re-enrollment while
+    two-factor sign-in is on. Nothing changes at sign-in until ``enable_totp``
+    has seen a code made from it; until then the current secret keeps working,
+    and starting again replaces the new one."""
+    user = _reauthenticate(_user_or_404(user_id), password, totp_code, recovery_code)
+    secret = two_factor.new_secret()
+    persist_user({**user, "totp_pending_secret": secret, "updated_at": utc_now()})
+    return two_factor.provisioning(secret, str(user["name"]))
+
+
+def enable_totp(user_id: str, code: str, *, keep_token: str) -> dict[str, Any]:
+    """Make the secret from ``start_totp_setup`` the user's, once the
+    authenticator app has shown it holds it; a previous secret stops working.
+    Answers new recovery codes, which are never shown again and replace any
+    earlier ones, and signs the user out everywhere else: those sessions never
+    gave a code made from this secret."""
+    user = _user_or_404(user_id)
+    pending = user.get("totp_pending_secret")
+    if not pending:
+        raise api_error(409, "totp_setup_required", "Start the two-factor setup first.")
+    step = two_factor.check_totp(pending, code, last_step=None, status=422)
+    recovery_codes, digests = two_factor.new_recovery_codes(user_id)
+    updated = {
+        **user,
+        "totp_enabled": True,
+        "totp_secret": pending,
+        "totp_pending_secret": None,
+        "totp_last_step": step,
+        "totp_recovery": digests,
+        "updated_at": utc_now(),
+    }
+    persist_user(updated)
+    delete_other_sessions_for_user(user_id, keep_token)
+    return {"user": _public_user(updated), "recovery_codes": recovery_codes}
+
+
+def disable_totp(
+    user_id: str, password: str, *, totp_code: str | None = None, recovery_code: str | None = None
+) -> dict[str, Any]:
+    """Turn the user's own two-factor sign-in off."""
+    user = _user_or_404(user_id)
+    if not user.get("totp_enabled"):
+        raise api_error(409, "totp_not_enabled", "Two-factor sign-in is not on.")
+    user = _reauthenticate(user, password, totp_code, recovery_code)
+    updated = {**user, **two_factor.CLEARED, "updated_at": utc_now()}
+    persist_user(updated)
+    return _public_user(updated)
+
+
+def regenerate_recovery_codes(
+    user_id: str, password: str, *, totp_code: str | None = None, recovery_code: str | None = None
+) -> dict[str, Any]:
+    """A new set of recovery codes for the user; every earlier one stops
+    working."""
+    user = _user_or_404(user_id)
+    if not user.get("totp_enabled"):
+        raise api_error(409, "totp_not_enabled", "Two-factor sign-in is not on.")
+    user = _reauthenticate(user, password, totp_code, recovery_code)
+    recovery_codes, digests = two_factor.new_recovery_codes(user_id)
+    persist_user({**user, "totp_recovery": digests, "updated_at": utc_now()})
+    return {"recovery_codes": recovery_codes}
 
 
 def whoami(user_id: str, token: str | None = None) -> dict[str, Any]:
@@ -435,6 +586,7 @@ def whoami(user_id: str, token: str | None = None) -> dict[str, Any]:
         "user": _public_user(user),
         "role": rbac.role_to_dto(role, with_permissions=False) if role else None,
         "permissions": rbac.allowed_functions(role.id if role else None),
+        **({"recovery_codes_left": len(user.get("totp_recovery") or [])} if user.get("totp_enabled") else {}),
         **(_session_expiry(session) if session else {}),
     }
 

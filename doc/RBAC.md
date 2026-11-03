@@ -50,6 +50,10 @@ other role is allowed exactly what it lists.
 | `auth.change_password` | self-service | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `auth.extend_session` | self-service | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `auth.touch_session` | self-service | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `auth.totp_setup` | self-service | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `auth.totp_enable` | self-service | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `auth.totp_disable` | self-service | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `auth.totp_recovery_codes` | self-service | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `dashboard.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `system.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `system.logs` | read | ✓ | ✓ | – | – | ✓ |
@@ -130,9 +134,11 @@ role's ID or its name.
   request; nobody signs in again.
 - Every role allows the self-service functions (`always_allowed` in
   `GET /api/v1/functions`): `auth.login`, `auth.logout`, `auth.whoami`,
-  `auth.change_password`, `auth.extend_session` and `auth.touch_session`. A
-  custom role lists them whatever it was given, so its users can always sign
-  out, keep their session and change their password.
+  `auth.change_password`, `auth.extend_session`, `auth.touch_session`,
+  `auth.totp_setup`, `auth.totp_enable`, `auth.totp_disable` and
+  `auth.totp_recovery_codes`. A custom role
+  lists them whatever it was given, so its users can always sign out, keep their
+  session, change their password and manage their two-factor sign-in.
 - A built-in role cannot be changed or deleted (`409 built_in_role`); clone it
   instead. A custom role that users hold cannot be deleted
   (`409 role_in_use`, naming them): give them another role first.

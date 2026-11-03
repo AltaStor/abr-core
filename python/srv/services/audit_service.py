@@ -282,6 +282,10 @@ def record_request(
     response = _json_body(response_body) if exc is None else {}
 
     if function_id == "auth.login":
+        # Only the first step of a sign-in with a code: the second request says
+        # how it ended, and every ordinary sign-in would read as a failure.
+        if getattr(exc, "code", None) == "totp_required":
+            return None
         name = str(request_body.get("name") or "").strip()
         user = response.get("user") if isinstance(response.get("user"), dict) else _user_named(name)
         context = AuditContext(
@@ -290,6 +294,7 @@ def record_request(
             user_id=(user or {}).get("id"),
             role=(user or {}).get("role"),
             auth_session_id=auth_session_ref(response.get("token")),
+            details={"recovery_codes_left": response["recovery_codes_left"]} if "recovery_codes_left" in response else {},
         )
     if context is None or not context.user:
         return None
