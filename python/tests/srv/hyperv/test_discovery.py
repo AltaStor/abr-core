@@ -467,6 +467,57 @@ class TheLastKnownGuestOsIsRememberedTests(unittest.TestCase):
         self.assertEqual(self._guest_os(self._scan("")), "")
 
 
+class GuestIpAddressTests(unittest.TestCase):
+    def setUp(self) -> None:
+        RESOURCES_BY_HV.clear()
+
+    def tearDown(self) -> None:
+        RESOURCES_BY_HV.clear()
+
+    @staticmethod
+    def _vm_record(addresses) -> dict:
+        node = HyperVNode.__new__(HyperVNode)
+        node._owners = {}
+        return node._vm_record(HYPERV_NODE_A, dict(STANDALONE_VM, power_state="Running", ip_addresses=addresses))
+
+    @staticmethod
+    def _scan(ip_address: str) -> dict:
+        node = FakeHyperVNode(HYPERV_HOST, "u", "p")
+        node.inventory = {
+            "virtual_machines": [dict(STANDALONE_VM, ip_address=ip_address)],
+            "disks": [],
+            "network_adapters": [],
+        }
+        with patch("python.srv.plugins.hyperv.HyperVNode", return_value=node):
+            resources = build_hyperv_resources(dict(INVENTORY_RECORD))
+        return next(item for item in resources if item["resource_type"] == "virtual_machine")["payload"]
+
+    def test_the_ipv4_address_the_guest_reports_is_the_vms_address(self) -> None:
+        self.assertEqual(self._vm_record(["192.0.2.162", "fe80::215:5dff:fe0c:1e01"])["ip_address"], "192.0.2.162")
+
+    def test_ipv4_wins_over_an_ipv6_address_reported_first(self) -> None:
+        self.assertEqual(self._vm_record(["2001:db8::5", "192.0.2.7"])["ip_address"], "192.0.2.7")
+
+    def test_link_local_addresses_are_skipped_and_a_global_ipv6_is_kept(self) -> None:
+        self.assertEqual(self._vm_record(["169.254.10.1", "fe80::1%4", "2001:db8::5"])["ip_address"], "2001:db8::5")
+
+    def test_a_single_address_unwrapped_by_powershell_still_counts(self) -> None:
+        self.assertEqual(self._vm_record("192.0.2.7")["ip_address"], "192.0.2.7")
+
+    def test_a_guest_that_reports_no_address_has_none(self) -> None:
+        for addresses in (None, [], ["", "not-an-address"]):
+            with self.subTest(addresses=addresses):
+                self.assertEqual(self._vm_record(addresses)["ip_address"], "")
+
+    def test_the_address_reaches_the_inventory(self) -> None:
+        self.assertEqual(self._scan("192.0.2.162")["ip_address"], "192.0.2.162")
+
+    def test_a_vm_without_an_address_now_does_not_keep_an_old_one(self) -> None:
+        RESOURCES_BY_HV[INVENTORY_RECORD["id"]] = {("virtual_machine", STANDALONE_VM["vm_id"]): {"payload": {"ip_address": "192.0.2.162"}}}
+
+        self.assertIsNone(self._scan("")["ip_address"])
+
+
 def _snapshot(node_name: str, vms: list[dict], disks: list[dict], nics: list[dict]) -> dict:
     return {
         "host": dict(HOSTS[0], name=node_name),

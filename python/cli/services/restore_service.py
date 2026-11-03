@@ -29,6 +29,7 @@ class RestoreService:
                 "vm": self._coalesce_string(getattr(args, "vm", None)),
                 "backup": self._coalesce_string(getattr(args, "backup", None)),
                 "inventory": self._coalesce_string(getattr(args, "inventory", None)),
+                "job": self._coalesce_string(getattr(args, "job", None)),
             }.items()
             if value is not None
         }

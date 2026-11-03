@@ -139,6 +139,12 @@ class _FakePool:
     def __exit__(self, *exc: object) -> None:
         return None
 
+    def open(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
     def exchange_keys(self) -> None:
         self.keys_exchanged = True
 

@@ -209,6 +209,7 @@ def build_vcenter_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
                     "num_cpu": vm["num_cpu"],
                     "memory_mb": vm["memory_mb"],
                     "guest_os": vm["guest_os"],
+                    "ip_address": vm.get("ip_address") or None,
                     "firmware": vm.get("firmware"),
                     # The inventory tree nests VMs under their host (and takes the
                     # datacenter from that host), so this linkage is what makes a
@@ -373,6 +374,7 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
                     "num_cpu": vm["num_cpu"],
                     "memory_mb": vm["memory_mb"],
                     "guest_os": guest_os,
+                    "ip_address": vm.get("ip_address") or None,
                     "firmware": vm.get("firmware"),
                     "generation": vm.get("generation"),
                     "version": vm.get("version"),

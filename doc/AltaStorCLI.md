@@ -598,15 +598,38 @@ abr job create-copy --name <name> (--source <name> | --source-id <id>) [--reposi
 Example: 
 abr job create-copy --name "Copied Job" --source "Existing Job" 
 
+abr job create-backup-copy 
+
+Description: Create a backup copy job. It copies the restore points of its sources - backup jobs (--source-job) or whole repositories, every job's points in them (--source-repo) - into another repository (--repository), where it keeps a chain of its own for each VM with its own retention, GFS, Object Lock dates and encryption key, independently of the sources. It reads stored backups only and never touches the VMs, vCenter or the Hyper-V hosts, so it runs whether a VM is on, off or gone. Copies are restored like any other restore point (abr restore list --job <name>). 
+
+abr job create-backup-copy --name <name> (--source-job <name> ... | --source-job-id <id> ... | --source-repo <name> ... | --source-repo-id <id> ...) (--repository <name> | --repository-id <id>) [--mode <periodic|immediate>] [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--run-after-job <name> | --run-after-job-id <id>] [--copy-window "<[days] HH:MM-HH:MM>" ...] [--retry-count <0..20>] [--retry-interval <minutes>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--gfs-weekly <n>] [--gfs-monthly <n>] [--gfs-yearly <n>] [--active-full-schedule ...] [--synthetic-full-schedule ...] [--compression-level <0..9>] [--set-encryption [--encryption-key]] 
+
+Notes: 
+• --mode periodic (the default) copies on the job's own schedule (daily, weekly, monthly, periodic or cron, as for backup jobs), by hand with abr job start, or each time a run of another job ends (--run-after-job). Each run copies the newest state of every VM and merges whatever is new since the last copy into one restore point. 
+• --mode immediate copies every new restore point of a source as soon as the backup that wrote it ends, one at a time; points that piled up (for example while the destination was down) are copied one after another. It takes no --schedule and no --run-after-job. 
+• The first copy of a VM is a full backup of the source's current chain - its newest full and the incrementals on it; older chains are not copied. Later copies are incrementals on it. When the source starts a new chain (an active or a synthetic full), the next copy is a new full too. 
+• Without --vm/--vms every VM the sources back up is copied, including VMs added to them later; with them, only those VMs, which must be backed up by the sources. 
+• The destination must not be a source: neither a --source-repo nor the repository of a --source-job. When the sources hold Hyper-V VMs, it must be a repository the Hyper-V hosts reach (S3, or SMB with its share), since a Hyper-V restore reads it from the host. 
+• Encrypted sources need an encryption key of the copy job's own (--set-encryption, read from ABR_ENCRYPTION_KEY or prompted for), so the copies stay encrypted; unencrypted sources may still be copied encrypted. The key is entered, never generated. 
+• A full schedule (--active-full-schedule or --synthetic-full-schedule) is required, as for backup jobs, so retention can drop old chains. An active full copies the newest state from the source again; a synthetic full merges the copied chain inside the destination without reading the source. 
+• --copy-window limits when copies move data. A rule is "[days] HH:MM-HH:MM": days separated by commas in week order (mon,wed,fri), each day once; without days, every day. The end may be past midnight (22:00-06:00 runs from the evening of each day given into the next morning). Repeat the option for more rules; none means any time. A copy started outside the window waits in the queue (its log says when the window opens). A copy still running when the window closes is stopped, what it wrote is discarded, and it is queued again for the next opening. 
+• A VM whose copy fails is retried within the same session --retry-count times, --retry-interval minutes apart: 5 times right away for periodic, 3 times 10 minutes apart for immediate, unless set. Configuration errors and a stop are not retried. 
+• A failed or stopped copy leaves the source and the copies made so far as they were. Each copy session logs the source job and repository, the VM, the destination, the restore points copied, the bytes and the time. 
+
+Examples: 
+abr job create-backup-copy --name "SQL-offsite" --source-job "SQL-nightly" --repository "S3-offsite" --schedule daily --time 03:00 --retention-days 90 --active-full-schedule monthly --active-full-day-of-month 1 --active-full-time 04:00 
+abr job create-backup-copy --name "All-to-cloud" --mode immediate --source-repo "Local-Repo-1" --repository "S3-offsite" --copy-window "mon,tue,wed,thu,fri 22:00-06:00" --copy-window "sat,sun 00:00-24:00" --active-full-schedule weekly --active-full-days sun --active-full-time 04:00 
+abr job create-backup-copy --name "SQL-after-nightly" --source-job "SQL-nightly" --vms "sql-01" --repository "Archive-SMB" --run-after-job "SQL-nightly" --synthetic-full-schedule weekly --synthetic-full-days sat --synthetic-full-time 05:00 
+
 abr job list 
 
-Description: Show all configured jobs, including inventory, repository, VM count, schedule summary, schedule state, and run timestamps when available. LAST RESULT is how the job's last run went over all of its VMs: Success, Warning, Stopped or Failed, with the number of VMs affected, or Running while any VM is still being backed up. It is empty for a job that has not run since the server was upgraded to report it. 
+Description: Show all configured jobs, including inventory, repository, VM count, schedule summary, schedule state, and run timestamps when available. LAST RESULT is how the job's last run went over all of its VMs: Success, Warning, Stopped or Failed, with the number of VMs affected, or Running while any VM is still being backed up. It is empty for a job that has not run since the server was upgraded to report it. TYPE is backup or backup-copy; a backup copy job has no inventory of its own. 
 
 abr job list [--output json] 
 
 abr job info 
 
-Description: Display detailed job bindings, tracked virtual machines, schedule configuration, schedule state, execution policy references, and timestamps. last_result summarises the last run, last_run_issues names each VM that failed, stopped or finished with warnings together with the reason and its session, and last_run_id lists that run's sessions with abr session list --run. With --output json the run is in last_run, with the result of every VM. 
+Description: Display detailed job bindings, tracked virtual machines, schedule configuration, schedule state, execution policy references, and timestamps. last_result summarises the last run, last_run_issues names each VM that failed, stopped or finished with warnings together with the reason and its session, and last_run_id lists that run's sessions with abr session list --run. With --output json the run is in last_run, with the result of every VM. For a backup copy job it also shows copy_mode, source_jobs, source_repositories, run_after_job, copy_window and retry; with --output json they are in backup_copy. 
 
 abr job info --name <name> [--id <id>] 
 
@@ -616,9 +639,13 @@ Description: Update job configuration binding, scheduling, schedule state, or pr
 
 abr job edit --name <name> [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--repository <repo_name>] [--inventory <inventory_name>] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] [--on-quiesce-failure <fail|crash-consistent>] 
 
+A backup copy job takes the options of job create-backup-copy as well: --mode, --source-job, --source-job-id, --source-repo, --source-repo-id (each replaces that list; none empties it), --run-after-job (none clears it), --copy-window (replaces the rules; none means any time), --retry-count, --retry-interval and --all-vms (copy every VM of the sources again). They are refused on a backup job, and --inventory, --on-quiesce-failure and --guest-consistency on a backup copy job, with the reason. 
+
+--set-encryption takes the key as job create does: from ABR_ENCRYPTION_KEY, or prompted for (twice) when it is not set, or with --encryption-key. On a job without encryption it turns encryption on. On an encrypted job a different key becomes the job's new key for the backups that follow (key rotation): the earlier backups keep the key they were written with and restore with it, and giving the current key again changes nothing. With no key in the environment and no terminal to prompt on, the command fails instead of leaving the key as it was. --reset-encryption turns encryption off and drops the job's keys. 
+
 abr job retention 
 
-Description: Apply the job's retention policy now to every backup chain the job wrote, or preview it with --dry-run. Retention also runs after each backup, for that backup's own chain; this covers all of them at once, including VMs that have since left the job. 
+Description: Apply the job's retention policy now to every backup chain the job wrote, or preview it with --dry-run. For a backup copy job that is its own chains in its destination; the restore points of its sources are never touched. Retention also runs after each backup, for that backup's own chain; this covers all of them at once, including VMs that have since left the job. 
 
 abr job retention --name <name> [--id <id>] [--dry-run] [--output json] 
 
@@ -734,7 +761,9 @@ abr restore list
 
 Description: Show restore points that can be used for VM recovery. 
 
-abr restore list [--vm <name-or-id>] [--backup <backup-id>] [--inventory <name-or-id>] [--output json] 
+abr restore list [--vm <name-or-id>] [--backup <backup-id>] [--inventory <name-or-id>] [--job <name-or-id>] [--output json] 
+
+--job lists the restore points one job wrote, a backup job or a backup copy job; with --output json a copy carries copy_source: the source job, repository and restore points it was copied from. 
 
 Note: 
 This command returns stable restore-point records including point ID, backup ID, VM ID/name, inventory, repository, time, type, and status. Empty results return success with `items: []`. 
@@ -779,7 +808,7 @@ Description: The original VM is damaged or unavailable, and the backup must be r
 Syntax: abr restore start --point-id <id> --in-place --force [--power-on] 
 Example: abr restore start --point-id rp-2026-05-16-0200-f1 --in-place --force --power-on 
 
---in-place selects this mode explicitly. It cannot be combined with --target-inventory/--target-host/--datastore/--new-name -- in-place restore always uses the source VM's own placement, never a caller-supplied one. It can be combined with --repo for a backup-copy source (scenario 3 below). 
+--in-place selects this mode explicitly. It cannot be combined with --target-inventory/--target-host/--datastore/--new-name -- in-place restore always uses the source VM's own placement, never a caller-supplied one. A restore point a backup copy job made is restored in place the same way (scenario 3 below). 
 
 An in-place restore keeps the VM's identity: the restored machine carries the original's SMBIOS uuid and vSphere instanceUuid, so guest licensing, vCenter tags, monitoring and this product's own backup jobs and backup chains keep matching it. Only vCenter's internal moRef changes. A restore to a new name is the opposite by design: it creates a separate VM with its own identity, which is what cloning a machine alongside the original calls for. 
 --force authorizes the overwrite once --in-place has been selected; it has no effect and no meaning without --in-place. Omitting --in-place leaves the flag rejected outright, since there is nothing for it to authorize. 
@@ -822,9 +851,11 @@ Tracking progress:
 - Use `abr session log --id <restore-session-id>`
  
 3. Restore from Backup Copy (From remote / disaster storage) 
-Description: The local backup repository is lost, so recovery is performed directly from an external or cloud backup copy repository. 
-Syntax: abr restore start --point-id <id> --repo <name> --target-inventory <name> --target-datastore <name> [--power-on] 
-Example: abr restore start --point-id rp-2026-05-16-0200-f1 --repo My-NFS --target-inventory DR-Inventory --target-datastore DR-SSD --power-on 
+Description: The source backups are lost or their repository is unreachable, so the VM is restored from the restore points a backup copy job made in its own repository. A copy is a restore point of its own, with its own ID, and is restored in place or to a new VM exactly like any other: no --repo and no encryption key are needed (the copy job's key is used), and the source repository and the source backups are never read. 
+Find the copies: abr restore list --vm <name> lists them next to the source points (the REPOSITORY column tells them apart); abr restore list --job <copy job> lists only the copies. 
+Syntax: abr restore start --restore-point <copy point id> (--in-place --force | --new-name <name> --target-inventory <name> --datastore <name>) [--power-on] 
+Example: abr restore start --restore-point 6b0f2c1e-8d4a-4c55-9a1e-3f7d2b9c8e10 --new-name sql-01-dr --target-inventory DR-Inventory --datastore DR-SSD --power-on 
+--repo, if given, only checks that the restore point is in that repository; the ID of a source point with the copy's repository is refused, since the copy has an ID of its own. 
 
 SYSTEM COMMANDS 
 

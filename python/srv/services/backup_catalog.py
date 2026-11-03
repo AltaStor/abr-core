@@ -301,7 +301,7 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
         return None
 
     result = task.get("result")
-    if not isinstance(result, dict):
+    if not isinstance(result, dict) or result.get("nothing_copied"):
         return None
 
     if result.get("stop_requested_after_completion"):
@@ -451,6 +451,8 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
         "placements": placements,
         "created_at": created_at,
     }
+    if isinstance(result.get("copy_source"), dict):
+        record["copy_source"] = dict(result["copy_source"])
     normalized_record = normalize_backup_point(record)
     if not normalized_record.get("segment_id"):
         normalized_record["segment_id"] = normalized_record["id"]

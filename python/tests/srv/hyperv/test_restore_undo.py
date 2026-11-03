@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from python.srv.plugins.hyperv import hyperv_restore
+from python.srv.plugins.hyperv.hyperv import HyperVNode
 
 
 class FakeNode:
@@ -23,6 +24,10 @@ class FakeNode:
 
     def replace_vm_disks(self, vm_id, disks):
         self.calls.append(("replace_vm_disks", vm_id, [disk["path"] for disk in disks]))
+
+    def stop_disk_tool(self, node, paths):
+        self.calls.append(("stop_disk_tool", node, list(paths)))
+        return []
 
     def remove_files(self, node, paths):
         self.calls.append(("remove_files", node, list(paths)))
@@ -61,6 +66,7 @@ class RestoreUndoTests(unittest.TestCase):
             node.calls,
             [
                 ("resolve_node", "hv-node-02"),
+                ("stop_disk_tool", "HV-NODE-02", [r"C:\Hyper-V\vm-r\Virtual Hard Disks\disk1.vhdx"]),
                 ("remove_files", "HV-NODE-02", [r"C:\Hyper-V\vm-r\Virtual Hard Disks\disk1.vhdx"]),
                 (
                     "remove_empty_folders",
@@ -125,8 +131,30 @@ class RestoreUndoAfterStopTests(unittest.TestCase):
 
         self.assertEqual(
             [call[0] for call in node.calls],
-            ["resolve_node", "replace_vm_disks", "remove_files", "remove_empty_folders"],
+            ["resolve_node", "replace_vm_disks", "stop_disk_tool", "remove_files", "remove_empty_folders"],
         )
+
+
+class RemoveFilesTests(unittest.TestCase):
+    def _removed(self, paths: list[str]) -> list[str]:
+        node = HyperVNode.__new__(HyperVNode)
+        with patch.object(HyperVNode, "_run_script", return_value=[{"failed": []}]) as run:
+            node.remove_files("HV-NODE-02", paths)
+        return run.call_args.args[1]["paths"]
+
+    def test_a_disk_goes_with_its_change_tracking_files(self) -> None:
+        disk = r"C:\Hyper-V\vm-r\Virtual Hard Disks\disk1.vhdx"
+        snapshot = r"C:\Hyper-V\vm-r\Virtual Hard Disks\disk1_ABC.AVHDX"
+
+        self.assertEqual(
+            self._removed([disk, snapshot]),
+            [disk, snapshot, f"{disk}.rct", f"{disk}.mrt", f"{snapshot}.rct", f"{snapshot}.mrt"],
+        )
+
+    def test_other_files_are_removed_alone(self) -> None:
+        config = r"C:\Hyper-V\vm-r\Virtual Machines\vm.vmcx"
+
+        self.assertEqual(self._removed([config]), [config])
 
 
 if __name__ == "__main__":

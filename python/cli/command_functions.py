@@ -50,6 +50,7 @@ COMMAND_FUNCTIONS: dict[str, str] = {
     "inventory test": "inventory.test",
     "job create": "job.create",
     "job create-copy": "job.create",
+    "job create-backup-copy": "job.create",
     "job list": "job.view",
     "job info": "job.view",
     "job edit": "job.edit",

@@ -1,11 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright © 2026 Norvitex OÜ
 
+import ipaddress
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List
 
 
 ProgressCallback = Callable[[dict[str, Any]], None] | None
+
+
+def guest_ip_address(values: Any) -> str:
+    addresses = []
+    for value in [values] if isinstance(values, str) else values or []:
+        try:
+            address = ipaddress.ip_address(str(value).split("%")[0].strip())
+        except ValueError:
+            continue
+        if not (address.is_link_local or address.is_loopback or address.is_unspecified):
+            addresses.append(address)
+
+    preferred = [address for address in addresses if address.version == 4] or addresses
+    return str(preferred[0]) if preferred else ""
 
 
 class QuiesceFailedError(RuntimeError):

@@ -9,7 +9,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from .mongo_db_wrapper import TASKS, TASK_LOCK, claim_task, load_queued_tasks, persist_task
-from ..services import notification_detectors
+from ..services import backup_copy, notification_detectors
 from ..services.backup_catalog import discard_unregistered_output, register_backup_from_completed_task
 from .task_executor import TaskStopRequested, run_task
 from .utils import utc_now
@@ -163,7 +163,7 @@ class TaskProcessPool:
         # Pull a window wide enough to skip over backups that are at the cap (or
         # whose VM is busy) and still reach any queued restores/light tasks behind
         # them.
-        queued_tasks = load_queued_tasks(limit=self._worker_count)
+        queued_tasks = load_queued_tasks()
         if queued_tasks:
             logger.debug("Found %d queued task(s). Attempting to dispatch...", len(queued_tasks))
 
@@ -176,6 +176,9 @@ class TaskProcessPool:
             task_type = str(queued_task.get("task_type", ""))
             vm_key = vm_key_for_task(queued_task) if task_type == "backup" else None
             if task_type == "backup":
+                if backup_copy.waits_for_window(queued_task):
+                    logger.debug("Backup copy task '%s' held: its copy window is closed.", task_id)
+                    continue
                 if running_backups >= self._max_concurrent_backups:
                     # Leave it queued; a later poll picks it up once a slot frees.
                     logger.debug(
@@ -374,6 +377,10 @@ class TaskProcessPool:
             self._fail_unrecorded_backup(task_id, unrecorded_backup)
         else:
             notification_detectors.task_finished(dict(finished))
+            try:
+                backup_copy.on_session_finished(dict(finished))
+            except Exception:
+                logger.exception("Could not start the backup copies that follow task '%s'", task_id)
 
     def _fail_unrecorded_backup(self, task_id: str, snapshot: dict[str, object]) -> None:
         removed = False

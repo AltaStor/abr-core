@@ -122,6 +122,7 @@ from python.srv.services.inventory_management import (
     inventory_type_from_record,
     normalize_inventory_type,
 )
+from python.srv.services.backup_copy import apply_copy_settings, copy_job_view, create_copy_sessions
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
@@ -251,6 +252,18 @@ EXECUTION_REASONS = (
     "VmConfigurationChanged",
 )
 JOB_TYPES = ("backup", "backup-copy")
+COPY_JOB_FIELDS = (
+    "copy_mode",
+    "source_jobs",
+    "source_job_ids",
+    "source_repositories",
+    "source_repository_ids",
+    "run_after_job",
+    "run_after_job_id",
+    "retry_count",
+    "retry_interval_minutes",
+    "copy_window",
+)
 TASK_TYPES = ("backup", "restore")
 
 VERIFY_ARTIFACT_TIMEOUT_SECONDS = env_int("ALTASTOR_VERIFY_TIMEOUT_SECONDS")
@@ -4068,6 +4081,21 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
     item["repo_name"] = str(item.get("repo_name") or metadata.get("repo_name") or metadata.get("repository_name") or (_split_csv(str(metadata.get("repo") or ""))[0] if isinstance(metadata.get("repo"), str) else (metadata.get("repo") or [None])[0]) or "")
     item["source_job_id"] = str(item.get("source_job_id") or metadata.get("source_job_id") or "")
     item["source_job_name"] = str(item.get("source_job_name") or metadata.get("source_job_name") or "")
+    if item["job_type"] == "backup-copy":
+        item["copy_mode"] = str(item.get("copy_mode") or "periodic")
+        item["source_job_ids"] = [str(value) for value in item.get("source_job_ids") or [] if str(value or "").strip()] or (
+            [item["source_job_id"]] if item["source_job_id"] else []
+        )
+        item["source_job_names"] = [str(value or "") for value in item.get("source_job_names") or []] or (
+            [item["source_job_name"]] if item["source_job_name"] else []
+        )
+        item["source_repository_ids"] = [str(value) for value in item.get("source_repository_ids") or [] if str(value or "").strip()]
+        item["source_repository_names"] = [str(value or "") for value in item.get("source_repository_names") or []]
+        item["run_after_job_id"] = str(item.get("run_after_job_id") or "")
+        item["run_after_job_name"] = str(item.get("run_after_job_name") or "")
+        item["retry_count"] = item.get("retry_count")
+        item["retry_interval_minutes"] = item.get("retry_interval_minutes")
+        item["copy_window"] = [rule for rule in item.get("copy_window") or [] if isinstance(rule, dict)]
     raw_schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else None
     if raw_schedule is None and isinstance(metadata.get("schedule"), dict):
         raw_schedule = metadata.get("schedule")
@@ -4433,10 +4461,8 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
             "id": normalized.get("repo_id") or None,
             "name": normalized.get("repo_name") or None,
         },
-        "source_job": {
-            "id": normalized.get("source_job_id") or None,
-            "name": normalized.get("source_job_name") or None,
-        } if normalized["job_type"] == "backup-copy" else None,
+        "source_job": (copy_job_view(normalized)["source_jobs"] or [None])[0] if normalized["job_type"] == "backup-copy" else None,
+        "backup_copy": copy_job_view(normalized) if normalized["job_type"] == "backup-copy" else None,
         "schedule": _schedule_dto(normalized.get("schedule")),
         "schedule_summary": normalized.get("schedule_summary"),
         "enabled": bool(normalized.get("enabled")),
@@ -4763,6 +4789,101 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     return job_to_dto(_persist_canonical_job(job))
 
 
+def create_backup_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
+    name = str(payload.get("name") or "")
+    raw_schedule = payload.get("schedule")
+    schedule = _schedule_from_request(raw_schedule) if raw_schedule not in (None, "") else None
+    retention_days = _validate_retention_days(payload["retention_days"]) if payload.get("retention_days") is not None else 14
+    retention_min_fulls = (
+        _validate_retention_min_fulls(payload["retention_min_fulls"])
+        if payload.get("retention_min_fulls") is not None
+        else DEFAULT_RETENTION_MIN_FULLS
+    )
+    raw_gfs = payload.get("gfs")
+    gfs = _validate_gfs_counts(raw_gfs if isinstance(raw_gfs, dict) else payload)
+    gfs["enabled"] = _coerce_gfs_enabled(raw_gfs.get("enabled") if isinstance(raw_gfs, dict) else payload.get("gfs_enabled"))
+    active_full_days = _normalize_day_list(payload.get("active_full_days") or ())
+    synthetic_full_days = _normalize_day_list(payload.get("synthetic_full_days") or ())
+    active_full_schedule = _schedule_from_request(payload.get("active_full_schedule"))
+    synthetic_full_schedule = _schedule_from_request(payload.get("synthetic_full_schedule"))
+    if "active_full_schedule" in payload and not _schedule_weekdays(active_full_schedule):
+        active_full_days = []
+    if "synthetic_full_schedule" in payload and not _schedule_weekdays(synthetic_full_schedule):
+        synthetic_full_days = []
+    now = utc_now()
+    active_full_schedule = _execution_schedule_with_state(
+        "active_full_schedule",
+        active_full_schedule,
+        _requested_execution_schedule_state(payload, "active_full_schedule"),
+        active_full_days,
+        schedule,
+        now,
+    )
+    synthetic_full_schedule = _execution_schedule_with_state(
+        "synthetic_full_schedule",
+        synthetic_full_schedule,
+        _requested_execution_schedule_state(payload, "synthetic_full_schedule"),
+        synthetic_full_days,
+        schedule,
+        now,
+    )
+    base_is_enabled = isinstance(schedule, dict) and bool(schedule.get("enabled", True))
+    job_enabled = bool(payload.get("enabled", True)) if not isinstance(schedule, dict) else base_is_enabled
+    description = str(payload.get("description") or "").strip()
+    task_parameters = payload.get("task_parameters") if isinstance(payload.get("task_parameters"), dict) else {}
+    _ensure_encryption_key_strength(task_parameters)
+    task_parameters = _validate_task_parameters(task_parameters)
+    _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
+    _ensure_ascii_name(name, field="Job name", code="invalid_job")
+    _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+    _ensure(
+        not any(str(existing.get("name") or "").lower() == name.lower() for existing in catalog_records(JOBS)),
+        409,
+        "job_name_exists",
+        "Job name already exists",
+        name=name,
+    )
+    _ensure_full_backup_schedule(
+        {
+            "active_full_schedule": active_full_schedule,
+            "active_full_days": active_full_days,
+            "synthetic_full_schedule": synthetic_full_schedule,
+            "synthetic_full_days": synthetic_full_days,
+        }
+    )
+    job = {
+        "id": str(uuid4()),
+        "name": name,
+        "job_type": "backup-copy",
+        "inventory_id": "",
+        "inventory_name": "",
+        "schedule": schedule,
+        "retention_days": retention_days,
+        "retention_min_fulls": retention_min_fulls,
+        "gfs": gfs,
+        "active_full_days": active_full_days,
+        "synthetic_full_days": synthetic_full_days,
+        "active_full_schedule": active_full_schedule,
+        "synthetic_full_schedule": synthetic_full_schedule,
+        "active_full_next_run_at": _execution_schedule_next_run(active_full_schedule) if job_enabled else None,
+        "synthetic_full_next_run_at": _execution_schedule_next_run(synthetic_full_schedule) if job_enabled else None,
+        "description": description,
+        "task_parameters": dict(task_parameters),
+        "storage_layout": STORAGE_LAYOUT_BY_ID,
+        "enabled": job_enabled,
+        "status": "active" if job_enabled else "disabled",
+        "created_at": now,
+        "updated_at": now,
+        "next_incremental_run_at": (
+            schedule_next_run(schedule, after=_parse_dt(now)).isoformat() if schedule and base_is_enabled else None
+        ),
+        "last_run_at": None,
+        "last_session_id": None,
+    }
+    apply_copy_settings(job, payload, creating=True)
+    return job_to_dto(_persist_canonical_job(job))
+
+
 def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or "")
     source_job = resolve_job(
@@ -4837,6 +4958,22 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     if not job["source_job_id"]:
         job.pop("source_job_id", None)
         job.pop("source_job_name", None)
+    if source_job["job_type"] == "backup-copy":
+        for key in (
+            "copy_mode",
+            "source_job_ids",
+            "source_job_names",
+            "source_repository_ids",
+            "source_repository_names",
+            "run_after_job_id",
+            "run_after_job_name",
+            "retry_count",
+            "retry_interval_minutes",
+        ):
+            job[key] = _json_clone(source_job.get(key))
+        job.pop("source_job_id", None)
+        job.pop("source_job_name", None)
+        apply_copy_settings(job, {"repo_id": job["repo_id"]}, creating=False)
     return job_to_dto(_persist_canonical_job(job))
 
 
@@ -4995,6 +5132,20 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         merged = _merge_task_parameters(stored_parameters, payload["task_parameters"])
         updated["task_parameters"] = _validate_task_parameters(merged, previous=stored_parameters)
         changed = True
+    copy_only = [key for key in COPY_JOB_FIELDS if payload.get(key) is not None]
+    _ensure(
+        updated["job_type"] == "backup-copy" or not copy_only,
+        422,
+        "invalid_job",
+        f"{', '.join(copy_only)} apply to backup copy jobs only, and {updated.get('name')} is a backup job",
+    )
+    backup_only = [key for key in ("inventory", "inventory_id") if payload.get(key) is not None]
+    _ensure(
+        updated["job_type"] == "backup" or not backup_only,
+        422,
+        "invalid_job",
+        f"{', '.join(backup_only)} apply to backup jobs only: backup copy job {updated.get('name')} reads the VMs of its sources",
+    )
     if updated["job_type"] == "backup":
         if "repo" in payload or "repo_id" in payload:
             repository = resolve_repository(name=payload.get("repo"), record_id=payload.get("repo_id"))
@@ -5017,19 +5168,8 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if any(key in payload for key in ("repo", "repo_id", "inventory", "inventory_id")):
             _ensure_hyperv_reaches_repository(updated["inventory_id"], resolve_repository(record_id=updated["repo_id"]))
     else:
-        if "repo" in payload or "repo_id" in payload:
-            repository = resolve_repository(name=payload.get("repo"), record_id=payload.get("repo_id"))
-            updated["repo_id"] = repository["id"]
-            updated["repo_name"] = repository["name"]
-            changed = True
-        if "source_job" in payload or "source_job_id" in payload:
-            source = resolve_job(name=payload.get("source_job"), record_id=payload.get("source_job_id"))
-            updated["source_job_id"] = source["id"]
-            updated["source_job_name"] = source["name"]
-            updated["inventory_id"] = source["inventory_id"]
-            updated["inventory_name"] = source["inventory_name"]
-            changed = True
-    if updated["job_type"] == "backup" and _touches_full_backup_policy(payload):
+        changed = apply_copy_settings(updated, payload, creating=False) or changed
+    if _touches_full_backup_policy(payload):
         _ensure_full_backup_schedule(updated)
     _ensure(changed, 422, "invalid_job", "job edit requires at least one editable option")
     updated["updated_at"] = utc_now()
@@ -6120,7 +6260,7 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
     point the running backup chains onto cannot go from under it.
     """
     job = resolve_job(record_id=job_id)
-    _ensure(job.get("job_type") == "backup", 422, "invalid_job", "Retention applies to backup jobs")
+    _ensure(job.get("job_type") in JOB_TYPES, 422, "invalid_job", "Retention applies to backup and backup copy jobs")
     busy_vms = {
         str(task.get("resource_external_id") or "")
         for task in catalog_records(TASKS)
@@ -7779,6 +7919,7 @@ def _restore_point_type(point: dict[str, Any]) -> str:
 
 def restore_point_to_dto(point: dict[str, Any]) -> dict[str, Any]:
     return {
+        "copy_source": point.get("copy_source") if isinstance(point.get("copy_source"), dict) else None,
         "id": point.get("id"),
         "restore_point_id": point.get("id"),
         "backup_id": point.get("chain_id"),
@@ -7830,11 +7971,21 @@ def _restore_point_matches_inventory(point: dict[str, Any], selector: str) -> bo
     return str(point.get("inventory_id") or "") == selector or str(point.get("inventory_name") or "").lower() == lowered
 
 
-def list_restore_points(*, vm: str | None = None, backup_id: str | None = None, inventory: str | None = None) -> list[dict[str, Any]]:
+def list_restore_points(
+    *, vm: str | None = None, backup_id: str | None = None, inventory: str | None = None, job: str | None = None
+) -> list[dict[str, Any]]:
     vm_selector = str(vm or "").strip()
     backup_selector = str(backup_id or "").strip()
     inventory_selector = str(inventory or "").strip()
+    job_selector = str(job or "").strip()
     points = normalized_backup_points()
+    if job_selector:
+        points = [
+            point
+            for point in points
+            if str(point.get("job_id") or "") == job_selector
+            or str(point.get("job_name") or "").lower() == job_selector.lower()
+        ]
     if vm_selector:
         points = [point for point in points if _restore_point_matches_vm(point, vm_selector)]
     if backup_selector:
@@ -9249,40 +9400,6 @@ def restore_point_list(vm_id: str) -> list[dict[str, Any]]:
     return [restore_point_to_dto(point) for point in points]
 
 
-def _create_completed_copy_session(job: dict[str, Any], *, run_id: str | None = None) -> dict[str, Any]:
-    source_job_id = str(job.get("source_job_id") or "")
-    source_points = [point for point in normalized_backup_points() if str(point.get("job_id") or "") == source_job_id]
-    session = {
-        "id": str(uuid4()),
-        "job_id": job["id"],
-        "task_type": "backup",
-        "hypervisor_id": job.get("inventory_id"),
-        "resource_type": "virtual_machine",
-        "resource_external_id": source_points[-1]["vm_id"] if source_points else source_job_id,
-        "status": "completed",
-        "trigger": "manual",
-        "run_id": run_id,
-        "parameters": {
-            "copy_job": True,
-            "target_repository_id": job.get("repo_id"),
-            "target_repository_name": job.get("repo_name"),
-        },
-        "result": {
-            "message": "Backup copy session completed",
-            "finished_at": utc_now(),
-            "progress": 100,
-            "resolved_backup_type": "ActiveFull",
-            "resolved_backup_reason": "ForceFull",
-        },
-        "created_at": utc_now(),
-        "updated_at": utc_now(),
-        "logs": [],
-    }
-    _append_task_log(session, level="info", message="Backup copy session completed", component="copy")
-    persist_task(session)
-    return session_to_dto(session)
-
-
 def _create_backup_session(
     job: dict[str, Any],
     *,
@@ -9438,7 +9555,16 @@ def start_job_record(
     run_id = str(uuid4())
     run_started_at = utc_now()
     if job["job_type"] == "backup-copy":
-        sessions.append(_create_completed_copy_session(job, run_id=run_id))
+        sessions.extend(
+            create_copy_sessions(
+                job,
+                trigger="manual",
+                run_id=run_id,
+                force_full=force_full,
+                force_synthetic=force_synthetic,
+                include_idle=True,
+            )
+        )
     else:
         for vm_id, vm_name in zip(job.get("vm_ids") or [], _job_vm_current_names(job)):
             execution_type, execution_reason = resolve_job_execution(

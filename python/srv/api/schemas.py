@@ -332,6 +332,7 @@ class JobDTO(_LenientModel):
     vms: list[_Ref] | DocArray = []
     repository: _Ref
     source_job: _Ref | DocObject = None
+    backup_copy: DocObject = Field(default=None, description="Backup copy jobs only: copy_mode, source_jobs, source_repositories, run_after_job and retry")
     schedule: ScheduleDTO | DocObject = None
     schedule_summary: str | None = None
     enabled: bool = False
@@ -536,6 +537,7 @@ class DefaultRepositoryResult(_LenientModel):
 
 class RestorePointDTO(_LenientModel):
     id: str
+    copy_source: DocObject = Field(default=None, description="Copies made by a backup copy job only: the source job, repository and restore points it was copied from")
     created_at: str | None = None
     execution_type: str | None = None
     execution_reason: str | None = None
@@ -953,6 +955,45 @@ class CreateCopyJobRequest(_LenientModel):
     description: LaxStr | None = None
 
 
+COPY_MODE = "periodic copies the newest restore point of each VM on the job's schedule, merging what is new into one; immediate copies every new restore point as soon as a backup of a source creates it. null or omitted on create: periodic"
+COPY_SOURCE_JOBS = "Backup jobs whose restore points are copied, by name (case-insensitive); with source_job_ids, source_repositories and source_repository_ids, at least one source"
+COPY_SOURCE_JOB_IDS = "Backup jobs whose restore points are copied, by ID"
+COPY_SOURCE_REPOSITORIES = "Repositories whose restore points are copied, every job's, by name (case-insensitive)"
+COPY_SOURCE_REPOSITORY_IDS = "Repositories whose restore points are copied, by ID"
+COPY_RUN_AFTER = "Periodic copies only: start the copy each time a run of this job finishes, by name or with run_after_job_id by ID; empty clears it"
+COPY_RETRY_COUNT = "Retries of a VM whose copy failed, 0 to 20, within the same session; null or omitted: 5 for periodic, 3 for immediate"
+COPY_WINDOW = "When copies may move data: rules '[days] HH:MM-HH:MM' (days separated by commas in week order, mon,wed,fri; no days is every day; the end may be past midnight, 22:00-06:00) or objects {days, start, end}, in the server's time zone. A copy waits outside them and stops when they close; empty or none: any time"
+COPY_RETRY_INTERVAL = "Minutes between those retries, 0 to 1440; null or omitted: 0 for periodic, 10 for immediate"
+
+
+class CreateBackupCopyJobRequest(_LenientModel):
+    name: LaxStr | None = None
+    copy_mode: LaxStr | None = Field(default=None, description=COPY_MODE)
+    source_jobs: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_JOBS)
+    source_job_ids: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_JOB_IDS)
+    source_repositories: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_REPOSITORIES)
+    source_repository_ids: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_REPOSITORY_IDS)
+    run_after_job: LaxStr | None = Field(default=None, description=COPY_RUN_AFTER)
+    run_after_job_id: LaxStr | None = Field(default=None, description=COPY_RUN_AFTER)
+    retry_count: RawInt | None = Field(default=None, description=COPY_RETRY_COUNT)
+    retry_interval_minutes: RawInt | None = Field(default=None, description=COPY_RETRY_INTERVAL)
+    copy_window: list[Any] | LaxStr | None = Field(default=None, description=COPY_WINDOW)
+    vms: list[LaxStr] | LaxStr | None = Field(default=None, description="Only these VMs of the sources, by name or ID; null or omitted: every VM the sources back up")
+    repo: LaxStr | None = Field(default=None, description="Repository the copies go to, by name; it must not be a source")
+    repo_id: LaxStr | None = Field(default=None, description="Repository the copies go to, by ID; it must not be a source")
+    schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="Periodic copies only: when the copy runs")
+    enabled: LaxBool | None = Field(default=None, description="Used only when no schedule is given; with a schedule its own enabled decides. null or omitted: true")
+    retention_days: RawInt | None = Field(default=None, description="How long the copies are kept, independently of the sources; null or omitted: 14")
+    retention_min_fulls: RawInt | None = None
+    gfs: Annotated[SkipValidation[GfsRequest] | None, _checked_booleans(GfsRequest)] = None
+    active_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="When a copy is made as a full backup read from the source")
+    synthetic_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="When the copied chain is merged into a new full in the destination")
+    active_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE)
+    synthetic_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE)
+    description: LaxStr | None = None
+    task_parameters: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = Field(default=None, description="Compression and encryption of the copies; encrypted sources need an encryption key here")
+
+
 class UpdateJobRequest(_LenientModel):
     name: LaxStr | None = None
     schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
@@ -978,6 +1019,16 @@ class UpdateJobRequest(_LenientModel):
     vms: list[LaxStr] | LaxStr | None = Field(default=None, description=f"{JOB_VMS}; replaces the job's VM list")
     source_job: LaxStr | None = Field(default=None, description="Backup copy jobs only: the source job by name (case-insensitive); or source_job_id")
     source_job_id: LaxStr | None = Field(default=None, description="Backup copy jobs only: the source job by ID; or source_job")
+    copy_mode: LaxStr | None = Field(default=None, description=COPY_MODE)
+    source_jobs: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_JOBS)
+    source_job_ids: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_JOB_IDS)
+    source_repositories: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_REPOSITORIES)
+    source_repository_ids: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_REPOSITORY_IDS)
+    run_after_job: LaxStr | None = Field(default=None, description=COPY_RUN_AFTER)
+    run_after_job_id: LaxStr | None = Field(default=None, description=COPY_RUN_AFTER)
+    retry_count: RawInt | None = Field(default=None, description=COPY_RETRY_COUNT)
+    retry_interval_minutes: RawInt | None = Field(default=None, description=COPY_RETRY_INTERVAL)
+    copy_window: list[Any] | LaxStr | None = Field(default=None, description=COPY_WINDOW)
 
 
 class StartJobRequest(_LenientModel):

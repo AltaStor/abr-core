@@ -215,22 +215,46 @@ class EncryptionKeyTests(unittest.TestCase):
     def test_job_create_with_set_encryption_reads_the_key_from_the_environment(self) -> None:
         args = SimpleNamespace(set_encryption=True, reset_encryption=False, encryption_key=None)
         with patch.dict("os.environ", {"ABR_ENCRYPTION_KEY": "from-env"}, clear=True), patch("getpass.getpass") as prompt:
-            updates = JobService._build_task_parameter_updates(args, creating=True)
+            updates = JobService._build_task_parameter_updates(args)
         self.assertEqual(updates["encryption_key"], "from-env")
         prompt.assert_not_called()
 
     def test_job_create_prompts_twice_for_a_new_key(self) -> None:
         args = SimpleNamespace(set_encryption=True, reset_encryption=False, encryption_key=None)
         with patch.dict("os.environ", {}, clear=True), patch("getpass.getpass", side_effect=["k", "k"]) as prompt:
-            updates = JobService._build_task_parameter_updates(args, creating=True)
+            updates = JobService._build_task_parameter_updates(args)
         self.assertEqual(updates["encryption_key"], "k")
         self.assertEqual(prompt.call_count, 2)
 
-    def test_job_edit_set_encryption_without_the_flag_keeps_the_stored_key(self) -> None:
+    def test_job_edit_set_encryption_reads_the_key_from_the_environment_like_create(self) -> None:
         args = SimpleNamespace(set_encryption=True, reset_encryption=False, encryption_key=None)
         with patch.dict("os.environ", {"ABR_ENCRYPTION_KEY": "from-env"}, clear=True), patch("getpass.getpass") as prompt:
             updates = JobService._build_task_parameter_updates(args)
-        self.assertEqual(updates, {"encryption_enabled": True})
+        self.assertEqual(updates, {"encryption_enabled": True, "encryption_key": "from-env"})
+        prompt.assert_not_called()
+
+    def test_job_edit_set_encryption_prompts_twice_without_the_environment(self) -> None:
+        args = SimpleNamespace(set_encryption=True, reset_encryption=False, encryption_key=None)
+        with patch.dict("os.environ", {}, clear=True), patch("getpass.getpass", side_effect=["k", "k"]) as prompt:
+            updates = JobService._build_task_parameter_updates(args)
+        self.assertEqual(updates["encryption_key"], "k")
+        self.assertEqual(prompt.call_count, 2)
+
+    def test_job_edit_set_encryption_with_no_key_and_no_terminal_fails_instead_of_doing_nothing(self) -> None:
+        args = SimpleNamespace(set_encryption=True, reset_encryption=False, encryption_key=None)
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("getpass.getpass", side_effect=EOFError),
+            self.assertRaises(CliStructuredError) as caught,
+        ):
+            JobService._build_task_parameter_updates(args)
+        self.assertIn("ABR_ENCRYPTION_KEY", caught.exception.message)
+
+    def test_job_edit_without_set_encryption_never_reads_a_key(self) -> None:
+        args = SimpleNamespace(set_encryption=False, reset_encryption=False, encryption_key=None, compression_level=5)
+        with patch.dict("os.environ", {"ABR_ENCRYPTION_KEY": "from-env"}, clear=True), patch("getpass.getpass") as prompt:
+            updates = JobService._build_task_parameter_updates(args)
+        self.assertEqual(updates, {"compression_level": 5})
         prompt.assert_not_called()
 
     def test_a_bare_key_flag_without_set_encryption_is_still_refused(self) -> None:

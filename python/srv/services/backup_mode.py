@@ -41,55 +41,42 @@ def _normalized_execution_type(parameters: dict[str, Any]) -> str | None:
     return mapping.get(normalized, None)
 
 
-def has_previous_successful_backup(task: dict[str, Any]) -> bool:
+def _points_of_task_chain(task: dict[str, Any]) -> list[dict[str, Any]]:
     job_id = str(task.get("job_id") or "").strip()
     hypervisor_id = str(task.get("hypervisor_id") or "").strip()
     resource_type = str(task.get("resource_type") or "").strip()
     resource_external_id = str(task.get("resource_external_id") or "").strip()
-    if not hypervisor_id or not resource_type or not resource_external_id:
-        return False
-
+    points = []
     for backup in catalog_records(BACKUPS):
         if str(backup.get("status") or "") not in {"available", "completed", "healthy"}:
             continue
         origin = backup.get("origin") if isinstance(backup.get("origin"), dict) else {}
         source = backup.get("source") if isinstance(backup.get("source"), dict) else {}
-        if job_id and str(origin.get("job_id") or "").strip() == job_id:
-            return True
-        if (
-            str(source.get("hypervisor_id") or "").strip() == hypervisor_id
-            and str(source.get("resource_type") or "").strip() == resource_type
-            and str(source.get("resource_external_id") or "").strip() == resource_external_id
-        ):
-            return True
-    return False
-
-
-def _newest_point_of_chain(task: dict[str, Any]) -> dict[str, Any] | None:
-    job_id = str(task.get("job_id") or "").strip()
-    hypervisor_id = str(task.get("hypervisor_id") or "").strip()
-    resource_type = str(task.get("resource_type") or "").strip()
-    resource_external_id = str(task.get("resource_external_id") or "").strip()
-    newest: dict[str, Any] | None = None
-    newest_created = ""
-    for backup in catalog_records(BACKUPS):
-        if str(backup.get("status") or "") not in {"available", "completed", "healthy"}:
-            continue
-        origin = backup.get("origin") if isinstance(backup.get("origin"), dict) else {}
-        source = backup.get("source") if isinstance(backup.get("source"), dict) else {}
-        matches = bool(job_id) and str(origin.get("job_id") or "").strip() == job_id
-        if not matches:
+        point_vm = str(backup.get("vm_id") or source.get("vm_external_id") or source.get("resource_external_id") or "")
+        if job_id:
+            matches = str(backup.get("job_id") or origin.get("job_id") or "").strip() == job_id and (
+                not resource_external_id or point_vm.strip() == resource_external_id
+            )
+        else:
             matches = (
-                str(source.get("hypervisor_id") or "").strip() == hypervisor_id
+                not isinstance(backup.get("copy_source"), dict)
+                and bool(hypervisor_id and resource_type and resource_external_id)
+                and str(source.get("hypervisor_id") or "").strip() == hypervisor_id
                 and str(source.get("resource_type") or "").strip() == resource_type
                 and str(source.get("resource_external_id") or "").strip() == resource_external_id
             )
-        if not matches:
-            continue
-        created = str(backup.get("created_at") or "")
-        if newest is None or created > newest_created:
-            newest, newest_created = backup, created
-    return newest
+        if matches:
+            points.append(backup)
+    return points
+
+
+def has_previous_successful_backup(task: dict[str, Any]) -> bool:
+    return bool(_points_of_task_chain(task))
+
+
+def _newest_point_of_chain(task: dict[str, Any]) -> dict[str, Any] | None:
+    points = _points_of_task_chain(task)
+    return max(points, key=lambda backup: str(backup.get("created_at") or "")) if points else None
 
 
 def encryption_changed_since_last_backup(task: dict[str, Any], parameters: dict[str, Any]) -> bool:
