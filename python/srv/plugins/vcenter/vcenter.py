@@ -18,7 +18,7 @@ from pyVim.connect import Disconnect, SmartConnect
 from pyVmomi import vim, vmodl
 from ...core.credential_encryption import StoredCredentialUnreadable, is_encrypted, unreadable_credential_message
 from ...core.server_defaults import env_int
-from ..hypervisor import Hypervisor, QuiesceFailedError
+from ..hypervisor import Hypervisor, QuiesceFailedError, guest_ip_address
 from .vcenter_disk_types import (
     VddkDiskType,
     classify_vmware_disk_eager_zeroed,
@@ -338,6 +338,18 @@ def _fault_message(error: Any) -> str:
         or error
     )
 
+
+
+def _reported_ip_address(vm: Any, summary: Any) -> str:
+    guest = getattr(summary, "guest", None)
+    address = guest_ip_address([getattr(guest, "ipAddress", None)])
+    if address or getattr(guest, "toolsRunningStatus", None) != "guestToolsRunning":
+        return address
+    try:
+        nics = getattr(vm.guest, "net", None) or []
+    except vmodl.MethodFault:
+        return ""
+    return guest_ip_address([value for nic in nics for value in (getattr(nic, "ipAddress", None) or [])])
 
 
 class VCenterNode(Hypervisor):
@@ -2264,6 +2276,7 @@ class VCenterNode(Hypervisor):
                     "num_cpu": config.numCpu,
                     "memory_mb": config.memorySizeMB,
                     "guest_os": config.guestFullName,
+                    "ip_address": _reported_ip_address(vm, summary),
                     "firmware": firmware,
                     "host": _running_host_name(runtime),
                 }

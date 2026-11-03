@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Tuple
 from ...core.credential_encryption import StoredCredentialUnreadable, is_encrypted, unreadable_credential_message
 from ...core.mongo_db_wrapper import HYPERVISORS, update_hypervisor_fields
 from ...core.storage_tool import mask_secret_values, redact_disk_tool_command, split_disk_tool_secrets
-from ..hypervisor import Hypervisor, ProgressCallback
+from ..hypervisor import Hypervisor, ProgressCallback, guest_ip_address
 from . import vhdx_tool
 
 logger = logging.getLogger(__name__)
@@ -187,20 +187,6 @@ def _certificate_reason(exc: BaseException) -> str:
 def _answers_without_tls(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "wrong_version_number" in text or "wrong version number" in text or "record layer failure" in text
-
-
-def guest_ip_address(values: Any) -> str:
-    addresses = []
-    for value in [values] if isinstance(values, str) else values or []:
-        try:
-            address = ipaddress.ip_address(str(value).split("%")[0].strip())
-        except ValueError:
-            continue
-        if not (address.is_link_local or address.is_loopback or address.is_unspecified):
-            addresses.append(address)
-
-    preferred = [address for address in addresses if address.version == 4] or addresses
-    return str(preferred[0]) if preferred else ""
 
 
 def winrm_protocol(value: Any) -> str | None:
@@ -1424,7 +1410,8 @@ class HyperVNode(Hypervisor):
         """Delete files on a node; returns the ones that could not be removed."""
         if not paths:
             return []
-        rows = self._run_script("remove_files.ps1", {"paths": paths}, node)
+        sidecars = [f"{path}{suffix}" for path in paths if path.lower().endswith((".vhdx", ".avhdx")) for suffix in (".rct", ".mrt")]
+        rows = self._run_script("remove_files.ps1", {"paths": [*paths, *sidecars]}, node)
         return [str(item) for item in ((rows[0] if rows else {}).get("failed") or [])]
 
     def backup(
