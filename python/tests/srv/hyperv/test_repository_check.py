@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from python.srv.plugins.hyperv import hyperv_backup, vhdx_tool
-from python.srv.plugins.hyperv.hyperv import HyperVError
+from python.srv.plugins.hyperv.hyperv import HyperVError, HyperVUnreachableError
 
 
 STORAGE_ARGS = ["--mode", "s3", "--folder", "bucket", "--path", "et/vm/task-1", "--endpoint", "http://s3.example.test:9000"]
@@ -120,6 +120,53 @@ class RepositoryCheckBeforeCheckpointTests(unittest.TestCase):
         self.assertIsInstance(error, hyperv_backup.HyperVBackupError)
         self.assertIn("could not checkpoint", str(error))
         self.assertEqual([call[0] for call in node.calls], ["run_disk_tool", "create_recovery_checkpoint"])
+
+
+class LostHostMessageTests(unittest.TestCase):
+    _run = RepositoryCheckBeforeCheckpointTests._run
+
+    def _lost(self, where: str) -> Exception | None:
+        lost = HyperVUnreachableError("hv.example.test", [5985], "the connection dropped", protocol="http")
+
+        def drop(*args, **kwargs):
+            raise lost
+
+        target = {"tool": "ensure_disk_tool", "connect": "ensure_vm_host_connected", "checkpoint": "create_recovery_checkpoint"}[where]
+        with patch.object(FakeNode, target, side_effect=drop):
+            _node, error, _discard = self._run({"exit_code": 0, "result": {"command": "info", "status": "ok"}, "lines": ["{", "}"]})
+        return error
+
+    def test_a_connection_lost_between_steps_names_the_host_and_the_vm(self) -> None:
+        for where in ("tool", "connect"):
+            with self.subTest(where=where):
+                error = self._lost(where)
+
+                self.assertIsInstance(error, hyperv_backup.HyperVBackupError)
+                self.assertEqual(
+                    str(error),
+                    "Cannot reach Hyper-V host hv.example.test over WinRM (HTTP, port 5985) while backing up et-vm: "
+                    "the connection dropped",
+                )
+
+    def test_a_step_that_names_itself_keeps_its_own_words(self) -> None:
+        error = self._lost("checkpoint")
+
+        self.assertIn("could not checkpoint et-vm", str(error))
+        self.assertIn("did not answer WinRM over HTTP on port 5985", str(error))
+
+    def test_other_failures_keep_their_message(self) -> None:
+        _node, error, _discard = self._run({"exit_code": 0, "result": {"command": "info", "status": "ok"}, "lines": ["{", "}"]})
+
+        self.assertIn("checkpoint refused by the test", str(error))
+        self.assertNotIn("Cannot reach", str(error))
+
+    def test_a_host_that_never_answered_still_gets_a_sentence(self) -> None:
+        lost = HyperVUnreachableError("hv.example.test", [5985, 5986])
+
+        self.assertEqual(
+            hyperv_backup.lost_host_message(lost, "et-vm"),
+            "Cannot reach Hyper-V host hv.example.test over WinRM while backing up et-vm: it did not answer",
+        )
 
 
 class FailureMessageTests(unittest.TestCase):

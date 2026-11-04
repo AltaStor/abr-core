@@ -70,7 +70,14 @@ from ..vcenter.vcenter_backup import (
     _stop_message,
 )
 from . import vhdx_tool
-from .hyperv import QUIESCABLE_STATES, HyperVError, HyperVNode, node_options, protocol_recorder
+from .hyperv import (
+    QUIESCABLE_STATES,
+    HyperVError,
+    HyperVNode,
+    HyperVUnreachableError,
+    node_options,
+    protocol_recorder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +92,23 @@ REPOSITORY_CHECK_TIMEOUT_SECONDS = 120
 
 class HyperVBackupError(RuntimeError):
     pass
+
+
+def lost_host(exc: BaseException) -> HyperVUnreachableError | None:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, HyperVUnreachableError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def lost_host_message(lost: HyperVUnreachableError, vm_name: str) -> str:
+    over = f" ({lost.protocol.upper()}, port {', '.join(str(port) for port in lost.ports)})" if lost.protocol else ""
+    detail = lost.detail or "it did not answer"
+    return f"Cannot reach Hyper-V host {lost.host} over WinRM{over} while backing up {vm_name}: {detail}"
 
 
 class _ChangeTrackingLost(Exception):
@@ -733,6 +757,9 @@ def run_hyperv_backup(
             exc,
         )
         _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
+        lost = lost_host(exc)
+        if lost is not None and str(exc) == str(lost):
+            raise HyperVBackupError(lost_host_message(lost, vm_name)) from exc
         if isinstance(exc, (HyperVError, vhdx_tool.VhdxToolError)):
             raise HyperVBackupError(str(exc)) from exc
         raise
