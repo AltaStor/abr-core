@@ -2558,7 +2558,15 @@ def resolve_repository(name: str | None = None, record_id: str | None = None) ->
     return normalize_repository_record(resolve_selector(catalog_records(REPOSITORIES), name=name, record_id=record_id, label="Repository"))
 
 
-def _ensure_smb_repository_share(server: Any, share: Any, username: Any, password: Any) -> None:
+def _ensure_smb_repository_share(
+    server: Any,
+    share: Any,
+    username: Any,
+    password: Any,
+    *,
+    previous_username: Any = None,
+    stored_password: Any = None,
+) -> None:
     """An SMB repository's server and share name the share Hyper-V hosts reach
     its folder by (abr-vhdx-tool writes there from the host); its username and
     password are the account that opens it, else the inventory's."""
@@ -2568,11 +2576,25 @@ def _ensure_smb_repository_share(server: Any, share: Any, username: Any, passwor
         "invalid_repository",
         "smb repositories require --server and --share, or --address \\\\server\\share",
     )
+    account = str(username or "").strip()
+    previous = str(previous_username or "").strip()
+    given = bool(str(password or ""))
     _ensure(
-        not str(username or "").strip() or bool(str(password or "")),
+        bool(account) or not given,
         422,
         "invalid_repository",
-        "An SMB repository's account needs --password with --username",
+        "An SMB repository's password needs the account it belongs to: give --username with --password, or "
+        "leave both out so the hosts open the share with the inventory's account",
+    )
+    keeps_stored = bool(previous) and account == previous and bool(str(stored_password or ""))
+    _ensure(
+        not account or given or keeps_stored,
+        422,
+        "invalid_repository",
+        f"The account {account} needs its own password: give --password with --username; the password of "
+        f"{previous} is not used for another account"
+        if previous and account != previous
+        else "An SMB repository's account needs --password with --username",
     )
 
 
@@ -2795,8 +2817,10 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
             _ensure_smb_repository_share(
                 metadata.get("server"),
                 metadata.get("share"),
-                payload.get("username", metadata.get("username")),
-                payload.get("password", metadata.get("password")),
+                payload["username"] if payload.get("username") is not None else metadata.get("username"),
+                payload.get("password"),
+                previous_username=metadata.get("username"),
+                stored_password=metadata.get("password") if payload.get("password") is None else None,
             )
         else:
             _refuse_local_repository_share(payload.get("server"), payload.get("share"))
