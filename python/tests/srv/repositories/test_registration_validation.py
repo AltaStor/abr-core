@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from python.srv.core.mongo_db_wrapper import REPOSITORIES
 from python.srv.core.storage_tool import StorageToolError, with_smb_type
-from python.srv.services import abr_v41
+from python.srv.services import abr_v41, share_mount
 from python.srv.services.api_errors import ApiError
 
 S3_PAYLOAD = {
@@ -285,6 +285,46 @@ class LocalRegistrationValidationTests(_FolderCase):
 
 
 class SmbRegistrationValidationTests(_FolderCase):
+    def setUp(self) -> None:
+        super().setUp()
+        mounted = patch.object(
+            abr_v41, "share_mount_check", return_value={"name": "share_mount", "status": "ok", "message": "mounted"}
+        )
+        self.share_check = mounted.start()
+        self.addCleanup(mounted.stop)
+
+    def test_a_folder_on_the_local_disk_with_a_made_up_share_is_refused(self) -> None:
+        with patch.object(abr_v41, "share_mount_check", wraps=share_mount.share_mount_check), patch.object(
+            share_mount, "is_this_appliance", return_value=False
+        ), self.assertRaises(ApiError) as caught:
+            abr_v41.create_repository_record(
+                {"name": "SmbFake", "type": "smb", "path": self._path("fake"), "address": r"\\192.0.2.99\nosuchshare"}
+            )
+
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertIn("is not the share \\\\192.0.2.99\\nosuchshare", caught.exception.message)
+        self.assertEqual(list(REPOSITORIES), [])
+
+    def test_the_test_connection_runs_the_same_check_and_saves_nothing(self) -> None:
+        with patch.object(abr_v41, "share_mount_check", wraps=share_mount.share_mount_check), patch.object(
+            share_mount, "is_this_appliance", return_value=False
+        ):
+            result = abr_v41.test_smb_connection(
+                {"type": "smb", "path": self._path("fake"), "address": r"\\192.0.2.99\nosuchshare"}
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("is not the share", result["message"])
+        self.assertIn("share_mount", [check["name"] for check in result["checks"]])
+        self.assertEqual(list(REPOSITORIES), [])
+
+    def test_the_test_connection_passes_a_mounted_share(self) -> None:
+        result = abr_v41.test_smb_connection({"type": "smb", "path": self._path("hv"), "server": "backup01", "share": "hv"})
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["message"], "SMB folder and share match")
+        self.assertEqual(list(REPOSITORIES), [])
+
     def test_the_share_and_the_folder_it_is_mounted_at_are_kept(self) -> None:
         mount = self._path("hv")
         repository = abr_v41.create_repository_record(

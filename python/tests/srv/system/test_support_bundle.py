@@ -201,6 +201,7 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
         self.assertEqual(probe["metadata"]["token"], "********")
         self.assertEqual(probe["metadata"]["credentials"]["password"], "********")
 
+    @patch("python.srv.services.abr_v41.share_mount_check", new=lambda repository: {"name": "share_mount", "status": "ok", "message": "mounted"})
     def test_smb_repository_password_is_redacted_in_the_catalog_section(self) -> None:
         from python.srv.core.mongo_db_wrapper import REPOSITORIES
         from python.srv.services import abr_v41

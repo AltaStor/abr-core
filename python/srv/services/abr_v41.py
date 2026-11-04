@@ -125,6 +125,7 @@ from python.srv.services.inventory_management import (
 from python.srv.services.backup_copy import apply_copy_settings, copy_job_view, create_copy_sessions
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
+from python.srv.services.share_mount import share_mount_check
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.hyperv.vhdx_tool import VhdxToolError, ensure_hyperv_repository
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
@@ -2986,6 +2987,13 @@ def _verify_local_repository(repository: dict[str, Any], *, whole_chains: bool =
     except OSError as exc:
         checks.append({"name": "filesystem_probe", "status": "failed", "message": str(exc)})
         return {"status": "error", "checks": checks, "message": f"Filesystem probe failed: {exc}"}
+    share_check = share_mount_check(repository)
+    if share_check is not None:
+        checks.append(share_check)
+        if share_check["status"] == "failed":
+            return {"status": "error", "checks": checks, "message": share_check["message"]}
+        if share_check["status"] == "warning":
+            permission_warnings = [*permission_warnings, share_check["message"]]
 
     location_mismatch = _repository_storage_location_mismatch(repository)
     checks.append(
@@ -3793,6 +3801,28 @@ def test_s3_connection(payload: dict[str, Any]) -> dict[str, Any]:
     if error is not None:
         return {"status": "error", "checks": checks, "message": error}
     return {"status": "success", "checks": checks, "message": "S3 connection succeeded"}
+
+
+def test_smb_connection(payload: dict[str, Any]) -> dict[str, Any]:
+    path = str(payload.get("path") or "").strip()
+    address = str(payload.get("address") or "").strip()
+    server = str(payload.get("server") or "").strip()
+    share = str(payload.get("share") or "").strip()
+    if address and (not server or not share):
+        parsed_server, parsed_share = _split_repository_address("smb", address)
+        server = server or parsed_server
+        share = share or parsed_share
+    _ensure_appliance_folder("smb", path)
+    _ensure_smb_repository_share(server, share, payload.get("username"), payload.get("password"))
+    record = {"id": "", "type": "smb", "path": path, "metadata": {"server": server, "share": share}}
+    result = _verify_local_repository(record)
+    if result.get("status") != "success":
+        return {"status": "error", "checks": result.get("checks") or [], "message": result.get("message")}
+    return {
+        "status": "success",
+        "checks": result.get("checks") or [],
+        "message": str(result.get("message") or "").replace("Repository is available", "SMB folder and share match", 1),
+    }
 
 
 def _repository_verification_result(repository: dict[str, Any]) -> dict[str, Any]:

@@ -146,6 +146,7 @@ class S3RepositorySupportTests(unittest.TestCase):
             "super-secret-key",
         )
 
+    @patch("python.srv.services.abr_v41.share_mount_check", new=lambda repository: {"name": "share_mount", "status": "ok", "message": "mounted"})
     def test_create_smb_repository_masks_password_in_response(self) -> None:
         repository = abr_v41.create_repository_record(
             {
@@ -165,6 +166,7 @@ class S3RepositorySupportTests(unittest.TestCase):
         stored = REPOSITORIES[repository["id"]]
         self.assertEqual(stored["metadata"]["password"], "Canary-Password-9f3b21")
 
+    @patch("python.srv.services.abr_v41.share_mount_check", new=lambda repository: {"name": "share_mount", "status": "ok", "message": "mounted"})
     def test_list_and_resolve_smb_repository_also_mask_the_password(self) -> None:
         created = abr_v41.create_repository_record(
             {
