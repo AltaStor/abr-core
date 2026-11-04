@@ -24,6 +24,7 @@ from python.srv.core.storage_tool import (
     copy_disk_tool_chain,
     disk_tool_storage_args,
     ensure_private_directory,
+    remove_empty_parents,
     is_abr_repository,
     join_s3_prefix,
     make_durable,
@@ -157,6 +158,7 @@ def _discard_partial_merge(
     written: list[str],
     task_root: Path,
     in_flight: str | None = None,
+    below: Path | None = None,
 ) -> None:
     names = list(written)
     if in_flight and in_flight not in names:
@@ -182,6 +184,8 @@ def _discard_partial_merge(
             task_root.rmdir()
     except OSError:
         pass
+    if below is not None:
+        remove_empty_parents(task_root.parent, below=below)
 
 
 def _repository_storage_root(repository: dict[str, Any]) -> str:
@@ -496,12 +500,12 @@ def run_synthetic_full(
             from python.srv.core.task_executor import TaskStopRequested
 
             _discard_partial_merge(
-                repository, destination_path, written_names, task_root, in_flight=backup_name
+                repository, destination_path, written_names, task_root, in_flight=backup_name, below=destination_root
             )
             raise TaskStopRequested("Synthetic full cancelled; the merged backup was discarded") from exc
         except StorageToolError as exc:
             _discard_partial_merge(
-                repository, destination_path, written_names, task_root, in_flight=backup_name
+                repository, destination_path, written_names, task_root, in_flight=backup_name, below=destination_root
             )
             detail = _no_room_detail(repository, points, free_at_start)
             raise SyntheticFullError(
@@ -511,7 +515,7 @@ def run_synthetic_full(
             if exc.errno != errno.ENOSPC:
                 raise
             _discard_partial_merge(
-                repository, destination_path, written_names, task_root, in_flight=backup_name
+                repository, destination_path, written_names, task_root, in_flight=backup_name, below=destination_root
             )
             raise SyntheticFullError(
                 f"Merging disk {position + 1}/{total} failed: "
@@ -551,7 +555,7 @@ def run_synthetic_full(
         stored_total = _dir_size_bytes(task_root)
     manifest_payload = _source_manifest(points[-1])
     if not manifest_payload:
-        _discard_partial_merge(repository, destination_path, written_names, task_root)
+        _discard_partial_merge(repository, destination_path, written_names, task_root, below=destination_root)
         raise SyntheticFullError(
             f"The manifest of restore point {points[-1].get('id')} could not be read, so the merged backup "
             "would not be restorable"
@@ -595,7 +599,7 @@ def run_synthetic_full(
     try:
         make_durable(task_root, up_to=destination_root)
     except OSError as exc:
-        _discard_partial_merge(repository, destination_path, written_names, task_root)
+        _discard_partial_merge(repository, destination_path, written_names, task_root, below=destination_root)
         raise SyntheticFullError(
             f"The synthetic full was written but could not be flushed to stable storage in {task_root}: {exc}. "
             "It is not kept, so a crash cannot leave a restore point with empty files."

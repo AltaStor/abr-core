@@ -649,16 +649,16 @@ def _copy_once(
                 should_cancel=lambda: cancel_requested(task_id) or _window_closed(job),
             )
         except ProcessCancelled as exc:
-            _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name)
+            _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name, below=destination_root)
             if not cancel_requested(task_id) and _window_closed(job):
                 raise _stop_for_window(job, "while it copied; what it had written was discarded") from exc
             raise TaskStopRequested("Backup copy cancelled; what it had written was discarded") from exc
         except StorageToolError as exc:
-            _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name)
+            _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name, below=destination_root)
             detail = _no_room_detail(repository, points, free_at_start)
             raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {detail or exc}") from exc
         except OSError as exc:
-            _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name)
+            _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name, below=destination_root)
             if exc.errno == errno.ENOSPC:
                 raise BackupCopyError(
                     f"Copying disk {position + 1}/{total} failed: "
@@ -686,7 +686,7 @@ def _copy_once(
 
     manifest_payload = _source_manifest(target)
     if not manifest_payload:
-        _discard_partial_merge(repository, destination_path, written, task_root)
+        _discard_partial_merge(repository, destination_path, written, task_root, below=destination_root)
         raise BackupCopyValidationError(
             f"The manifest of restore point {target.get('id')} could not be read, so its copy would not be restorable"
         )
@@ -745,7 +745,7 @@ def _copy_once(
     try:
         make_durable(task_root, up_to=destination_root)
     except OSError as exc:
-        _discard_partial_merge(repository, destination_path, written, task_root)
+        _discard_partial_merge(repository, destination_path, written, task_root, below=destination_root)
         raise BackupCopyError(
             f"The copy was written but could not be flushed to stable storage in {task_root}: {exc}. "
             "It is not kept, so a crash cannot leave a restore point with empty files."

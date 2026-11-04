@@ -717,11 +717,11 @@ def run_hyperv_backup(
         }
     except ProcessCancelled as exc:
         logger.info("Hyper-V backup session %s of VM %s stopped; discarding what it had written.", task_id, vm_name)
-        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root)
+        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
         raise TaskStopRequested(_stop_message(stranded, abr_path, task_root)) from exc
     except TaskStopRequested:
         logger.info("Hyper-V backup session %s of VM %s stopped; discarding what it had written.", task_id, vm_name)
-        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root)
+        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
         raise TaskStopRequested(_stop_message(stranded, abr_path, task_root)) from None
     except Exception as exc:
         logger.exception(
@@ -732,7 +732,7 @@ def run_hyperv_backup(
             time.time() - start_time,
             exc,
         )
-        _discard_task_backups(repository, abr_path, written_backup_names, task_root)
+        _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
         if isinstance(exc, (HyperVError, vhdx_tool.VhdxToolError)):
             raise HyperVBackupError(str(exc)) from exc
         raise

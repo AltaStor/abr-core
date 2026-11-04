@@ -110,6 +110,7 @@ class RepositoryCheckBeforeCheckpointTests(unittest.TestCase):
         )
         discard.assert_called_once()
         self.assertEqual(discard.call_args.args[2], [])
+        self.assertEqual(discard.call_args.args[4], discard.call_args.args[3].parent)
 
     def test_reachable_repository_goes_on_to_the_checkpoint(self) -> None:
         node, error, _ = self._run(

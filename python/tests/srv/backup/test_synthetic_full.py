@@ -506,6 +506,28 @@ class SyntheticFullRunTests(unittest.TestCase):
         self.assertEqual(removed, ["01-disk.vmdk", "02-disk.vmdk"])
 
     @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    def test_a_merge_into_a_new_chain_that_fails_leaves_no_folder_behind(self, remove_mock) -> None:
+        root = Path(self._root) / "target"
+        task_root = root / "job-1" / "vm-1" / "task-new"
+        task_root.mkdir(parents=True)
+
+        synthetic_full._discard_partial_merge(REPOSITORIES[REPO_ID], str(task_root), [], task_root, below=root)
+
+        self.assertEqual(list(root.iterdir()), [])
+        remove_mock.assert_not_called()
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    def test_a_merge_next_to_an_existing_chain_keeps_its_folder(self, remove_mock) -> None:
+        root = Path(self._root) / "target"
+        (root / "vm-1" / "task-old").mkdir(parents=True)
+        task_root = root / "vm-1" / "task-new"
+        task_root.mkdir()
+
+        synthetic_full._discard_partial_merge(REPOSITORIES[REPO_ID], str(task_root), [], task_root, below=root)
+
+        self.assertEqual([path.name for path in (root / "vm-1").iterdir()], ["task-old"])
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_an_object_lock_that_blocks_cleanup_is_reported(self, copy_mock, remove_mock) -> None:
         for point_id in ("p1", "p2", "p3"):
