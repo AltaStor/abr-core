@@ -435,8 +435,11 @@ def run_hyperv_backup(
             # A checkpoint can only be application consistent when there is
             # a running guest to quiesce.
             achieved = consistency
+            consistency_reason: str | None = None
             if str(state.get("state") or "") not in QUIESCABLE_STATES:
                 achieved = "crash"
+                if consistency == "application":
+                    consistency_reason = "vm_not_running"
             _emit(
                 progress_callback,
                 "snapshot",
@@ -455,6 +458,7 @@ def run_hyperv_backup(
                 _warn(progress_callback, "snapshot", 15, message)
                 warnings.append(message)
                 achieved = "crash"
+                consistency_reason = "vss_failed"
                 try:
                     checkpoint = node.create_recovery_checkpoint(vm_id, "crash")
                 except HyperVError as retry_exc:
@@ -591,6 +595,7 @@ def run_hyperv_backup(
                 "checkpoint_id": str(checkpoint.get("checkpoint_id") or ""),
                 "consistency_requested": consistency,
                 "consistency": achieved,
+                "consistency_reason": consistency_reason,
                 "source_node": source_node,
                 "cluster_name": node.cluster_name,
                 "excluded_disks": excluded_disks,

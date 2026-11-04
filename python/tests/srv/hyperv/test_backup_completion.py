@@ -162,3 +162,47 @@ class HyperVBackupCompletionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConsistencyReasonTests(unittest.TestCase):
+    _run = HyperVBackupCompletionTests._run
+
+    def _backup(self, parameters: dict, state: str, refuse_application: bool = False) -> tuple[dict, dict, list]:
+        asked: list[str] = []
+
+        def checkpoint(node, vm_id, consistency="application"):
+            asked.append(consistency)
+            if refuse_application and consistency == "application":
+                raise hyperv_backup.HyperVError("The guest does not answer the Backup (volume shadow copy) service")
+            return {"checkpoint_id": "cp-1", "computer": "NODE-A"}
+
+        running = {"name": "et-vm", "computer": "NODE-A", "state": state, "version": "12.0"}
+        with patch.object(FakeNode, "ensure_vm_host_connected", return_value=running), patch.object(
+            FakeNode, "create_recovery_checkpoint", checkpoint
+        ):
+            result, task_root, *_ = self._run(parameters, None)
+        manifest = json.loads((task_root / "manifest.json").read_text(encoding="utf-8"))
+        return result, manifest, asked
+
+    def test_a_guest_that_cannot_do_vss_says_so_on_the_session_and_the_point(self) -> None:
+        result, manifest, asked = self._backup({}, "Running", refuse_application=True)
+
+        self.assertEqual(asked, ["application", "crash"])
+        self.assertEqual((result["consistency"], result["consistency_reason"]), ("crash", "vss_failed"))
+        self.assertEqual(manifest["consistency_reason"], "vss_failed")
+        self.assertTrue(any("crash-consistent one instead" in warning for warning in result["warnings"]))
+
+    def test_a_vm_that_is_not_running_says_it_had_no_guest_to_quiesce(self) -> None:
+        result, manifest, asked = self._backup({}, "Off")
+
+        self.assertEqual(asked, ["crash"])
+        self.assertEqual((result["consistency"], result["consistency_reason"]), ("crash", "vm_not_running"))
+        self.assertEqual(manifest["consistency_reason"], "vm_not_running")
+
+    def test_an_application_consistent_backup_and_a_crash_job_need_no_reason(self) -> None:
+        application, _manifest, _asked = self._backup({}, "Running")
+        crash, _manifest, asked = self._backup({"hyperv_consistency": "crash"}, "Running")
+
+        self.assertEqual((application["consistency"], application["consistency_reason"]), ("application", None))
+        self.assertEqual((crash["consistency"], crash["consistency_reason"]), ("crash", None))
+        self.assertEqual(asked, ["crash"])
