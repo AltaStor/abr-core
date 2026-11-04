@@ -860,7 +860,7 @@ class S3ImmutabilityDeletionReportingTests(unittest.TestCase):
         self.assertEqual(result["immutable_restore_points"], 1)
         self.assertEqual(result["retained_restore_point_ids"], ["point-1"])
         self.assertIn("Object Lock", result["message"])
-        self.assertIn("kept in the catalog", result["message"])
+        self.assertIn("marked for deletion and removed automatically once the lock expires", result["message"])
         self.assertNotIn("storage root", result["message"])
         self.assertIn("point-1", BACKUPS)
 

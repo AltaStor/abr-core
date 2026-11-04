@@ -1055,5 +1055,41 @@ class AccessLockRetryTests(unittest.TestCase):
             self.assertEqual(sweep.call_count, 2)
 
 
+class PendingDeletionRetryTests(unittest.TestCase):
+    def test_the_retry_waits_for_its_interval_and_never_overlaps_itself(self) -> None:
+        import threading
+
+        scheduler = JobScheduler()
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_sweep() -> int:
+            started.set()
+            release.wait(5)
+            return 0
+
+        with patch.dict("os.environ", {"BACKUPSERVER_DELETE_RETRY_SECONDS": "900"}), patch(
+            "python.srv.services.abr_v41.retry_pending_deletions", side_effect=slow_sweep
+        ) as sweep, patch("python.srv.core.job_scheduler.time.monotonic") as clock:
+            clock.return_value = scheduler._deletion_sweep_at + 899
+            scheduler._retry_pending_deletions()
+            self.assertIsNone(scheduler._deletion_sweep)
+
+            clock.return_value = scheduler._deletion_sweep_at + 901
+            scheduler._retry_pending_deletions()
+            self.assertTrue(started.wait(5))
+
+            clock.return_value += 1800
+            scheduler._retry_pending_deletions()
+            self.assertEqual(sweep.call_count, 1)
+
+            release.set()
+            scheduler._deletion_sweep.join(5)
+            clock.return_value += 901
+            scheduler._retry_pending_deletions()
+            scheduler._deletion_sweep.join(5)
+            self.assertEqual(sweep.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

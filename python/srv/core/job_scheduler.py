@@ -65,6 +65,8 @@ class JobScheduler:
         self._thread: threading.Thread | None = None
         self._access_lock_sweep: threading.Thread | None = None
         self._access_lock_sweep_at = time.monotonic()
+        self._deletion_sweep: threading.Thread | None = None
+        self._deletion_sweep_at = time.monotonic()
         self._reported_clock_anomalies: dict[str, str] = {}
 
     def start(self) -> None:
@@ -103,6 +105,10 @@ class JobScheduler:
                 self._retry_access_locks()
             except Exception as exc:
                 logger.exception("Could not start the relocation block retry: %s", exc)
+            try:
+                self._retry_pending_deletions()
+            except Exception:
+                logger.exception("Could not start the retry of restore points waiting for deletion")
             finally:
                 self._stop_event.wait(self._poll_interval_seconds)
         logger.debug("Job scheduler thread exiting.")
@@ -122,6 +128,22 @@ class JobScheduler:
             daemon=True,
         )
         self._access_lock_sweep.start()
+
+    def _retry_pending_deletions(self) -> None:
+        now = time.monotonic()
+        if now - self._deletion_sweep_at < env_int("BACKUPSERVER_DELETE_RETRY_SECONDS"):
+            return
+        if self._deletion_sweep is not None and self._deletion_sweep.is_alive():
+            return
+        self._deletion_sweep_at = now
+        from python.srv.services.abr_v41 import retry_pending_deletions
+
+        self._deletion_sweep = threading.Thread(
+            target=retry_pending_deletions,
+            name="pending-deletion-retry",
+            daemon=True,
+        )
+        self._deletion_sweep.start()
 
     def _dispatch_due_jobs(self) -> None:
         now = datetime.fromisoformat(utc_now())

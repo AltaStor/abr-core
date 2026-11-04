@@ -738,7 +738,8 @@ abr backup delete --id <id> [--force]
 Behavior: 
 • Safety enforcement: If deletion would orphan dependent increments, the command fails with a dependency protection error regardless of --force. If deletion would violate GFS protection, the command fails with a dependency protection error unless --force is given. 
 • --force: deliberately deletes a chain that carries an active GFS archival mark, discarding data the GFS policy marked for retention. This is the supported way to retire a repository whose only remaining chains are GFS-protected -- without it, such a chain (and the repository holding it) can never be removed. 
-• Executing this command physically and permanently deletes data blocks from the storage. 
+• Executing this command physically and permanently deletes data blocks from the storage.
+• S3 Object Lock: restore points whose data the lock still holds, and the older points they need to restore, are not deleted yet. They are marked for deletion (status deleting) and the server removes them by itself once the lock expires, whether or not their job still exists or runs (it tries every BACKUPSERVER_DELETE_RETRY_SECONDS, 900 s by default). The command says how many were kept and until when, and exits non-zero since the chain is not gone yet. Until then they cannot be restored, and no job builds on them, merges them, copies them or extends their lock; abr backup list shows "N point(s) deleting after <date>" in STATUS, and abr backup info shows pending_deletion and each point's status. Running abr backup delete again tries the storage again at once. 
  
 
 abr backup verify 
