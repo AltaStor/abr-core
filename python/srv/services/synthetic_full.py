@@ -311,6 +311,16 @@ def _hypervisor_kind(task: dict[str, Any], manifest: dict[str, Any]) -> str:
     )
 
 
+def _nothing_to_merge(job: dict[str, Any] | None, parameters: dict[str, Any], points: list[dict[str, Any]]) -> bool:
+    return (
+        isinstance(job, dict)
+        and str(job.get("job_type") or "") == "backup-copy"
+        and str(parameters.get("resolved_backup_reason") or "") != "ForceSynthetic"
+        and len(points) == 1
+        and str(points[0].get("execution_type") or "") in FULL_EXECUTION_TYPES
+    )
+
+
 def run_synthetic_full(
     task: dict[str, Any],
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -358,6 +368,19 @@ def run_synthetic_full(
             )
 
     points = resolve_source_chain(job_id, vm_id, source_repository_id or None)
+    if _nothing_to_merge(JOBS.get(job_id), parameters, points):
+        vm_name = str(points[0].get("vm_name") or parameters.get("vm_name") or vm_id)
+        return {
+            "operation": "backup",
+            "worker_mode": "synthetic-full",
+            "nothing_copied": True,
+            "message": (
+                f"Nothing to merge for {vm_name}: its newest restore point in {repository.get('name')} "
+                "is already a full backup"
+            ),
+            "vm_name": vm_name,
+            "vm_external_id": vm_id,
+        }
     validate_chain(points)
     merges = build_disk_merges(points)
 

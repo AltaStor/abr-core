@@ -429,6 +429,57 @@ class SyntheticFullRunTests(unittest.TestCase):
 
         copy_mock.assert_not_called()
 
+    def _lone_full(self, job_type: str, reason: str) -> dict[str, object]:
+        BACKUPS.pop("p2")
+        BACKUPS.pop("p3")
+        JOBS[JOB_ID]["job_type"] = job_type
+        task = self._task()
+        task["parameters"]["resolved_backup_reason"] = reason
+        return task
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_copy_jobs_scheduled_merge_of_a_lone_full_has_nothing_to_do(self, copy_mock) -> None:
+        for reason in ("SyntheticFullSchedule", "SyntheticFullWindow"):
+            with self.subTest(reason=reason):
+                self.setUp()
+                result = synthetic_full.run_synthetic_full(self._lone_full("backup-copy", reason))
+
+                self.assertTrue(result["nothing_copied"])
+                self.assertEqual(
+                    result["message"],
+                    "Nothing to merge for web01: its newest restore point in Local is already a full backup",
+                )
+        copy_mock.assert_not_called()
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_synthetic_full_asked_for_by_hand_still_refuses_a_lone_full(self, copy_mock) -> None:
+        for job_type in ("backup-copy", "backup"):
+            with self.subTest(job_type=job_type):
+                self.setUp()
+                with self.assertRaises(SyntheticFullValidationError) as ctx:
+                    synthetic_full.run_synthetic_full(self._lone_full(job_type, "ForceSynthetic"))
+                self.assertIn("only a full backup with no incrementals", str(ctx.exception))
+        copy_mock.assert_not_called()
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_backup_jobs_scheduled_merge_of_a_lone_full_still_refuses(self, copy_mock) -> None:
+        with self.assertRaises(SyntheticFullValidationError):
+            synthetic_full.run_synthetic_full(self._lone_full("backup", "SyntheticFullSchedule"))
+
+        copy_mock.assert_not_called()
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_copy_jobs_scheduled_merge_with_incrementals_still_merges(self, copy_mock) -> None:
+        copy_mock.return_value = {"raw_data_size": 1024, "stored_data_size": 512, "merged_from": 3}
+        JOBS[JOB_ID]["job_type"] = "backup-copy"
+        task = self._task()
+        task["parameters"]["resolved_backup_reason"] = "SyntheticFullSchedule"
+
+        result = synthetic_full.run_synthetic_full(task)
+
+        self.assertNotIn("nothing_copied", result)
+        self.assertEqual(result["merged_restore_point_ids"], ["p1", "p2", "p3"])
+
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_a_newer_full_starts_a_fresh_chain_to_merge(self, copy_mock) -> None:
         copy_mock.return_value = {"raw_data_size": 1, "stored_data_size": 1, "merged_from": 2}
