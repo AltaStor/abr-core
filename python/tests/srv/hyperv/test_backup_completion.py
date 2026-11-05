@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import tempfile
 import unittest
@@ -158,6 +159,123 @@ class HyperVBackupCompletionTests(unittest.TestCase):
         self.assertIn("could not be flushed to stable storage", str(error))
         self.assertIn(str(task_root), str(error))
         discard.assert_called_once()
+
+    def test_a_backup_the_repository_had_no_room_to_flush_says_it_ran_out_of_space(self) -> None:
+        error, _task_root, _root, _durable, discard, _fsynced = self._run(
+            {"resolved_backup_type": "ActiveFull"}, None, flush_error=OSError(errno.ENOSPC, "No space left on device")
+        )
+
+        self.assertIn("The repository 'repo' ran out of space", str(error))
+        self.assertNotIn("Errno", str(error))
+        discard.assert_called_once()
+
+
+TOOL_WRITE_ERROR = (
+    "Virtual disk 'C:\\VMs\\et-vm\\disk.vhdx' attached read-only as \\\\.\\PhysicalDrive3; "
+    "Write error, expected 4194410 bytes, written 4256589585 bytes!; failed to save data range at offset 62914560"
+)
+
+
+class _FailingNode:
+    def __init__(self, lines: list[str]) -> None:
+        self.lines = lines
+
+    def run_disk_tool(self, node, args, **kwargs):
+        return {"exit_code": 1, "result": None, "lines": self.lines}
+
+
+class OutOfSpaceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = self.enterContext(tempfile.TemporaryDirectory())
+        self.repository = {"id": "repo-1", "name": "Shared", "type": "smb", "path": self.root}
+
+    def _free(self, free_bytes: int | None):
+        return patch.object(hyperv_backup, "filesystem_free_bytes", return_value=free_bytes)
+
+    def _back_up(self, lines: list[str], free_bytes: int | None) -> str:
+        with (
+            self._free(free_bytes),
+            patch.object(hyperv_backup, "cancel_requested", return_value=False),
+            self.assertRaises(hyperv_backup.HyperVBackupError) as raised,
+        ):
+            hyperv_backup._back_up_disks(
+                _FailingNode(lines),
+                "NODE-A",
+                [{**_disk(), "capacity_gb": 1}],
+                task_id="task-1",
+                vm_name="et-vm",
+                incremental=False,
+                change_ids={},
+                storage_args=[],
+                storage_env={},
+                repository=self.repository,
+                abr_path=self.root,
+                repository_label="Shared",
+                compression_level=3,
+                encryption_key="",
+                tool_timeout_seconds=900,
+                written_backup_names=[],
+                progress_callback=None,
+            )
+        return str(raised.exception)
+
+    def test_a_write_error_on_a_full_share_says_the_repository_ran_out_of_space(self) -> None:
+        message = self._back_up([f"Error: {TOOL_WRITE_ERROR}"], 40 * 1024**2)
+
+        self.assertEqual(
+            message,
+            f"Backing up disk SCSI 0:0 of et-vm failed: The repository 'Shared' at {self.root} ran out of space "
+            "(40.0 MiB free when this disk started). Free space in that filesystem, or point the job at another repository",
+        )
+
+    def test_a_write_error_with_more_room_than_the_disk_had_reached_keeps_the_tools_own_words(self) -> None:
+        message = self._back_up([f"Error: {TOOL_WRITE_ERROR}"], 261 * 1024**2)
+
+        self.assertIn("Write error, expected 4194410 bytes", message)
+        self.assertNotIn("ran out of space", message)
+
+    def test_a_write_error_without_an_offset_or_a_free_space_figure_keeps_the_tools_own_words(self) -> None:
+        for lines, free in (([f"Error: {TOOL_WRITE_ERROR.split('; failed')[0]}"], 1024), ([f"Error: {TOOL_WRITE_ERROR}"], None)):
+            with self.subTest(free=free):
+                message = self._back_up(lines, free)
+
+                self.assertIn("Write error, expected 4194410 bytes", message)
+                self.assertNotIn("ran out of space", message)
+
+    def test_a_tool_that_says_the_disk_is_full_is_believed_whatever_the_free_space(self) -> None:
+        message = self._back_up(["Error: There is not enough space on the disk."], None)
+
+        self.assertIn("The repository 'Shared'", message)
+        self.assertIn("ran out of space", message)
+
+    def test_another_tool_failure_on_a_full_share_is_not_called_a_space_problem(self) -> None:
+        message = self._back_up(["Error: Access is denied."], 0)
+
+        self.assertIn("Access is denied", message)
+        self.assertNotIn("ran out of space", message)
+
+    def test_a_session_folder_the_share_has_no_room_for_says_the_repository_ran_out_of_space(self) -> None:
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with (
+            self._free(0),
+            patch.object(hyperv_backup, "ensure_private_directory", side_effect=full),
+            self.assertRaises(hyperv_backup.HyperVBackupError) as raised,
+        ):
+            hyperv_backup._make_task_root(self.repository, Path(self.root) / "vm" / "task-1")
+
+        self.assertEqual(
+            str(raised.exception),
+            f"The repository 'Shared' at {self.root} ran out of space (0 B free). "
+            "Free space in that filesystem, or point the job at another repository",
+        )
+
+    def test_a_session_folder_that_fails_for_another_reason_keeps_its_error(self) -> None:
+        denied = PermissionError(errno.EACCES, "Permission denied")
+        with (
+            patch.object(hyperv_backup, "ensure_private_directory", side_effect=denied),
+            self.assertRaises(PermissionError),
+        ):
+            hyperv_backup._make_task_root(self.repository, Path(self.root) / "vm" / "task-1")
 
 
 if __name__ == "__main__":
