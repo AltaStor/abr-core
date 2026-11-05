@@ -2742,6 +2742,7 @@ def create_repository_record(payload: dict[str, Any], *, metadata_flags: dict[st
         _assert_immutability_is_usable(s3_config)
     persist_repository(record)
     created = normalize_repository_record(record)
+    created["warnings"] = [*created.get("warnings", []), *((registration_check or {}).get("warnings") or [])]
     if bucket_was_missing:
         created["warnings"] = [
             *created.get("warnings", []),
@@ -2940,6 +2941,7 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
     updated["updated_at"] = utc_now()
     persist_repository(updated)
     edited = normalize_repository_record(updated)
+    edited["warnings"] = [*edited.get("warnings", []), *((registration_check or {}).get("warnings") or [])]
     if next_immutability is not None:
         edited["immutability_effect"] = _immutability_effect_report(
             record_id, previous=previous_immutability or {}, current=next_immutability
@@ -2974,7 +2976,9 @@ def _repository_storage_location_mismatch(repository: dict[str, Any]) -> str | N
     )
 
 
-def _verify_local_repository(repository: dict[str, Any], *, whole_chains: bool = False) -> dict[str, Any]:
+def _verify_local_repository(
+    repository: dict[str, Any], *, whole_chains: bool = False, check_backups: bool = True
+) -> dict[str, Any]:
     path = Path(str(repository.get("path") or ""))
     checks: list[dict[str, Any]] = []
     exists, is_dir, access_error = _stat_operator_path(path)
@@ -3033,18 +3037,19 @@ def _verify_local_repository(repository: dict[str, Any], *, whole_chains: bool =
     if location_mismatch:
         return {"status": "error", "checks": checks, "message": location_mismatch}
 
-    backup_health = _verify_repository_backup_health(str(repository.get("id") or ""), whole_chains=whole_chains)
-    checks.append(
-        {
-            "name": "block_consistency",
-            "status": backup_health["status"],
-            "message": backup_health["message"],
-            **({"errors": backup_health["errors"]} if backup_health["errors"] else {}),
-        }
-    )
-    if backup_health["status"] == "failed":
-        return {"status": "error", "checks": checks, "message": f"Backup integrity check failed: {backup_health['message']}"}
-    
+    if check_backups:
+        backup_health = _verify_repository_backup_health(str(repository.get("id") or ""), whole_chains=whole_chains)
+        checks.append(
+            {
+                "name": "block_consistency",
+                "status": backup_health["status"],
+                "message": backup_health["message"],
+                **({"errors": backup_health["errors"]} if backup_health["errors"] else {}),
+            }
+        )
+        if backup_health["status"] == "failed":
+            return {"status": "error", "checks": checks, "message": f"Backup integrity check failed: {backup_health['message']}"}
+
     message = "Repository is available"
     if permission_warnings:
         message = f"{message}. Warning: {' '.join(permission_warnings)}"
@@ -3841,8 +3846,13 @@ def test_smb_connection(payload: dict[str, Any]) -> dict[str, Any]:
         share = share or parsed_share
     _ensure_appliance_folder("smb", path)
     _ensure_smb_repository_share(server, share, payload.get("username"), payload.get("password"))
-    record = {"id": "", "type": "smb", "path": path, "metadata": {"server": server, "share": share}}
-    result = _verify_local_repository(record)
+    record = {
+        "id": "",
+        "type": "smb",
+        "path": path,
+        "metadata": {"server": server, "share": share, "username": payload.get("username"), "password": payload.get("password")},
+    }
+    result = _with_share_account(_verify_local_repository(record, check_backups=False), record)
     if result.get("status") != "success":
         return {"status": "error", "checks": result.get("checks") or [], "message": result.get("message")}
     return {
@@ -3889,11 +3899,14 @@ def _repository_connection_identity(record: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _verification_summary(result: dict[str, Any]) -> dict[str, Any]:
-    return {
+    summary = {
         "status": str(result.get("status") or "error"),
         "message": str(result.get("message") or ""),
         "checked_at": utc_now(),
     }
+    if result.get("warnings"):
+        summary["warnings"] = list(result["warnings"])
+    return summary
 
 
 def _repository_registration_checks(
@@ -3901,7 +3914,7 @@ def _repository_registration_checks(
 ) -> dict[str, Any] | None:
     repo_type = str(record.get("type") or "")
     if is_file_repository(record):
-        return _verify_local_repository(record)
+        return _with_share_account(_verify_local_repository(record, check_backups=False), record)
     if repo_type != "s3":
         return None
     config = extract_s3_config(record)
@@ -3918,6 +3931,23 @@ def _repository_registration_checks(
         "checks": checks,
         "message": "S3 repository is available; immutability: disabled, backups stay deletable",
     }
+
+
+def _with_share_account(result: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    if result.get("status") != "success":
+        return result
+    from python.srv.plugins.hyperv.hyperv import check_share_account
+
+    account = check_share_account(record)
+    if account is None:
+        return result
+    checked = {**result, "checks": [*(result.get("checks") or []), account]}
+    if account["status"] == "failed":
+        return {**checked, "status": "error", "message": account["message"]}
+    if account["status"] == "warning":
+        checked["warnings"] = [*(result.get("warnings") or []), account["message"]]
+        checked["message"] = f"{result.get('message')}. Warning: {account['message']}"
+    return checked
 
 
 def _assert_bucket_creation_is_sensible(record: dict[str, Any], *, create_bucket: bool) -> None:

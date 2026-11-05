@@ -293,6 +293,12 @@ class SmbRegistrationValidationTests(_FolderCase):
         )
         self.share_check = mounted.start()
         self.addCleanup(mounted.stop)
+        account = patch(
+            "python.srv.plugins.hyperv.hyperv.check_share_account",
+            return_value={"name": "share_account", "status": "ok", "message": "opened"},
+        )
+        account.start()
+        self.addCleanup(account.stop)
 
     def test_a_folder_on_the_local_disk_with_a_made_up_share_is_refused(self) -> None:
         with patch.object(abr_v41, "share_mount_check", wraps=share_mount.share_mount_check), patch.object(

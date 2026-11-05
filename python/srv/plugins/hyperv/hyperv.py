@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Tuple
 import requests
 
 from ...core.credential_encryption import StoredCredentialUnreadable, is_encrypted, unreadable_credential_message
-from ...core.mongo_db_wrapper import HYPERVISORS, update_hypervisor_fields
+from ...core.mongo_db_wrapper import HYPERVISORS, JOBS, catalog_records, update_hypervisor_fields
 from ...core.server_defaults import env_int
 from ...core.storage_tool import mask_secret_values, redact_disk_tool_command, split_disk_tool_secrets
 from ..hypervisor import Hypervisor, ProgressCallback, guest_ip_address
@@ -1534,3 +1534,86 @@ def _slot_sort_key(slot: str) -> tuple[int, int, int, str]:
     if not match:
         return (9, 0, 0, str(slot))
     return (_CONTROLLER_ORDER.get(match.group(1).lower(), 5), int(match.group(2)), int(match.group(3)), "")
+
+
+SHARE_ACCOUNT_CHECK = "share_account"
+SHARE_REFUSED = "cannot open the repository share"
+
+
+def _share_account_check(status: str, message: str) -> dict[str, Any]:
+    return {"name": SHARE_ACCOUNT_CHECK, "status": status, "message": message}
+
+
+def _hyperv_inventories_for(repository_id: str) -> list[dict[str, Any]]:
+    inventories = [
+        record
+        for record in catalog_records(HYPERVISORS)
+        if isinstance(record, dict) and str(record.get("kind") or "").lower() == "hyper-v"
+    ]
+    used = {
+        str(job.get("inventory_id") or "")
+        for job in catalog_records(JOBS)
+        if isinstance(job, dict) and str(job.get("repo_id") or "") == repository_id
+    }
+    return sorted(inventories, key=lambda record: str(record.get("id") or "") not in used)
+
+
+def _share_account_probe(hypervisor: dict[str, Any], repository: dict[str, Any], timeout: int) -> dict[str, Any]:
+    from .hyperv_backup import HyperVBackupError, connection_settings, open_node
+
+    unc = vhdx_tool.windows_share(repository) or ""
+    metadata = repository.get("metadata") if isinstance(repository.get("metadata"), dict) else {}
+    try:
+        connection = connection_settings(hypervisor)
+        account = str(metadata.get("username") or "").strip() or f"{connection['user']} (the inventory's account)"
+        with open_node(connection) as node:
+            host = node.nodes[0]
+            args, env = vhdx_tool.storage_invocation(repository, abr_path=None)
+            run = node.run_disk_tool(host, ["info", "--json", *args], env=env, timeout=timeout)
+    except (HyperVError, HyperVBackupError, vhdx_tool.VhdxToolError) as exc:
+        return _share_account_check("warning", f"The share account was not checked: {exc}")
+    result = run.get("result") or {}
+    if run.get("exit_code") == 0 and result.get("status") in (None, "ok"):
+        return _share_account_check("ok", f"{host} opened the share {unc} as {account}")
+    lines = [str(line) for line in run.get("lines") or []]
+    refused = next((line for line in lines if SHARE_REFUSED in line), None)
+    if refused:
+        reason = refused.rsplit(": ", 1)[-1].strip()
+        return _share_account_check("failed", f"{host} could not open the share {unc} as {account}: {reason}")
+    detail = vhdx_tool.failure_message(result, lines, run.get("exit_code"))
+    return _share_account_check("warning", f"The share account was not checked: {host} could not read {unc}: {detail}")
+
+
+def check_share_account(repository: dict[str, Any]) -> dict[str, Any] | None:
+    if str(repository.get("type") or "").strip().lower() != "smb":
+        return None
+    metadata = repository.get("metadata") if isinstance(repository.get("metadata"), dict) else {}
+    if metadata.get("support_hyperv") or not vhdx_tool.windows_share(repository):
+        return None
+    inventories = _hyperv_inventories_for(str(repository.get("id") or ""))
+    if not inventories:
+        return _share_account_check(
+            "warning",
+            "The share account was not checked: no Hyper-V inventory is registered to open the share with it",
+        )
+    hypervisor = inventories[0]
+    deadline = env_int("ALTASTOR_SMB_ACCOUNT_CHECK_SECONDS")
+    outcome: dict[str, Any] = {}
+
+    def probe() -> None:
+        try:
+            outcome.update(_share_account_probe(hypervisor, repository, deadline))
+        except Exception as exc:
+            logger.warning("Could not check the share account of repository %s", repository.get("name"), exc_info=True)
+            outcome.update(_share_account_check("warning", f"The share account was not checked: {exc}"))
+
+    worker = threading.Thread(target=probe, name="smb-account-check", daemon=True)
+    worker.start()
+    worker.join(deadline)
+    if worker.is_alive() or not outcome:
+        host = (hypervisor.get("metadata") or {}).get("host") or hypervisor.get("name")
+        return _share_account_check(
+            "warning",
+            f"The share account was not checked: Hyper-V host {host} did not answer within {deadline} s",
+        )
+    return dict(outcome)
