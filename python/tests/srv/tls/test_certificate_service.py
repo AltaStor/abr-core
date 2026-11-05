@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import socket
 import ssl
 import stat
@@ -16,6 +17,7 @@ from unittest.mock import patch
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi.testclient import TestClient
 
@@ -105,6 +107,67 @@ class _Pki:
     @property
     def chain_pem(self) -> str:
         return _pem(self.leaf) + _pem(self.intermediate)
+
+
+_SHA256_SIGNATURES = {
+    "rsa": bytes.fromhex("06092a864886f70d01010b0500"),
+    "ec": bytes.fromhex("06082a8648ce3d040302"),
+}
+_WEAK_SIGNATURES = {
+    "sha1WithRSAEncryption": ("rsa", bytes.fromhex("06092a864886f70d0101050500"), hashes.SHA1()),
+    "md5WithRSAEncryption": ("rsa", bytes.fromhex("06092a864886f70d0101040500"), hashes.MD5()),
+    "ecdsa-with-SHA1": ("ec", bytes.fromhex("06072a8648ce3d0401"), hashes.SHA1()),
+}
+
+
+def _der(tag: int, body: bytes) -> bytes:
+    if len(body) < 0x80:
+        return bytes([tag, len(body)]) + body
+    size = len(body).to_bytes((len(body).bit_length() + 7) // 8, "big")
+    return bytes([tag, 0x80 | len(size)]) + size + body
+
+
+def _der_body(element: bytes) -> bytes:
+    size = element[1]
+    return element[2:] if size < 0x80 else element[2 + (size & 0x7F) :]
+
+
+def _signed_with(cert: x509.Certificate, signing_key, algorithm: str) -> x509.Certificate:
+    kind, identifier, digest = _WEAK_SIGNATURES[algorithm]
+    tbs = _der_body(cert.tbs_certificate_bytes).replace(
+        _der(0x30, _SHA256_SIGNATURES[kind]), _der(0x30, identifier), 1
+    )
+    tbs = _der(0x30, tbs)
+    if kind == "rsa":
+        signature = signing_key.sign(tbs, asym_padding.PKCS1v15(), digest)
+    else:
+        signature = signing_key.sign(tbs, ec.ECDSA(digest))
+    return x509.load_der_x509_certificate(
+        _der(0x30, tbs + _der(0x30, identifier) + _der(0x03, b"\x00" + signature))
+    )
+
+
+def _self_signed(key, algorithm: str, *, signing_key=None) -> x509.Certificate:
+    now = datetime.now(timezone.utc)
+    name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COMMON_NAME, "192.0.2.10"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Example Corp"),
+        ]
+    )
+    signing_key = signing_key or key
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=365))
+        .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("192.0.2.10"))]), critical=False)
+        .sign(signing_key, hashes.SHA256())
+    )
+    return _signed_with(cert, signing_key, algorithm)
 
 
 def _served_certificate(
@@ -273,6 +336,39 @@ class DescribeCertificateTests(_TlsDirTestCase):
     def test_a_self_signed_certificate_alone_is_a_complete_chain(self) -> None:
         codes = [w["code"] for w in tls_certificate_service.get_certificate()["warnings"]]
         self.assertNotIn("chain_incomplete", codes)
+
+    def test_a_self_signed_certificate_signed_with_sha1_or_md5_is_a_complete_chain(self) -> None:
+        for algorithm, key in (
+            ("sha1WithRSAEncryption", rsa.generate_private_key(public_exponent=65537, key_size=2048)),
+            ("md5WithRSAEncryption", rsa.generate_private_key(public_exponent=65537, key_size=2048)),
+            ("ecdsa-with-SHA1", ec.generate_private_key(ec.SECP256R1())),
+        ):
+            with self.subTest(algorithm):
+                cert = _self_signed(key, algorithm)
+                self.assertEqual(cert.signature_algorithm_oid._name, algorithm)
+
+                installed = tls_certificate_service.install_certificate(_pem(cert), _key_pem(key))
+
+                self.assertNotIn("chain_incomplete", [w["code"] for w in installed["warnings"]])
+                described = tls_certificate_service.get_certificate()
+                self.assertTrue(described["self_signed"])
+                self.assertNotIn("chain_incomplete", [w["code"] for w in described["warnings"]])
+
+    def test_a_weak_hash_certificate_naming_itself_but_signed_by_another_key_is_not_self_signed(self) -> None:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cert = _self_signed(key, "sha1WithRSAEncryption", signing_key=other)
+
+        self.assertFalse(tls_certificate_service._is_self_signed(cert))
+        warnings = tls_certificate_service._chain_warnings([cert])
+        self.assertEqual([w["code"] for w in warnings], ["chain_incomplete"])
+
+    def test_a_weak_hash_self_signed_certificate_with_a_broken_signature_is_not_self_signed(self) -> None:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        der = bytearray(_self_signed(key, "sha1WithRSAEncryption").public_bytes(serialization.Encoding.DER))
+        der[-1] ^= 0x01
+
+        self.assertFalse(tls_certificate_service._is_self_signed(x509.load_der_x509_certificate(bytes(der))))
 
 
 class InstallCertificateTests(_TlsDirTestCase):
