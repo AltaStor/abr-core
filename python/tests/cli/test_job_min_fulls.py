@@ -8,6 +8,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
+from python.cli.exit_codes import INVALID_STATE
 from python.cli.parsing.parser_builder import AltaStorParserBuilder
 from python.cli.services.job_service import JobService
 
@@ -82,6 +83,32 @@ class RetentionMinFullsFlagTests(unittest.TestCase):
         _stdout, stderr = self._retention_stderr(result)
 
         self.assertIn("Retention of job nightly: keep 7 day(s). 0 of 0 restore point(s) removed.", stderr)
+
+
+    def test_job_retention_fails_naming_a_share_that_is_not_mounted(self) -> None:
+        reason = "The share \\\\nas\\backups of repository Shared is not mounted at /mnt/hv: it is a folder on this appliance's own ext4 filesystem at /. Mount it there, then try again"
+        chain = {
+            "vm_name": "demo-vm", "repository_name": "Shared", "points": 2, "removed": [], "held": [], "failed": [],
+            "kept_for_chain": [], "kept_min_fulls": [], "skipped_reason": reason, "repository_unavailable": reason,
+        }
+        result = {
+            "job_name": "nightly", "retention_days": 7, "retention_min_fulls": 0, "gfs": {},
+            "summary": {"points": 2, "removed": 0, "failed": 0, "unavailable": 1}, "chains": [chain],
+        }
+        codes = {}
+        for dry_run in (False, True):
+            argv = ["job", "retention", "--id", "job-1", *(["--dry-run"] if dry_run else [])]
+            args = self._parse(*argv)
+            stderr = io.StringIO()
+            with patch("python.cli.api.client.requests.request", return_value=_FakeResponse(result)), redirect_stdout(
+                io.StringIO()
+            ), redirect_stderr(stderr):
+                codes[dry_run] = (args.handler(args), stderr.getvalue())
+
+        self.assertEqual(codes[False][0], INVALID_STATE)
+        self.assertIn("Error: 1 chain(s) were not touched: The share", codes[False][1])
+        self.assertEqual(codes[True][0], 0)
+        self.assertIn("Warning: 1 chain(s) were not touched", codes[True][1])
 
 
 if __name__ == "__main__":

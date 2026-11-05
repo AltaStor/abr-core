@@ -33,6 +33,7 @@ from python.srv.core.storage_tool import (
     write_file_durably,
 )
 from python.srv.core.subprocess_util import ProcessCancelled
+from python.srv.services.share_mount import unmounted_share_message
 from python.srv.core.utils import utc_now
 from python.srv.services.backup_mode import object_lock_expiry, object_lock_generation_plan
 
@@ -370,6 +371,9 @@ def run_synthetic_full(
             raise SyntheticFullValidationError(
                 f"Synthetic full backups need a local or s3 repository; '{candidate.get('type')}' cannot merge a chain"
             )
+        unmounted = unmounted_share_message(candidate)
+        if unmounted:
+            raise SyntheticFullValidationError(unmounted)
 
     points = resolve_source_chain(job_id, vm_id, source_repository_id or None)
     if _nothing_to_merge(JOBS.get(job_id), parameters, points):

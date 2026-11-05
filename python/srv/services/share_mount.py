@@ -100,8 +100,8 @@ def samba_share_path(name: str) -> str | None:
     return value
 
 
-def _check(status: str, message: str) -> dict[str, Any]:
-    return {"name": CHECK_NAME, "status": status, "message": message}
+def _check(status: str, message: str, **found: str) -> dict[str, Any]:
+    return {"name": CHECK_NAME, "status": status, "message": message, **found}
 
 
 def share_mount_check(repository: dict[str, Any], mountinfo: Path = MOUNTINFO) -> dict[str, Any] | None:
@@ -136,6 +136,9 @@ def share_mount_check(repository: dict[str, Any], mountinfo: Path = MOUNTINFO) -
             "failed",
             f"{path} is not the share {unc}: it is {mounted}, mounted at {mount.point}. Give the share that is "
             f"mounted there, or mount {unc} at {path}",
+            share=unc,
+            path=str(path),
+            found=f"{mounted} is mounted there instead",
         )
 
     if mount.fstype in NFS_FILESYSTEMS:
@@ -150,6 +153,9 @@ def share_mount_check(repository: dict[str, Any], mountinfo: Path = MOUNTINFO) -
             "failed",
             f"{path} is not the share {unc}: it is on the NFS export {mount.source}, mounted at {mount.point}, "
             f"of another server. Mount {unc} at {path}",
+            share=unc,
+            path=str(path),
+            found=f"the NFS export {mount.source} of another server is mounted there instead",
         )
 
     if is_this_appliance(server):
@@ -162,7 +168,13 @@ def share_mount_check(repository: dict[str, Any], mountinfo: Path = MOUNTINFO) -
                 f"so it is not known to share {path}",
             )
         if exported is None:
-            return _check("failed", f"This appliance has no Samba share named {share[0]}, so {unc} does not exist")
+            return _check(
+                "failed",
+                f"This appliance has no Samba share named {share[0]}, so {unc} does not exist",
+                share=unc,
+                path=str(path),
+                found=f"this appliance has no Samba share named {share[0]}",
+            )
         served = Path(exported).expanduser().resolve().joinpath(*share[1:])
         if served == path:
             return _check("ok", f"The share {unc} is served by this appliance from {path}")
@@ -170,6 +182,9 @@ def share_mount_check(repository: dict[str, Any], mountinfo: Path = MOUNTINFO) -
             "failed",
             f"{path} is not the share {unc}: this appliance shares {served} under that name. Give {served} as the "
             "folder, or the share of this folder",
+            share=unc,
+            path=str(path),
+            found=f"this appliance shares {served} under that name",
         )
     return _check(
         "failed",
@@ -177,4 +192,30 @@ def share_mount_check(repository: dict[str, Any], mountinfo: Path = MOUNTINFO) -
         f"{mount.point}, so the Hyper-V hosts would write to the share and this appliance to its own disk. "
         f"Mount the share at {path} first (for example mount -t cifs //{server}/{'/'.join(share)} {path}), "
         "then add the repository",
+        share=unc,
+        path=str(path),
+        found=f"it is a folder on this appliance's own {mount.fstype} filesystem at {mount.point}",
     )
+
+
+class ShareNotMountedError(RuntimeError):
+    pass
+
+
+def unmounted_share_message(repository: dict[str, Any], mountinfo: Path = MOUNTINFO) -> str | None:
+    check = share_mount_check(repository, mountinfo)
+    if not check or check.get("status") != "failed":
+        return None
+    name = str(repository.get("name") or repository.get("id") or "")
+    return (
+        f"The share {check['share']} of repository {name} is not mounted at {check['path']}: {check['found']}. "
+        "Mount it there, then try again"
+    )
+
+
+def ensure_share_mounted(repository: dict[str, Any] | None) -> None:
+    if not isinstance(repository, dict):
+        return
+    message = unmounted_share_message(repository)
+    if message:
+        raise ShareNotMountedError(message)

@@ -505,6 +505,16 @@ class SyntheticFullRunTests(unittest.TestCase):
         removed = [call.args[2] for call in remove_mock.call_args_list]
         self.assertEqual(removed, ["01-disk.vmdk", "02-disk.vmdk"])
 
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_share_that_is_not_mounted_refuses_the_merge_before_anything_is_written(self, copy_mock) -> None:
+        with patch.object(synthetic_full, "unmounted_share_message", return_value="The share is not mounted"), self.assertRaises(
+            SyntheticFullValidationError
+        ) as caught:
+            synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(str(caught.exception), "The share is not mounted")
+        copy_mock.assert_not_called()
+
     @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
     def test_a_merge_into_a_new_chain_that_fails_leaves_no_folder_behind(self, remove_mock) -> None:
         root = Path(self._root) / "target"

@@ -125,7 +125,7 @@ from python.srv.services.inventory_management import (
 from python.srv.services.backup_copy import apply_copy_settings, copy_job_view, create_copy_sessions
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
-from python.srv.services.share_mount import share_mount_check
+from python.srv.services.share_mount import share_mount_check, unmounted_share_message
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.hyperv.vhdx_tool import VhdxToolError, ensure_hyperv_repository
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
@@ -2196,6 +2196,9 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
                 )
             except OSError as exc:
                 storage["error"] = str(exc)
+            unmounted = unmounted_share_message(item) if storage["available"] else None
+            if unmounted:
+                storage.update({"available": False, "error": unmounted, "capacity_bytes": None, "used_bytes": None, "free_bytes": None})
         else:
             storage["error"] = "Repository path is empty"
         if not storage["available"]:
@@ -3961,8 +3964,26 @@ def verify_repository(record_id: str) -> dict[str, Any]:
     return payload
 
 
+def _ensure_share_mounted(repository: dict[str, Any] | None) -> None:
+    message = unmounted_share_message(repository) if isinstance(repository, dict) else None
+    _ensure(
+        not message,
+        409,
+        "repository_share_not_mounted",
+        str(message),
+        repository=(repository or {}).get("name"),
+        path=(repository or {}).get("path"),
+    )
+
+
+def _point_repository_unmounted(point: dict[str, Any]) -> str | None:
+    repository = REPOSITORIES.get(str(point.get("repository_id") or ""))
+    return unmounted_share_message(repository) if isinstance(repository, dict) else None
+
+
 def rescan_repository(record_id: str) -> dict[str, Any]:
     repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    _ensure_share_mounted(repository)
     reconciled = reconcile_repository_points(repository)
     updated = _json_clone(repository)
     metadata = dict(updated.get("metadata") if isinstance(updated.get("metadata"), dict) else {})
@@ -6153,6 +6174,18 @@ def apply_retention_to_chain(
     if not points:
         return failures
     report["vm_name"] = points[-1].get("vm_name")
+    unmounted = _point_repository_unmounted(points[-1])
+    if unmounted:
+        report["skipped_reason"] = unmounted
+        report["repository_unavailable"] = unmounted
+        LOGGER.warning(
+            "Retention deleted nothing for job %s, VM %s in repository %s: %s",
+            job.get("id"),
+            report.get("vm_name") or vm_id,
+            repository_id,
+            unmounted,
+        )
+        return failures
     clock_block = clock_guard.retention_block()
     report["clock_blocked"] = clock_block
     if clock_block and not dry_run:
@@ -6349,6 +6382,7 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         "kept_min_fulls": sum(len(item["kept_min_fulls"]) for item in chains),
         "failed": sum(len(item["failed"]) for item in chains),
         "skipped": sum(1 for item in chains if item["skipped_reason"]),
+        "unavailable": sum(1 for item in chains if item.get("repository_unavailable")),
     }
     return {
         "job_id": str(job["id"]),
@@ -7654,6 +7688,10 @@ def retry_pending_deletions(now: datetime | None = None) -> int:
         pending = [point for point in points if point.get("status") == POINT_DELETING]
         if not pending:
             continue
+        unmounted = _point_repository_unmounted(pending[-1])
+        if unmounted:
+            LOGGER.warning("Restore point(s) of backup chain %s waiting for deletion are kept: %s", chain_id, unmounted)
+            continue
         removed_here = 0
         held: list[str] = []
         for segment in _segment_points(pending):
@@ -7735,6 +7773,8 @@ def delete_backup_chain(
     ]
     if inconsistent:
         raise api_error(409, "inconsistent_backup_chain", "Repository/catalog state is inconsistent", restore_point_ids=inconsistent)
+    for repository_id in dict.fromkeys(str(point.get("repository_id") or "") for point in points):
+        _ensure_share_mounted(REPOSITORIES.get(repository_id))
 
     artifacts_removed = True
     retained_points: list[str] = []
@@ -9895,6 +9935,7 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         **({"missing_point_id": missing_ancestor} if missing_ancestor else {}),
     )
 
+    _ensure_share_mounted(REPOSITORIES.get(str(point.get("repository_id") or "")))
     request = _normalize_restore_request_payload(payload, point)
     _validate_restore_request_matches_point(request, point)
 

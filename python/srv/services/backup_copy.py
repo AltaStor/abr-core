@@ -41,6 +41,7 @@ from python.srv.services.backup_mode import (
     object_lock_expiry,
     object_lock_generation_plan,
 )
+from python.srv.services.share_mount import unmounted_share_message
 from python.srv.services.synthetic_full import (
     FULL_EXECUTION_TYPES,
     _discard_partial_merge,
@@ -550,6 +551,9 @@ def _copy_once(
             raise BackupCopyValidationError(
                 f"Repository {candidate.get('name')} is of type '{candidate.get('type')}', which backup copy cannot read or write"
             )
+        unmounted = unmounted_share_message(candidate)
+        if unmounted:
+            raise BackupCopyValidationError(unmounted)
 
     merges = build_disk_merges(points)
     for merge in merges:

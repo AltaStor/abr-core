@@ -543,6 +543,15 @@ class CopyRetryTests(_Catalog):
 
         self.assertEqual(self.calls, 1)
 
+    def test_a_share_that_is_not_mounted_is_not_retried_and_named(self) -> None:
+        with patch.object(backup_copy, "unmounted_share_message", return_value="The share is not mounted"), patch.object(
+            backup_copy, "_copy_once", wraps=backup_copy._copy_once
+        ) as copy_once, self.assertRaises(BackupCopyValidationError) as caught:
+            backup_copy.run_backup_copy(self.task, progress_callback=self.messages.append)
+
+        self.assertEqual(str(caught.exception), "The share is not mounted")
+        self.assertEqual(copy_once.call_count, 1)
+
     def test_a_run_with_nothing_new_records_no_restore_point(self) -> None:
         with patch.object(backup_copy, "plan_copy", return_value=None):
             result = backup_copy.run_backup_copy(self.task)

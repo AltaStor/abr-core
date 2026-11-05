@@ -20,6 +20,7 @@ from ...core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_
 from ...core.credential_encryption import is_encrypted, unreadable_encryption_key_message
 from ...core.server_defaults import env_int
 from ...core.task_executor import TaskStopRequested, cancel_requested
+from ...services.share_mount import ensure_share_mounted
 from ...core.storage_tool import (
     StorageToolError,
     apply_repository_immutability,
@@ -894,6 +895,7 @@ def _resolve_backup_storage_layout(
     layout: str = STORAGE_LAYOUT_BY_NAME,
 ) -> tuple[Path, Path, str | None]:
     configured_destination = parameters.get("destination_dir") or parameters.get("backup_root")
+    ensure_share_mounted(repository)
 
     if is_s3_repository(repository):
         if configured_destination:
