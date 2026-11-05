@@ -33,12 +33,14 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
-from ...core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES
+from ...core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES, catalog_records
+from ...core.server_defaults import env_int
 from ...core.storage_tool import chain_source_names, is_s3_repository
 from ...core.subprocess_util import ProcessCancelled
 from ...core.task_executor import TaskStopRequested, cancel_requested
@@ -144,12 +146,69 @@ def _restore_layers(
     return layers
 
 
-def restored_bytes(disk: dict[str, Any], layers: list[dict[str, Any]], source_allocated: int = 0) -> int:
-    allocated = int(disk.get("allocated_bytes") or source_allocated or 0)
-    if allocated:
-        return allocated
+def restored_estimate(
+    disk: dict[str, Any], layers: list[dict[str, Any]], *, later_allocated: int = 0, source_allocated: int = 0
+) -> tuple[int, str]:
+    recorded = int(disk.get("allocated_bytes") or 0)
+    if recorded:
+        return recorded, "what the disk took when this backup was made"
+    if later_allocated:
+        return later_allocated, "what the disk took at a later backup of it"
+    if source_allocated:
+        return source_allocated, "what the source VM's disk takes now"
     bounds = [sum(int(layer.get("logical_bytes") or 0) for layer in layers), int(disk.get("capacity_bytes") or 0)]
-    return min([value for value in bounds if value] or [0])
+    return min([value for value in bounds if value] or [0]), "the data of the chain's backups, at most the disk's capacity"
+
+
+def restored_bytes(disk: dict[str, Any], layers: list[dict[str, Any]], source_allocated: int = 0) -> int:
+    return restored_estimate(disk, layers, source_allocated=source_allocated)[0]
+
+
+def later_allocated_bytes(point: dict[str, Any] | None, disk: dict[str, Any]) -> int:
+    if not isinstance(point, dict) or not point.get("vm_id"):
+        return 0
+    created = str(point.get("created_at") or "")
+    later = sorted(
+        (
+            record
+            for record in catalog_records(BACKUPS)
+            if str(record.get("vm_id") or "") == str(point["vm_id"]) and str(record.get("created_at") or "") > created
+        ),
+        key=lambda record: str(record.get("created_at") or ""),
+    )
+    for record in later:
+        artifact = record.get("artifact") if isinstance(record.get("artifact"), dict) else {}
+        size = source_allocated_bytes(disk, [item for item in artifact.get("disks") or [] if isinstance(item, dict)])
+        if size:
+            return size
+    return 0
+
+
+def source_vm_disks(
+    point: dict[str, Any] | None, source_vm_id: str, target_inventory_id: str, node: HyperVNode
+) -> list[dict[str, Any]]:
+    source_inventory_id = str((point or {}).get("inventory_id") or "")
+    if not source_inventory_id or source_inventory_id == target_inventory_id:
+        try:
+            return node.get_vm_disks(source_vm_id)
+        except HyperVError:
+            return []
+    hypervisor = HYPERVISORS.get(source_inventory_id) or {}
+    if hypervisor.get("kind") != HYPERVISOR_KIND:
+        return []
+    found: list[dict[str, Any]] = []
+
+    def ask() -> None:
+        try:
+            with open_node(connection_settings(hypervisor)) as source:
+                found.extend(source.get_vm_disks(source_vm_id))
+        except Exception:
+            logger.info("Could not ask inventory %s for the disks of VM %s", hypervisor.get("name"), source_vm_id, exc_info=True)
+
+    worker = threading.Thread(target=ask, name="source-vm-disks", daemon=True)
+    worker.start()
+    worker.join(env_int("ALTASTOR_HYPERV_SOURCE_SIZE_SECONDS"))
+    return list(found) if not worker.is_alive() else []
 
 
 def source_allocated_bytes(disk: dict[str, Any], source_disks: list[dict[str, Any]]) -> int:
@@ -390,12 +449,14 @@ def run_hyperv_restore(
                 f"{len(resources['switches'])} virtual switch(es)",
             )
 
+            later_sizes = [
+                0 if int(disk.get("allocated_bytes") or 0) else later_allocated_bytes(point, disk) for disk in disks
+            ]
             source_disks = list(live_disks.values())
-            if not source_disks and source_vm_id and not all(int(disk.get("allocated_bytes") or 0) for disk in disks):
-                try:
-                    source_disks = node.get_vm_disks(source_vm_id)
-                except HyperVError:
-                    source_disks = []
+            if not source_disks and source_vm_id and not all(
+                int(disk.get("allocated_bytes") or 0) or later for disk, later in zip(disks, later_sizes)
+            ):
+                source_disks = source_vm_disks(point, source_vm_id, str(hypervisor.get("id") or ""), node)
 
             plan = []
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -403,7 +464,6 @@ def run_hyperv_restore(
                 slot = str(disk.get("slot") or disk.get("disk_label") or "")
                 provisioning = _provisioning(disk, parameters.get("disk_type"))
                 layers = _restore_layers(point, disk, index, repository)
-                data_bytes = sum(int(layer.get("logical_bytes") or 0) for layer in layers)
                 if mode == "in_place":
                     current = live_disks.get(slot, {})
                     current_path = str(current.get("current_datastore_path") or "")
@@ -421,15 +481,27 @@ def run_hyperv_restore(
                     folder = f"{vm_base_folder(target_datastore)}\\{target_vm_name}\\Virtual Hard Disks"
                     target_path = f"{folder}\\{_disk_file_name(disk, index)}"
                     current_path = ""
-                written = restored_bytes(disk, layers, source_allocated_bytes(disk, source_disks))
+                written, basis = restored_estimate(
+                    disk,
+                    layers,
+                    later_allocated=later_sizes[index - 1],
+                    source_allocated=source_allocated_bytes(disk, source_disks),
+                )
                 needed = int(disk.get("capacity_bytes") or 0) if provisioning == "fixed" else written
+                _emit(
+                    progress_callback,
+                    "validate",
+                    7,
+                    f"Disk {slot} needs {_gib(needed)} on {target_datastore} ("
+                    + ("its full capacity, as a fixed VHDX" if provisioning == "fixed" else basis)
+                    + ")",
+                )
                 plan.append(
                     {
                         "index": index,
                         "slot": slot,
                         "disk": disk,
                         "layers": layers,
-                        "data_bytes": data_bytes,
                         "written_bytes": written,
                         "provisioning": provisioning,
                         "datastore": target_datastore,
@@ -592,8 +664,8 @@ def run_hyperv_restore(
                         raise HyperVRestoreError(
                             f"Restoring disk {slot} from {layer['abr_backup_name']} failed: {detail}"
                         )
-                total_read += item["data_bytes"]
-                total_sent += item["data_bytes"]
+                total_read += item["written_bytes"]
+                total_sent += item["written_bytes"]
                 if item["provisioning"] == "fixed":
                     _emit(
                         progress_callback,
@@ -611,7 +683,7 @@ def run_hyperv_restore(
                         "previous_path": item["previous_path"] or None,
                         "provisioning": item["provisioning"],
                         "capacity_bytes": int(disk.get("capacity_bytes") or 0),
-                        "data_bytes": item["data_bytes"],
+                        "data_bytes": item["written_bytes"],
                         "datastore": item["datastore"],
                         "restored_from": [layer["abr_backup_name"] for layer in layers],
                     }
@@ -621,7 +693,7 @@ def run_hyperv_restore(
                     "transfer",
                     progress + span,
                     f"Disk {index}/{len(plan)} ({slot}) restored to {item['path']} ({item['provisioning']}, "
-                    f"{_gib(item['data_bytes'])} of data)",
+                    f"about {_gib(item['written_bytes'])})",
                     processed_bytes=total_read,
                     transferred_bytes=total_sent,
                 )
@@ -738,7 +810,7 @@ def run_hyperv_restore(
         duration = time.time() - start_time
         summary = (
             f"{mode_label} recovery of {source_vm_name} completed: {target_vm_name} on {node_name}, "
-            f"{len(restored)} disk(s), {_gib(total_read)} of data, in {duration:.1f}s"
+            f"{len(restored)} disk(s), about {_gib(total_read)}, in {duration:.1f}s"
             + (f", {len(warnings)} warning(s)" if warnings else "")
         )
         logger.info("Session %s: %s", task_id, summary)

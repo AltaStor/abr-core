@@ -194,7 +194,13 @@ switch, and `--nic-network "nic2=Isolated"` one adapter by its name, so two
 adapters on one switch can land on different ones. The source VM is not touched. Before anything is written the
 restore checks, on the host itself, that every target storage location exists
 there and has room, that every mapped virtual switch exists, and that the name
-is free. A VM that had a virtual TPM gets a new one, so secrets sealed to the
+is free. The room a dynamic disk needs is what its file took on the host when the
+backup was made; for a backup made before that was recorded, what the disk took
+at a later backup of it, else what the source VM's disk takes now (asked of the
+source VM's own inventory when the restore goes to another one, for up to
+`ALTASTOR_HYPERV_SOURCE_SIZE_SECONDS`), and only without any of these the data
+of the chain's backups, at most the disk's capacity. The session log names, per
+disk, how much it needs and where that figure comes from. A VM that had a virtual TPM gets a new one, so secrets sealed to the
 old TPM (BitLocker keys, for one) need their recovery keys; the session warns
 about it.
 
