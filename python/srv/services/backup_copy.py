@@ -23,6 +23,7 @@ from python.srv.core.mongo_db_wrapper import (
     catalog_records,
     persist_task,
 )
+from python.srv.core.time_zones import RENAMED_ZONES
 from python.srv.core.storage_tool import (
     StorageToolError,
     chain_retention_till,
@@ -1298,7 +1299,13 @@ def _window_rule(rule: Any) -> dict[str, Any]:
         "label": _days_label(days),
         "start": start_text.strip(),
         "end": end_text.strip(),
-        "timezone": str(rule.get("timezone") or "") if isinstance(rule, dict) and rule.get("timezone") else _server_timezone_name(),
+        "timezone": (
+            # By its current name, as schedules are: "Europe/Kiev" from a
+            # browser is kept as "Europe/Kyiv".
+            RENAMED_ZONES.get(str(rule["timezone"]), str(rule["timezone"]))
+            if isinstance(rule, dict) and rule.get("timezone")
+            else _server_timezone_name()
+        ),
     }
 
 

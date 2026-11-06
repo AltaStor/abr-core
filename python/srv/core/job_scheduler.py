@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .mongo_db_wrapper import HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, catalog_records, persist_job, persist_task
 from .server_defaults import env_int
+from .time_zones import load_zone
 from .utils import utc_now
 from python.srv.services import clock_guard, notification_detectors
 from python.srv.services.backup_copy import create_copy_sessions
@@ -320,7 +321,7 @@ class JobScheduler:
     def _schedule_timezone(self, schedule: dict[str, Any]) -> ZoneInfo:
         name = str(schedule.get("timezone") or "UTC")
         try:
-            return ZoneInfo(name)
+            return load_zone(name)
         except ZoneInfoNotFoundError:
             logger.warning("Unknown schedule timezone %r; falling back to UTC.", name)
             return ZoneInfo("UTC")

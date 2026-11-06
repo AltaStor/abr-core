@@ -207,7 +207,10 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   - a failed restore destroys only the VM it created, never one merely
     matching by name;
   - the data mover's relocation block on a VM is lifted when a backup ends
-    abnormally, with retries.
+    abnormally, with retries;
+  - a vCenter or Hyper-V backup, backup copy or synthetic full that fails or
+    is stopped before a VM's first restore point leaves no empty folder for
+    the VM (or its job) in the repository.
 - Schedules:
   - changing a full backup schedule replaces its weekday list instead of
     merging into the old one;
@@ -217,6 +220,12 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
     switch and its schedule stay in step on edit;
   - a next run pushed into the future by a wrong clock, or into the past by
     the repeated DST hour, is corrected.
+- A job saved from a browser whose zone it reports by an old name, such as
+  "Europe/Kiev" (Chrome, Firefox and Node all do), is accepted and kept by the
+  current name, "Europe/Kyiv", instead of being refused with "Unknown time
+  zone": Debian 13 no longer has the old names unless `tzdata-legacy` is
+  installed. A schedule or copy window already stored by an old name runs on
+  that zone instead of on UTC.
 - A session stopped while still queued gets an end time and a reason, shown
   for earlier ones too.
 - A deletion counts as done when the data is already gone from storage,

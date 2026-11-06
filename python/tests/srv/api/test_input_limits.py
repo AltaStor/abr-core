@@ -11,7 +11,9 @@ from fastapi.testclient import TestClient
 
 from python.srv.api.auth_guard import require_session
 from python.srv.backup_server import app
+from python.srv.core.job_scheduler import JobScheduler
 from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, SESSIONS, TASKS, USERS
+from python.srv.core.time_zones import RENAMED_ZONES, load_zone
 from python.srv.services import abr_v41, auth_service
 from python.srv.services.api_errors import ApiError
 
@@ -147,6 +149,37 @@ class JobFieldTests(_Api):
         self._refused(abr_v41.create_backup_job, self._payload(active_full_schedule={"type": "weekly", "days": ["sunday"], "time": "02:00", "timezone": "Nowhere/Land"}))
         job = abr_v41.create_backup_job(self._payload(schedule={"type": "daily", "time": "03:00", "timezone": "Europe/Kyiv"}))
         self.assertEqual(job["schedule"]["timezone"], "Europe/Kyiv")
+
+    def test_a_zone_a_browser_reports_by_its_old_name_is_kept_by_its_current_one(self) -> None:
+        # What the Web UI sent from a browser in Kyiv: Chrome reports the zone as
+        # "Europe/Kiev", a name Debian 13's tzdata no longer has.
+        response = self.client.post(
+            "/api/v1/jobs",
+            json=self._payload(
+                schedule={"schedule_type": "daily", "start_time": "22:00", "timezone": "Europe/Kiev"},
+                active_full_schedule={"enabled": False, "timezone": "Europe/Kiev", "type": "monthly", "time": "22:00", "day_of_month": 1},
+                synthetic_full_schedule={"enabled": True, "timezone": "Asia/Calcutta", "type": "weekly", "time": "22:00", "days": ["saturday"]},
+            ),
+        )
+        self.assertIn(response.status_code, (200, 201), response.text)
+        stored = JOBS[str(response.json()["id"])]
+        self.assertEqual(stored["schedule"]["timezone"], "Europe/Kyiv")
+        self.assertEqual(stored["active_full_schedule"]["timezone"], "Europe/Kyiv")
+        self.assertEqual(stored["synthetic_full_schedule"]["timezone"], "Asia/Kolkata")
+
+        edited = abr_v41.edit_job_record(str(stored["id"]), {"schedule": {"type": "daily", "time": "03:00", "timezone": "Asia/Saigon"}})
+        self.assertEqual(edited["schedule"]["timezone"], "Asia/Ho_Chi_Minh")
+
+    def test_a_schedule_stored_by_an_old_zone_name_runs_on_that_zone(self) -> None:
+        # A catalog from an appliance whose tzdata still had the old names.
+        stored = {"kind": "daily", "time": "03:00", "enabled": True, "timezone": "Europe/Kiev"}
+        self.assertEqual(abr_v41._schedule_dto(stored)["timezone"], "Europe/Kyiv")
+        self.assertEqual(JobScheduler(poll_interval_seconds=0.1)._schedule_timezone(stored).key, "Europe/Kyiv")
+
+    def test_every_renamed_zone_is_known_by_its_current_name(self) -> None:
+        for old, current in RENAMED_ZONES.items():
+            with self.subTest(zone=old):
+                self.assertEqual(load_zone(old).key, current)
 
     @patch.object(abr_v41, "_server_timezone_name", return_value="Europe/Berlin")
     def test_a_schedule_reports_the_zone_it_runs_on(self, _server_zone: object) -> None:

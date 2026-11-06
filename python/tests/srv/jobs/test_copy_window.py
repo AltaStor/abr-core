@@ -94,6 +94,15 @@ class CopyWindowStateTests(unittest.TestCase):
 
         self.assertEqual(backup_copy.copy_window_state(job, _at(5, 10))["closes_at"], _at(7, 0))
 
+    def test_a_zone_a_browser_reports_by_its_old_name_is_kept_and_kept_to(self) -> None:
+        # Chrome reports Kyiv as "Europe/Kiev", which Debian 13's tzdata no longer has.
+        (rule,) = backup_copy.parse_copy_window([{"days": ["mon"], "start": "22:00", "end": "23:00", "timezone": "Europe/Kiev"}])
+        self.assertEqual(rule["timezone"], "Europe/Kyiv")
+
+        # A rule stored by the old name opens at 22:00 in Kyiv (20:00 UTC in November), not at 22:00 UTC.
+        stored = {"copy_window": [{**rule, "timezone": "Europe/Kiev"}]}
+        self.assertEqual(backup_copy.copy_window_state(stored, _at(0, 12))["opens_at"], _at(0, 20))
+
 
 class _Catalog(unittest.TestCase):
     def setUp(self) -> None:

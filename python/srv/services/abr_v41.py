@@ -103,6 +103,7 @@ from python.srv.core.storage_tool import (
     sanitize_s3_config,
     verify_disk_tool_backup,
 )
+from python.srv.core.time_zones import load_zone
 from python.srv.core.utils import utc_now
 from python.srv.services.inventory_management import (
     INVENTORY_KIND_BY_TYPE,
@@ -468,7 +469,7 @@ def _server_timezone_aliases() -> set[str]:
 def _load_timezone(name: str | None) -> ZoneInfo:
     candidate = str(name or _server_timezone_name()).strip() or "UTC"
     try:
-        return ZoneInfo(candidate)
+        return load_zone(candidate)
     except ZoneInfoNotFoundError:
         if candidate.upper() in _server_timezone_aliases():
             try:
@@ -4342,10 +4343,14 @@ def _ensure_known_timezone(schedule: dict[str, Any] | None) -> dict[str, Any] | 
     if not name:
         return schedule
     try:
-        ZoneInfo(name)
-        return schedule
+        zone = load_zone(name)
     except (ZoneInfoNotFoundError, ValueError):
         pass
+    else:
+        # Kept by its current name: "Europe/Kiev" from a browser is stored as
+        # "Europe/Kyiv", which every appliance knows.
+        schedule["timezone"] = zone.key
+        return schedule
     _ensure(
         name.upper() in _server_timezone_aliases(),
         422,
