@@ -8552,6 +8552,17 @@ def _restore_target_network_id(inventory_id: str, network_name: str) -> str:
     return f"{inventory_id}::network::{network_name}"
 
 
+def _automatic_restore_host_id(hosts: list[dict[str, Any]], original_host: Any) -> str | None:
+    """The host a restore without a chosen one lands on, among the hosts of
+    one target environment: the source VM's own host when that environment
+    has a host by its name, otherwise its first host."""
+    original = str(original_host or "").strip().lower()
+    return next(
+        (item["id"] for item in hosts if original and str(item.get("name") or "").strip().lower() == original),
+        hosts[0]["id"] if hosts else None,
+    )
+
+
 def _build_restore_target_hosts(inventory_id: str) -> list[dict[str, Any]]:
     hosts = []
     inventory = HYPERVISORS.get(inventory_id, {})
@@ -8760,14 +8771,7 @@ def get_restore_context(restore_point_id: str) -> dict[str, Any]:
         target_inventories[0]["id"] if target_inventories else None,
     )
     default_hosts = [item for item in hosts if item.get("inventory_id") == default_inventory_id]
-    default_host_id = next(
-        (
-            item["id"]
-            for item in default_hosts
-            if str(item.get("name") or "").strip().lower() == str(source_vm.get("original_host") or "").strip().lower()
-        ),
-        default_hosts[0]["id"] if default_hosts else None,
-    )
+    default_host_id = _automatic_restore_host_id(default_hosts, source_vm.get("original_host"))
     default_datastores = [item for item in datastores if item.get("inventory_id") == default_inventory_id]
     default_datastore_id = next(
         (
@@ -10075,7 +10079,20 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             "In-place restore requires the source VM's original host to be known",
         )
     else:
-        target_host = str(request.get("target_host_identifier") or defaults.get("target_host_id") or "").strip()
+        target_host = str(request.get("target_host_identifier") or "").strip()
+        if not target_host:
+            # No host chosen: a host of the TARGET environment. The context's
+            # default is one of the restore point's own environment, which
+            # another environment does not have (404 host_not_found).
+            if str(defaults.get("target_inventory_id") or "") == str(target_inventory["id"]):
+                target_host = str(defaults.get("target_host_id") or "").strip()
+            else:
+                target_host = str(
+                    _automatic_restore_host_id(
+                        _build_restore_target_hosts(str(target_inventory["id"])), source_vm.get("original_host")
+                    )
+                    or ""
+                ).strip()
     _ensure(bool(target_host), 422, "invalid_restore", "Restore target host is required")
     host = _resolve_host(str(target_inventory["id"]), target_host)
     resolved_target_host_id = str(host.get("external_id") or host.get("name") or "").strip() or None

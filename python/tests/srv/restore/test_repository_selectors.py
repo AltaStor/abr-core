@@ -137,6 +137,24 @@ class RestoreRepositorySelectorTests(unittest.TestCase):
 
         self.assertEqual(TASKS[started["restore_session_id"]]["hypervisor_id"], other["id"])
 
+    def test_without_a_host_a_restore_into_another_inventory_lands_on_a_host_of_that_inventory(self) -> None:
+        # The Web UI's "Automatic" sends no host. The restore point's own host is
+        # not in the other inventory, which used to answer 404 host_not_found.
+        other = self._second_inventory()
+
+        started = self._restore_into(target_inventory_id=other["id"], target_datastore="otherds")
+
+        parameters = TASKS[started["restore_session_id"]]["parameters"]
+        self.assertEqual(parameters["target_inventory_id"], other["id"])
+        self.assertEqual(parameters["target_host_name"], "esx-02.local")
+
+    def test_without_a_host_a_restore_into_the_source_inventory_keeps_its_default_host(self) -> None:
+        self._second_inventory()
+
+        started = self._restore_into(target_inventory_id=self.inventory["id"], target_datastore="tstds")
+
+        self.assertEqual(TASKS[started["restore_session_id"]]["parameters"]["target_host_name"], "esx-01.local")
+
     def test_a_name_and_an_id_of_different_inventories_still_conflict(self) -> None:
         self._second_inventory()
 
