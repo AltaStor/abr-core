@@ -29,7 +29,7 @@ from typing import Any
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, padding, rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from python.srv.core import tls_bootstrap
@@ -114,12 +114,31 @@ def _subject_alt_names(cert: x509.Certificate) -> tuple[list[str], list[str]]:
     )
 
 
+def _signature_matches(cert: x509.Certificate, public_key: Any) -> bool:
+    signature, signed, digest = cert.signature, cert.tbs_certificate_bytes, cert.signature_hash_algorithm
+    try:
+        if isinstance(public_key, rsa.RSAPublicKey):
+            scheme = cert.signature_algorithm_parameters
+            public_key.verify(signature, signed, scheme if isinstance(scheme, padding.PSS) else padding.PKCS1v15(), digest)
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(signature, signed, ec.ECDSA(digest))
+        elif isinstance(public_key, dsa.DSAPublicKey):
+            public_key.verify(signature, signed, digest)
+        else:
+            return False
+    except (ValueError, TypeError, InvalidSignature, UnsupportedAlgorithm):
+        return False
+    return True
+
+
 def _is_self_signed(cert: x509.Certificate) -> bool:
     if cert.issuer != cert.subject:
         return False
     try:
         cert.verify_directly_issued_by(cert)
-    except (ValueError, TypeError, InvalidSignature, UnsupportedAlgorithm):
+    except (ValueError, UnsupportedAlgorithm):
+        return _signature_matches(cert, cert.public_key())
+    except (TypeError, InvalidSignature):
         return False
     return True
 

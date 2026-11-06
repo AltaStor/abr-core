@@ -736,6 +736,19 @@ class JobCommands:
             )
             if not dry_run:
                 return INVALID_STATE
+        unavailable = [
+            str(chain.get("repository_unavailable"))
+            for chain in (result.get("chains") if isinstance(result, dict) else None) or []
+            if isinstance(chain, dict) and chain.get("repository_unavailable")
+        ]
+        if unavailable:
+            print(
+                ("Warning: " if dry_run else "Error: ")
+                + f"{len(unavailable)} chain(s) were not touched: {unavailable[0]}",
+                file=sys.stderr,
+            )
+            if not dry_run:
+                return INVALID_STATE
         if int(summary.get("failed") or 0):
             print(
                 f"Error: {int(summary.get('failed'))} expired restore point(s) could not be removed and are kept "

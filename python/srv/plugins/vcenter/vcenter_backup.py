@@ -20,6 +20,7 @@ from ...core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_
 from ...core.credential_encryption import is_encrypted, unreadable_encryption_key_message
 from ...core.server_defaults import env_int
 from ...core.task_executor import TaskStopRequested, cancel_requested
+from ...services.share_mount import ensure_share_mounted
 from ...core.storage_tool import (
     StorageToolError,
     apply_repository_immutability,
@@ -30,6 +31,7 @@ from ...core.storage_tool import (
     disk_tool_storage_args,
     disk_tool_supports_retention_till,
     ensure_private_directory,
+    remove_empty_parents,
     extract_s3_config,
     filesystem_free_bytes,
     is_s3_repository,
@@ -802,6 +804,7 @@ def _discard_task_backups(
     abr_path: str | None,
     backup_names: list[str],
     task_root: Path,
+    below: Path | None = None,
 ) -> list[str]:
     stranded: list[str] = []
     if isinstance(repository, dict):
@@ -812,6 +815,8 @@ def _discard_task_backups(
                 if _backup_still_stored(repository, abr_path, backup_name):
                     stranded.append(backup_name)
     shutil.rmtree(task_root, ignore_errors=True)
+    if below is not None:
+        remove_empty_parents(task_root.parent, below=below)
     if stranded:
         logger.error(
             "Backup left %d disk image(s) behind in %s: %s. Object Lock keeps them until their "
@@ -890,6 +895,7 @@ def _resolve_backup_storage_layout(
     layout: str = STORAGE_LAYOUT_BY_NAME,
 ) -> tuple[Path, Path, str | None]:
     configured_destination = parameters.get("destination_dir") or parameters.get("backup_root")
+    ensure_share_mounted(repository)
 
     if is_s3_repository(repository):
         if configured_destination:
@@ -3459,7 +3465,7 @@ def run_vcenter_backup(
             "Backup task %s stopped; discarding the backup data it had written.", task.get("id")
         )
         stranded = _discard_task_backups(
-            repository, repository_abr_path, written_backup_names, task_root
+            repository, repository_abr_path, written_backup_names, task_root, destination_root
         )
         raise TaskStopRequested(
             _stop_message(stranded, repository_abr_path, task_root)
@@ -3469,12 +3475,12 @@ def run_vcenter_backup(
             "Backup task %s stopped; discarding the backup data it had written.", task.get("id")
         )
         stranded = _discard_task_backups(
-            repository, repository_abr_path, written_backup_names, task_root
+            repository, repository_abr_path, written_backup_names, task_root, destination_root
         )
         raise TaskStopRequested(_stop_message(stranded, repository_abr_path, task_root)) from None
     except Exception as exc:
         logger.exception("Task %s failed critically during vCenter interaction: %s", task.get("id"), exc)
-        _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root)
+        _discard_task_backups(repository, repository_abr_path, written_backup_names, task_root, destination_root)
         changes = _vm_changes_during_backup(
             host, username, password, port, verify_ssl, vm_name, watch_moref, watch_since
         )

@@ -505,6 +505,132 @@ class SyntheticFullRunTests(unittest.TestCase):
         removed = [call.args[2] for call in remove_mock.call_args_list]
         self.assertEqual(removed, ["01-disk.vmdk", "02-disk.vmdk"])
 
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_share_that_is_not_mounted_refuses_the_merge_before_anything_is_written(self, copy_mock) -> None:
+        with patch.object(synthetic_full, "unmounted_share_message", return_value="The share is not mounted"), self.assertRaises(
+            SyntheticFullValidationError
+        ) as caught:
+            synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(str(caught.exception), "The share is not mounted")
+        copy_mock.assert_not_called()
+
+    def _merge_into_files(self, copy_mock, remove_mock) -> None:
+        def _write(**kwargs: object) -> dict[str, object]:
+            destination = Path(str(kwargs["destination_abr_path"]))
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / f"{kwargs['backup_name']}.abrd").write_bytes(b"x" * 4096)
+            (destination / f"{kwargs['backup_name']}.abri").write_bytes(b"")
+            return {"raw_data_size": 4096, "stored_data_size": 4096, "merged_from": 3}
+
+        def _remove(repository, abr_path, backup_name, **kwargs) -> None:
+            for stored in Path(str(abr_path)).glob(f"{backup_name}.*"):
+                stored.unlink()
+
+        copy_mock.side_effect = _write
+        remove_mock.side_effect = _remove
+
+    def _left_in_the_repository(self) -> list[str]:
+        return sorted(str(path.relative_to(self._root)) for path in Path(self._root).rglob("*"))
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_manifest_that_does_not_fit_discards_the_merge_and_its_folders(self, copy_mock, remove_mock) -> None:
+        self._merge_into_files(copy_mock, remove_mock)
+
+        def _full(path: Path, text: str) -> None:
+            path.with_name(f".{path.name}.tmp").write_text(text[:10])
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with patch("python.srv.services.synthetic_full.write_file_durably", side_effect=_full):
+            with self.assertRaises(SyntheticFullError) as error:
+                synthetic_full.run_synthetic_full(self._task())
+
+        self.assertIn("ran out of space", str(error.exception))
+        self.assertEqual([call.args[2] for call in remove_mock.call_args_list], ["01-disk.vmdk"])
+        self.assertEqual(self._left_in_the_repository(), [])
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_manifest_that_cannot_be_written_for_another_reason_discards_the_merge(self, copy_mock, remove_mock) -> None:
+        self._merge_into_files(copy_mock, remove_mock)
+
+        with patch("python.srv.services.synthetic_full.write_file_durably", side_effect=OSError(errno.EIO, "Input/output error")):
+            with self.assertRaises(OSError):
+                synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual(self._left_in_the_repository(), [])
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_an_unexpected_error_after_the_merge_discards_it(self, copy_mock, remove_mock) -> None:
+        self._merge_into_files(copy_mock, remove_mock)
+
+        with patch("python.srv.services.synthetic_full._source_manifest", side_effect=RuntimeError("catalog gone")):
+            with self.assertRaises(RuntimeError):
+                synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual([call.args[2] for call in remove_mock.call_args_list], ["01-disk.vmdk"])
+        self.assertEqual(self._left_in_the_repository(), [])
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_merge_that_cannot_be_flushed_removes_its_manifest_from_the_tool_storage_too(self, copy_mock, remove_mock) -> None:
+        self._merge_into_files(copy_mock, remove_mock)
+
+        with patch("python.srv.services.synthetic_full.make_durable", side_effect=OSError(errno.EIO, "Input/output error")):
+            with self.assertRaises(SyntheticFullError):
+                synthetic_full.run_synthetic_full(self._task())
+
+        self.assertEqual([call.args[2] for call in remove_mock.call_args_list], ["01-disk.vmdk", "manifest"])
+        self.assertEqual(self._left_in_the_repository(), [])
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_merge_the_share_could_not_hold_is_found_at_the_flush_and_named_as_out_of_space(self, copy_mock, remove_mock) -> None:
+        self._merge_into_files(copy_mock, remove_mock)
+
+        with patch("python.srv.services.synthetic_full.make_durable", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            with self.assertRaises(SyntheticFullError) as error:
+                synthetic_full.run_synthetic_full(self._task())
+
+        self.assertIn("ran out of space", str(error.exception))
+        self.assertIn("'Local'", str(error.exception))
+        self.assertEqual(self._left_in_the_repository(), [])
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_completed_merge_keeps_everything_it_wrote(self, copy_mock, remove_mock) -> None:
+        self._merge_into_files(copy_mock, remove_mock)
+
+        result = synthetic_full.run_synthetic_full(self._task())
+
+        remove_mock.assert_not_called()
+        task_root = Path(result["manifest_path"]).parent
+        self.assertEqual(sorted(path.name for path in task_root.iterdir()), ["01-disk.vmdk.abrd", "01-disk.vmdk.abri", "manifest.json"])
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    def test_a_merge_into_a_new_chain_that_fails_leaves_no_folder_behind(self, remove_mock) -> None:
+        root = Path(self._root) / "target"
+        task_root = root / "job-1" / "vm-1" / "task-new"
+        task_root.mkdir(parents=True)
+
+        synthetic_full._discard_partial_merge(REPOSITORIES[REPO_ID], str(task_root), [], task_root, below=root)
+
+        self.assertEqual(list(root.iterdir()), [])
+        remove_mock.assert_not_called()
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    def test_a_merge_next_to_an_existing_chain_keeps_its_folder(self, remove_mock) -> None:
+        root = Path(self._root) / "target"
+        (root / "vm-1" / "task-old").mkdir(parents=True)
+        task_root = root / "vm-1" / "task-new"
+        task_root.mkdir()
+
+        synthetic_full._discard_partial_merge(REPOSITORIES[REPO_ID], str(task_root), [], task_root, below=root)
+
+        self.assertEqual([path.name for path in (root / "vm-1").iterdir()], ["task-old"])
+
     @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_an_object_lock_that_blocks_cleanup_is_reported(self, copy_mock, remove_mock) -> None:

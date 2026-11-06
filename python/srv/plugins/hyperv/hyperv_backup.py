@@ -27,8 +27,10 @@ backup's reference point stays, so the next incremental still has a position.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import re
 import time
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
@@ -37,10 +39,12 @@ from ...core.mongo_db_wrapper import HYPERVISORS, REPOSITORIES, RESOURCES_BY_HV
 from ...core.storage_tool import (
     StorageToolError,
     apply_repository_immutability,
+    describe_bytes,
     disk_tool_immutability_args,
     disk_tool_storage_args,
     ensure_private_directory,
     extract_s3_config,
+    filesystem_free_bytes,
     is_s3_repository,
     make_durable,
     run_disk_tool,
@@ -70,7 +74,14 @@ from ..vcenter.vcenter_backup import (
     _stop_message,
 )
 from . import vhdx_tool
-from .hyperv import QUIESCABLE_STATES, HyperVError, HyperVNode, node_options, protocol_recorder
+from .hyperv import (
+    QUIESCABLE_STATES,
+    HyperVError,
+    HyperVNode,
+    HyperVUnreachableError,
+    node_options,
+    protocol_recorder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +96,71 @@ REPOSITORY_CHECK_TIMEOUT_SECONDS = 120
 
 class HyperVBackupError(RuntimeError):
     pass
+
+
+_WRITE_FAILED = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
+_NO_SPACE = re.compile(r"no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
+_FAILED_AT_OFFSET = re.compile(r"at offset (\d+)", re.IGNORECASE)
+
+
+def _repository_free_bytes(repository: dict[str, Any]) -> int | None:
+    if is_s3_repository(repository):
+        return None
+    root = str(repository.get("path") or "").strip()
+    return filesystem_free_bytes(root) if root else None
+
+
+def out_of_space_message(repository: dict[str, Any], free_bytes: int | None, *, before: bool = False) -> str:
+    name = str(repository.get("name") or repository.get("id") or "the destination")
+    root = str(repository.get("path") or "").strip()
+    where = f"repository {name!r}" + (f" at {root}" if root else "")
+    when = " when this disk started" if before else ""
+    free = f" ({describe_bytes(free_bytes)} free{when})" if free_bytes is not None else ""
+    return f"The {where} ran out of space{free}. Free space in that filesystem, or point the job at another repository"
+
+
+def out_of_space_detail(repository: dict[str, Any], tool_error: str, free_before: int | None) -> str | None:
+    if not _WRITE_FAILED.search(tool_error or ""):
+        return None
+    if _NO_SPACE.search(tool_error):
+        return out_of_space_message(repository, _repository_free_bytes(repository))
+    offset = _FAILED_AT_OFFSET.search(tool_error)
+    if free_before is None or offset is None or free_before > int(offset.group(1)):
+        return None
+    return out_of_space_message(repository, free_before, before=True)
+
+
+def _out_of_space_error(repository: dict[str, Any], exc: OSError) -> HyperVBackupError | None:
+    if exc.errno != errno.ENOSPC:
+        return None
+    return HyperVBackupError(out_of_space_message(repository, _repository_free_bytes(repository)))
+
+
+def _make_task_root(repository: dict[str, Any], task_root: Path) -> None:
+    try:
+        ensure_private_directory(task_root)
+    except OSError as exc:
+        error = _out_of_space_error(repository, exc)
+        if error is None:
+            raise
+        raise error from exc
+
+
+def lost_host(exc: BaseException) -> HyperVUnreachableError | None:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, HyperVUnreachableError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def lost_host_message(lost: HyperVUnreachableError, vm_name: str) -> str:
+    over = f" ({lost.protocol.upper()}, port {', '.join(str(port) for port in lost.ports)})" if lost.protocol else ""
+    detail = lost.detail or "it did not answer"
+    return f"Cannot reach Hyper-V host {lost.host} over WinRM{over} while backing up {vm_name}: {detail}"
 
 
 class _ChangeTrackingLost(Exception):
@@ -343,7 +419,7 @@ def run_hyperv_backup(
     destination_root, task_root, abr_path = _resolve_backup_storage_layout(
         task=task, vm_name=vm_name, parameters=parameters, repository=repository
     )
-    ensure_private_directory(task_root)
+    _make_task_root(repository, task_root)
     storage_args, storage_env = vhdx_tool.storage_invocation(repository, abr_path=abr_path)
     repository_label = _repository_label(repository, str(abr_path))
     inventory_name = str(hypervisor.get("name") or task.get("hypervisor_id") or "")
@@ -411,8 +487,11 @@ def run_hyperv_backup(
             # A checkpoint can only be application consistent when there is
             # a running guest to quiesce.
             achieved = consistency
+            consistency_reason: str | None = None
             if str(state.get("state") or "") not in QUIESCABLE_STATES:
                 achieved = "crash"
+                if consistency == "application":
+                    consistency_reason = "vm_not_running"
             _emit(
                 progress_callback,
                 "snapshot",
@@ -431,6 +510,7 @@ def run_hyperv_backup(
                 _warn(progress_callback, "snapshot", 15, message)
                 warnings.append(message)
                 achieved = "crash"
+                consistency_reason = "vss_failed"
                 try:
                     checkpoint = node.create_recovery_checkpoint(vm_id, "crash")
                 except HyperVError as retry_exc:
@@ -508,7 +588,7 @@ def run_hyperv_backup(
                 except _ChangeTrackingLost as exc:
                     _discard_task_backups(repository, abr_path, written_backup_names, task_root)
                     written_backup_names.clear()
-                    ensure_private_directory(task_root)
+                    _make_task_root(repository, task_root)
                     change_ids = {}
                     _fall_back_to_full(
                         f"Resilient change tracking of {vm_name} no longer knows the previous backup's position "
@@ -567,6 +647,7 @@ def run_hyperv_backup(
                 "checkpoint_id": str(checkpoint.get("checkpoint_id") or ""),
                 "consistency_requested": consistency,
                 "consistency": achieved,
+                "consistency_reason": consistency_reason,
                 "source_node": source_node,
                 "cluster_name": node.cluster_name,
                 "excluded_disks": excluded_disks,
@@ -615,7 +696,13 @@ def run_hyperv_backup(
                 "created_at": utc_now(),
             }
             resolved_backup_type = manifest_payload["resolved_backup_type"]
-            write_file_durably(manifest_path, json.dumps(manifest_payload, indent=2, sort_keys=True))
+            try:
+                write_file_durably(manifest_path, json.dumps(manifest_payload, indent=2, sort_keys=True))
+            except OSError as exc:
+                error = _out_of_space_error(repository, exc)
+                if error is None:
+                    raise
+                raise error from exc
             try:
                 run_disk_tool(
                     [
@@ -641,6 +728,9 @@ def run_hyperv_backup(
             try:
                 make_durable(task_root, up_to=destination_root)
             except OSError as exc:
+                error = _out_of_space_error(repository, exc)
+                if error is not None:
+                    raise error from exc
                 raise HyperVBackupError(
                     f"The backup of {vm_name} was written but could not be flushed to stable storage in "
                     f"{task_root}: {exc}. It is not kept, so a crash cannot leave a restore point with empty files."
@@ -717,11 +807,11 @@ def run_hyperv_backup(
         }
     except ProcessCancelled as exc:
         logger.info("Hyper-V backup session %s of VM %s stopped; discarding what it had written.", task_id, vm_name)
-        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root)
+        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
         raise TaskStopRequested(_stop_message(stranded, abr_path, task_root)) from exc
     except TaskStopRequested:
         logger.info("Hyper-V backup session %s of VM %s stopped; discarding what it had written.", task_id, vm_name)
-        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root)
+        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
         raise TaskStopRequested(_stop_message(stranded, abr_path, task_root)) from None
     except Exception as exc:
         logger.exception(
@@ -732,7 +822,10 @@ def run_hyperv_backup(
             time.time() - start_time,
             exc,
         )
-        _discard_task_backups(repository, abr_path, written_backup_names, task_root)
+        _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
+        lost = lost_host(exc)
+        if lost is not None and str(exc) == str(lost):
+            raise HyperVBackupError(lost_host_message(lost, vm_name)) from exc
         if isinstance(exc, (HyperVError, vhdx_tool.VhdxToolError)):
             raise HyperVBackupError(str(exc)) from exc
         raise
@@ -832,6 +925,7 @@ def _back_up_disks(
             worker_mode=WORKER_MODE,
         )
         written_backup_names.append(backup_name)
+        free_before = _repository_free_bytes(repository)
         run = node.run_disk_tool(
             source_node,
             args,
@@ -847,7 +941,10 @@ def _back_up_disks(
             detail = vhdx_tool.failure_message(result, lines, run.get("exit_code"))
             if change_id and vhdx_tool.change_tracking_lost(result, lines, run.get("exit_code")):
                 raise _ChangeTrackingLost(detail)
-            raise HyperVBackupError(f"Backing up disk {slot} of {vm_name} failed: {detail}")
+            no_room = out_of_space_detail(repository, detail, free_before)
+            if no_room:
+                logger.warning("Backing up disk %s of %s failed on a full repository: %s", slot, vm_name, detail)
+            raise HyperVBackupError(f"Backing up disk {slot} of {vm_name} failed: {no_room or detail}")
         logical = int(result.get("raw_data_size") or 0)
         stored = int(result.get("stored_data_size") or 0)
         total_read += logical

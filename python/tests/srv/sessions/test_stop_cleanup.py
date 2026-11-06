@@ -125,6 +125,40 @@ class DiscardTaskBackupsTests(unittest.TestCase):
                 )
 
 
+class FailedRunFolderTests(unittest.TestCase):
+    def test_a_first_run_that_wrote_nothing_leaves_no_folder_behind(self) -> None:
+        with patch("python.srv.plugins.vcenter.vcenter_backup.remove_disk_tool_backup"), tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            task_root = root / "job-1" / "vm-1" / "task-1"
+            task_root.mkdir(parents=True)
+
+            _discard_task_backups(REPOSITORY, str(task_root), [], task_root, root)
+
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_a_vm_folder_that_holds_a_chain_keeps_it(self) -> None:
+        with patch("python.srv.plugins.vcenter.vcenter_backup.remove_disk_tool_backup"), tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            (root / "vm-1" / "task-0").mkdir(parents=True)
+            (root / "vm-1" / "task-0" / "manifest.json").write_text("{}", encoding="utf-8")
+            task_root = root / "vm-1" / "task-1"
+            task_root.mkdir()
+
+            _discard_task_backups(REPOSITORY, str(task_root), [], task_root, root)
+
+            self.assertEqual([path.name for path in (root / "vm-1").iterdir()], ["task-0"])
+
+    def test_a_discard_midway_through_a_run_leaves_the_parents_for_the_retry(self) -> None:
+        with patch("python.srv.plugins.vcenter.vcenter_backup.remove_disk_tool_backup"), tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            task_root = root / "vm-1" / "task-1"
+            task_root.mkdir(parents=True)
+
+            _discard_task_backups(REPOSITORY, str(task_root), [], task_root)
+
+            self.assertTrue((root / "vm-1").is_dir())
+
+
 class BackupStillStoredTests(unittest.TestCase):
     def test_a_readable_backup_is_still_stored(self) -> None:
         with patch(

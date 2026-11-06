@@ -9,9 +9,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from python.srv.core.credential_encryption import decrypt_secret
 from python.srv.core.mongo_db_wrapper import REPOSITORIES
 from python.srv.core.storage_tool import StorageToolError, with_smb_type
-from python.srv.services import abr_v41
+from python.srv.services import abr_v41, share_mount
 from python.srv.services.api_errors import ApiError
 
 S3_PAYLOAD = {
@@ -285,6 +286,52 @@ class LocalRegistrationValidationTests(_FolderCase):
 
 
 class SmbRegistrationValidationTests(_FolderCase):
+    def setUp(self) -> None:
+        super().setUp()
+        mounted = patch.object(
+            abr_v41, "share_mount_check", return_value={"name": "share_mount", "status": "ok", "message": "mounted"}
+        )
+        self.share_check = mounted.start()
+        self.addCleanup(mounted.stop)
+        account = patch(
+            "python.srv.plugins.hyperv.hyperv.check_share_account",
+            return_value={"name": "share_account", "status": "ok", "message": "opened"},
+        )
+        account.start()
+        self.addCleanup(account.stop)
+
+    def test_a_folder_on_the_local_disk_with_a_made_up_share_is_refused(self) -> None:
+        with patch.object(abr_v41, "share_mount_check", wraps=share_mount.share_mount_check), patch.object(
+            share_mount, "is_this_appliance", return_value=False
+        ), self.assertRaises(ApiError) as caught:
+            abr_v41.create_repository_record(
+                {"name": "SmbFake", "type": "smb", "path": self._path("fake"), "address": r"\\192.0.2.99\nosuchshare"}
+            )
+
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertIn("is not the share \\\\192.0.2.99\\nosuchshare", caught.exception.message)
+        self.assertEqual(list(REPOSITORIES), [])
+
+    def test_the_test_connection_runs_the_same_check_and_saves_nothing(self) -> None:
+        with patch.object(abr_v41, "share_mount_check", wraps=share_mount.share_mount_check), patch.object(
+            share_mount, "is_this_appliance", return_value=False
+        ):
+            result = abr_v41.test_smb_connection(
+                {"type": "smb", "path": self._path("fake"), "address": r"\\192.0.2.99\nosuchshare"}
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("is not the share", result["message"])
+        self.assertIn("share_mount", [check["name"] for check in result["checks"]])
+        self.assertEqual(list(REPOSITORIES), [])
+
+    def test_the_test_connection_passes_a_mounted_share(self) -> None:
+        result = abr_v41.test_smb_connection({"type": "smb", "path": self._path("hv"), "server": "backup01", "share": "hv"})
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["message"], "SMB folder and share match")
+        self.assertEqual(list(REPOSITORIES), [])
+
     def test_the_share_and_the_folder_it_is_mounted_at_are_kept(self) -> None:
         mount = self._path("hv")
         repository = abr_v41.create_repository_record(
@@ -329,6 +376,96 @@ class SmbRegistrationValidationTests(_FolderCase):
 
         metadata = REPOSITORIES[repository["id"]]["metadata"]
         self.assertEqual((metadata["username"], metadata["password"]), (None, None))
+
+    def _with_account(self) -> dict:
+        return abr_v41.create_repository_record(
+            {
+                "name": "SmbRepo",
+                "type": "smb",
+                "path": self._path("hv"),
+                "server": "backup01",
+                "share": "hv",
+                "username": "CORP\\backupsvc",
+                "password": "s3cret",
+            }
+        )
+
+    def test_a_new_account_without_its_password_is_refused_and_the_old_one_kept(self) -> None:
+        repository = self._with_account()
+        before = dict(REPOSITORIES[repository["id"]]["metadata"])
+
+        with self.assertRaises(ApiError) as caught:
+            abr_v41.edit_repository_record(repository["id"], {"username": "CORP\\other"})
+
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertIn("The account CORP\\other needs its own password", caught.exception.message)
+        metadata = REPOSITORIES[repository["id"]]["metadata"]
+        self.assertEqual((metadata["username"], metadata["password"]), (before["username"], before["password"]))
+
+    def test_a_new_account_with_its_password_and_a_new_password_alone_are_taken(self) -> None:
+        repository = self._with_account()
+
+        abr_v41.edit_repository_record(repository["id"], {"username": "CORP\\other", "password": "n3w"})
+        after_account = REPOSITORIES[repository["id"]]["metadata"]["password"]
+        abr_v41.edit_repository_record(repository["id"], {"password": "n3wer"})
+
+        metadata = REPOSITORIES[repository["id"]]["metadata"]
+        self.assertEqual(metadata["username"], "CORP\\other")
+        self.assertNotEqual(metadata["password"], after_account)
+        self.assertEqual(decrypt_secret(metadata["password"]), "n3wer")
+
+    def test_the_same_account_sent_again_keeps_its_password(self) -> None:
+        repository = self._with_account()
+        stored = REPOSITORIES[repository["id"]]["metadata"]["password"]
+
+        abr_v41.edit_repository_record(repository["id"], {"username": "CORP\\backupsvc", "description": "edited"})
+
+        self.assertEqual(REPOSITORIES[repository["id"]]["metadata"]["password"], stored)
+
+    def test_an_empty_password_for_the_account_is_still_refused(self) -> None:
+        repository = self._with_account()
+
+        with self.assertRaises(ApiError) as caught:
+            abr_v41.edit_repository_record(repository["id"], {"password": ""})
+
+        self.assertIn("needs --password with --username", caught.exception.message)
+
+    def test_a_password_without_an_account_is_refused_on_create_and_on_edit(self) -> None:
+        with self.assertRaises(ApiError) as created:
+            abr_v41.create_repository_record(
+                {"name": "SmbRepo", "type": "smb", "path": self._path("hv"), "server": "backup01", "share": "hv", "password": "s3cret"}
+            )
+        self.assertEqual(created.exception.status_code, 422)
+        self.assertIn("password needs the account it belongs to", created.exception.message)
+        self.assertEqual(list(REPOSITORIES), [])
+
+        repository = self._with_account()
+        with self.assertRaises(ApiError) as edited:
+            abr_v41.edit_repository_record(repository["id"], {"username": "", "password": "n3w"})
+        self.assertIn("password needs the account it belongs to", edited.exception.message)
+        self.assertEqual(REPOSITORIES[repository["id"]]["metadata"]["username"], "CORP\\backupsvc")
+
+    def test_the_path_may_change_while_empty_but_never_onto_another_repository_or_under_backups(self) -> None:
+        repository = self._with_account()
+        other = abr_v41.create_repository_record(
+            {"name": "SmbOther", "type": "smb", "path": self._path("parent/other"), "server": "backup01", "share": "hv2"}
+        )
+
+        moved = abr_v41.edit_repository_record(repository["id"], {"path": self._path("moved")})
+        self.assertEqual(moved["path"], self._path("moved"))
+
+        with self.assertRaises(ApiError) as overlap:
+            abr_v41.edit_repository_record(repository["id"], {"path": self._path("parent")})
+        self.assertEqual((overlap.exception.status_code, overlap.exception.code), (409, "repository_path_overlaps"))
+
+        from python.srv.core.mongo_db_wrapper import BACKUPS
+
+        BACKUPS["point-1"] = {"id": "point-1", "repository_id": repository["id"], "job_id": "job-1", "vm_id": "vm-1", "created_at": "2026-01-01T00:00:00Z"}
+        self.addCleanup(BACKUPS.pop, "point-1", None)
+        with self.assertRaises(ApiError) as held:
+            abr_v41.edit_repository_record(repository["id"], {"path": self._path("again")})
+        self.assertEqual((held.exception.status_code, held.exception.code), (409, "repository_has_backups"))
+        self.assertIn(other["id"], REPOSITORIES)
 
     def test_a_local_repository_with_a_share_from_before_becomes_an_smb_repository(self) -> None:
         local = {"id": "r1", "type": "local", "path": "/srv/hv", "metadata": {"server": "backup01", "share": "hv"}}

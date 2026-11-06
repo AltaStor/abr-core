@@ -493,6 +493,9 @@ class AbrV41EngineTests(unittest.TestCase):
         )
         reachable.start()
         self.addCleanup(reachable.stop)
+        mounted = patch("python.srv.services.abr_v41.unmounted_share_message", return_value=None)
+        mounted.start()
+        self.addCleanup(mounted.stop)
         HYPERVISORS.clear()
         JOBS.clear()
         REPOSITORIES.clear()
@@ -2421,6 +2424,7 @@ class AbrV41EngineTests(unittest.TestCase):
             min(switched_on["next_incremental_run_at"], switched_on["synthetic_full_next_run_at"]),
         )
 
+    @patch("python.srv.services.abr_v41.share_mount_check", new=lambda repository: {"name": "share_mount", "status": "ok", "message": "mounted"})
     def test_create_repository_record_accepts_remote_address_and_preserves_description(self) -> None:
         REPOSITORIES.clear()
         mount = tempfile.mkdtemp(prefix="abr-smb-repo-")

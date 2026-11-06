@@ -123,6 +123,31 @@ class BackupCommandTests(unittest.TestCase):
         )
 
     @patch("python.cli.api.client.requests.request")
+    def test_list_shows_points_waiting_for_deletion_and_until_when(self, request_mock: object) -> None:
+        pending = {"restore_point_count": 3, "requested_at": "2026-10-29T10:54:00+00:00", "delete_after": "2026-10-30T10:52:00+00:00"}
+        request_mock.return_value = _FakeResponse(
+            {
+                "items": [
+                    {"id": "backup-1", "status": "deleting", "pending_deletion": pending},
+                    {"id": "backup-2", "status": "available", "pending_deletion": {**pending, "restore_point_count": 1}},
+                    {"id": "backup-3", "status": "available", "pending_deletion": None},
+                ]
+            }
+        )
+        args = SimpleNamespace(base_url="http://example.test", output="table", log_level="info", repo=None)
+
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            BackupCommands().list(args)
+
+        lines = {line.split()[0]: line for line in stream.getvalue().splitlines() if line.startswith("backup-")}
+        self.assertIn("3 point(s) deleting after 2026-10-30T10:52:00+00:00", lines["backup-1"])
+        self.assertNotIn("deleting  ", lines["backup-1"].split("3 point(s)")[0])
+        self.assertIn("available, 1 point(s) deleting after 2026-10-30T10:52:00+00:00", lines["backup-2"])
+        self.assertIn("available", lines["backup-3"])
+        self.assertNotIn("deleting", lines["backup-3"])
+
+    @patch("python.cli.api.client.requests.request")
     def test_list_without_repo_sends_no_params(self, request_mock: object) -> None:
         request_mock.return_value = _FakeResponse({"items": []})
         args = SimpleNamespace(base_url="http://example.test", output="json", log_level="info", repo=None)

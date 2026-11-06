@@ -20,6 +20,16 @@ BACKUP_DELETE_TIMEOUT_SECONDS = 21600
 def _announce_session(session_id: object) -> None:
     print(f"Session: {session_id}", file=sys.stderr)
 
+def _chain_status(chain: dict[str, Any]) -> str:
+    status = str(chain.get("status") or "")
+    pending = chain.get("pending_deletion") if isinstance(chain.get("pending_deletion"), dict) else None
+    if not pending:
+        return status
+    after = pending.get("delete_after")
+    waiting = f"{pending.get('restore_point_count')} point(s) deleting" + (f" after {after}" if after else "")
+    return waiting if status == "deleting" else f"{status}, {waiting}"
+
+
 RESTORE_POINT_COLUMNS = [
     ("id", "ID"),
     ("created_at", "CREATED"),
@@ -105,7 +115,11 @@ class BackupCommands:
 
     def list(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
-        deps.context.print_output(deps.context.api_client.get("api/v1/backups", params={"repo": args.repo} if args.repo else None), [("id", "ID"), ("name", "NAME"), ("status", "STATUS"), ("restore_point_count", "POINTS"), ("latest_execution_type", "LATEST TYPE"), ("last_restore_point_at", "LATEST POINT")])
+        payload = deps.context.api_client.get("api/v1/backups", params={"repo": args.repo} if args.repo else None)
+        if deps.context.output == "table":
+            chains = payload.get("items") if isinstance(payload, dict) else payload
+            payload = [{**chain, "status": _chain_status(chain)} for chain in chains or [] if isinstance(chain, dict)]
+        deps.context.print_output(payload, [("id", "ID"), ("name", "NAME"), ("status", "STATUS"), ("restore_point_count", "POINTS"), ("latest_execution_type", "LATEST TYPE"), ("last_restore_point_at", "LATEST POINT")])
         return 0
 
     def info(self, args: argparse.Namespace) -> int:
@@ -116,6 +130,7 @@ class BackupCommands:
             return 0
 
         chain = dict(payload)
+        chain["status"] = _chain_status(chain)
         restore_points = chain.pop("restore_points", None) or []
         deps.context.print_output(chain)
         if restore_points:

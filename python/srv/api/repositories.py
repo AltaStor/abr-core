@@ -38,6 +38,12 @@ def test_s3_connection(
     return abr_v41.test_s3_connection(unset_excluded(payload))
 
 
+def test_smb_connection(
+    payload: CreateRepositoryRequest = Body(default_factory=CreateRepositoryRequest),
+) -> S3TestResult:
+    return abr_v41.test_smb_connection(unset_excluded(payload))
+
+
 def test_s3_immutability(
     payload: CreateRepositoryRequest = Body(default_factory=CreateRepositoryRequest),
 ) -> S3TestResult:
@@ -95,6 +101,7 @@ def apply_repository_immutability(repository_id: str) -> RepositoryImmutabilityA
 register(router, [
     ("", create_repository, ["POST"], "repository.create"),
     ("/test-s3", test_s3_connection, ["POST"], "repository.create"),
+    ("/test-smb", test_smb_connection, ["POST"], "repository.create"),
     ("/test-immutability", test_s3_immutability, ["POST"], "repository.create"),
     ("", list_repositories, ["GET"], "repository.view"),
     ("/default", get_default_repository, ["GET"], "repository.view"),

@@ -24,6 +24,7 @@ from python.srv.core.storage_tool import (
     copy_disk_tool_chain,
     disk_tool_storage_args,
     ensure_private_directory,
+    remove_empty_parents,
     is_abr_repository,
     join_s3_prefix,
     make_durable,
@@ -32,6 +33,7 @@ from python.srv.core.storage_tool import (
     write_file_durably,
 )
 from python.srv.core.subprocess_util import ProcessCancelled
+from python.srv.services.share_mount import unmounted_share_message
 from python.srv.core.utils import utc_now
 from python.srv.services.backup_mode import object_lock_expiry, object_lock_generation_plan
 
@@ -157,6 +159,7 @@ def _discard_partial_merge(
     written: list[str],
     task_root: Path,
     in_flight: str | None = None,
+    below: Path | None = None,
 ) -> None:
     names = list(written)
     if in_flight and in_flight not in names:
@@ -177,11 +180,18 @@ def _discard_partial_merge(
             destination_path or task_root,
             ", ".join(stranded),
         )
+    for leftover in ("manifest.json", ".manifest.json.tmp"):
+        try:
+            (task_root / leftover).unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Synthetic full could not remove %s", task_root / leftover, exc_info=True)
     try:
         if task_root.exists() and not any(task_root.iterdir()):
             task_root.rmdir()
     except OSError:
         pass
+    if below is not None:
+        remove_empty_parents(task_root.parent, below=below)
 
 
 def _repository_storage_root(repository: dict[str, Any]) -> str:
@@ -261,6 +271,7 @@ def _write_synthetic_manifest(
     task_root: Path,
     destination_path: str | None,
     payload: dict[str, Any],
+    written: list[str],
     retention_days: int | None = None,
     retention_till: str | None = None,
 ) -> Path:
@@ -286,6 +297,7 @@ def _write_synthetic_manifest(
             ],
             timeout=60,
         )
+        written.append("manifest")
         apply_repository_immutability(
             repository,
             destination_path,
@@ -366,6 +378,9 @@ def run_synthetic_full(
             raise SyntheticFullValidationError(
                 f"Synthetic full backups need a local or s3 repository; '{candidate.get('type')}' cannot merge a chain"
             )
+        unmounted = unmounted_share_message(candidate)
+        if unmounted:
+            raise SyntheticFullValidationError(unmounted)
 
     points = resolve_source_chain(job_id, vm_id, source_repository_id or None)
     if _nothing_to_merge(JOBS.get(job_id), parameters, points):
@@ -395,15 +410,6 @@ def run_synthetic_full(
         layout=storage_layout,
     )
     free_at_start = _free_bytes_at_start(repository)
-    if not is_s3_repository(repository):
-        try:
-            ensure_private_directory(task_root.parent)
-        except OSError as exc:
-            if exc.errno != errno.ENOSPC:
-                raise
-            raise SyntheticFullError(
-                _out_of_space_message(repository, _free_bytes_at_start(repository))
-            ) from exc
     source_paths = {merge["source_path"] for merge in merges}
     if repository_id == source_repository_id and destination_path is not None and destination_path in source_paths:
         raise SyntheticFullValidationError(
@@ -465,141 +471,153 @@ def run_synthetic_full(
         f"into a synthetic full in '{target_name}'",
     )
 
-    for position, merge in enumerate(merges):
-        template = merge["template"]
-        backup_name = str(template.get("abr_backup_name") or "")
-        base = int(position * 100 / total)
-        span = max(int(100 / total), 1)
-        _emit(base, f"Merging disk {position + 1}/{total}")
+    in_flight: str | None = None
+    try:
+        if not is_s3_repository(repository):
+            try:
+                ensure_private_directory(task_root.parent)
+            except OSError as exc:
+                if exc.errno != errno.ENOSPC:
+                    raise
+                raise SyntheticFullError(
+                    _out_of_space_message(repository, _free_bytes_at_start(repository))
+                ) from exc
+        for position, merge in enumerate(merges):
+            template = merge["template"]
+            backup_name = str(template.get("abr_backup_name") or "")
+            base = int(position * 100 / total)
+            span = max(int(100 / total), 1)
+            _emit(base, f"Merging disk {position + 1}/{total}")
+            in_flight = backup_name
 
-        def _on_progress(percent: int, _block: int, base=base, span=span, position=position) -> None:
-            _emit(base + int(percent * span / 100), f"Merging disk {position + 1}/{total}: {percent}%")
+            def _on_progress(percent: int, _block: int, base=base, span=span, position=position) -> None:
+                _emit(base + int(percent * span / 100), f"Merging disk {position + 1}/{total}: {percent}%")
 
-        try:
-            result = copy_disk_tool_chain(
-                source_repository=source_repository,
-                source_abr_path=merge["source_path"],
-                source_names=merge["source_names"],
-                destination_repository=repository,
-                destination_abr_path=destination_path,
-                backup_name=backup_name,
-                compression_level=compression_level,
-                encryption_key=encryption_key,
-                source_encryption_key=encryption_key,
-                retention_days=retention_days,
-                retention_till=retention_till,
-                timeout=timeout_seconds,
-                on_progress=_on_progress,
-                should_cancel=lambda: cancel_requested(task_id),
-            )
-        except ProcessCancelled as exc:
-            from python.srv.core.task_executor import TaskStopRequested
+            try:
+                result = copy_disk_tool_chain(
+                    source_repository=source_repository,
+                    source_abr_path=merge["source_path"],
+                    source_names=merge["source_names"],
+                    destination_repository=repository,
+                    destination_abr_path=destination_path,
+                    backup_name=backup_name,
+                    compression_level=compression_level,
+                    encryption_key=encryption_key,
+                    source_encryption_key=encryption_key,
+                    retention_days=retention_days,
+                    retention_till=retention_till,
+                    timeout=timeout_seconds,
+                    on_progress=_on_progress,
+                    should_cancel=lambda: cancel_requested(task_id),
+                )
+            except ProcessCancelled as exc:
+                from python.srv.core.task_executor import TaskStopRequested
 
-            _discard_partial_merge(
-                repository, destination_path, written_names, task_root, in_flight=backup_name
+                raise TaskStopRequested("Synthetic full cancelled; the merged backup was discarded") from exc
+            except StorageToolError as exc:
+                detail = _no_room_detail(repository, points, free_at_start)
+                raise SyntheticFullError(
+                    f"Merging disk {position + 1}/{total} failed: {detail or exc}"
+                ) from exc
+            except OSError as exc:
+                if exc.errno != errno.ENOSPC:
+                    raise
+                raise SyntheticFullError(
+                    f"Merging disk {position + 1}/{total} failed: "
+                    + _out_of_space_message(repository, _free_bytes_at_start(repository))
+                ) from exc
+
+            written_names.append(backup_name)
+            in_flight = None
+
+            logical = int(result.get("raw_data_size") or 0)
+            stored = int(result.get("stored_data_size") or 0)
+            logical_total += logical
+            stored_total += stored
+            entry = dict(template)
+            entry.update(
+                {
+                    "abr_path": destination_path,
+                    "abr_backup_name": backup_name,
+                    "logical_bytes": logical,
+                    "stored_bytes": stored,
+                    "compression_ratio": (round(stored / logical, 6) if logical else None),
+                    "store_mode": "synthetic-full",
+                    "merged_from": result.get("merged_from") or len(merge["source_names"]),
+                    "repository_id": repository_id,
+                    "repository_type": str(repository.get("type") or "local"),
+                    "storage_mode": "s3" if is_s3_repository(repository) else "local",
+                    "destination_path": "",
+                    "parent_path": "",
+                    "change_id": _merged_change_id(merge["newest"]),
+                    "previous_change_id": "",
+                    "utility_change_id": "",
+                }
             )
-            raise TaskStopRequested("Synthetic full cancelled; the merged backup was discarded") from exc
-        except StorageToolError as exc:
-            _discard_partial_merge(
-                repository, destination_path, written_names, task_root, in_flight=backup_name
-            )
-            detail = _no_room_detail(repository, points, free_at_start)
+            disk_outputs.append(entry)
+
+        repository_type = str(repository.get("type") or "local")
+        if repository_type != "s3" and stored_total <= 0:
+            stored_total = _dir_size_bytes(task_root)
+        manifest_payload = _source_manifest(points[-1])
+        if not manifest_payload:
             raise SyntheticFullError(
-                f"Merging disk {position + 1}/{total} failed: {detail or exc}"
-            ) from exc
-        except OSError as exc:
-            if exc.errno != errno.ENOSPC:
-                raise
-            _discard_partial_merge(
-                repository, destination_path, written_names, task_root, in_flight=backup_name
+                f"The manifest of restore point {points[-1].get('id')} could not be read, so the merged backup "
+                "would not be restorable"
             )
-            raise SyntheticFullError(
-                f"Merging disk {position + 1}/{total} failed: "
-                + _out_of_space_message(repository, _free_bytes_at_start(repository))
-            ) from exc
-
-        written_names.append(backup_name)
-
-        logical = int(result.get("raw_data_size") or 0)
-        stored = int(result.get("stored_data_size") or 0)
-        logical_total += logical
-        stored_total += stored
-        entry = dict(template)
-        entry.update(
+        manifest_payload.update(
             {
-                "abr_path": destination_path,
-                "abr_backup_name": backup_name,
-                "logical_bytes": logical,
-                "stored_bytes": stored,
-                "compression_ratio": (round(stored / logical, 6) if logical else None),
-                "store_mode": "synthetic-full",
-                "merged_from": result.get("merged_from") or len(merge["source_names"]),
+                "operation": "vm-backup",
+                "backup_mode": "full",
+                "resolved_backup_type": "SyntheticFull",
+                "resolved_backup_reason": str(parameters.get("resolved_backup_reason") or "SyntheticFullWindow"),
+                "parent_point_id": None,
+                "storage_layout": storage_layout,
+                "incremental": False,
+                "differential": False,
+                "synthetic_full": True,
+                "merged_from": len(points),
+                "merged_restore_point_ids": [str(point.get("id") or "") for point in points],
+                "snapshot_name": "",
+                "snapshot_moref": "",
+                "disks": disk_outputs,
+                "compression_level": compression_level,
+                "encryption_enabled": bool(encryption_key),
                 "repository_id": repository_id,
-                "repository_type": str(repository.get("type") or "local"),
-                "storage_mode": "s3" if is_s3_repository(repository) else "local",
-                "destination_path": "",
-                "parent_path": "",
-                "change_id": _merged_change_id(merge["newest"]),
-                "previous_change_id": "",
-                "utility_change_id": "",
+                "repository_type": repository_type,
+                "storage_mode": "s3" if repository_type == "s3" else "local",
+                "repository_storage_path": destination_path if repository_type == "s3" else str(task_root),
+                "backup_root": str(task_root),
+                "logical_bytes": logical_total,
+                "transferred_bytes": stored_total,
+                "created_at": utc_now(),
             }
         )
-        disk_outputs.append(entry)
-
-    repository_type = str(repository.get("type") or "local")
-    if repository_type != "s3" and stored_total <= 0:
-        stored_total = _dir_size_bytes(task_root)
-    manifest_payload = _source_manifest(points[-1])
-    if not manifest_payload:
-        _discard_partial_merge(repository, destination_path, written_names, task_root)
-        raise SyntheticFullError(
-            f"The manifest of restore point {points[-1].get('id')} could not be read, so the merged backup "
-            "would not be restorable"
+        manifest_path = _write_synthetic_manifest(
+            repository,
+            task_root,
+            destination_path,
+            manifest_payload,
+            written_names,
+            retention_days=retention_days,
+            retention_till=retention_till,
         )
-    manifest_payload.update(
-        {
-            "operation": "vm-backup",
-            "backup_mode": "full",
-            "resolved_backup_type": "SyntheticFull",
-            "resolved_backup_reason": str(parameters.get("resolved_backup_reason") or "SyntheticFullWindow"),
-            "parent_point_id": None,
-            "storage_layout": storage_layout,
-            "incremental": False,
-            "differential": False,
-            "synthetic_full": True,
-            "merged_from": len(points),
-            "merged_restore_point_ids": [str(point.get("id") or "") for point in points],
-            "snapshot_name": "",
-            "snapshot_moref": "",
-            "disks": disk_outputs,
-            "compression_level": compression_level,
-            "encryption_enabled": bool(encryption_key),
-            "repository_id": repository_id,
-            "repository_type": repository_type,
-            "storage_mode": "s3" if repository_type == "s3" else "local",
-            "repository_storage_path": destination_path if repository_type == "s3" else str(task_root),
-            "backup_root": str(task_root),
-            "logical_bytes": logical_total,
-            "transferred_bytes": stored_total,
-            "created_at": utc_now(),
-        }
-    )
-    manifest_path = _write_synthetic_manifest(
-        repository,
-        task_root,
-        destination_path,
-        manifest_payload,
-        retention_days=retention_days,
-        retention_till=retention_till,
-    )
-    try:
-        make_durable(task_root, up_to=destination_root)
-    except OSError as exc:
-        _discard_partial_merge(repository, destination_path, written_names, task_root)
-        raise SyntheticFullError(
-            f"The synthetic full was written but could not be flushed to stable storage in {task_root}: {exc}. "
-            "It is not kept, so a crash cannot leave a restore point with empty files."
-        ) from exc
+        try:
+            make_durable(task_root, up_to=destination_root)
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                raise SyntheticFullError(
+                    _out_of_space_message(repository, _free_bytes_at_start(repository))
+                ) from exc
+            raise SyntheticFullError(
+                f"The synthetic full was written but could not be flushed to stable storage in {task_root}: {exc}. "
+                "It is not kept, so a crash cannot leave a restore point with empty files."
+            ) from exc
+    except BaseException:
+        _discard_partial_merge(
+            repository, destination_path, written_names, task_root, in_flight=in_flight, below=destination_root
+        )
+        raise
     _emit(
         100,
         f"Synthetic full written to '{target_name}' from {len(points)} restore point(s): "

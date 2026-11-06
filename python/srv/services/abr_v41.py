@@ -125,6 +125,7 @@ from python.srv.services.inventory_management import (
 from python.srv.services.backup_copy import apply_copy_settings, copy_job_view, create_copy_sessions
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
+from python.srv.services.share_mount import share_mount_check, unmounted_share_message
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.hyperv.vhdx_tool import VhdxToolError, ensure_hyperv_repository
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
@@ -2195,6 +2196,9 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
                 )
             except OSError as exc:
                 storage["error"] = str(exc)
+            unmounted = unmounted_share_message(item) if storage["available"] else None
+            if unmounted:
+                storage.update({"available": False, "error": unmounted, "capacity_bytes": None, "used_bytes": None, "free_bytes": None})
         else:
             storage["error"] = "Repository path is empty"
         if not storage["available"]:
@@ -2557,7 +2561,15 @@ def resolve_repository(name: str | None = None, record_id: str | None = None) ->
     return normalize_repository_record(resolve_selector(catalog_records(REPOSITORIES), name=name, record_id=record_id, label="Repository"))
 
 
-def _ensure_smb_repository_share(server: Any, share: Any, username: Any, password: Any) -> None:
+def _ensure_smb_repository_share(
+    server: Any,
+    share: Any,
+    username: Any,
+    password: Any,
+    *,
+    previous_username: Any = None,
+    stored_password: Any = None,
+) -> None:
     """An SMB repository's server and share name the share Hyper-V hosts reach
     its folder by (abr-vhdx-tool writes there from the host); its username and
     password are the account that opens it, else the inventory's."""
@@ -2567,11 +2579,25 @@ def _ensure_smb_repository_share(server: Any, share: Any, username: Any, passwor
         "invalid_repository",
         "smb repositories require --server and --share, or --address \\\\server\\share",
     )
+    account = str(username or "").strip()
+    previous = str(previous_username or "").strip()
+    given = bool(str(password or ""))
     _ensure(
-        not str(username or "").strip() or bool(str(password or "")),
+        bool(account) or not given,
         422,
         "invalid_repository",
-        "An SMB repository's account needs --password with --username",
+        "An SMB repository's password needs the account it belongs to: give --username with --password, or "
+        "leave both out so the hosts open the share with the inventory's account",
+    )
+    keeps_stored = bool(previous) and account == previous and bool(str(stored_password or ""))
+    _ensure(
+        not account or given or keeps_stored,
+        422,
+        "invalid_repository",
+        f"The account {account} needs its own password: give --password with --username; the password of "
+        f"{previous} is not used for another account"
+        if previous and account != previous
+        else "An SMB repository's account needs --password with --username",
     )
 
 
@@ -2716,6 +2742,7 @@ def create_repository_record(payload: dict[str, Any], *, metadata_flags: dict[st
         _assert_immutability_is_usable(s3_config)
     persist_repository(record)
     created = normalize_repository_record(record)
+    created["warnings"] = [*created.get("warnings", []), *((registration_check or {}).get("warnings") or [])]
     if bucket_was_missing:
         created["warnings"] = [
             *created.get("warnings", []),
@@ -2794,8 +2821,10 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
             _ensure_smb_repository_share(
                 metadata.get("server"),
                 metadata.get("share"),
-                payload.get("username", metadata.get("username")),
-                payload.get("password", metadata.get("password")),
+                payload["username"] if payload.get("username") is not None else metadata.get("username"),
+                payload.get("password"),
+                previous_username=metadata.get("username"),
+                stored_password=metadata.get("password") if payload.get("password") is None else None,
             )
         else:
             _refuse_local_repository_share(payload.get("server"), payload.get("share"))
@@ -2912,6 +2941,7 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
     updated["updated_at"] = utc_now()
     persist_repository(updated)
     edited = normalize_repository_record(updated)
+    edited["warnings"] = [*edited.get("warnings", []), *((registration_check or {}).get("warnings") or [])]
     if next_immutability is not None:
         edited["immutability_effect"] = _immutability_effect_report(
             record_id, previous=previous_immutability or {}, current=next_immutability
@@ -2946,7 +2976,9 @@ def _repository_storage_location_mismatch(repository: dict[str, Any]) -> str | N
     )
 
 
-def _verify_local_repository(repository: dict[str, Any], *, whole_chains: bool = False) -> dict[str, Any]:
+def _verify_local_repository(
+    repository: dict[str, Any], *, whole_chains: bool = False, check_backups: bool = True
+) -> dict[str, Any]:
     path = Path(str(repository.get("path") or ""))
     checks: list[dict[str, Any]] = []
     exists, is_dir, access_error = _stat_operator_path(path)
@@ -2986,6 +3018,13 @@ def _verify_local_repository(repository: dict[str, Any], *, whole_chains: bool =
     except OSError as exc:
         checks.append({"name": "filesystem_probe", "status": "failed", "message": str(exc)})
         return {"status": "error", "checks": checks, "message": f"Filesystem probe failed: {exc}"}
+    share_check = share_mount_check(repository)
+    if share_check is not None:
+        checks.append(share_check)
+        if share_check["status"] == "failed":
+            return {"status": "error", "checks": checks, "message": share_check["message"]}
+        if share_check["status"] == "warning":
+            permission_warnings = [*permission_warnings, share_check["message"]]
 
     location_mismatch = _repository_storage_location_mismatch(repository)
     checks.append(
@@ -2998,18 +3037,19 @@ def _verify_local_repository(repository: dict[str, Any], *, whole_chains: bool =
     if location_mismatch:
         return {"status": "error", "checks": checks, "message": location_mismatch}
 
-    backup_health = _verify_repository_backup_health(str(repository.get("id") or ""), whole_chains=whole_chains)
-    checks.append(
-        {
-            "name": "block_consistency",
-            "status": backup_health["status"],
-            "message": backup_health["message"],
-            **({"errors": backup_health["errors"]} if backup_health["errors"] else {}),
-        }
-    )
-    if backup_health["status"] == "failed":
-        return {"status": "error", "checks": checks, "message": f"Backup integrity check failed: {backup_health['message']}"}
-    
+    if check_backups:
+        backup_health = _verify_repository_backup_health(str(repository.get("id") or ""), whole_chains=whole_chains)
+        checks.append(
+            {
+                "name": "block_consistency",
+                "status": backup_health["status"],
+                "message": backup_health["message"],
+                **({"errors": backup_health["errors"]} if backup_health["errors"] else {}),
+            }
+        )
+        if backup_health["status"] == "failed":
+            return {"status": "error", "checks": checks, "message": f"Backup integrity check failed: {backup_health['message']}"}
+
     message = "Repository is available"
     if permission_warnings:
         message = f"{message}. Warning: {' '.join(permission_warnings)}"
@@ -3587,6 +3627,8 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
     for point in normalized_backup_points():
         if str(point.get("segment_id") or "") != segment_id or str(point.get("id") or "") in skip:
             continue
+        if point.get("status") == POINT_DELETING:
+            continue
         repository = REPOSITORIES.get(str(point.get("repository_id") or ""))
         if not isinstance(repository, dict) or not is_s3_repository(repository):
             continue
@@ -3652,7 +3694,11 @@ def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
         repository_id=record_id,
     )
 
-    points = [point for point in normalized_backup_points() if str(point.get("repository_id") or "") == record_id]
+    points = [
+        point
+        for point in normalized_backup_points()
+        if str(point.get("repository_id") or "") == record_id and point.get("status") != POINT_DELETING
+    ]
     updated: list[str] = []
     failures: list[dict[str, Any]] = []
     applied_days: set[int] = set()
@@ -3789,6 +3835,33 @@ def test_s3_connection(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "success", "checks": checks, "message": "S3 connection succeeded"}
 
 
+def test_smb_connection(payload: dict[str, Any]) -> dict[str, Any]:
+    path = str(payload.get("path") or "").strip()
+    address = str(payload.get("address") or "").strip()
+    server = str(payload.get("server") or "").strip()
+    share = str(payload.get("share") or "").strip()
+    if address and (not server or not share):
+        parsed_server, parsed_share = _split_repository_address("smb", address)
+        server = server or parsed_server
+        share = share or parsed_share
+    _ensure_appliance_folder("smb", path)
+    _ensure_smb_repository_share(server, share, payload.get("username"), payload.get("password"))
+    record = {
+        "id": "",
+        "type": "smb",
+        "path": path,
+        "metadata": {"server": server, "share": share, "username": payload.get("username"), "password": payload.get("password")},
+    }
+    result = _with_share_account(_verify_local_repository(record, check_backups=False), record)
+    if result.get("status") != "success":
+        return {"status": "error", "checks": result.get("checks") or [], "message": result.get("message")}
+    return {
+        "status": "success",
+        "checks": result.get("checks") or [],
+        "message": str(result.get("message") or "").replace("Repository is available", "SMB folder and share match", 1),
+    }
+
+
 def _repository_verification_result(repository: dict[str, Any]) -> dict[str, Any]:
     repo_type = str(repository.get("type") or "")
     if is_file_repository(repository):
@@ -3826,11 +3899,14 @@ def _repository_connection_identity(record: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _verification_summary(result: dict[str, Any]) -> dict[str, Any]:
-    return {
+    summary = {
         "status": str(result.get("status") or "error"),
         "message": str(result.get("message") or ""),
         "checked_at": utc_now(),
     }
+    if result.get("warnings"):
+        summary["warnings"] = list(result["warnings"])
+    return summary
 
 
 def _repository_registration_checks(
@@ -3838,7 +3914,7 @@ def _repository_registration_checks(
 ) -> dict[str, Any] | None:
     repo_type = str(record.get("type") or "")
     if is_file_repository(record):
-        return _verify_local_repository(record)
+        return _with_share_account(_verify_local_repository(record, check_backups=False), record)
     if repo_type != "s3":
         return None
     config = extract_s3_config(record)
@@ -3855,6 +3931,23 @@ def _repository_registration_checks(
         "checks": checks,
         "message": "S3 repository is available; immutability: disabled, backups stay deletable",
     }
+
+
+def _with_share_account(result: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    if result.get("status") != "success":
+        return result
+    from python.srv.plugins.hyperv.hyperv import check_share_account
+
+    account = check_share_account(record)
+    if account is None:
+        return result
+    checked = {**result, "checks": [*(result.get("checks") or []), account]}
+    if account["status"] == "failed":
+        return {**checked, "status": "error", "message": account["message"]}
+    if account["status"] == "warning":
+        checked["warnings"] = [*(result.get("warnings") or []), account["message"]]
+        checked["message"] = f"{result.get('message')}. Warning: {account['message']}"
+    return checked
 
 
 def _assert_bucket_creation_is_sensible(record: dict[str, Any], *, create_bucket: bool) -> None:
@@ -3901,8 +3994,26 @@ def verify_repository(record_id: str) -> dict[str, Any]:
     return payload
 
 
+def _ensure_share_mounted(repository: dict[str, Any] | None) -> None:
+    message = unmounted_share_message(repository) if isinstance(repository, dict) else None
+    _ensure(
+        not message,
+        409,
+        "repository_share_not_mounted",
+        str(message),
+        repository=(repository or {}).get("name"),
+        path=(repository or {}).get("path"),
+    )
+
+
+def _point_repository_unmounted(point: dict[str, Any]) -> str | None:
+    repository = REPOSITORIES.get(str(point.get("repository_id") or ""))
+    return unmounted_share_message(repository) if isinstance(repository, dict) else None
+
+
 def rescan_repository(record_id: str) -> dict[str, Any]:
     repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    _ensure_share_mounted(repository)
     reconciled = reconcile_repository_points(repository)
     updated = _json_clone(repository)
     metadata = dict(updated.get("metadata") if isinstance(updated.get("metadata"), dict) else {})
@@ -5280,7 +5391,7 @@ def grouped_backup_points() -> dict[str, list[dict[str, Any]]]:
 
 def _points_for_job_vm_repo(job_id: str, vm_id: str, repository_id: str | None) -> list[dict[str, Any]]:
     chain_id = _chain_id_for_point(job_id, vm_id, repository_id)
-    return list(grouped_backup_points().get(chain_id, []))
+    return [point for point in grouped_backup_points().get(chain_id, []) if point.get("status") != POINT_DELETING]
 
 
 def _latest_successful_point(job_id: str, vm_id: str, repository_id: str | None) -> dict[str, Any] | None:
@@ -5792,6 +5903,7 @@ def _point_artifact_locations(point: dict[str, Any]) -> list[tuple[str, str]]:
 
 POINT_MISSING = "missing"
 POINT_CHAIN_BROKEN = "chain_broken"
+POINT_DELETING = "deleting"
 
 
 def _missing_ancestor(point: dict[str, Any], by_id: dict[str, dict[str, Any]], gone: set[str], unknown: set[str]) -> str | None:
@@ -5822,6 +5934,8 @@ def reconcile_repository_points(repository: dict[str, Any]) -> dict[str, int]:
     for point in points:
         point_id = str(point.get("id") or "")
         status = str(point.get("status") or "available")
+        if status == POINT_DELETING:
+            continue
         locations = _point_artifact_locations(point)
         if not locations:
             if status == POINT_MISSING:
@@ -6090,6 +6204,18 @@ def apply_retention_to_chain(
     if not points:
         return failures
     report["vm_name"] = points[-1].get("vm_name")
+    unmounted = _point_repository_unmounted(points[-1])
+    if unmounted:
+        report["skipped_reason"] = unmounted
+        report["repository_unavailable"] = unmounted
+        LOGGER.warning(
+            "Retention deleted nothing for job %s, VM %s in repository %s: %s",
+            job.get("id"),
+            report.get("vm_name") or vm_id,
+            repository_id,
+            unmounted,
+        )
+        return failures
     clock_block = clock_guard.retention_block()
     report["clock_blocked"] = clock_block
     if clock_block and not dry_run:
@@ -6286,6 +6412,7 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         "kept_min_fulls": sum(len(item["kept_min_fulls"]) for item in chains),
         "failed": sum(len(item["failed"]) for item in chains),
         "skipped": sum(1 for item in chains if item["skipped_reason"]),
+        "unavailable": sum(1 for item in chains if item.get("repository_unavailable")),
     }
     return {
         "job_id": str(job["id"]),
@@ -6631,6 +6758,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "immutability_expires_at": point.get("immutability_expires_at"),
             "parent_point_id": point.get("parent_point_id"),
             "status": point.get("status"),
+            "deletion_requested_at": point.get("deletion_requested_at"),
             "vm_id": point.get("vm_id"),
             "vm_name": point.get("vm_name"),
             "repository_id": point.get("repository_id"),
@@ -6669,7 +6797,25 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
         "latest_execution_type": latest.get("execution_type"),
         "latest_execution_reason": latest.get("execution_reason"),
         "gfs_protected": any(bool(point.get("gfs_protected")) for point in points),
+        "pending_deletion": _pending_deletion_summary(points),
         "restore_points": restore_points,
+    }
+
+
+def _pending_deletion_summary(points: list[dict[str, Any]]) -> dict[str, Any] | None:
+    pending = [point for point in points if point.get("status") == POINT_DELETING]
+    if not pending:
+        return None
+    lock_dates = [
+        _parse_dt(str(point.get("immutability_expires_at")))
+        for point in pending
+        if str(point.get("immutability_expires_at") or "").strip()
+    ]
+    requested = [str(point.get("deletion_requested_at")) for point in pending if point.get("deletion_requested_at")]
+    return {
+        "restore_point_count": len(pending),
+        "requested_at": min(requested) if requested else None,
+        "delete_after": max(lock_dates).isoformat() if lock_dates else None,
     }
 
 
@@ -7538,6 +7684,86 @@ def _discard_chain_leftovers(points: list[dict[str, Any]]) -> None:
         _remove_empty_chain_folders(folders, repository)
 
 
+def _mark_for_deletion(point_ids: list[str]) -> str | None:
+    requested_at = utc_now()
+    lock_dates: list[datetime] = []
+    for point_id in point_ids:
+        record = BACKUPS.get(point_id)
+        if not isinstance(record, dict):
+            continue
+        marked = dict(record)
+        marked["status"] = POINT_DELETING
+        marked["deletion_requested_at"] = record.get("deletion_requested_at") or requested_at
+        persist_backup(marked)
+        expires_at = str(marked.get("immutability_expires_at") or "").strip()
+        try:
+            if expires_at:
+                lock_dates.append(_parse_dt(expires_at))
+        except (TypeError, ValueError):
+            continue
+    return max(lock_dates).isoformat() if lock_dates else None
+
+
+def _deletion_due(point: dict[str, Any], now: datetime) -> bool:
+    try:
+        return _parse_dt(str(point.get("immutability_expires_at") or "")) <= now
+    except (TypeError, ValueError):
+        return True
+
+
+def retry_pending_deletions(now: datetime | None = None) -> int:
+    current = now or _now_utc()
+    removed = 0
+    for chain_id, points in grouped_backup_points().items():
+        pending = [point for point in points if point.get("status") == POINT_DELETING]
+        if not pending:
+            continue
+        unmounted = _point_repository_unmounted(pending[-1])
+        if unmounted:
+            LOGGER.warning("Restore point(s) of backup chain %s waiting for deletion are kept: %s", chain_id, unmounted)
+            continue
+        removed_here = 0
+        held: list[str] = []
+        for segment in _segment_points(pending):
+            for point in reversed(segment):
+                point_id = str(point.get("id") or "")
+                if not _deletion_due(point, current):
+                    held.append(point_id)
+                    break
+                try:
+                    if _delete_backup_artifacts_from_point(point):
+                        delete_backup(point_id)
+                    elif _point_repository_holds_immutable_backups(point):
+                        held.append(point_id)
+                        break
+                    else:
+                        _delete_local_point_cache(point)
+                        delete_backup(point_id)
+                except Exception:
+                    LOGGER.exception("Could not remove restore point %s, which is waiting for deletion", point_id)
+                    held.append(point_id)
+                    break
+                removed_here += 1
+        removed += removed_here
+        if removed_here:
+            LOGGER.info(
+                "Removed %d restore point(s) of backup chain %s that were waiting for deletion: their Object Lock "
+                "has expired",
+                removed_here,
+                chain_id,
+            )
+        refused = [point_id for point_id in held if _deletion_due(BACKUPS.get(point_id) or {}, current)]
+        if refused:
+            LOGGER.warning(
+                "Restore point(s) %s of backup chain %s are waiting for deletion, but the storage still refuses to "
+                "delete their data; they are tried again in %d s",
+                ", ".join(refused),
+                chain_id,
+                env_int("BACKUPSERVER_DELETE_RETRY_SECONDS"),
+            )
+    return removed
+
+
 def delete_backup_chain(
     backup_id: str,
     *,
@@ -7577,6 +7803,8 @@ def delete_backup_chain(
     ]
     if inconsistent:
         raise api_error(409, "inconsistent_backup_chain", "Repository/catalog state is inconsistent", restore_point_ids=inconsistent)
+    for repository_id in dict.fromkeys(str(point.get("repository_id") or "") for point in points):
+        _ensure_share_mounted(REPOSITORIES.get(repository_id))
 
     artifacts_removed = True
     retained_points: list[str] = []
@@ -7628,6 +7856,7 @@ def delete_backup_chain(
         _discard_chain_leftovers(points)
 
     kept_points = len(retained_points) + len(kept_for_chain)
+    delete_after = _mark_for_deletion(retained_points + kept_for_chain) if retained_points else None
     _emit(100, f"Deleted {total_points - kept_points} of {total_points} restore point(s)")
     immutable_points = len(retained_points)
     result = {
@@ -7644,15 +7873,18 @@ def delete_backup_chain(
         if immutable_points:
             result["immutable_restore_points"] = immutable_points
             result["retained_restore_point_ids"] = retained_points
+            result["pending_deletion_restore_point_ids"] = retained_points + kept_for_chain
+            result["delete_after"] = delete_after
         if kept_for_chain:
             result["kept_for_chain_restore_point_ids"] = kept_for_chain
         result["message"] = (
             (
-                f"{immutable_points} restore point(s) are still held under S3 Object Lock and the storage refused "
-                "to delete their data. They are kept in the catalog and retried once the lock expires, so nothing "
-                "is left untracked in the bucket."
+                f"{immutable_points} restore point(s) are still held under S3 Object Lock"
+                + (f" until {delete_after}" if delete_after else "")
+                + ", so the storage refused to delete their data. They are marked for deletion and removed "
+                "automatically once the lock expires; until then they cannot be restored or used by a job."
                 + (
-                    f" {len(kept_for_chain)} older restore point(s) they need to restore are kept with them."
+                    f" {len(kept_for_chain)} older restore point(s) they need to restore are marked with them."
                     if kept_for_chain
                     else ""
                 )
@@ -9721,12 +9953,19 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             "restore an earlier point"
         )
         if missing_ancestor
+        else (
+            f"Restore point is waiting for deletion: abr backup delete asked for it on "
+            f"{point.get('deletion_requested_at')}, and it is removed once its Object Lock expires "
+            f"({point.get('immutability_expires_at')})"
+        )
+        if point.get("status") == POINT_DELETING
         else "Restore point is not available for restore",
         point_id=point_id,
         status=point.get("status"),
         **({"missing_point_id": missing_ancestor} if missing_ancestor else {}),
     )
 
+    _ensure_share_mounted(REPOSITORIES.get(str(point.get("repository_id") or "")))
     request = _normalize_restore_request_payload(payload, point)
     _validate_restore_request_matches_point(request, point)
 

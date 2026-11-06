@@ -146,6 +146,7 @@ class S3RepositorySupportTests(unittest.TestCase):
             "super-secret-key",
         )
 
+    @patch("python.srv.services.abr_v41.share_mount_check", new=lambda repository: {"name": "share_mount", "status": "ok", "message": "mounted"})
     def test_create_smb_repository_masks_password_in_response(self) -> None:
         repository = abr_v41.create_repository_record(
             {
@@ -165,6 +166,7 @@ class S3RepositorySupportTests(unittest.TestCase):
         stored = REPOSITORIES[repository["id"]]
         self.assertEqual(stored["metadata"]["password"], "Canary-Password-9f3b21")
 
+    @patch("python.srv.services.abr_v41.share_mount_check", new=lambda repository: {"name": "share_mount", "status": "ok", "message": "mounted"})
     def test_list_and_resolve_smb_repository_also_mask_the_password(self) -> None:
         created = abr_v41.create_repository_record(
             {
@@ -702,7 +704,7 @@ class S3RepositorySupportTests(unittest.TestCase):
         self.assertEqual(payload["last_verify"]["status"], "error")
 
     @patch("python.srv.core.storage_tool.run_disk_tool")
-    def test_registering_or_editing_a_repository_still_reads_only_the_newest_points_and_says_so(
+    def test_registering_or_editing_a_repository_reads_no_backups_while_repo_verify_still_does(
         self, run_disk_tool_mock: object
     ) -> None:
         run_disk_tool_mock.side_effect = _disk_tool_stub("full.vmdk", "inc-1.vmdk")
@@ -712,13 +714,14 @@ class S3RepositorySupportTests(unittest.TestCase):
             self._chain_point(repository, "c-inc-1", "2026-01-02T00:00:00+00:00", "inc-1.vmdk", parent="c-full")
 
             result = abr_v41._repository_registration_checks(dict(REPOSITORIES[repository["id"]]))
+            registered = [call.args[0][2] for call in run_disk_tool_mock.call_args_list if call.args[0][0] == "verify"]
+            abr_v41.verify_repository(repository["id"])
 
         verified = [call.args[0][2] for call in run_disk_tool_mock.call_args_list if call.args[0][0] == "verify"]
-        self.assertEqual(verified, ["inc-1.vmdk"])
-        block_check = next(check for check in result["checks"] if check["name"] == "block_consistency")
-        self.assertEqual(
-            block_check["message"], "Verified 1 backup artifact(s) of the newest restore point of each of 1 chain(s)"
-        )
+        self.assertEqual(registered, [])
+        self.assertNotIn("block_consistency", [check["name"] for check in result["checks"]])
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(verified, ["full.vmdk", "inc-1.vmdk"])
 
     @patch("python.srv.core.storage_tool.run_disk_tool")
     def test_repo_verify_reads_only_the_points_this_repository_holds(self, run_disk_tool_mock: object) -> None:

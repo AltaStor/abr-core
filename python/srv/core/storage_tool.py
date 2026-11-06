@@ -305,6 +305,16 @@ def describe_bytes(value: int) -> str:
 
 
 def ensure_private_directory(path: Path) -> None:
+    for attempt in range(3):
+        try:
+            _create_private_directories(path)
+            return
+        except FileNotFoundError:
+            if attempt == 2:
+                raise
+
+
+def _create_private_directories(path: Path) -> None:
     missing: list[Path] = []
     current = path
     while not current.exists():
@@ -318,6 +328,17 @@ def ensure_private_directory(path: Path) -> None:
             os.chmod(directory, 0o750)
         except OSError:
             pass
+
+
+def remove_empty_parents(folder: Path, *, below: Path) -> None:
+    boundary = Path(below)
+    current = Path(folder)
+    while current != boundary and boundary in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
 
 
 def _fsync_path(path: Path) -> None:
