@@ -544,8 +544,8 @@ class RestorePointDTO(_LenientModel):
     gfs_marks: GfsMarksDTO | DocObject = None
     gfs_protected: bool = False
     parent_point_id: str | None = None
-    status: str | None = Field(default=None, description="available, missing, chain_broken, or deleting: abr backup delete asked for it while S3 Object Lock still held it, and it is removed once the lock expires")
-    deletion_requested_at: DocStr = Field(default=None, description="With status deleting: when abr backup delete asked for this restore point")
+    status: str | None = Field(default=None, description="available, missing, chain_broken, or deleting: a delete or retention pass is removing it (a pass cut short finishes on its own), or S3 Object Lock still holds it and it is removed once the lock expires; a deleting point is not offered for restore")
+    deletion_requested_at: DocStr = Field(default=None, description="With status deleting: when its removal was asked for")
     vm_id: str | None = None
     vm_name: str | None = None
     repository_id: str | None = None

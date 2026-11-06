@@ -67,7 +67,7 @@ class JobScheduler:
         self._access_lock_sweep: threading.Thread | None = None
         self._access_lock_sweep_at = time.monotonic()
         self._deletion_sweep: threading.Thread | None = None
-        self._deletion_sweep_at = time.monotonic()
+        self._deletion_sweep_at = float("-inf")
         self._reported_clock_anomalies: dict[str, str] = {}
 
     def start(self) -> None:

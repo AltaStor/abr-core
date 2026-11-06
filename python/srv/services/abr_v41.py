@@ -6313,6 +6313,7 @@ def apply_retention_to_chain(
             if dry_run:
                 report["removed"].append(point_id)
                 continue
+            _mark_for_deletion([point_id])
             if _delete_backup_artifacts_from_point(point):
                 delete_backup(point["id"])
                 _RETENTION_LOCK_REPORTED.discard(point_id)
@@ -7246,6 +7247,14 @@ def verify_backup_chain(
     work_items: list[tuple[dict[str, Any], dict[str, Any], str]] = []
 
     for point in points:
+        if point.get("status") == POINT_DELETING:
+            warnings.append(
+                {
+                    "point_id": point["id"],
+                    "message": "Restore point is waiting for deletion and is not offered for restore, so it was not verified",
+                }
+            )
+            continue
         if point["execution_type"] == "Incremental" and not point.get("parent_point_id"):
             warnings.append({"point_id": point["id"], "message": "Incremental restore point does not have a recorded parent"})
 
@@ -7333,7 +7342,7 @@ def verify_backup_chain(
         "result": result_state,
         "warnings": warnings,
         "errors": errors,
-        "checked_restore_points": len(points),
+        "checked_restore_points": sum(1 for point in points if point.get("status") != POINT_DELETING),
         "checked_artifacts": checked_artifacts,
     }
     if canceled:
@@ -7709,6 +7718,19 @@ def _mark_for_deletion(point_ids: list[str]) -> str | None:
     return max(lock_dates).isoformat() if lock_dates else None
 
 
+def _deleting_point_message(point: dict[str, Any]) -> str:
+    requested = point.get("deletion_requested_at")
+    if not str(point.get("immutability_expires_at") or "").strip():
+        return (
+            f"Restore point is being deleted: its removal started on {requested} and part of its data may already "
+            "be gone; the server finishes removing it"
+        )
+    return (
+        f"Restore point is waiting for deletion: abr backup delete asked for it on {requested}, and it is "
+        f"removed once its Object Lock expires ({point.get('immutability_expires_at')})"
+    )
+
+
 def _deletion_due(point: dict[str, Any], now: datetime) -> bool:
     try:
         return _parse_dt(str(point.get("immutability_expires_at") or "")) <= now
@@ -7840,6 +7862,7 @@ def delete_backup_chain(
                 )
                 kept_for_chain.append(point_id)
                 continue
+            _mark_for_deletion([point_id])
             if _delete_backup_artifacts_from_point(point):
                 delete_backup(point["id"])
                 continue
@@ -9962,11 +9985,7 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
             "restore an earlier point"
         )
         if missing_ancestor
-        else (
-            f"Restore point is waiting for deletion: abr backup delete asked for it on "
-            f"{point.get('deletion_requested_at')}, and it is removed once its Object Lock expires "
-            f"({point.get('immutability_expires_at')})"
-        )
+        else _deleting_point_message(point)
         if point.get("status") == POINT_DELETING
         else "Restore point is not available for restore",
         point_id=point_id,
