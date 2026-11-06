@@ -194,6 +194,14 @@ def _answers_without_tls(exc: BaseException) -> bool:
     return "wrong_version_number" in text or "wrong version number" in text or "record layer failure" in text
 
 
+def tool_location(args: List[str]) -> str:
+    for flag in ("--path", "--folder"):
+        if flag in args:
+            position = args.index(flag) + 1
+            return str(args[position]) if position < len(args) else ""
+    return ""
+
+
 def _stop_pipeline(shell: Any, node: str) -> None:
     try:
         shell.stop()
@@ -1167,9 +1175,8 @@ class HyperVNode(Hypervisor):
         ``NN%`` lines to ``on_progress``.
 
         Returns ``exit_code``, the ``--json`` ``result`` and the other
-        ``lines`` it printed. A stop request or a timeout stops the run,
-        which ends the tool; it discards what it had written itself, and no
-        virtual disk stays attached once it is gone.
+        ``lines`` it printed. A stop request or a timeout stops the run and
+        ends the tool process, so nothing on the host keeps its files open.
         """
         from pypsrp.complex_objects import ObjectMeta, PSInvocationState
         from pypsrp.exceptions import WinRMError
@@ -1223,9 +1230,11 @@ class HyperVNode(Hypervisor):
             while shell.state == PSInvocationState.RUNNING:
                 if should_cancel is not None and should_cancel():
                     _stop_pipeline(shell, node)
+                    self._end_tool(node, args)
                     raise ProcessCancelled("cancellation requested")
                 if timeout and time.monotonic() - started > timeout:
                     _stop_pipeline(shell, node)
+                    self._end_tool(node, args)
                     raise HyperVError(f"abr-vhdx-tool on {node} did not finish within {int(timeout)}s")
                 try:
                     shell.poll_invoke(timeout=2)
@@ -1271,6 +1280,18 @@ class HyperVNode(Hypervisor):
         protocol = "https" if transport.ssl else "http"
         logger.warning("Lost the WinRM connection to %s:%s (%s): %s", transport.server, transport.port, detail, exc)
         return HyperVUnreachableError(transport.server, [transport.port], detail, protocol=protocol)
+
+    def _end_tool(self, node: str, args: List[str]) -> None:
+        location = tool_location(args)
+        if not location:
+            return
+        try:
+            stopped = self.stop_disk_tool(node, [location])
+        except Exception as exc:
+            logger.warning("Could not end abr-vhdx-tool writing %s on %s: %s", location, node, exc)
+            return
+        if stopped:
+            logger.info("Ended %s on %s, which was still working on %s", ", ".join(stopped), node, location)
 
     def stop_disk_tool(self, node: str, paths: list[str]) -> list[str]:
         if not paths:

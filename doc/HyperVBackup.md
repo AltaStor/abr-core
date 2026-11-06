@@ -156,7 +156,11 @@ reason `IncrementalFallbackToFull`, when:
   starts over as a full.
 
 Whatever happens, the checkpoint does not outlive the run, and a failed or
-stopped run leaves no disk image in the repository. A failed run keeps the
+stopped run leaves no disk image in the repository: a stop ends abr-vhdx-tool
+on the host, then the session's folder is removed, retried for up to
+`ALTASTOR_HYPERV_DISCARD_RETRY_SECONDS` while the host lets go of its files. A
+folder that still cannot be removed is named in the session's message, and the
+next backup of the job removes it. A failed run keeps the
 previous backup's reference point, so the next incremental still has its
 position. If the checkpoint cannot be turned into a reference point, it is
 removed instead, and the next backup is a full one.

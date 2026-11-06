@@ -65,8 +65,9 @@ def vm_key_for_task(task: dict[str, object]) -> tuple[str, str] | None:
 
 
 def _keep_backup_snapshot(result: dict[str, object], previous_result: dict[str, object]) -> None:
-    if "backup_snapshot" not in result and isinstance(previous_result.get("backup_snapshot"), dict):
-        result["backup_snapshot"] = previous_result["backup_snapshot"]
+    for field in ("backup_snapshot", "left_session_data"):
+        if field not in result and isinstance(previous_result.get(field), dict):
+            result[field] = previous_result[field]
 
 
 class TaskProcessPool:

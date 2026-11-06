@@ -31,6 +31,7 @@ import errno
 import json
 import logging
 import re
+import shutil
 import time
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
@@ -47,9 +48,11 @@ from ...core.storage_tool import (
     filesystem_free_bytes,
     is_s3_repository,
     make_durable,
+    remove_empty_parents,
     run_disk_tool,
     write_file_durably,
 )
+from ...core.server_defaults import env_int
 from ...core.subprocess_util import ProcessCancelled
 from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...core.utils import utc_now
@@ -134,6 +137,116 @@ def _out_of_space_error(repository: dict[str, Any], exc: OSError) -> HyperVBacku
     if exc.errno != errno.ENOSPC:
         return None
     return HyperVBackupError(out_of_space_message(repository, _repository_free_bytes(repository)))
+
+
+DISCARD_RETRY_PAUSE_SECONDS = 2
+
+
+def remove_session_folder(folder: Path, seconds: int) -> str:
+    deadline = time.monotonic() + max(0, seconds)
+    while True:
+        try:
+            shutil.rmtree(folder)
+            return ""
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            reason = f"{exc.strerror} ({exc.filename})" if exc.strerror and exc.filename else str(exc)
+        if time.monotonic() >= deadline:
+            return reason
+        time.sleep(DISCARD_RETRY_PAUSE_SECONDS)
+
+
+def _discard_session(
+    repository: dict[str, Any],
+    abr_path: str,
+    written_backup_names: list[str],
+    task_root: Path,
+    destination_root: Path,
+) -> tuple[list[str], str]:
+    stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
+    if is_s3_repository(repository):
+        return stranded, ""
+    reason = remove_session_folder(task_root, env_int("ALTASTOR_HYPERV_DISCARD_RETRY_SECONDS", minimum=0))
+    if not reason:
+        remove_empty_parents(task_root.parent, below=destination_root)
+    return stranded, reason
+
+
+def _left_data_message(task_root: Path, reason: str) -> str:
+    return (
+        f"What this session had written could not be removed from {task_root}: {reason}. "
+        "The next backup of this job removes it"
+    )
+
+
+def _record_left_data(
+    progress_callback: ProgressCallback, repository: dict[str, Any], task_root: Path, reason: str, *, warn: bool
+) -> None:
+    logger.error("Hyper-V backup left %s behind: %s", task_root, reason)
+    if progress_callback is None:
+        return
+    payload: dict[str, object] = {
+        "updated_at": utc_now(),
+        "left_session_data": {"path": str(task_root), "repository_id": str(repository.get("id") or ""), "reason": reason},
+    }
+    if warn:
+        payload.update({"message": _left_data_message(task_root, reason), "log_level": "warn"})
+    else:
+        payload["log_entry"] = False
+    try:
+        progress_callback(payload)
+    except TaskStopRequested:
+        pass
+
+
+def _stopped(
+    progress_callback: ProgressCallback,
+    repository: dict[str, Any],
+    abr_path: str,
+    written_backup_names: list[str],
+    task_root: Path,
+    destination_root: Path,
+) -> str:
+    stranded, reason = _discard_session(repository, abr_path, written_backup_names, task_root, destination_root)
+    message = _stop_message(stranded, abr_path, task_root)
+    if not reason:
+        return message
+    _record_left_data(progress_callback, repository, task_root, reason, warn=False)
+    return f"{message}. {_left_data_message(task_root, reason)}"
+
+
+def _remove_left_session_data(
+    task: dict[str, Any], repository: dict[str, Any], progress_callback: ProgressCallback
+) -> None:
+    from ...services.backup_catalog import forget_left_session_data, left_session_data
+
+    if is_s3_repository(repository):
+        return
+    root = Path(str(repository.get("path") or "")).expanduser().resolve()
+    try:
+        pending = left_session_data(str(task.get("job_id") or ""), exclude_task_id=str(task.get("id") or ""))
+    except Exception:
+        logger.exception("Could not look up what earlier sessions of job %s left in its repository", task.get("job_id"))
+        return
+    for task_id, entry in pending:
+        folder = Path(str(entry.get("path") or ""))
+        if str(entry.get("repository_id") or "") != str(repository.get("id") or ""):
+            continue
+        if folder.name != task_id or root not in folder.resolve().parents:
+            continue
+        reason = remove_session_folder(folder, 0)
+        if reason:
+            _warn(
+                progress_callback,
+                "prepare",
+                6,
+                f"Could not remove what session {task_id} left in {folder}: {reason}. The next backup tries again",
+            )
+            continue
+        remove_empty_parents(folder.parent, below=root)
+        _emit(progress_callback, "prepare", 6, f"Removed what session {task_id} left in {folder} when it ended")
+        forget_left_session_data(task_id)
 
 
 def _make_task_root(repository: dict[str, Any], task_root: Path) -> None:
@@ -420,6 +533,7 @@ def run_hyperv_backup(
         task=task, vm_name=vm_name, parameters=parameters, repository=repository
     )
     _make_task_root(repository, task_root)
+    _remove_left_session_data(task, repository, progress_callback)
     storage_args, storage_env = vhdx_tool.storage_invocation(repository, abr_path=abr_path)
     repository_label = _repository_label(repository, str(abr_path))
     inventory_name = str(hypervisor.get("name") or task.get("hypervisor_id") or "")
@@ -807,12 +921,12 @@ def run_hyperv_backup(
         }
     except ProcessCancelled as exc:
         logger.info("Hyper-V backup session %s of VM %s stopped; discarding what it had written.", task_id, vm_name)
-        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
-        raise TaskStopRequested(_stop_message(stranded, abr_path, task_root)) from exc
+        message = _stopped(progress_callback, repository, abr_path, written_backup_names, task_root, destination_root)
+        raise TaskStopRequested(message) from exc
     except TaskStopRequested:
         logger.info("Hyper-V backup session %s of VM %s stopped; discarding what it had written.", task_id, vm_name)
-        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
-        raise TaskStopRequested(_stop_message(stranded, abr_path, task_root)) from None
+        message = _stopped(progress_callback, repository, abr_path, written_backup_names, task_root, destination_root)
+        raise TaskStopRequested(message) from None
     except Exception as exc:
         logger.exception(
             "Hyper-V backup session %s of VM %s (%s) failed after %.1fs: %s",
@@ -822,7 +936,9 @@ def run_hyperv_backup(
             time.time() - start_time,
             exc,
         )
-        _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
+        _stranded, reason = _discard_session(repository, abr_path, written_backup_names, task_root, destination_root)
+        if reason:
+            _record_left_data(progress_callback, repository, task_root, reason, warn=True)
         lost = lost_host(exc)
         if lost is not None and str(exc) == str(lost):
             raise HyperVBackupError(lost_host_message(lost, vm_name)) from exc
