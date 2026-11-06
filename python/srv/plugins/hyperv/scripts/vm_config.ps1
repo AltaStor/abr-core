@@ -52,6 +52,7 @@ $adapters = @(Get-VMNetworkAdapter -VM $vm | ForEach-Object {
         label = [string]$_.Name
         network = [string]$_.SwitchName
         connected = [bool]$_.SwitchName
+        adapter_id = [string]$_.Id -replace '^.*\\', ''
         mac = [string]$_.MacAddress
         dynamic_mac = [bool]$_.DynamicMacAddressEnabled
         legacy = [bool]$_.IsLegacy

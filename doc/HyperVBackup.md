@@ -205,16 +205,43 @@ old TPM (BitLocker keys, for one) need their recovery keys; the session warns
 about it.
 
 **In place** (`abr restore start --in-place --force`, or *Original location*
-with the typed confirmation in the console) keeps the VM itself -- its id,
-network adapters and cluster role -- and replaces its disks. The restored disks
-are written next to the current ones, then the VM is turned off, set back to the
-processor and memory the backup recorded, pointed at the restored files, and only
-then are the replaced files deleted. Its network adapters go back to the virtual
-switches and access VLANs the backup recorded, and the session says which ones
-moved; a switch the backup recorded that the host no longer has refuses the
-restore before anything changes. A VM with checkpoints is refused: replacing
-disks under a checkpoint chain would break it. Its next backup is a full one,
-since the new disks start their change tracking over.
+with the typed confirmation in the console) keeps the VM itself -- its id and
+cluster role -- and replaces its disks. The restored disks are written next to
+the current ones, then the VM is turned off, set back to the configuration the
+backup recorded, pointed at the restored files, and only then are the replaced
+files deleted. A VM with checkpoints is refused: replacing disks under a
+checkpoint chain would break it. Its next backup is a full one, since the new
+disks start their change tracking over.
+
+What an in-place restore sets back to the restore point, and the session lists
+what it changed:
+
+- processor count, reserve, limit and weight, and nested virtualization;
+- memory, dynamic memory with its minimum, maximum and buffer, and memory weight;
+- notes, automatic start and stop actions, and checkpoint type;
+- the boot order, when the VM booted from one of the restored disks (generation
+  2) or always (generation 1);
+- the network adapters: an adapter of the backup that the VM no longer has is
+  created again with its name, switch, access VLAN and, if it had one, its
+  static MAC address; an adapter added after the backup is removed; one moved to
+  another switch or VLAN goes back. Adapters are matched by the id the backup
+  recorded; when that adapter is gone, one that already has its name, switch,
+  VLAN and static MAC address is kept as it is (an adapter an earlier in-place
+  restore recreated, for one). Restore points taken before the id was recorded
+  match adapters by MAC address, then by name. A switch the backup recorded that the host no longer
+  has refuses the restore before anything changes.
+
+What it deliberately leaves as it is, and names in a session warning when it
+differs from the restore point:
+
+- Secure Boot and its template, and the virtual TPM: changing them under an
+  installed guest can stop it from booting or lose the secrets sealed to the TPM
+  (BitLocker keys, for one);
+- DVD drives and the media in them;
+- hard disks attached after the backup: their data is not in the backup, so they
+  stay attached as they are;
+- the configuration version, which cannot go back;
+- the boot order of a generation 2 VM that did not boot from a restored disk.
 
 A failure removes what the restore created and, in place, points the VM back at
 its original disks.

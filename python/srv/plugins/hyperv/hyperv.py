@@ -1430,8 +1430,21 @@ class HyperVNode(Hypervisor):
     def set_boot_disk(self, vm_name: str, slot: str, boot_order: List[Dict[str, Any]] | None = None) -> None:
         self._run_vm_script(vm_name, "set_boot.ps1", {"slot": slot, "boot_order": boot_order or []})
 
-    def set_vm_hardware(self, vm_name: str, config: Dict[str, Any]) -> None:
-        self._run_vm_script(
+    def set_vm_hardware(self, vm_name: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        optional = (
+            "cpu_reserve",
+            "cpu_limit",
+            "cpu_weight",
+            "nested_virtualization",
+            "memory_buffer",
+            "memory_priority",
+            "notes",
+            "automatic_start_action",
+            "automatic_start_delay",
+            "automatic_stop_action",
+            "checkpoint_type",
+        )
+        rows = self._run_vm_script(
             vm_name,
             "set_hardware.ps1",
             {
@@ -1440,11 +1453,13 @@ class HyperVNode(Hypervisor):
                 "dynamic_memory": bool(config.get("dynamic_memory")),
                 "memory_minimum_mb": int(config.get("memory_minimum_mb") or 0),
                 "memory_maximum_mb": int(config.get("memory_maximum_mb") or 0),
+                **{key: config.get(key) for key in optional},
             },
         )
+        return [dict(item) for item in ((rows[0] if rows else {}).get("changed") or []) if isinstance(item, dict)]
 
-    def connect_vm_adapters(self, vm_name: str, adapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        rows = self._run_vm_script(vm_name, "connect_adapters.ps1", {"adapters": adapters})
+    def restore_vm_adapters(self, vm_name: str, adapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows = self._run_vm_script(vm_name, "restore_adapters.ps1", {"adapters": adapters})
         return [dict(item) for item in rows]
 
     def replace_vm_disks(self, vm_name: str, disks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
