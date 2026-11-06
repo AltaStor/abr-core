@@ -124,9 +124,11 @@ It mirrors the VMware backup step for step:
    removed first. The same cleanup runs when the server starts.
 2. abr-vhdx-tool on the node that owns the VM checks that it can reach the
    repository (`info` on the run's folder, with the same storage options and
-   credentials the backup uses). A node that cannot reach it fails the run
-   with the tool's reason before the VM is touched: no checkpoint is taken and
-   the previous backup's reference point stays.
+   credentials the backup uses) and, for an SMB repository, that it can write
+   there (a small `abr-write-check` metadata file it saves and removes again).
+   A node that cannot reach it, or whose share account may only read, fails the
+   run with the reason before the VM is touched: no checkpoint is taken and the
+   previous backup's reference point stays.
 3. The checkpoint freezes the VM's disks: from then on the VM writes to new
    differencing disks, and the files the backup reads no longer change. Taking
    it also turns RCT on for the VM's disks.
@@ -269,6 +271,7 @@ Lock validation. Credentials and encryption keys are never written to either.
 | --- | --- |
 | `reaches S3 and SMB repositories only` | Point the job at an S3 or SMB repository (`abr repo add --type smb`) |
 | `cannot reach repository` | The reason that follows it: the S3 endpoint, keys and bucket the repository names, or its share, as seen from that node |
+| `can read repository ... but cannot write to it` | Give the account it names write access to the share, or set an account that has it (`abr repo edit --username ... --password`) |
 | `cannot open the repository share` | The share's account (the repository's `--username`, else the inventory's), and that every node reaches the share on TCP 445 |
 | `did not answer WinRM over HTTPS on port ...` | No HTTPS listener on that port of the host: set one up, or set the inventory to HTTP (`abr inventory edit --protocol http`) |
 | `the port answers without TLS` | The port is an HTTP listener: give the HTTPS listener's port, or set the inventory to HTTP |

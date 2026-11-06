@@ -104,6 +104,7 @@ class HyperVBackupError(RuntimeError):
 _WRITE_FAILED = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _NO_SPACE = re.compile(r"no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _FAILED_AT_OFFSET = re.compile(r"at offset (\d+)", re.IGNORECASE)
+NEARLY_FULL_BYTES = 64 * 1024 * 1024
 
 
 def _repository_free_bytes(repository: dict[str, Any]) -> int | None:
@@ -595,7 +596,7 @@ def run_hyperv_backup(
             tool_path = node.ensure_disk_tool(source_node)
             _emit(progress_callback, "prepare", 10, f"abr-vhdx-tool is ready on {source_node} at {tool_path}")
             _check_repository_access(
-                node, source_node, storage_args, storage_env, repository_label, task_id, progress_callback
+                node, source_node, storage_args, storage_env, repository_label, task_id, progress_callback, repository
             )
 
             # A checkpoint can only be application consistent when there is
@@ -958,19 +959,52 @@ def _check_repository_access(
     repository_label: str,
     task_id: str,
     progress_callback: ProgressCallback,
+    repository: dict[str, Any] | None = None,
 ) -> None:
-    run = node.run_disk_tool(
-        source_node,
-        ["info", "--json", *storage_args],
-        env=storage_env,
-        should_cancel=lambda: cancel_requested(task_id),
-        timeout=REPOSITORY_CHECK_TIMEOUT_SECONDS,
-    )
-    result = run.get("result") or {}
-    if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
-        detail = vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
+    def tool(args: list[str]) -> tuple[bool, str]:
+        run = node.run_disk_tool(
+            source_node,
+            args,
+            env=storage_env,
+            should_cancel=lambda: cancel_requested(task_id),
+            timeout=REPOSITORY_CHECK_TIMEOUT_SECONDS,
+        )
+        result = run.get("result") or {}
+        if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
+            return False, vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
+        return True, ""
+
+    reached, detail = tool(["info", "--json", *storage_args])
+    if not reached:
         raise HyperVBackupError(f"{source_node} cannot reach repository {repository_label}: {detail}")
-    _emit(progress_callback, "prepare", 12, f"Repository {repository_label} is reachable from {source_node}")
+    if isinstance(repository, dict) and not is_s3_repository(repository):
+        source = f"{node.ensure_host_bundle(source_node)}\\{WRITE_CHECK_SOURCE}"
+        written, detail = tool(["meta_save", "--json", "--name", WRITE_CHECK_NAME, *storage_args, "--source", source])
+        if not written:
+            raise HyperVBackupError(_cannot_write_message(repository, storage_env, source_node, repository_label, detail))
+        removed, detail = tool(["remove", "--json", "--force", "--name", WRITE_CHECK_NAME, *storage_args])
+        if not removed:
+            logger.warning("Could not remove the write check %s from %s: %s", WRITE_CHECK_NAME, repository_label, detail)
+    _emit(progress_callback, "prepare", 12, f"Repository {repository_label} is reachable and writable from {source_node}")
+
+
+WRITE_CHECK_NAME = "abr-write-check"
+WRITE_CHECK_SOURCE = "scripts\\tool_info.ps1"
+
+
+def _cannot_write_message(
+    repository: dict[str, Any], storage_env: dict[str, str], source_node: str, repository_label: str, detail: str
+) -> str:
+    free = _repository_free_bytes(repository)
+    if free is not None and free < NEARLY_FULL_BYTES:
+        return f"{source_node} cannot write to repository {repository_label}: {out_of_space_message(repository, free)}"
+    share = str(storage_env.get("ABR_SMB_SHARE") or vhdx_tool.windows_share(repository) or repository.get("path") or "")
+    account = str(storage_env.get("ABR_SMB_USER") or "")
+    who = f"the account {account}" if account else "the account of the Hyper-V inventory"
+    return (
+        f"{source_node} can read repository {repository_label} but cannot write to it: {who} has no write access "
+        f"to {share}. Give it write access to the share, or set an account that has it ({detail})"
+    )
 
 
 def _back_up_disks(
