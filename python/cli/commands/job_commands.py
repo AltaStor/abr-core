@@ -22,6 +22,8 @@ from ..parsing.validators import (
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
 
+RETENTION_TIMEOUT_SECONDS = 21600
+
 
 def _session_failure_exit_code(session: Any) -> int:
     if not isinstance(session, dict):
@@ -703,7 +705,9 @@ class JobCommands:
         deps = CommandDependencies(args)
         dry_run = bool(getattr(args, "dry_run", False))
         result = deps.context.api_client.post(
-            f"api/v1/jobs/{self._resolve_id(deps, args)}/retention", json={"dry_run": dry_run}
+            f"api/v1/jobs/{self._resolve_id(deps, args)}/retention",
+            json={"dry_run": dry_run},
+            timeout=RETENTION_TIMEOUT_SECONDS,
         )
         summary = result.get("summary") if isinstance(result, dict) else {}
         summary = summary if isinstance(summary, dict) else {}

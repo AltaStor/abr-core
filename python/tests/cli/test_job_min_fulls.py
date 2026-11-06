@@ -8,7 +8,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
-from python.cli.exit_codes import INVALID_STATE
+from python.cli.exit_codes import GENERAL_ERROR, INVALID_STATE
 from python.cli.parsing.parser_builder import AltaStorParserBuilder
 from python.cli.services.job_service import JobService
 
@@ -109,6 +109,50 @@ class RetentionMinFullsFlagTests(unittest.TestCase):
         self.assertIn("Error: 1 chain(s) were not touched: The share", codes[False][1])
         self.assertEqual(codes[True][0], 0)
         self.assertIn("Warning: 1 chain(s) were not touched", codes[True][1])
+
+    def _retention_run(self, result: dict, *extra: str) -> tuple[int, str, object]:
+        args = self._parse("job", "retention", "--id", "job-1", *extra)
+        stderr = io.StringIO()
+        with patch("python.cli.api.client.requests.request", return_value=_FakeResponse(result)) as request, redirect_stdout(
+            io.StringIO()
+        ), redirect_stderr(stderr):
+            code = args.handler(args)
+        return code, stderr.getvalue(), request
+
+    def test_job_retention_waits_for_the_server_as_long_as_a_backup_delete(self) -> None:
+        from python.cli.commands.backup_commands import BACKUP_DELETE_TIMEOUT_SECONDS
+        from python.cli.commands.job_commands import RETENTION_TIMEOUT_SECONDS
+
+        result = {"job_name": "nightly", "retention_days": 7, "gfs": {}, "summary": {"points": 0, "removed": 0}, "chains": []}
+        for extra in ((), ("--dry-run",)):
+            with self.subTest(extra=extra):
+                _code, _stderr, request = self._retention_run(result, *extra)
+
+                self.assertEqual(request.call_args.kwargs["timeout"], RETENTION_TIMEOUT_SECONDS)
+                self.assertEqual(RETENTION_TIMEOUT_SECONDS, BACKUP_DELETE_TIMEOUT_SECONDS)
+
+    def test_job_retention_exits_with_an_error_when_points_could_not_be_removed(self) -> None:
+        chain = {
+            "vm_name": "demo-vm", "repository_name": "S3", "points": 4, "removed": ["incr-a"], "held": [],
+            "failed": ["full-a"], "kept_for_chain": [], "kept_min_fulls": [], "skipped_reason": None,
+        }
+        result = {"job_name": "nightly", "retention_days": 2, "gfs": {}, "summary": {"points": 4, "removed": 1, "failed": 1}, "chains": [chain]}
+
+        code, stderr, _request = self._retention_run(result)
+
+        self.assertEqual(code, GENERAL_ERROR)
+        self.assertIn("Error: 1 expired restore point(s) could not be removed", stderr)
+
+    def test_job_retention_succeeds_when_points_are_only_held_by_object_lock(self) -> None:
+        chain = {
+            "vm_name": "demo-vm", "repository_name": "S3", "points": 4, "removed": ["incr-a"], "held": [{"id": "full-a", "until": "2026-11-10T00:00:00+00:00"}],
+            "failed": [], "kept_for_chain": [], "kept_min_fulls": [], "skipped_reason": None,
+        }
+        result = {"job_name": "nightly", "retention_days": 2, "gfs": {}, "summary": {"points": 4, "removed": 1, "failed": 0}, "chains": [chain]}
+
+        code, _stderr, _request = self._retention_run(result)
+
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
