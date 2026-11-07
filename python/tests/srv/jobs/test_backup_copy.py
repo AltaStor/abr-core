@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import errno
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from python.srv.core.job_scheduler import JobScheduler
@@ -21,6 +23,7 @@ from python.srv.services import abr_v41, backup_copy
 from python.srv.services.api_errors import ApiError
 from python.srv.services.backup_catalog import register_backup_from_completed_task
 from python.srv.services.backup_copy import BackupCopyError, BackupCopyValidationError
+from python.srv.services.synthetic_full import SyntheticFullError
 
 FULL = {"type": "weekly", "days": ["sunday"], "time": "02:00"}
 VM = "vm-1"
@@ -505,6 +508,69 @@ class CopyToggleTests(_Catalog):
         self.assertEqual([task["trigger"] for task in sessions], ["schedule"])
         plan = backup_copy.plan_copy(abr_v41.normalize_job_record(JOBS[self.copy["id"]]), VM)
         self.assertEqual((plan["kind"], [point["id"] for point in plan["points"]], plan["parent"]["id"]), ("incremental", ["i1"], "c1"))
+
+
+class CopyRunsToTheEndTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        self._point("f1", "ActiveFull")
+        self.copy = self._copy_job(retry_count=0)
+        self.task = backup_copy.create_copy_sessions(JOBS[self.copy["id"]], trigger="manual", include_idle=True)[0]
+        self.removed: list[str] = []
+        for target, value in (
+            ("copy_disk_tool_chain", {"raw_data_size": 10, "stored_data_size": 4, "merged_from": 1}),
+            ("_source_manifest", {"format_version": 1, "vm_config": {}}),
+        ):
+            self.enterContext(patch.object(backup_copy, target, return_value=value))
+        self.enterContext(patch("python.srv.services.synthetic_full.run_disk_tool"))
+        self.enterContext(patch("python.srv.services.synthetic_full.apply_repository_immutability"))
+        self.enterContext(
+            patch(
+                "python.srv.services.synthetic_full.remove_disk_tool_backup",
+                side_effect=lambda repository, path, name, **kwargs: self.removed.append(name),
+            )
+        )
+
+    def test_a_copy_writes_its_manifest_and_completes(self) -> None:
+        result = backup_copy.run_backup_copy(self.task)
+
+        self.assertTrue(Path(result["manifest_path"]).is_file())
+        self.assertEqual(self.removed, [])
+
+    def test_a_copy_that_cannot_be_flushed_removes_its_disks_and_its_manifest(self) -> None:
+        with patch.object(backup_copy, "make_durable", side_effect=OSError(5, "Input/output error")), self.assertRaises(
+            BackupCopyError
+        ):
+            backup_copy.run_backup_copy(self.task)
+
+        self.assertEqual(self.removed, ["disk-0.vmdk", "manifest"])
+
+    def _left_in_the_destination(self) -> list[str]:
+        root = Path(REPOSITORIES["dst"]["path"])
+        return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+
+    def test_a_copy_whose_manifest_does_not_fit_removes_what_it_wrote(self) -> None:
+        def full(path, text):
+            path.with_name(f".{path.name}.tmp").write_text(text[:10])
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with patch("python.srv.services.synthetic_full.write_file_durably", side_effect=full), self.assertRaises(
+            SyntheticFullError
+        ) as caught:
+            backup_copy.run_backup_copy(self.task)
+
+        self.assertIn("ran out of space", str(caught.exception))
+        self.assertEqual(self.removed, ["disk-0.vmdk"])
+        self.assertEqual(self._left_in_the_destination(), [])
+
+    def test_an_unexpected_error_after_the_disks_were_copied_removes_them(self) -> None:
+        with patch.object(backup_copy, "_source_manifest", side_effect=RuntimeError("catalog gone")), self.assertRaises(
+            RuntimeError
+        ):
+            backup_copy.run_backup_copy(self.task)
+
+        self.assertEqual(self.removed, ["disk-0.vmdk"])
+        self.assertEqual(self._left_in_the_destination(), [])
 
 
 class CopyRetryTests(_Catalog):

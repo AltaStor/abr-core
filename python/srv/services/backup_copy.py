@@ -592,14 +592,6 @@ def _copy_once(
     )
 
     free_at_start = _free_bytes_at_start(repository)
-    if not is_s3_repository(repository):
-        try:
-            ensure_private_directory(task_root.parent)
-        except OSError as exc:
-            if exc.errno != errno.ENOSPC:
-                raise
-            raise BackupCopyError(_out_of_space_message(repository, free_at_start)) from exc
-
     retention_days = None
     retention_till = None
     generation: dict[str, Any] | None = None
@@ -622,139 +614,157 @@ def _copy_once(
             retention_days = int(generation["lock_days"])
             retention_till = chain_retention_till(repository, generation.get("expires_at"))
 
-    total = len(merges)
     written: list[str] = []
-    disk_outputs: list[dict[str, Any]] = []
-    logical_total = 0
-    stored_total = 0
-    for position, merge in enumerate(merges):
-        backup_name = str(merge["template"].get("abr_backup_name") or "")
-        base = int(position * 100 / total)
-        span = max(int(100 / total), 1)
-        emit(base, f"Copying disk {position + 1}/{total}")
-
-        def _on_progress(percent: int, _block: int, base=base, span=span, position=position) -> None:
-            emit(base + int(percent * span / 100), f"Copying disk {position + 1}/{total}: {percent}%")
-
-        try:
-            result = copy_disk_tool_chain(
-                source_repository=source_repository,
-                source_abr_path=merge["source_path"],
-                source_names=merge["source_names"],
-                destination_repository=repository,
-                destination_abr_path=destination_path,
-                backup_name=backup_name,
-                compression_level=compression_level,
-                encryption_key=encryption_key,
-                source_encryption_key=source_key,
-                retention_days=retention_days,
-                retention_till=retention_till,
-                timeout=timeout_seconds,
-                on_progress=_on_progress,
-                should_cancel=lambda: cancel_requested(task_id) or _window_closed(job),
-            )
-        except ProcessCancelled as exc:
-            _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name, below=destination_root)
-            if not cancel_requested(task_id) and _window_closed(job):
-                raise _stop_for_window(job, "while it copied; what it had written was discarded") from exc
-            raise TaskStopRequested("Backup copy cancelled; what it had written was discarded") from exc
-        except StorageToolError as exc:
-            _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name, below=destination_root)
-            detail = _no_room_detail(repository, points, free_at_start)
-            raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {detail or exc}") from exc
-        except OSError as exc:
-            _discard_partial_merge(repository, destination_path, written, task_root, in_flight=backup_name, below=destination_root)
-            if exc.errno == errno.ENOSPC:
-                raise BackupCopyError(
-                    f"Copying disk {position + 1}/{total} failed: "
-                    + _out_of_space_message(repository, _free_bytes_at_start(repository))
-                ) from exc
-            raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {exc}") from exc
-        written.append(backup_name)
-
-        entry = _disk_entry(
-            merge,
-            result,
-            abr_path=destination_path,
-            abr_backup_name=backup_name,
-            repository_id=repository_id,
-            repository_type=str(repository.get("type") or "local"),
-            storage_mode="s3" if is_s3_repository(repository) else "local",
-        )
-        logical_total += int(entry.get("logical_bytes") or 0)
-        stored_total += int(entry.get("stored_bytes") or 0)
-        disk_outputs.append(entry)
-
-    repository_type = str(repository.get("type") or "local")
-    if repository_type != "s3" and stored_total <= 0:
-        stored_total = _dir_size_bytes(task_root)
-
-    manifest_payload = _source_manifest(target)
-    if not manifest_payload:
-        _discard_partial_merge(repository, destination_path, written, task_root, below=destination_root)
-        raise BackupCopyValidationError(
-            f"The manifest of restore point {target.get('id')} could not be read, so its copy would not be restorable"
-        )
-
-    execution_type = "ActiveFull" if kind == "full" else "Incremental"
-    requested_type = str(parameters.get("resolved_backup_type") or "Incremental")
-    execution_reason = (
-        "SourceNewChain"
-        if kind == "full" and requested_type not in FULL_EXECUTION_TYPES
-        else str(parameters.get("resolved_backup_reason") or "BackupCopy")
-    )
-
-    parent = plan.get("parent") or {}
-    copy_source = {
-        "job_id": target.get("job_id"),
-        "job_name": target.get("job_name"),
-        "repository_id": source_repository_id,
-        "repository_name": source_repository.get("name"),
-        "point_id": target.get("id"),
-        "point_ids": [str(point.get("id") or "") for point in points],
-        "execution_types": [str(point.get("execution_type") or "") for point in points],
-        "created_at": target.get("created_at"),
-    }
-
-    manifest_payload.update(
-        {
-            "operation": "vm-backup",
-            "backup_mode": "full" if kind == "full" else "incremental",
-            "resolved_backup_type": execution_type,
-            "resolved_backup_reason": execution_reason,
-            "parent_point_id": parent.get("id"),
-            "storage_layout": storage_layout,
-            "incremental": kind != "full",
-            "differential": False,
-            "synthetic_full": False,
-            "copy_source": copy_source,
-            "snapshot_name": "",
-            "snapshot_moref": "",
-            "disks": disk_outputs,
-            "compression_level": compression_level,
-            "encryption_enabled": bool(encryption_key),
-            "repository_id": repository_id,
-            "repository_type": repository_type,
-            "storage_mode": "s3" if repository_type == "s3" else "local",
-            "repository_storage_path": destination_path if repository_type == "s3" else str(task_root),
-            "backup_root": str(task_root),
-            "logical_bytes": logical_total,
-            "transferred_bytes": stored_total,
-            "created_at": utc_now(),
-        }
-    )
-
-    manifest_path = _write_synthetic_manifest(
-        repository, task_root, destination_path, manifest_payload, retention_days=retention_days, retention_till=retention_till
-    )
+    in_flight: str | None = None
     try:
-        make_durable(task_root, up_to=destination_root)
-    except OSError as exc:
-        _discard_partial_merge(repository, destination_path, written, task_root, below=destination_root)
-        raise BackupCopyError(
-            f"The copy was written but could not be flushed to stable storage in {task_root}: {exc}. "
-            "It is not kept, so a crash cannot leave a restore point with empty files."
-        ) from exc
+        if not is_s3_repository(repository):
+            try:
+                ensure_private_directory(task_root.parent)
+            except OSError as exc:
+                if exc.errno != errno.ENOSPC:
+                    raise
+                raise BackupCopyError(_out_of_space_message(repository, free_at_start)) from exc
+
+        total = len(merges)
+        disk_outputs: list[dict[str, Any]] = []
+        logical_total = 0
+        stored_total = 0
+        for position, merge in enumerate(merges):
+            backup_name = str(merge["template"].get("abr_backup_name") or "")
+            base = int(position * 100 / total)
+            span = max(int(100 / total), 1)
+            emit(base, f"Copying disk {position + 1}/{total}")
+            in_flight = backup_name
+
+            def _on_progress(percent: int, _block: int, base=base, span=span, position=position) -> None:
+                emit(base + int(percent * span / 100), f"Copying disk {position + 1}/{total}: {percent}%")
+
+            try:
+                result = copy_disk_tool_chain(
+                    source_repository=source_repository,
+                    source_abr_path=merge["source_path"],
+                    source_names=merge["source_names"],
+                    destination_repository=repository,
+                    destination_abr_path=destination_path,
+                    backup_name=backup_name,
+                    compression_level=compression_level,
+                    encryption_key=encryption_key,
+                    source_encryption_key=source_key,
+                    retention_days=retention_days,
+                    retention_till=retention_till,
+                    timeout=timeout_seconds,
+                    on_progress=_on_progress,
+                    should_cancel=lambda: cancel_requested(task_id) or _window_closed(job),
+                )
+            except ProcessCancelled as exc:
+                if not cancel_requested(task_id) and _window_closed(job):
+                    raise _stop_for_window(job, "while it copied; what it had written was discarded") from exc
+                raise TaskStopRequested("Backup copy cancelled; what it had written was discarded") from exc
+            except StorageToolError as exc:
+                detail = _no_room_detail(repository, points, free_at_start)
+                raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {detail or exc}") from exc
+            except OSError as exc:
+                if exc.errno == errno.ENOSPC:
+                    raise BackupCopyError(
+                        f"Copying disk {position + 1}/{total} failed: "
+                        + _out_of_space_message(repository, _free_bytes_at_start(repository))
+                    ) from exc
+                raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {exc}") from exc
+            written.append(backup_name)
+            in_flight = None
+
+            entry = _disk_entry(
+                merge,
+                result,
+                abr_path=destination_path,
+                abr_backup_name=backup_name,
+                repository_id=repository_id,
+                repository_type=str(repository.get("type") or "local"),
+                storage_mode="s3" if is_s3_repository(repository) else "local",
+            )
+            logical_total += int(entry.get("logical_bytes") or 0)
+            stored_total += int(entry.get("stored_bytes") or 0)
+            disk_outputs.append(entry)
+
+        repository_type = str(repository.get("type") or "local")
+        if repository_type != "s3" and stored_total <= 0:
+            stored_total = _dir_size_bytes(task_root)
+
+        manifest_payload = _source_manifest(target)
+        if not manifest_payload:
+            raise BackupCopyValidationError(
+                f"The manifest of restore point {target.get('id')} could not be read, so its copy would not be restorable"
+            )
+
+        execution_type = "ActiveFull" if kind == "full" else "Incremental"
+        requested_type = str(parameters.get("resolved_backup_type") or "Incremental")
+        execution_reason = (
+            "SourceNewChain"
+            if kind == "full" and requested_type not in FULL_EXECUTION_TYPES
+            else str(parameters.get("resolved_backup_reason") or "BackupCopy")
+        )
+
+        parent = plan.get("parent") or {}
+        copy_source = {
+            "job_id": target.get("job_id"),
+            "job_name": target.get("job_name"),
+            "repository_id": source_repository_id,
+            "repository_name": source_repository.get("name"),
+            "point_id": target.get("id"),
+            "point_ids": [str(point.get("id") or "") for point in points],
+            "execution_types": [str(point.get("execution_type") or "") for point in points],
+            "created_at": target.get("created_at"),
+        }
+
+        manifest_payload.update(
+            {
+                "operation": "vm-backup",
+                "backup_mode": "full" if kind == "full" else "incremental",
+                "resolved_backup_type": execution_type,
+                "resolved_backup_reason": execution_reason,
+                "parent_point_id": parent.get("id"),
+                "storage_layout": storage_layout,
+                "incremental": kind != "full",
+                "differential": False,
+                "synthetic_full": False,
+                "copy_source": copy_source,
+                "snapshot_name": "",
+                "snapshot_moref": "",
+                "disks": disk_outputs,
+                "compression_level": compression_level,
+                "encryption_enabled": bool(encryption_key),
+                "repository_id": repository_id,
+                "repository_type": repository_type,
+                "storage_mode": "s3" if repository_type == "s3" else "local",
+                "repository_storage_path": destination_path if repository_type == "s3" else str(task_root),
+                "backup_root": str(task_root),
+                "logical_bytes": logical_total,
+                "transferred_bytes": stored_total,
+                "created_at": utc_now(),
+            }
+        )
+
+        manifest_path = _write_synthetic_manifest(
+            repository,
+            task_root,
+            destination_path,
+            manifest_payload,
+            written,
+            retention_days=retention_days,
+            retention_till=retention_till,
+        )
+        try:
+            make_durable(task_root, up_to=destination_root)
+        except OSError as exc:
+            raise BackupCopyError(
+                f"The copy was written but could not be flushed to stable storage in {task_root}: {exc}. "
+                "It is not kept, so a crash cannot leave a restore point with empty files."
+            ) from exc
+    except BaseException:
+        _discard_partial_merge(
+            repository, destination_path, written, task_root, in_flight=in_flight, below=destination_root
+        )
+        raise
 
     return {
         "operation": "backup",
