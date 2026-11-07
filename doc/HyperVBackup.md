@@ -272,6 +272,7 @@ Lock validation. Credentials and encryption keys are never written to either.
 | `reaches S3 and SMB repositories only` | Point the job at an S3 or SMB repository (`abr repo add --type smb`) |
 | `cannot reach repository` | The reason that follows it: the S3 endpoint, keys and bucket the repository names, or its share, as seen from that node |
 | `can read repository ... but cannot write to it` | Give the account it names write access to the share, or set an account that has it (`abr repo edit --username ... --password`) |
+| `abr-vhdx-tool on ... ended unexpectedly (exit code ...)` | The tool stopped without reporting an error of its own: it was killed, ran out of memory or was stopped by antivirus software on that host (the host's Application event log, and the antivirus log). Its last output is quoted for context only |
 | `cannot open the repository share` | The share's account (the repository's `--username`, else the inventory's), and that every node reaches the share on TCP 445 |
 | `did not answer WinRM over HTTPS on port ...` | No HTTPS listener on that port of the host: set one up, or set the inventory to HTTP (`abr inventory edit --protocol http`) |
 | `the port answers without TLS` | The port is an HTTP listener: give the HTTPS listener's port, or set the inventory to HTTP |

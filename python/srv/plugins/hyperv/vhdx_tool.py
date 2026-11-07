@@ -33,6 +33,7 @@ from ...core.credential_encryption import decrypt_secret, is_encrypted
 from ...core.storage_tool import APP_ROOT, REPO_ROOT, RETENTION_TILL_OPTION, disk_tool_storage_args, is_s3_repository
 
 TOOL_NAME = "abr-vhdx-tool.exe"
+TOOL_NAME_LABEL = "abr-vhdx-tool"
 HOST_ARCHITECTURE = "x64"
 DEFAULT_REMOTE_TOOL_PATH = r"C:\Program Files\AltaStor\abr-vhdx-tool.exe"
 DEFAULT_REMOTE_WORK_DIR = r"C:\ProgramData\AltaStor\abr-hyperv"
@@ -274,6 +275,29 @@ def _tool_error(result: dict[str, Any] | None, lines: list[str], exit_code: int 
     if errors:
         return "; ".join(error[len("Error:"):].strip() for error in errors)
     return f"exit code {exit_code}"
+
+
+def ended_unexpectedly(result: dict[str, Any] | None, lines: Iterable[str], exit_code: int | None) -> bool:
+    if result is not None or exit_code in (0, None):
+        return False
+    return not any(str(line).strip().startswith("Error:") for line in lines)
+
+
+def unexpected_end_message(node: str, exit_code: int, lines: Iterable[str], action: str) -> str:
+    code = f"exit code {exit_code}"
+    if abs(int(exit_code)) > 0xFFFF:
+        code += f", 0x{int(exit_code) & 0xFFFFFFFF:08X}"
+    last = next(
+        (
+            text
+            for text in (str(line).strip() for line in reversed(list(lines)))
+            if text and not text.startswith("ABR_TOOL_EXIT=") and progress_percent(text) is None
+        ),
+        "",
+    )
+    return f"{TOOL_NAME_LABEL} on {node} ended unexpectedly ({code}) while {action}" + (
+        f". Its last output: {last}" if last else ". It printed nothing"
+    )
 
 
 def failure_message(result: dict[str, Any] | None, lines: Iterable[str], exit_code: int | None) -> str:

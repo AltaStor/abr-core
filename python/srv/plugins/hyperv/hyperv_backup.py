@@ -1088,6 +1088,12 @@ def _back_up_disks(
         result = run.get("result") or {}
         if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
             lines = run.get("lines") or []
+            if vhdx_tool.ended_unexpectedly(run.get("result"), lines, run.get("exit_code")):
+                raise HyperVBackupError(
+                    vhdx_tool.unexpected_end_message(
+                        source_node, run["exit_code"], lines, f"backing up disk {slot} of {vm_name}"
+                    )
+                )
             detail = vhdx_tool.failure_message(result, lines, run.get("exit_code"))
             if change_id and vhdx_tool.change_tracking_lost(result, lines, run.get("exit_code")):
                 raise _ChangeTrackingLost(detail)

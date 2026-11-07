@@ -665,6 +665,12 @@ def run_hyperv_restore(
                     )
                     result = run.get("result") or {}
                     if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
+                        if vhdx_tool.ended_unexpectedly(run.get("result"), run.get("lines") or [], run.get("exit_code")):
+                            raise HyperVRestoreError(
+                                vhdx_tool.unexpected_end_message(
+                                    node_name, run["exit_code"], run.get("lines") or [], f"restoring disk {slot} of {target_vm_name}"
+                                )
+                            )
                         detail = vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
                         raise HyperVRestoreError(
                             f"Restoring disk {slot} from {layer['abr_backup_name']} failed: {detail}"

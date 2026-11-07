@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from python.srv.core import storage_tool
-from python.srv.plugins.hyperv import hyperv_backup
+from python.srv.plugins.hyperv import hyperv_backup, vhdx_tool
 
 
 def _disk(slot: str = "SCSI 0:0") -> dict:
@@ -276,6 +276,83 @@ class OutOfSpaceTests(unittest.TestCase):
             self.assertRaises(PermissionError),
         ):
             hyperv_backup._make_task_root(self.repository, Path(self.root) / "vm" / "task-1")
+
+
+INFO_LINE = "Virtual disk 'C:\\VMs\\et-vm\\disk.vhdx' attached read-only as \\\\.\\PhysicalDrive3"
+
+
+class _EndedNode:
+    def __init__(self, run: dict) -> None:
+        self.run = run
+
+    def run_disk_tool(self, node, args, **kwargs):
+        return self.run
+
+
+class ToolEndedUnexpectedlyTests(unittest.TestCase):
+    def _back_up(self, run: dict) -> str:
+        with patch.object(hyperv_backup, "cancel_requested", return_value=False), patch.object(
+            hyperv_backup, "filesystem_free_bytes", return_value=50 * 1024**3
+        ), self.assertRaises(hyperv_backup.HyperVBackupError) as raised:
+            hyperv_backup._back_up_disks(
+                _EndedNode(run),
+                "NODE-A",
+                [{**_disk(), "capacity_gb": 1}],
+                task_id="task-1",
+                vm_name="et-vm",
+                incremental=False,
+                change_ids={},
+                storage_args=[],
+                storage_env={},
+                repository={"id": "repo-1", "name": "Shared", "type": "smb", "path": "/mnt/hv"},
+                abr_path="/mnt/hv/et-vm/task-1",
+                repository_label="Shared",
+                compression_level=3,
+                encryption_key="",
+                tool_timeout_seconds=900,
+                written_backup_names=[],
+                progress_callback=None,
+            )
+        return str(raised.exception)
+
+    def test_a_tool_killed_on_the_host_is_named_as_ended_unexpectedly(self) -> None:
+        message = self._back_up({"exit_code": -1, "result": None, "lines": [INFO_LINE, "45%", "46%"]})
+
+        self.assertEqual(
+            message,
+            "abr-vhdx-tool on NODE-A ended unexpectedly (exit code -1) while backing up disk SCSI 0:0 of et-vm. "
+            f"Its last output: {INFO_LINE}",
+        )
+
+    def test_a_tool_that_reports_its_own_error_keeps_its_words(self) -> None:
+        message = self._back_up(
+            {"exit_code": 1, "result": {"status": "error", "error": "failed to create backup"}, "lines": [INFO_LINE]}
+        )
+
+        self.assertTrue(message.startswith("Backing up disk SCSI 0:0 of et-vm failed: "), message)
+        self.assertIn("failed to create backup", message)
+        self.assertNotIn("ended unexpectedly", message)
+
+    def test_an_error_line_without_a_result_is_still_the_tools_own_error(self) -> None:
+        message = self._back_up({"exit_code": 1, "result": None, "lines": [INFO_LINE, "Error: Access is denied."]})
+
+        self.assertIn("Access is denied", message)
+        self.assertNotIn("ended unexpectedly", message)
+
+    def test_the_end_is_recognised_only_without_a_result_or_an_error_line(self) -> None:
+        self.assertTrue(vhdx_tool.ended_unexpectedly(None, [INFO_LINE], -1))
+        self.assertTrue(vhdx_tool.ended_unexpectedly(None, [], 3221225477))
+        self.assertFalse(vhdx_tool.ended_unexpectedly(None, [INFO_LINE], 0))
+        self.assertFalse(vhdx_tool.ended_unexpectedly(None, [INFO_LINE], None))
+        self.assertFalse(vhdx_tool.ended_unexpectedly({"status": "error"}, [], 1))
+        self.assertFalse(vhdx_tool.ended_unexpectedly(None, ["Error: broken"], 1))
+
+    def test_a_crash_code_is_shown_in_hex_and_an_empty_run_says_so(self) -> None:
+        self.assertEqual(
+            vhdx_tool.unexpected_end_message("NODE-A", 3221225477, ["ABR_TOOL_EXIT=3221225477"], "restoring disk SCSI0:0"),
+            "abr-vhdx-tool on NODE-A ended unexpectedly (exit code 3221225477, 0xC0000005) while restoring disk SCSI0:0. "
+            "It printed nothing",
+        )
 
 
 if __name__ == "__main__":
