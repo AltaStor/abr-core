@@ -333,6 +333,7 @@ class JobDTO(_LenientModel):
     repository: _Ref
     source_job: _Ref | DocObject = None
     backup_copy: DocObject = Field(default=None, description="Backup copy jobs only: copy_mode, source_jobs, source_repositories, run_after_job and retry")
+    replication: DocObject = Field(default=None, description="Replication jobs only: source job and VM, target environment, host, datastore, network map, replica name, run_after_source, the replica: its VM, the restore point it is at and the time of the last successful update, and run_pending with pending_trigger (what asked for the next run and since when) when a trigger arrived while a run was going")
     schedule: ScheduleDTO | DocObject = None
     schedule_summary: str | None = None
     enabled: bool = False
@@ -996,6 +997,36 @@ class CreateBackupCopyJobRequest(_LenientModel):
     task_parameters: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = Field(default=None, description="Compression and encryption of the copies; encrypted sources need an encryption key here")
 
 
+REPLICATION_SOURCE_JOB = "The backup job whose restore points update the replica, by name (case-insensitive); or source_job_id. It must back up exactly one VM"
+REPLICATION_SOURCE_VM = "The VM of the source job to replicate, by name or ID; null or omitted: its only VM"
+REPLICATION_TARGET_INVENTORY = "The environment the replica lives in, by name; or target_inventory_id. Same platform as the source: VMware to VMware, Hyper-V to Hyper-V"
+REPLICATION_TARGET_HOST = "Host of the target environment the replica is created on: its ID or its name (case-insensitive)"
+REPLICATION_TARGET_DATASTORE = "Datastore (Hyper-V: storage path) the replica's disks are placed on: its ID or its name (case-insensitive)"
+REPLICATION_NETWORK_MAP = "Network mapping 'source=target', one entry per source network; a source network left out keeps a network of the same name"
+REPLICATION_NAME = "Name of the replica VM on the target; required on create"
+REPLICATION_AFTER_SOURCE = "true starts the job after each successful (or warning) run of the source backup job, instead of or together with the schedule"
+REPLICATION_START_POINT = "Restore point the first run creates the replica from; null or omitted: the newest one"
+REPLICATION_LOCKED = "Cannot be changed after the replica is created"
+
+
+class CreateReplicationJobRequest(_LenientModel):
+    name: LaxStr | None = None
+    source_job: LaxStr | None = Field(default=None, description=REPLICATION_SOURCE_JOB)
+    source_job_id: LaxStr | None = Field(default=None, description=REPLICATION_SOURCE_JOB)
+    source_vm: LaxStr | None = Field(default=None, description=REPLICATION_SOURCE_VM)
+    target_inventory: LaxStr | None = Field(default=None, description=REPLICATION_TARGET_INVENTORY)
+    target_inventory_id: LaxStr | None = Field(default=None, description=REPLICATION_TARGET_INVENTORY)
+    target_host: LaxStr | None = Field(default=None, description=REPLICATION_TARGET_HOST)
+    target_datastore: LaxStr | None = Field(default=None, description=REPLICATION_TARGET_DATASTORE)
+    network_map: list[LaxStr] | LaxStr | None = Field(default=None, description=REPLICATION_NETWORK_MAP)
+    replica_name: LaxStr | None = Field(default=None, description=REPLICATION_NAME)
+    run_after_source: LaxBool | None = Field(default=None, description=REPLICATION_AFTER_SOURCE)
+    restore_point_id: LaxStr | None = Field(default=None, description=REPLICATION_START_POINT)
+    schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="When the replica is updated; null or omitted: only manually or after the source backup")
+    enabled: LaxBool | None = Field(default=None, description="Used only when no schedule is given; with a schedule its own enabled decides. null or omitted: true")
+    description: LaxStr | None = None
+
+
 class UpdateJobRequest(_LenientModel):
     name: LaxStr | None = None
     schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
@@ -1019,8 +1050,17 @@ class UpdateJobRequest(_LenientModel):
     inventory: LaxStr | None = Field(default=None, description=INVENTORY_NAME)
     inventory_id: LaxStr | None = Field(default=None, description=INVENTORY_ID)
     vms: list[LaxStr] | LaxStr | None = Field(default=None, description=f"{JOB_VMS}; replaces the job's VM list")
-    source_job: LaxStr | None = Field(default=None, description="Backup copy jobs only: the source job by name (case-insensitive); or source_job_id")
-    source_job_id: LaxStr | None = Field(default=None, description="Backup copy jobs only: the source job by ID; or source_job")
+    source_job: LaxStr | None = Field(default=None, description="Backup copy and replication jobs only: the source job by name (case-insensitive); or source_job_id")
+    source_job_id: LaxStr | None = Field(default=None, description="Backup copy and replication jobs only: the source job by ID; or source_job")
+    source_vm: LaxStr | None = Field(default=None, description=f"Replication jobs only: {REPLICATION_SOURCE_VM}. {REPLICATION_LOCKED}")
+    target_inventory: LaxStr | None = Field(default=None, description=f"Replication jobs only: {REPLICATION_TARGET_INVENTORY}. {REPLICATION_LOCKED}")
+    target_inventory_id: LaxStr | None = Field(default=None, description=f"Replication jobs only. {REPLICATION_LOCKED}")
+    target_host: LaxStr | None = Field(default=None, description=f"Replication jobs only: {REPLICATION_TARGET_HOST}. {REPLICATION_LOCKED}")
+    target_datastore: LaxStr | None = Field(default=None, description=f"Replication jobs only: {REPLICATION_TARGET_DATASTORE}. {REPLICATION_LOCKED}")
+    network_map: list[LaxStr] | LaxStr | None = Field(default=None, description=f"Replication jobs only: {REPLICATION_NETWORK_MAP}. {REPLICATION_LOCKED}")
+    replica_name: LaxStr | None = Field(default=None, description="Replication jobs only: a new name; an existing replica is renamed on the next run")
+    run_after_source: LaxBool | None = Field(default=None, description=f"Replication jobs only: {REPLICATION_AFTER_SOURCE}")
+    restore_point_id: LaxStr | None = Field(default=None, description=f"Replication jobs only: {REPLICATION_START_POINT}. Used until the replica is created")
     copy_mode: LaxStr | None = Field(default=None, description=COPY_MODE)
     source_jobs: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_JOBS)
     source_job_ids: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_JOB_IDS)
@@ -1410,6 +1450,15 @@ class SystemHealthDTO(_LenientModel):
 class DeletedResult(_LenientModel):
     id: DocStr = None
     deleted: DocBool = None
+
+
+class JobDeletedResult(DeletedResult):
+    replica_deleted: DocBool = None
+    replica_vm_name: DocStr = None
+    removed_vms: DocStrArray = None
+    kept_vms: DocStrArray = None
+    files_left: DocStrArray = None
+    message: DocStr = None
 
 
 class RemovedResult(_LenientModel):

@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from python.srv.core.mongo_db_wrapper import (
     BACKUPS,
+    CATALOG_LOCK,
     DATABASE_NOT_CONFIGURED,
     HYPERVISORS,
     JOBS,
@@ -123,6 +124,7 @@ from python.srv.services.inventory_management import (
     inventory_type_from_record,
     normalize_inventory_type,
 )
+from python.srv.services import replication_service
 from python.srv.services.backup_copy import apply_copy_settings, copy_job_view, create_copy_sessions
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
@@ -253,7 +255,9 @@ EXECUTION_REASONS = (
     "IncrementalFallbackToFull",
     "VmConfigurationChanged",
 )
-JOB_TYPES = ("backup", "backup-copy")
+JOB_TYPES = ("backup", "backup-copy", "replication")
+BACKUP_KEEPING_JOB_TYPES = ("backup", "backup-copy")
+COPY_SHARED_KEYS = ("source_job", "source_job_id")
 COPY_JOB_FIELDS = (
     "copy_mode",
     "source_jobs",
@@ -1959,6 +1963,8 @@ def _reconcile_jobs_after_vm_identity_change(
     reassigned_at = utc_now()
     for job in catalog_records(JOBS):
         if str(job.get("inventory_id") or job.get("hypervisor_id") or "") != inventory_id:
+            continue
+        if replication_service.is_replication_job(job):
             continue
         vm_ids = job.get("vm_ids")
         if not isinstance(vm_ids, list) or not vm_ids:
@@ -4208,6 +4214,8 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
         item["retry_count"] = item.get("retry_count")
         item["retry_interval_minutes"] = item.get("retry_interval_minutes")
         item["copy_window"] = [rule for rule in item.get("copy_window") or [] if isinstance(rule, dict)]
+    if item["job_type"] == replication_service.REPLICATION_JOB_TYPE:
+        replication_service.normalize_replication_fields(item)
     raw_schedule = item.get("schedule") if isinstance(item.get("schedule"), dict) else None
     if raw_schedule is None and isinstance(metadata.get("schedule"), dict):
         raw_schedule = metadata.get("schedule")
@@ -4583,6 +4591,7 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         },
         "source_job": (copy_job_view(normalized)["source_jobs"] or [None])[0] if normalized["job_type"] == "backup-copy" else None,
         "backup_copy": copy_job_view(normalized) if normalized["job_type"] == "backup-copy" else None,
+        "replication": replication_service.replication_view(normalized) if normalized["job_type"] == replication_service.REPLICATION_JOB_TYPE else None,
         "schedule": _schedule_dto(normalized.get("schedule")),
         "schedule_summary": normalized.get("schedule_summary"),
         "enabled": bool(normalized.get("enabled")),
@@ -5004,6 +5013,48 @@ def create_backup_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     return job_to_dto(_persist_canonical_job(job))
 
 
+def create_replication_job(payload: dict[str, Any]) -> dict[str, Any]:
+    name = str(payload.get("name") or "")
+    raw_schedule = payload.get("schedule")
+    schedule = _schedule_from_request(raw_schedule) if raw_schedule not in (None, "") else None
+    base_is_enabled = isinstance(schedule, dict) and bool(schedule.get("enabled", True))
+    job_enabled = bool(payload.get("enabled", True)) if not isinstance(schedule, dict) else base_is_enabled
+    description = str(payload.get("description") or "").strip()
+    _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
+    _ensure_ascii_name(name, field="Job name", code="invalid_job")
+    _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+    _ensure(
+        not any(str(existing.get("name") or "").lower() == name.lower() for existing in catalog_records(JOBS)),
+        409,
+        "job_name_exists",
+        "Job name already exists",
+        name=name,
+    )
+    now = utc_now()
+    job = {
+        "id": str(uuid4()),
+        "name": name,
+        "job_type": replication_service.REPLICATION_JOB_TYPE,
+        "schedule": schedule,
+        "description": description,
+        "task_parameters": {},
+        "storage_layout": STORAGE_LAYOUT_BY_ID,
+        "enabled": job_enabled,
+        "status": "active" if job_enabled else "disabled",
+        "created_at": now,
+        "updated_at": now,
+        "next_incremental_run_at": (
+            schedule_next_run(schedule, after=_parse_dt(now)).isoformat() if schedule and base_is_enabled else None
+        ),
+        "last_run_at": None,
+        "last_session_id": None,
+        "replica": {},
+        "run_pending": False,
+    }
+    replication_service.apply_replication_settings(job, payload, creating=True)
+    return job_to_dto(_persist_canonical_job(job))
+
+
 def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     name = str(payload.get("name") or "")
     source_job = resolve_job(
@@ -5257,8 +5308,24 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         updated["job_type"] == "backup-copy" or not copy_only,
         422,
         "invalid_job",
-        f"{', '.join(copy_only)} apply to backup copy jobs only, and {updated.get('name')} is a backup job",
+        f"{', '.join(copy_only)} apply to backup copy jobs only, and {updated.get('name')} is a "
+        f"{'replication' if updated['job_type'] == replication_service.REPLICATION_JOB_TYPE else 'backup'} job",
     )
+    replication_only = [
+        key for key in replication_service.SETTING_KEYS if key not in COPY_SHARED_KEYS and payload.get(key) is not None
+    ]
+    _ensure(
+        updated["job_type"] == replication_service.REPLICATION_JOB_TYPE or not replication_only,
+        422,
+        "invalid_job",
+        f"{', '.join(replication_only)} apply to replication jobs only, and {updated.get('name')} is a "
+        f"{'backup copy' if updated['job_type'] == 'backup-copy' else 'backup'} job",
+    )
+    if updated["job_type"] == replication_service.REPLICATION_JOB_TYPE:
+        changed = replication_service.apply_replication_settings(updated, payload, creating=False) or changed
+        with CATALOG_LOCK:
+            replication_service.keep_run_state(updated)
+            return _finish_job_edit(updated, payload, changed, was_enabled)
     backup_only = [key for key in ("inventory", "inventory_id") if payload.get(key) is not None]
     _ensure(
         updated["job_type"] == "backup" or not backup_only,
@@ -5281,6 +5348,10 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             tokens = payload["vms"] if isinstance(payload["vms"], list) else _split_csv(str(payload["vms"]))
             vm_ids, vm_names = _resolve_vm_selection(str(updated["inventory_id"]), tokens, auto_discover=True)
             _ensure_unique_vms(vm_ids, vm_names)
+            replication_service.ensure_source_job_free(
+                current,
+                removed_vm_ids=[str(vm_id) for vm_id in current.get("vm_ids") or [] if str(vm_id) not in vm_ids],
+            )
             updated["vm_ids"] = vm_ids
             updated["vm_names"] = vm_names
             updated["vm_reassignments"] = []
@@ -5291,6 +5362,10 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         changed = apply_copy_settings(updated, payload, creating=False) or changed
     if _touches_full_backup_policy(payload):
         _ensure_full_backup_schedule(updated)
+    return _finish_job_edit(updated, payload, changed, was_enabled)
+
+
+def _finish_job_edit(updated: dict[str, Any], payload: dict[str, Any], changed: bool, was_enabled: bool) -> dict[str, Any]:
     _ensure(changed, 422, "invalid_job", "job edit requires at least one editable option")
     updated["updated_at"] = utc_now()
     if updated.get("schedule"):
@@ -5318,8 +5393,15 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return job_to_dto(_persist_canonical_job(updated))
 
 
-def delete_job_record(job_id: str) -> dict[str, Any]:
+def delete_job_record(job_id: str, *, delete_replica: bool = False) -> dict[str, Any]:
     job = _find_by_id(catalog_records(JOBS), job_id, label="Job")
+    is_replication = str(job.get("job_type") or "") == replication_service.REPLICATION_JOB_TYPE
+    _ensure(
+        is_replication or not delete_replica,
+        422,
+        "invalid_job",
+        f"--delete-replica applies to replication jobs only, and {job.get('name')} is not one",
+    )
     # The same sessions the job's active_session_count counts, so the console's
     # disabled Delete and this refusal agree (a "pending" task is queued too).
     active = _active_sessions_for_job(str(job.get("id") or job_id))
@@ -5330,8 +5412,28 @@ def delete_job_record(job_id: str) -> dict[str, Any]:
             "Job cannot be deleted while sessions are queued or running",
             session_id=active[0]["id"],
         )
+    if str(job.get("job_type") or "backup") == "backup":
+        replication_service.ensure_source_job_free(job)
+    removed = replication_service.delete_replica(normalize_job_record(job)) if delete_replica else None
     delete_job(job_id)
-    return {"id": str(job.get("id") or job_id), "deleted": True}
+    result: dict[str, Any] = {"id": str(job.get("id") or job_id), "deleted": True}
+    if removed is not None:
+        result.update(removed)
+        name = removed["replica_vm_name"]
+        if removed["replica_deleted"]:
+            result["message"] = f"Deleted the job and its replica {name}"
+        elif name:
+            result["message"] = f"Deleted the job; its replica {name} was not on the target any more"
+        else:
+            result["message"] = "Deleted the job; it had not created a replica yet"
+        if removed.get("kept_vms"):
+            result["message"] += (
+                f". Kept {', '.join(removed['kept_vms'])}: it carries this job's mark but is a copy of the finished "
+                "replica or is powered on, so it is not removed"
+            )
+        if removed["files_left"]:
+            result["message"] += f". Could not delete {', '.join(removed['files_left'])}; remove them by hand"
+    return result
 
 
 def _chain_id_for_point(job_id: str | None, vm_id: str | None, repository_id: str | None) -> str:
@@ -6224,6 +6326,13 @@ def apply_retention_to_chain(
     if not points:
         return failures
     report["vm_name"] = points[-1].get("vm_name")
+    reading = replication_service.sessions_reading(str(job["id"]), vm_id)
+    if reading:
+        report["skipped_reason"] = (
+            f"replication session {reading[0]['id']} is reading this chain; its expired restore points go once that "
+            "run has finished"
+        )
+        return failures
     unmounted = _point_repository_unmounted(points[-1])
     if unmounted:
         report["skipped_reason"] = unmounted
@@ -6407,7 +6516,12 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
     point the running backup chains onto cannot go from under it.
     """
     job = resolve_job(record_id=job_id)
-    _ensure(job.get("job_type") in JOB_TYPES, 422, "invalid_job", "Retention applies to backup and backup copy jobs")
+    _ensure(
+        job.get("job_type") in BACKUP_KEEPING_JOB_TYPES,
+        422,
+        "invalid_job",
+        "Retention applies to backup and backup copy jobs; a replication job keeps no restore points of its own",
+    )
     busy_vms = {
         str(task.get("resource_external_id") or "")
         for task in catalog_records(TASKS)
@@ -7583,6 +7697,20 @@ def _run_delete_session(
     return report
 
 
+def _ensure_chain_not_read(points: list[dict[str, Any]], backup_id: str, segment_id: str | None) -> None:
+    reading = replication_service.sessions_reading(str(points[0].get("job_id") or ""), str(points[0].get("vm_id") or ""))
+    _ensure(
+        not reading,
+        409,
+        "backup_chain_in_use",
+        f"Replication session {reading[0]['id'] if reading else ''} is reading the restore points of this backup "
+        f"chain to update its replica; delete the {'segment' if segment_id is not None else 'chain'} once that run "
+        "has finished",
+        backup_id=backup_id,
+        session_id=reading[0]["id"] if reading else None,
+    )
+
+
 def delete_backup_chain_request(
     backup_id: str, *, segment_id: str | None = None, force: bool = False, wait: bool = True
 ) -> dict[str, Any]:
@@ -7590,6 +7718,7 @@ def delete_backup_chain_request(
     points = chains.get(backup_id)
     if not points:
         raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
+    _ensure_chain_not_read(points, backup_id, segment_id)
 
     task = _create_delete_session(backup_id, points)
     task_id = str(task["id"])
@@ -7828,6 +7957,7 @@ def delete_backup_chain(
                 backup_id=backup_id, segment_id=segment_id,
             )
         points = segment
+    _ensure_chain_not_read(points, backup_id, segment_id)
     gfs_protected_point_ids = [point["id"] for point in points if bool(point.get("gfs_protected"))]
     if gfs_protected_point_ids and not force:
         raise api_error(409, "gfs_protected_backup", "Backup delete would violate GFS protection", backup_id=backup_id)
@@ -9829,12 +9959,30 @@ def start_job_record(
             f"Repository '{target_repository.get('name')}' cannot hold a merged backup",
             repository_id=target_repository_id,
         )
-    if force_synthetic and job["job_type"] != "backup-copy":
+    if job["job_type"] == replication_service.REPLICATION_JOB_TYPE:
+        _ensure(
+            not (force_full or force_synthetic or target_repository_id),
+            422,
+            "invalid_job",
+            f"{job.get('name')} is a replication job: it keeps no backups of its own, so there is no active or synthetic "
+            "full to start; abr job start runs it without options",
+        )
+        active = _active_sessions_for_job(str(job["id"]))
+        _ensure(
+            not active,
+            409,
+            "job_already_running",
+            f"Replication job {job.get('name')} is already running (session {active[0]['id'] if active else ''})",
+            session_id=active[0]["id"] if active else None,
+        )
+    if force_synthetic and job["job_type"] not in ("backup-copy", replication_service.REPLICATION_JOB_TYPE):
         _ensure_chain_can_be_merged(job)
     sessions = []
     run_id = str(uuid4())
     run_started_at = utc_now()
-    if job["job_type"] == "backup-copy":
+    if job["job_type"] == replication_service.REPLICATION_JOB_TYPE:
+        sessions.append(replication_service.create_replication_session(job, trigger="manual", run_id=run_id))
+    elif job["job_type"] == "backup-copy":
         sessions.extend(
             create_copy_sessions(
                 job,
@@ -9984,7 +10132,7 @@ def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
     return found[0] if found else None
 
 
-def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
+def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], str]:
     point = _resolve_restore_source_point(payload)
     point_id = str(point.get("id") or "")
     missing_ancestor = str(point.get("missing_ancestor_id") or "") if point.get("status") == POINT_CHAIN_BROKEN else ""
@@ -10320,7 +10468,6 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         "updated_at": utc_now(),
         "logs": [],
     }
-    _append_task_log(task, level="info", message=f"Queued restore session for restore point {point_id}", component="session")
     mode_label = "In-place" if restore_mode == "in_place" else "Out-of-place"
     placement_text = ", ".join(f"{source} -> {target}" for source, target in sorted((datastore_placement or {}).items()))
     network_text = ", ".join(f"{source} -> {target}" for source, target in sorted((network_map or {}).items()))
@@ -10332,6 +10479,15 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         + (f", network mapping {network_text}" if network_text and restore_mode != "in_place" else "")
         + (", power on afterwards" if power_on else "")
     )
+    return task, point, restore_summary
+
+
+def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
+    task, point, restore_summary = plan_restore_session(payload)
+    parameters = task["parameters"]
+    _append_task_log(
+        task, level="info", message=f"Queued restore session for restore point {parameters['point_id']}", component="session"
+    )
     _append_task_log(task, level="info", message=restore_summary, component="session")
     LOGGER.info("Restore session %s queued: %s", task["id"], restore_summary)
     persist_task(task)
@@ -10341,20 +10497,20 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
         "status": "started",
         "restore_session_id": session.get("id"),
         "session_state": session.get("state"),
-        "restore_point_id": point_id,
+        "restore_point_id": parameters["point_id"],
         "backup_id": point.get("chain_id"),
         "source_inventory_id": point.get("inventory_id"),
         "source_inventory_name": point.get("inventory_name"),
         "source_vm_id": point.get("vm_id"),
         "source_vm_name": point.get("vm_name"),
-        "target_inventory_id": task["parameters"].get("target_inventory_id"),
-        "target_inventory_name": task["parameters"].get("target_inventory_name"),
-        "target_host_id": resolved_target_host_id,
-        "target_host_name": task["parameters"].get("target_host_name"),
-        "target_datastore_id": resolved_target_datastore_id,
-        "datastore_name": task["parameters"].get("target_datastore_name"),
-        "new_name": task["parameters"].get("target_vm_name"),
-        "restore_mode": restore_mode,
+        "target_inventory_id": parameters.get("target_inventory_id"),
+        "target_inventory_name": parameters.get("target_inventory_name"),
+        "target_host_id": parameters.get("target_host_id"),
+        "target_host_name": parameters.get("target_host_name"),
+        "target_datastore_id": parameters.get("target_datastore_id"),
+        "datastore_name": parameters.get("target_datastore_name"),
+        "new_name": parameters.get("target_vm_name"),
+        "restore_mode": parameters.get("restore_mode"),
     }
 
 

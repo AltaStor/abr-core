@@ -51,6 +51,7 @@ COMMAND_FUNCTIONS: dict[str, str] = {
     "job create": "job.create",
     "job create-copy": "job.create",
     "job create-backup-copy": "job.create",
+    "job create-replication": "job.create",
     "job list": "job.view",
     "job info": "job.view",
     "job edit": "job.edit",

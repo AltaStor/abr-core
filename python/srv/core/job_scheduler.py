@@ -12,11 +12,11 @@ from uuid import uuid4
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .mongo_db_wrapper import HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, catalog_records, persist_job, persist_task
+from .mongo_db_wrapper import CATALOG_LOCK, HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, catalog_records, persist_job, persist_task
 from .server_defaults import env_int
 from .time_zones import load_zone
 from .utils import utc_now
-from python.srv.services import clock_guard, notification_detectors
+from python.srv.services import clock_guard, notification_detectors, replication_service
 from python.srv.services.backup_copy import create_copy_sessions
 from python.srv.services.abr_v41 import (
     execution_phases,
@@ -151,6 +151,9 @@ class JobScheduler:
         jobs = sorted(catalog_records(JOBS), key=lambda item: str(item.get("created_at", "")))
         self._report_clock_anomalies(jobs)
         for job in jobs:
+            if str(job.get("job_type") or "") == replication_service.REPLICATION_JOB_TYPE:
+                self._dispatch_replication(job, now)
+                continue
             if not self._is_supported_backup_job(job):
                 continue
 
@@ -192,6 +195,40 @@ class JobScheduler:
                 len(tasks),
                 tasks[-1]["id"],
             )
+
+    def _dispatch_replication(self, job: dict[str, Any], now: datetime) -> None:
+        job_id = str(job["id"])
+        normalized_job = normalize_job_record(job)
+        request = replication_service.pending_request(normalized_job)
+        if not normalized_job.get("enabled"):
+            if request is not None:
+                replication_service.drop_request(job_id, "the replication job is disabled")
+            return
+        if self._has_pending_task(job, now):
+            return
+        due_slots = self._due_slots(normalized_job, job, now) if self._schedule_can_fire(normalized_job.get("schedule")) else []
+        if not due_slots and request is None:
+            return
+        run_id = str(uuid4())
+        trigger = "schedule" if due_slots else str(request.get("trigger") or "pending")
+        task = replication_service.create_replication_session(normalized_job, trigger=trigger, run_id=run_id)
+        with CATALOG_LOCK:
+            fresh = dict(JOBS.get(job_id) or job)
+            self._advance_due_slots(fresh, due_slots)
+            fresh.update(
+                {
+                    "last_task_id": task["id"],
+                    "last_session_id": task["id"],
+                    "last_run_at": task["created_at"],
+                    "last_run": job_run_record(run_id, trigger=trigger, started_at=task["created_at"], session_ids=[task["id"]]),
+                    "updated_at": task["created_at"],
+                    "last_scheduler_error": None,
+                }
+            )
+            if due_slots:
+                fresh["last_scheduled_at"] = task["created_at"]
+            persist_job(fresh)
+        logger.info("Replication job '%s' started session '%s' (trigger %s).", job_id, task["id"], trigger)
 
     EXECUTION_SLOTS = (
         ("active_full_schedule", "ActiveFull", "active_full_next_run_at"),

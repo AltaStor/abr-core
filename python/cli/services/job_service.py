@@ -476,6 +476,18 @@ class JobService:
         ("retry_interval_minutes", "--retry-interval"),
         ("all_vms", "--all-vms"),
     )
+    REPLICATION_OPTION_FLAGS = (
+        ("source_vm", "--source-vm"),
+        ("target_inventory", "--target-inventory"),
+        ("target_inventory_id", "--target-inventory-id"),
+        ("target_host", "--target-host"),
+        ("target_datastore", "--datastore"),
+        ("network_map", "--network-map"),
+        ("replica_name", "--replica-name"),
+        ("run_after_source", "--run-after-source"),
+        ("restore_point_id", "--restore-point"),
+    )
+    REPLICATION_SHARED_COPY_FLAGS = ("source_jobs", "source_job_ids")
     BACKUP_ONLY_FLAGS = (
         ("inventory", "--inventory"),
         ("inventory_id", "--inventory-id"),
@@ -507,6 +519,55 @@ class JobService:
             if getattr(args, name, None) is not None:
                 fields[name] = int(getattr(args, name))
         return fields
+
+    def _replication_fields(self, args: Any) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        source_job = getattr(args, "source_job", None)
+        source_job_id = getattr(args, "source_job_id", None)
+        source_jobs = getattr(args, "source_jobs", None) or []
+        source_job_ids = getattr(args, "source_job_ids", None) or []
+        if len(source_jobs) > 1 or len(source_job_ids) > 1:
+            raise ValueError("A replication job has one source backup job: give --source-job or --source-job-id once")
+        source_job = self._coalesce_string(source_job, source_jobs[0] if source_jobs else None)
+        source_job_id = self._coalesce_string(source_job_id, source_job_ids[0] if source_job_ids else None)
+        if source_job:
+            fields["source_job"] = source_job
+        if source_job_id:
+            fields["source_job_id"] = source_job_id
+        for name in ("source_vm", "target_inventory", "target_inventory_id", "target_host", "target_datastore", "restore_point_id"):
+            value = self._coalesce_string(getattr(args, name, None))
+            if value:
+                fields[name] = value
+        network_map = [item for value in getattr(args, "network_map", None) or [] for item in parse_csv_values(value)]
+        if network_map:
+            fields["network_map"] = [] if [item.lower() for item in network_map] == ["none"] else network_map
+        replica_name = getattr(args, "replica_name", None)
+        if replica_name is not None:
+            fields["replica_name"] = str(replica_name).strip()
+        if getattr(args, "run_after_source", None) is not None:
+            fields["run_after_source"] = bool(args.run_after_source)
+        return fields
+
+    def create_replication_job_payload(self, args: Any) -> dict[str, Any]:
+        name = self._normalize_name(getattr(args, "name", None), label="Job name")
+        fields = self._replication_fields(args)
+        if not fields.get("source_job") and not fields.get("source_job_id"):
+            raise ValueError("job create-replication requires the source backup job: --source-job or --source-job-id")
+        if not fields.get("replica_name"):
+            raise ValueError("--replica-name is required")
+        payload: dict[str, Any] = {"name": name, **fields}
+        schedule_given = bool(getattr(args, "schedule", None)) or self._schedule_detail_fields_present(args)
+        schedule = self.build_schedule_payload(args) if schedule_given else None
+        if schedule is not None:
+            payload["schedule"] = schedule
+        else:
+            enabled_override = self._schedule_enabled_override(args)
+            if enabled_override is not None:
+                payload["enabled"] = enabled_override
+        description = self._coalesce_string(getattr(args, "description", None))
+        if description:
+            payload["description"] = description
+        return payload
 
     def create_backup_copy_job_payload(self, args: Any) -> dict[str, Any]:
         name = self._normalize_name(getattr(args, "name", None), label="Job name")
@@ -589,15 +650,28 @@ class JobService:
 
     def build_edit_payload(self, job: dict[str, Any], args: Any) -> dict[str, Any]:
         payload: dict[str, Any] = {}
-        is_copy = str(job.get("job_type") or "") == "backup-copy"
-        mismatched = [
-            flag
-            for name, flag in (self.BACKUP_ONLY_FLAGS if is_copy else self.COPY_OPTION_FLAGS)
-            if not self._is_empty_value(getattr(args, name, None))
-        ]
-        if mismatched:
-            kind = "backup jobs" if is_copy else "backup copy jobs"
-            raise ValueError(f"{', '.join(mismatched)} apply to {kind} only, and {job.get('name')} is a {'backup copy' if is_copy else 'backup'} job")
+        job_type = str(job.get("job_type") or "")
+        is_copy = job_type == "backup-copy"
+        is_replication = job_type == "replication"
+        label = "backup copy" if is_copy else "replication" if is_replication else "backup"
+
+        def given(flags: tuple[tuple[str, str], ...], skip: tuple[str, ...] = ()) -> list[str]:
+            return [flag for name, flag in flags if name not in skip and not self._is_empty_value(getattr(args, name, None))]
+
+        if is_replication:
+            for flags, kind in ((self.COPY_OPTION_FLAGS, "backup copy jobs"), (self.BACKUP_ONLY_FLAGS, "backup jobs")):
+                mismatched = given(flags, self.REPLICATION_SHARED_COPY_FLAGS)
+                if mismatched:
+                    raise ValueError(f"{', '.join(mismatched)} apply to {kind} only, and {job.get('name')} is a replication job")
+            payload.update(self._replication_fields(args))
+        else:
+            mismatched = given(self.REPLICATION_OPTION_FLAGS)
+            if mismatched:
+                raise ValueError(f"{', '.join(mismatched)} apply to replication jobs only, and {job.get('name')} is a {label} job")
+            mismatched = given(self.BACKUP_ONLY_FLAGS if is_copy else self.COPY_OPTION_FLAGS)
+            if mismatched:
+                kind = "backup jobs" if is_copy else "backup copy jobs"
+                raise ValueError(f"{', '.join(mismatched)} apply to {kind} only, and {job.get('name')} is a {label} job")
         if is_copy:
             payload.update(self._backup_copy_fields(args))
             if getattr(args, "all_vms", False):

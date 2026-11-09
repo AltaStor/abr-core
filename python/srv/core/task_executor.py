@@ -64,6 +64,7 @@ def run_task(
         logger.error("Task '%s' rejected: status is '%s', not 'queued'.", task_id, task.get("status"))
         raise TaskExecutionError("Only queued tasks can be executed")
 
+    from python.srv.services import replication_service
     from python.srv.services.backup_copy import (
         BackupCopyValidationError,
         is_backup_copy_task,
@@ -81,14 +82,25 @@ def run_task(
     hypervisor_kind = str(hypervisor.get("kind", ""))
     backup_copy = is_backup_copy_task(task)
     synthetic_full = task_type == "backup" and not backup_copy and is_synthetic_full_task(task)
-    plugin = None if synthetic_full or backup_copy else build_hypervisor_plugin(hypervisor)
-    worker_mode = "backup-copy" if backup_copy else "synthetic-full" if synthetic_full else worker_mode_for_kind(hypervisor_kind)
+    replication = replication_service.is_replication_task(task)
+    plugin = None if synthetic_full or backup_copy or replication else build_hypervisor_plugin(hypervisor)
+    worker_mode = (
+        "backup-copy"
+        if backup_copy
+        else "synthetic-full"
+        if synthetic_full
+        else "replication"
+        if replication
+        else worker_mode_for_kind(hypervisor_kind)
+    )
 
     logger.info("Task '%s': Type='%s', HypervisorKind='%s'", task_id, task_type, hypervisor_kind)
 
     try:
         if backup_copy:
             result = run_backup_copy(task, progress_callback=progress_callback)
+        elif replication:
+            result = replication_service.run_replication(task, progress_callback=progress_callback)
         elif synthetic_full:
             result = run_synthetic_full(task, progress_callback=progress_callback)
         elif task_type == "backup":
@@ -122,7 +134,9 @@ def run_task(
                 "message": str(exc),
                 "error_type": type(exc).__name__,
                 "failure_kind": (
-                    "validation" if isinstance(exc, (SyntheticFullValidationError, BackupCopyValidationError)) else "runtime"
+                    "validation"
+                    if isinstance(exc, (SyntheticFullValidationError, BackupCopyValidationError, replication_service.ReplicationValidationError))
+                    else "runtime"
                 ),
                 "traceback": traceback.format_exc(),
                 "finished_at": utc_now(),

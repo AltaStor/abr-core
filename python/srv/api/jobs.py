@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from fastapi import Body
+from fastapi import Body, Query
 
 from python.srv.services import abr_v41
 
@@ -12,7 +12,8 @@ from .schemas import (
     CreateBackupCopyJobRequest,
     CreateCopyJobRequest,
     CreateJobRequest,
-    DeletedResult,
+    CreateReplicationJobRequest,
+    JobDeletedResult,
     JobDTO,
     JobList,
     JobStartResult,
@@ -40,6 +41,12 @@ def create_backup_copy_job(
     return abr_v41.create_backup_copy_job(unset_excluded(payload))
 
 
+def create_replication_job(
+    payload: CreateReplicationJobRequest = Body(default_factory=CreateReplicationJobRequest),
+) -> JobDTO:
+    return abr_v41.create_replication_job(unset_excluded(payload))
+
+
 def list_jobs() -> JobList:
     return {"items": abr_v41.list_jobs()}
 
@@ -52,8 +59,17 @@ def patch_job(job_id: str, payload: UpdateJobRequest = Body(default_factory=Upda
     return abr_v41.edit_job_record(job_id, unset_excluded(payload))
 
 
-def delete_job(job_id: str) -> DeletedResult:
-    return abr_v41.delete_job_record(job_id)
+def delete_job(
+    job_id: str,
+    delete_replica: bool = Query(
+        default=False,
+        description=(
+            "Replication jobs only: true deletes the replica VM and its disks on the target too, and is refused while "
+            "the replica is powered on or the target cannot be reached; without it the replica VM is kept"
+        ),
+    ),
+) -> JobDeletedResult:
+    return abr_v41.delete_job_record(job_id, delete_replica=delete_replica)
 
 
 def start_job(job_id: str, payload: StartJobRequest = Body(default_factory=StartJobRequest)) -> JobStartResult:
@@ -75,6 +91,7 @@ register(router, [
     ("", create_job, ["POST"], "job.create"),
     ("/copy", create_copy_job, ["POST"], "job.create"),
     ("/backup-copy", create_backup_copy_job, ["POST"], "job.create"),
+    ("/replication", create_replication_job, ["POST"], "job.create"),
     ("", list_jobs, ["GET"], "job.view"),
     ("/{job_id}", get_job, ["GET"], "job.view"),
     ("/{job_id}", patch_job, ["PATCH"], "job.edit"),

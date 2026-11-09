@@ -1463,7 +1463,7 @@ class VCenterNode(Hypervisor):
             numCPUs=int(config_metadata.get("num_cpu") or 1),
             files=vim.vm.FileInfo(vmPathName=vm_path),
             deviceChange=device_changes,
-            annotation=f"Restored from backup on {self.host}",
+            annotation=str(config_metadata.get("annotation") or f"Restored from backup on {self.host}"),
         )
         config_spec.firmware = requested_firmware
 

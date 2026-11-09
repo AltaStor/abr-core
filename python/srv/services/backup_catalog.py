@@ -540,6 +540,13 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
                     ),
                     component="retention",
                 )
+            if report.get("skipped_reason"):
+                _append_task_log(
+                    task,
+                    level="info",
+                    message=f"Retention skipped this chain: {report['skipped_reason']}",
+                    component="retention",
+                )
             for failure in failures:
                 _record_session_warning(
                     task,

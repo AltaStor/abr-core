@@ -288,10 +288,10 @@ def _disk_placements(parameters: dict[str, Any], manifest_disks: list[dict[str, 
     return placements
 
 
-def _disk_file_name(disk: dict[str, Any], index: int) -> str:
+def _disk_file_name(disk: dict[str, Any], index: int, suffix: str = "") -> str:
     name = PureWindowsPath(str(disk.get("datastore_path") or "")).name or f"disk-{index}.vhdx"
     stem = PureWindowsPath(name).stem
-    return f"{stem}.vhdx"
+    return f"{stem}{suffix}.vhdx"
 
 
 def _adapter_targets(
@@ -484,7 +484,7 @@ def run_hyperv_restore(
                         or source_datastore
                     )
                     folder = f"{vm_base_folder(target_datastore)}\\{target_vm_name}\\Virtual Hard Disks"
-                    target_path = f"{folder}\\{_disk_file_name(disk, index)}"
+                    target_path = f"{folder}\\{_disk_file_name(disk, index, str(parameters.get('disk_name_suffix') or ''))}"
                     current_path = ""
                 written, basis = restored_estimate(
                     disk,
@@ -732,11 +732,15 @@ def run_hyperv_restore(
                     f"Creating VM {target_vm_name} on {node_name} (generation {vm_config.get('generation')}, "
                     f"{vm_config.get('num_cpu')} vCPU, {vm_config.get('memory_mb')} MB)",
                 )
+                replica_marker = str(parameters.get("replica_marker") or "")
+                shell_config = {**vm_config, "network_adapters": adapters}
+                if replica_marker:
+                    shell_config["notes"] = "\n".join(part for part in (str(vm_config.get("notes") or ""), replica_marker) if part)
                 created = node.create_vm_shell(
                     vm_name=target_vm_name,
                     host_name=node_name,
                     datastore_name=vm_base_folder(primary),
-                    config_metadata={**vm_config, "network_adapters": adapters},
+                    config_metadata=shell_config,
                     disk_layout=[
                         {"controller_type": item["disk"].get("controller_type"), "controller_number": item["disk"].get("controller_number")}
                         for item in plan
@@ -744,6 +748,8 @@ def run_hyperv_restore(
                 )
                 created_vm_id = str(created["vm_id"])
                 target_vm_id = created_vm_id
+                if replica_marker:
+                    _emit(progress_callback, "configure", 86, f"Created VM {target_vm_name} on {node_name}", created_vm_id=created_vm_id)
                 for item in plan:
                     node.attach_existing_disk(created_vm_id, item["path"], item["slot"])
                 node.set_boot_disk(created_vm_id, boot_slot, vm_config.get("boot_order") or [])
