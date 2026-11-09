@@ -329,6 +329,8 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
         }
     ]
 
+    hosts = _known_names_of_unavailable_nodes(hv, hosts)
+
     if cluster_name:
         resources.append(
             {
@@ -426,4 +428,59 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
 
+    unavailable = {
+        str(host_item.get("name") or "").lower(): str(host_item.get("name") or "")
+        for host_item in hosts
+        if host_item.get("status") == "unavailable"
+    }
+    if unavailable:
+        resources.extend(_kept_from_unavailable_nodes(hv, resources, unavailable))
     return resources
+
+
+def _known_names_of_unavailable_nodes(hv: dict[str, Any], hosts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    previous = dict(list(RESOURCES_BY_HV.get(str(hv.get("id") or ""), {}).items()))
+    known = {
+        str(external_id).lower(): str(external_id)
+        for resource_type, external_id in previous
+        if resource_type == "host" and str(external_id)
+    }
+    named = []
+    for host_item in hosts:
+        name = str(host_item.get("name") or "")
+        if host_item.get("status") == "unavailable" and known.get(name.lower(), name) != name:
+            host_item = {**host_item, "name": known[name.lower()]}
+        named.append(host_item)
+    return named
+
+
+def _kept_from_unavailable_nodes(
+    hv: dict[str, Any], resources: list[dict[str, Any]], unavailable: dict[str, str]
+) -> list[dict[str, Any]]:
+    previous = dict(list(RESOURCES_BY_HV.get(str(hv.get("id") or ""), {}).items()))
+    listed = {(item["resource_type"], str(item["external_id"])) for item in resources}
+    kept_vms: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    for (resource_type, external_id), item in previous.items():
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        if resource_type != "virtual_machine" or (resource_type, str(external_id)) in listed:
+            continue
+        if str(payload.get("host_name") or "").lower() not in unavailable:
+            continue
+        kept_vms.add(str(external_id))
+        kept.append({key: item[key] for key in ("resource_type", "external_id", "name", "payload") if key in item})
+    for (resource_type, external_id), item in previous.items():
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        if resource_type not in ("disk", "network_adapter") or (resource_type, str(external_id)) in listed:
+            continue
+        if str(payload.get("vm_id") or "") in kept_vms:
+            kept.append({key: item[key] for key in ("resource_type", "external_id", "name", "payload") if key in item})
+    if kept_vms:
+        discovery_logger.warning(
+            "Hyper-V discovery of inventory %s kept %d VM(s) of the node(s) that did not answer (%s) as they were "
+            "found last time, so their jobs keep running; they are listed again as soon as the node answers",
+            hv.get("name"),
+            len(kept_vms),
+            ", ".join(sorted(unavailable.values())),
+        )
+    return kept
