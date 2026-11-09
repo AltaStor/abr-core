@@ -127,6 +127,34 @@ class ConfiguredProtocolIsStrictTests(unittest.TestCase):
             _node(protocol="ftp")
 
 
+class ConnectionLogLineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        hyperv._LOGGED_CONNECTIONS.clear()
+        self.addCleanup(hyperv._LOGGED_CONNECTIONS.clear)
+
+    def _connected_levels(self, *nodes: HyperVNode) -> list[str]:
+        with _Host({hyperv.HTTPS_PORT, 15986}), self.assertLogs(hyperv.logger, level="DEBUG") as logs:
+            for node in nodes:
+                node.connect()
+        return [record.levelname for record in logs.records if record.getMessage().startswith("Connected to Hyper-V host")]
+
+    def test_the_first_connection_is_logged_at_info_and_its_repeats_at_debug(self) -> None:
+        levels = self._connected_levels(_node(protocol="https"), _node(protocol="https"), _node(protocol="https"))
+
+        self.assertEqual(levels, ["INFO", "DEBUG", "DEBUG"])
+
+    def test_another_user_port_or_host_is_logged_at_info_again(self) -> None:
+        levels = self._connected_levels(
+            _node(protocol="https"),
+            HyperVNode(HOST, "CORP\\other", "secret", protocol="https"),
+            _node(protocol="https", port=15986),
+            HyperVNode("192.0.2.91", "CORP\\backup", "secret", protocol="https"),
+            _node(protocol="https"),
+        )
+
+        self.assertEqual(levels, ["INFO", "INFO", "INFO", "INFO", "DEBUG"])
+
+
 class LegacyInventoryDetectsOnceTests(unittest.TestCase):
     def test_without_a_port_https_is_tried_first_then_http_and_the_result_is_reported(self) -> None:
         detected = MagicMock()

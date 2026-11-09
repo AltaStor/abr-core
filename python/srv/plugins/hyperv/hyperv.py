@@ -44,6 +44,17 @@ NODE_SNAPSHOT_TIMEOUT_SECONDS = 90
 RECONNECT_PAUSE_SECONDS = 10
 CONNECTION_ERRORS = (requests.ConnectionError, requests.Timeout)
 SCRIPT_DIR = Path(__file__).resolve().parent / "scripts"
+_LOGGED_CONNECTIONS: set[tuple[str, int, str, str]] = set()
+_LOGGED_CONNECTIONS_LOCK = threading.Lock()
+
+
+def connection_log_level(host: str, port: int, protocol: str, user: str) -> int:
+    key = (str(host).lower(), int(port), str(protocol).lower(), str(user).lower())
+    with _LOGGED_CONNECTIONS_LOCK:
+        if key in _LOGGED_CONNECTIONS:
+            return logging.DEBUG
+        _LOGGED_CONNECTIONS.add(key)
+        return logging.INFO
 
 
 class HyperVError(Exception):
@@ -636,7 +647,8 @@ class HyperVNode(Hypervisor):
                 continue
 
             self._resolved_port = port
-            logger.info(
+            logger.log(
+                connection_log_level(host, port, protocol, self.user),
                 "Connected to Hyper-V host %s over WinRM port %d (%s) as %s",
                 host,
                 port,
