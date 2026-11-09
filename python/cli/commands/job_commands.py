@@ -21,6 +21,7 @@ from ..parsing.validators import (
 )
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
+from .inventory_commands import INVENTORY_SCAN_TIMEOUT_SECONDS
 
 RETENTION_TIMEOUT_SECONDS = 21600
 REPLICA_DELETE_TIMEOUT_SECONDS = 1800
@@ -709,7 +710,9 @@ class JobCommands:
     def create(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
         payload = deps.jobs.create_backup_job_payload(args)
-        result = self._decorate_job(deps.context.api_client.post("api/v1/jobs", json=payload))
+        result = self._decorate_job(
+            deps.context.api_client.post("api/v1/jobs", json=payload, timeout=INVENTORY_SCAN_TIMEOUT_SECONDS)
+        )
         deps.context.print_output(result, self._columns())
         return 0
 
@@ -802,7 +805,9 @@ class JobCommands:
         job_id = self._resolve_id(deps, args)
         current = deps.context.api_client.get(f"api/v1/jobs/{job_id}")
         payload = deps.jobs.build_edit_payload(current, args)
-        result = self._decorate_job(deps.context.api_client.patch(f"api/v1/jobs/{job_id}", json=payload))
+        result = self._decorate_job(
+            deps.context.api_client.patch(f"api/v1/jobs/{job_id}", json=payload, timeout=INVENTORY_SCAN_TIMEOUT_SECONDS)
+        )
         deps.context.print_output(result, self._columns())
         return 0
 

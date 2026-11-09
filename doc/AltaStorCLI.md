@@ -477,7 +477,9 @@ abr inventory add --name Prod-vCenter --type vsphere --address 192.168.1.10 --us
 Note:
 VM discovery is not required up front. It runs automatically the first time you
 reference VM names in job create, so no manual inventory rescan is needed after
-inventory add.
+inventory add. job create, and job edit with new VMs, waits for that discovery
+as long as inventory rescan does (up to 15 minutes), so it reports the outcome
+the server reaches instead of failing while the job is still being created.
 
 A hyper-v inventory speaks WinRM over HTTPS on port 5986 unless --protocol
 http is given (port 5985). --port moves the port and keeps the protocol, so
