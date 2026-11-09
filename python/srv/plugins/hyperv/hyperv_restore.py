@@ -9,10 +9,10 @@ firmware and network adapters (on the mapped virtual switches) is built around
 them with create_vm_shell / attach_existing_disk -- the same interface the
 vCenter plugin restores through. The source VM is not touched.
 
-In place ("in_place"): the VM itself is kept -- its id, network adapters and
-cluster role -- and its disks are replaced. The restored disks are written
-next to the current ones under new names; once all are written the VM is
-turned off, set back to the processor and memory the backup recorded and
+In place ("in_place"): the VM itself is kept -- its id and cluster role --
+and its disks are replaced. The restored disks are written next to the
+current ones under new names; once all are written the VM is turned off, set
+back to the configuration the backup recorded, network adapters included, and
 pointed at the new files, and only then are the files it used before deleted.
 A VM with checkpoints is refused: replacing a disk under a checkpoint chain
 would break the chain.
@@ -288,10 +288,10 @@ def _disk_placements(parameters: dict[str, Any], manifest_disks: list[dict[str, 
     return placements
 
 
-def _disk_file_name(disk: dict[str, Any], index: int) -> str:
+def _disk_file_name(disk: dict[str, Any], index: int, suffix: str = "") -> str:
     name = PureWindowsPath(str(disk.get("datastore_path") or "")).name or f"disk-{index}.vhdx"
     stem = PureWindowsPath(name).stem
-    return f"{stem}.vhdx"
+    return f"{stem}{suffix}.vhdx"
 
 
 def _adapter_targets(
@@ -418,6 +418,7 @@ def run_hyperv_restore(
             # ---- validate the target ------------------------------------
             in_place_state: dict[str, Any] = {}
             live_disks: dict[str, dict[str, Any]] = {}
+            current_config: dict[str, Any] | None = None
             if mode == "in_place":
                 try:
                     in_place_state = node.locate_vm(source_vm_id)
@@ -435,6 +436,10 @@ def run_hyperv_restore(
                 target_vm_id = source_vm_id
                 target_vm_name = str(in_place_state.get("name") or source_vm_name)
                 live_disks = {disk["slot"]: disk for disk in node.get_vm_disks(source_vm_id)}
+                try:
+                    current_config = node.get_vm_restore_metadata(source_vm_id)
+                except HyperVError as exc:
+                    logger.warning("Could not read the configuration of %s before the in-place restore: %s", target_vm_name, exc)
             else:
                 try:
                     node_name = node.resolve_node(requested_host)
@@ -479,7 +484,7 @@ def run_hyperv_restore(
                         or source_datastore
                     )
                     folder = f"{vm_base_folder(target_datastore)}\\{target_vm_name}\\Virtual Hard Disks"
-                    target_path = f"{folder}\\{_disk_file_name(disk, index)}"
+                    target_path = f"{folder}\\{_disk_file_name(disk, index, str(parameters.get('disk_name_suffix') or ''))}"
                     current_path = ""
                 written, basis = restored_estimate(
                     disk,
@@ -660,6 +665,12 @@ def run_hyperv_restore(
                     )
                     result = run.get("result") or {}
                     if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
+                        if vhdx_tool.ended_unexpectedly(run.get("result"), run.get("lines") or [], run.get("exit_code")):
+                            raise HyperVRestoreError(
+                                vhdx_tool.unexpected_end_message(
+                                    node_name, run["exit_code"], run.get("lines") or [], f"restoring disk {slot} of {target_vm_name}"
+                                )
+                            )
                         detail = vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
                         raise HyperVRestoreError(
                             f"Restoring disk {slot} from {layer['abr_backup_name']} failed: {detail}"
@@ -721,11 +732,15 @@ def run_hyperv_restore(
                     f"Creating VM {target_vm_name} on {node_name} (generation {vm_config.get('generation')}, "
                     f"{vm_config.get('num_cpu')} vCPU, {vm_config.get('memory_mb')} MB)",
                 )
+                replica_marker = str(parameters.get("replica_marker") or "")
+                shell_config = {**vm_config, "network_adapters": adapters}
+                if replica_marker:
+                    shell_config["notes"] = "\n".join(part for part in (str(vm_config.get("notes") or ""), replica_marker) if part)
                 created = node.create_vm_shell(
                     vm_name=target_vm_name,
                     host_name=node_name,
                     datastore_name=vm_base_folder(primary),
-                    config_metadata={**vm_config, "network_adapters": adapters},
+                    config_metadata=shell_config,
                     disk_layout=[
                         {"controller_type": item["disk"].get("controller_type"), "controller_number": item["disk"].get("controller_number")}
                         for item in plan
@@ -733,6 +748,8 @@ def run_hyperv_restore(
                 )
                 created_vm_id = str(created["vm_id"])
                 target_vm_id = created_vm_id
+                if replica_marker:
+                    _emit(progress_callback, "configure", 86, f"Created VM {target_vm_name} on {node_name}", created_vm_id=created_vm_id)
                 for item in plan:
                     node.attach_existing_disk(created_vm_id, item["path"], item["slot"])
                 node.set_boot_disk(created_vm_id, boot_slot, vm_config.get("boot_order") or [])
@@ -745,7 +762,14 @@ def run_hyperv_restore(
                 )
                 previous_state = node.power_off_vm(target_vm_id)
                 logger.info("VM %s was %s before the in-place restore", target_vm_name, previous_state.get("previous_state"))
-                node.set_vm_hardware(target_vm_id, vm_config)
+                changed = node.set_vm_hardware(target_vm_id, vm_config)
+                if changed:
+                    _emit(
+                        progress_callback,
+                        "configure",
+                        86,
+                        f"{target_vm_name} set back to the backup's " + ", ".join(_setting_change(item) for item in changed),
+                    )
                 swapped = node.replace_vm_disks(
                     target_vm_id,
                     [
@@ -784,7 +808,18 @@ def run_hyperv_restore(
             written_files = []
             created_folders = []
             if mode == "in_place":
-                _reconnect_adapters(node, target_vm_id, target_vm_name, vm_config, warnings, progress_callback)
+                _restore_adapters(node, target_vm_id, target_vm_name, vm_config, warnings, progress_callback)
+                boot_restored = _restore_boot_order(
+                    node, target_vm_id, target_vm_name, vm_config, restored_slots, warnings, progress_callback
+                )
+                kept = _kept_as_they_are(current_config, vm_config, boot_restored)
+                if kept:
+                    message = (
+                        f"{target_vm_name} keeps what an in-place restore does not change, and it differs from the "
+                        "backup: " + "; ".join(kept)
+                    )
+                    _warn(progress_callback, "configure", 93, message)
+                    warnings.append(message)
             power_state = "Off"
             if power_on:
                 _emit(progress_callback, "finalize", 94, f"Starting {target_vm_name}")
@@ -997,7 +1032,14 @@ def _left_behind(left: dict[str, Any]) -> str:
     return "; ".join(parts) or "nothing"
 
 
-def _reconnect_adapters(
+def _setting_change(item: dict[str, Any]) -> str:
+    setting = str(item.get("setting") or "")
+    if setting == "notes":
+        return "notes"
+    return f"{setting} ({item.get('before') or 'none'} -> {item.get('after') or 'none'})"
+
+
+def _restore_adapters(
     node: HyperVNode,
     vm_id: str,
     vm_name: str,
@@ -1005,32 +1047,62 @@ def _reconnect_adapters(
     warnings: list[str],
     progress_callback: ProgressCallback,
 ) -> None:
+    recorded = vm_config.get("network_adapters")
+    if not isinstance(recorded, list):
+        message = f"The backup does not record the network adapters of {vm_name}, so they are left as they are"
+        _warn(progress_callback, "configure", 92, message)
+        warnings.append(message)
+        return
     wanted = [
         {
             "label": str(adapter.get("label") or ""),
             "switch": str(adapter.get("network") or ""),
             "vlan_mode": str(adapter.get("vlan_mode") or ""),
             "vlan_id": int(adapter.get("vlan_id") or 0),
+            "adapter_id": str(adapter.get("adapter_id") or ""),
+            "mac": str(adapter.get("mac") or ""),
+            "dynamic_mac": adapter.get("dynamic_mac") is not False,
+            "legacy": bool(adapter.get("legacy")),
         }
-        for adapter in vm_config.get("network_adapters") or []
+        for adapter in recorded
         if isinstance(adapter, dict)
     ]
-    if not wanted:
-        return
     try:
-        rows = node.connect_vm_adapters(vm_id, wanted)
+        rows = node.restore_vm_adapters(vm_id, wanted)
     except HyperVError as exc:
-        message = f"{vm_name} is restored, but its network adapters could not be set back to the backup's switches: {exc}"
+        message = f"{vm_name} is restored, but its network adapters could not be set back to the backup's: {exc}"
         _warn(progress_callback, "configure", 92, message)
         warnings.append(message)
         return
     for row in rows:
         label = row.get("label") or "network adapter"
-        if row.get("status") == "missing":
-            message = f"{vm_name} no longer has the network adapter {label} the backup recorded on {row.get('switch') or 'no switch'}"
-            _warn(progress_callback, "configure", 92, message)
-            warnings.append(message)
-        elif row.get("status") == "reconnected":
+        status = row.get("status")
+        if status == "removed":
+            _emit(
+                progress_callback,
+                "configure",
+                92,
+                f"Network adapter {label} on {row.get('previous') or 'no switch'} removed from {vm_name}: the backup "
+                "does not have it",
+            )
+        elif status == "created":
+            static = next(
+                (
+                    item["mac"]
+                    for item in wanted
+                    if item["label"] == row.get("label") and not item["dynamic_mac"] and item["mac"].strip("0")
+                ),
+                "",
+            )
+            _emit(
+                progress_callback,
+                "configure",
+                92,
+                f"Network adapter {label} of {vm_name} recreated on {row.get('switch') or 'no switch'}"
+                + (f" with its MAC address {static}" if static else "")
+                + ", as in the backup",
+            )
+        elif status == "reconnected":
             _emit(
                 progress_callback,
                 "configure",
@@ -1050,6 +1122,96 @@ def _reconnect_adapters(
                 f"Network adapter {label} of {vm_name} set back from {row.get('previous_vlan') or 'its VLAN'} "
                 f"to {vlan_text}, as in the backup",
             )
+
+
+def _first_boot_entry(config: dict[str, Any]) -> dict[str, Any]:
+    return next((entry for entry in config.get("boot_order") or [] if isinstance(entry, dict)), {})
+
+
+def _boot_entry_text(entry: dict[str, Any]) -> str:
+    kind = str(entry.get("boot_type") or "")
+    device = str(entry.get("device") or "")
+    return f"{kind} {device}".strip() or "nothing"
+
+
+def _restore_boot_order(
+    node: HyperVNode,
+    vm_id: str,
+    vm_name: str,
+    vm_config: dict[str, Any],
+    restored_slots: dict[str, str],
+    warnings: list[str],
+    progress_callback: ProgressCallback,
+) -> bool:
+    boot_order = [entry for entry in vm_config.get("boot_order") or [] if isinstance(entry, dict)]
+    if not boot_order:
+        return False
+    first = boot_order[0]
+    generation = int(vm_config.get("generation") or (2 if vm_config.get("firmware") == "efi" else 1))
+    slot = ""
+    if generation >= 2:
+        if first.get("boot_type") != "Drive" or str(first.get("device") or "").upper() not in restored_slots:
+            return False
+        slot = restored_slots[str(first.get("device") or "").upper()]
+    try:
+        node.set_boot_disk(vm_id, slot, boot_order)
+    except HyperVError as exc:
+        message = f"{vm_name} is restored, but its boot order could not be set back to the backup's: {exc}"
+        _warn(progress_callback, "configure", 93, message)
+        warnings.append(message)
+        return False
+    return True
+
+
+def _slot_paths(entries: Any) -> dict[str, str]:
+    return {
+        str(entry.get("slot") or "").upper(): str(entry.get("path") or "")
+        for entry in entries or []
+        if isinstance(entry, dict) and entry.get("slot")
+    }
+
+
+def _kept_as_they_are(
+    current: dict[str, Any] | None, backup: dict[str, Any], boot_restored: bool
+) -> list[str]:
+    if not current:
+        return ["the rest of its configuration, which could not be read to compare it with the backup"]
+    kept: list[str] = []
+    now_secure, then_secure = current.get("secure_boot_enabled"), backup.get("secure_boot_enabled")
+    if now_secure is not None and then_secure is not None and bool(now_secure) != bool(then_secure):
+        kept.append(f"Secure Boot is {'on' if now_secure else 'off'} (the backup: {'on' if then_secure else 'off'})")
+    elif now_secure and then_secure:
+        now_template = str(current.get("secure_boot_template") or "")
+        then_template = str(backup.get("secure_boot_template") or "")
+        if now_template and then_template and now_template != then_template:
+            kept.append(f"the Secure Boot template is {now_template} (the backup: {then_template})")
+    if "tpm_enabled" in backup and bool(current.get("tpm_enabled")) != bool(backup.get("tpm_enabled")):
+        kept.append(
+            f"the virtual TPM is {'on' if current.get('tpm_enabled') else 'off'} "
+            f"(the backup: {'on' if backup.get('tpm_enabled') else 'off'})"
+        )
+    if "dvd_drives" in backup:
+        now_dvd, then_dvd = _slot_paths(current.get("dvd_drives")), _slot_paths(backup.get("dvd_drives"))
+        for slot in sorted(set(now_dvd) | set(then_dvd)):
+            if slot not in then_dvd:
+                kept.append(f"the DVD drive {slot} was added after the backup")
+            elif slot not in now_dvd:
+                kept.append(f"the DVD drive {slot} of the backup is gone")
+            elif now_dvd[slot].lower() != then_dvd[slot].lower():
+                kept.append(f"the DVD drive {slot} holds {now_dvd[slot] or 'no media'} (the backup: {then_dvd[slot] or 'no media'})")
+    if "hard_drives" in backup:
+        then_disks = _slot_paths(backup.get("hard_drives"))
+        for slot, path in sorted(_slot_paths(current.get("hard_drives")).items()):
+            if slot not in then_disks:
+                kept.append(f"the hard disk {slot} ({path}) was attached after the backup")
+    now_version, then_version = str(current.get("version") or ""), str(backup.get("version") or "")
+    if now_version and then_version and now_version != then_version:
+        kept.append(f"the configuration version is {now_version} (the backup: {then_version})")
+    if not boot_restored:
+        now_first, then_first = _first_boot_entry(current), _first_boot_entry(backup)
+        if then_first and _boot_entry_text(now_first).lower() != _boot_entry_text(then_first).lower():
+            kept.append(f"it boots first from {_boot_entry_text(now_first)} (the backup: {_boot_entry_text(then_first)})")
+    return kept
 
 
 def _undo_note(progress_callback: ProgressCallback, warn: bool, stage: str, progress: int, message: str) -> None:

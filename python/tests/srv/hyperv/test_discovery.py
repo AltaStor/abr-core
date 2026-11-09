@@ -585,5 +585,155 @@ class HyperVNodeInventoryTests(unittest.TestCase):
         )
 
 
+
+class AnUnansweringNodeKeepsItsVmsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        RESOURCES_BY_HV.clear()
+        self.addCleanup(RESOURCES_BY_HV.clear)
+
+    @staticmethod
+    def _scan(node: FakeHyperVNode) -> list[dict]:
+        with patch("python.srv.plugins.hyperv.HyperVNode", return_value=node):
+            return build_hyperv_resources(dict(INVENTORY_RECORD))
+
+    @staticmethod
+    def _remember(resources: list[dict]) -> None:
+        RESOURCES_BY_HV[INVENTORY_RECORD["id"]] = {(item["resource_type"], item["external_id"]): item for item in resources}
+
+    @staticmethod
+    def _ids(resources: list[dict], resource_type: str) -> list[str]:
+        return sorted(str(item["external_id"]) for item in resources if item["resource_type"] == resource_type)
+
+    def _node_b_silent(self) -> FakeHyperVNode:
+        node = FakeHyperVNode(HYPERV_HOST, "u", "p")
+        node.hosts[1] = {**node.hosts[1], "status": "unavailable", "datastores": [], "networks": []}
+        node.inventory = {
+            "virtual_machines": [dict(STANDALONE_VM)],
+            "disks": [dict(item) for item in DISKS if item["vm_id"] == STANDALONE_VM["vm_id"]],
+            "network_adapters": [dict(item) for item in NICS if item["vm_id"] == STANDALONE_VM["vm_id"]],
+        }
+        return node
+
+    def test_the_vms_of_a_node_that_did_not_answer_stay_with_their_disks_and_adapters(self) -> None:
+        full = self._scan(FakeHyperVNode(HYPERV_HOST, "u", "p"))
+        self._remember(full)
+
+        with self.assertLogs("python.srv.services.discovery", level="WARNING") as logs:
+            again = self._scan(self._node_b_silent())
+
+        self.assertEqual(self._ids(again, "virtual_machine"), self._ids(full, "virtual_machine"))
+        self.assertEqual(self._ids(again, "disk"), self._ids(full, "disk"))
+        self.assertEqual(self._ids(again, "network_adapter"), self._ids(full, "network_adapter"))
+        self.assertIn(f"kept 1 VM(s) of the node(s) that did not answer ({HYPERV_NODE_B.upper()})", logs.output[0])
+
+    def test_a_vm_that_moved_to_a_node_that_answered_is_not_listed_twice(self) -> None:
+        self._remember(self._scan(FakeHyperVNode(HYPERV_HOST, "u", "p")))
+        node = self._node_b_silent()
+        node.inventory["virtual_machines"].append(dict(CLUSTERED_VM, owner_node=HYPERV_NODE_A))
+
+        again = self._scan(node)
+
+        vms = [item for item in again if item["resource_type"] == "virtual_machine"]
+        self.assertEqual(len(vms), 2)
+        moved = next(item for item in vms if item["external_id"] == CLUSTERED_VM["vm_id"])
+        self.assertEqual(moved["payload"]["host_name"], HYPERV_NODE_A)
+
+    def test_a_vm_removed_while_every_node_answers_is_gone_as_before(self) -> None:
+        self._remember(self._scan(FakeHyperVNode(HYPERV_HOST, "u", "p")))
+        node = FakeHyperVNode(HYPERV_HOST, "u", "p")
+        node.inventory = {
+            "virtual_machines": [dict(STANDALONE_VM)],
+            "disks": [dict(item) for item in DISKS if item["vm_id"] == STANDALONE_VM["vm_id"]],
+            "network_adapters": [dict(item) for item in NICS if item["vm_id"] == STANDALONE_VM["vm_id"]],
+        }
+
+        again = self._scan(node)
+
+        self.assertEqual(self._ids(again, "virtual_machine"), [STANDALONE_VM["vm_id"]])
+        self.assertNotIn(CLUSTERED_VM["vm_id"], " ".join(self._ids(again, "disk")))
+
+    def test_without_an_earlier_scan_nothing_is_made_up(self) -> None:
+        again = self._scan(self._node_b_silent())
+
+        self.assertEqual(self._ids(again, "virtual_machine"), [STANDALONE_VM["vm_id"]])
+
+
+class AnUnansweringNodeKeepsItsHostNameTests(unittest.TestCase):
+    def setUp(self) -> None:
+        RESOURCES_BY_HV.clear()
+        self.addCleanup(RESOURCES_BY_HV.clear)
+
+    @staticmethod
+    def _scan(node: FakeHyperVNode) -> list[dict]:
+        with patch("python.srv.plugins.hyperv.HyperVNode", return_value=node):
+            return build_hyperv_resources(dict(INVENTORY_RECORD))
+
+    @staticmethod
+    def _remember(resources: list[dict]) -> None:
+        RESOURCES_BY_HV[INVENTORY_RECORD["id"]] = {(item["resource_type"], item["external_id"]): item for item in resources}
+
+    @staticmethod
+    def _hosts(resources: list[dict]) -> dict[str, dict]:
+        return {str(item["external_id"]): item for item in resources if item["resource_type"] == "host"}
+
+    @staticmethod
+    def _node_b(name: str, status: str) -> FakeHyperVNode:
+        node = FakeHyperVNode(HYPERV_HOST, "u", "p")
+        if status == "unavailable":
+            node.hosts[1] = {
+                **node.hosts[1],
+                "name": name,
+                "dns_name": "",
+                "version": "",
+                "datastores": [],
+                "datastore_capacity": {},
+                "networks": [],
+                "status": status,
+            }
+            node.inventory = {
+                "virtual_machines": [dict(STANDALONE_VM)],
+                "disks": [dict(item) for item in DISKS if item["vm_id"] == STANDALONE_VM["vm_id"]],
+                "network_adapters": [dict(item) for item in NICS if item["vm_id"] == STANDALONE_VM["vm_id"]],
+            }
+        else:
+            node.hosts[1] = {**node.hosts[1], "name": name, "status": status}
+        return node
+
+    def test_a_node_that_did_not_answer_keeps_the_host_id_of_the_earlier_scan(self) -> None:
+        full = self._scan(FakeHyperVNode(HYPERV_HOST, "u", "p"))
+        self._remember(full)
+
+        with self.assertLogs("python.srv.services.discovery", level="WARNING") as logs:
+            again = self._scan(self._node_b(HYPERV_NODE_B.lower(), "unavailable"))
+
+        self.assertEqual(sorted(self._hosts(again)), sorted(self._hosts(full)))
+        silent = self._hosts(again)[HYPERV_NODE_B.upper()]
+        self.assertEqual(silent["name"], HYPERV_NODE_B.upper())
+        self.assertEqual(silent["payload"]["status"], "unavailable")
+        self.assertEqual(silent["payload"]["datastores"], [])
+        self.assertIn(f"did not answer ({HYPERV_NODE_B.upper()})", logs.output[0])
+
+    def test_a_node_seen_for_the_first_time_keeps_the_name_the_cluster_gives(self) -> None:
+        again = self._scan(self._node_b(HYPERV_NODE_B.lower(), "unavailable"))
+
+        self.assertIn(HYPERV_NODE_B.lower(), self._hosts(again))
+
+    def test_a_node_that_answers_is_named_as_it_names_itself(self) -> None:
+        self._remember(self._scan(FakeHyperVNode(HYPERV_HOST, "u", "p")))
+
+        again = self._scan(self._node_b(HYPERV_NODE_B.capitalize(), "connected"))
+
+        self.assertIn(HYPERV_NODE_B.capitalize(), self._hosts(again))
+        self.assertNotIn(HYPERV_NODE_B.upper(), self._hosts(again))
+
+    def test_another_inventory_lends_no_names(self) -> None:
+        RESOURCES_BY_HV["another-inventory"] = {("host", HYPERV_NODE_B.upper()): {"resource_type": "host", "external_id": HYPERV_NODE_B.upper()}}
+        self.addCleanup(RESOURCES_BY_HV.pop, "another-inventory", None)
+
+        again = self._scan(self._node_b(HYPERV_NODE_B.lower(), "unavailable"))
+
+        self.assertIn(HYPERV_NODE_B.lower(), self._hosts(again))
+
+
 if __name__ == "__main__":
     unittest.main()

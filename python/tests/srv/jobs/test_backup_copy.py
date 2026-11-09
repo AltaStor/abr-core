@@ -60,6 +60,7 @@ class _Catalog(unittest.TestCase):
             }
         )
         self.clock = 0
+        self.epoch = (datetime.now(timezone.utc) - timedelta(days=3)).replace(minute=0, second=0, microsecond=0)
 
     def _point(self, point_id: str, kind: str, *, job_id: str = "nightly", repo: str = "src", **extra) -> dict:
         self.clock += 1
@@ -76,7 +77,7 @@ class _Catalog(unittest.TestCase):
             "repository_name": REPOSITORIES[repo]["name"],
             "execution_type": kind,
             "full_backup": full,
-            "created_at": f"2026-11-0{1 + self.clock // 10}T0{self.clock % 10}:00:00+00:00",
+            "created_at": (self.epoch + timedelta(hours=self.clock)).isoformat(),
             "chain_id": f"backup::{job_id}::{VM}::{repo}",
             "artifact": {"disks": [{"index": 0, "abr_backup_name": "disk-0.vmdk", "abr_path": f"/r/{point_id}"}]},
         }

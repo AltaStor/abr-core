@@ -7,13 +7,13 @@ import unittest
 
 from python.srv.core.mongo_db_wrapper import BACKUPS, JOBS
 from python.srv.services import abr_v41
-from python.srv.services.backup_mode import (
-    encryption_changed_since_last_backup,
-    resolve_job_backup_mode,
-)
 from python.srv.services.backup_catalog import (
     _resolve_point_encryption_key_id,
     backfill_backup_encryption_key_ids,
+)
+from python.srv.services.backup_mode import (
+    encryption_changed_since_last_backup,
+    resolve_job_backup_mode,
 )
 
 KEY_A = "et-key-alpha-000000000001"
@@ -71,13 +71,45 @@ class JobKeyListTests(unittest.TestCase):
             [{"key_id": 0, "key": KEY_A}, {"key_id": 1, "key": KEY_B}],
         )
 
-    def test_turning_encryption_off_drops_the_list(self) -> None:
+    def test_turning_encryption_off_keeps_the_list_but_no_current_key(self) -> None:
         first = _validated({"encryption_enabled": True, "encryption_key": KEY_A})
 
         disabled = _validated({"encryption_enabled": False}, previous=first)
 
-        self.assertNotIn("encryption_keys", disabled)
+        self.assertEqual(disabled["encryption_keys"], [{"key_id": 0, "key": KEY_A}])
         self.assertNotIn("encryption_key_id", disabled)
+
+    def _turned_off(self, previous: dict) -> dict:
+        merged = abr_v41._merge_task_parameters(previous, {"encryption_enabled": None, "encryption_key": None})
+        return _validated(merged, previous=previous)
+
+    def test_turning_encryption_off_the_way_the_cli_does_keeps_the_list(self) -> None:
+        rotated = _validated({"encryption_enabled": True, "encryption_key": KEY_B}, previous=_validated({"encryption_enabled": True, "encryption_key": KEY_A}))
+
+        disabled = self._turned_off(rotated)
+
+        self.assertNotIn("encryption_key", disabled)
+        self.assertFalse(disabled.get("encryption_enabled"))
+        self.assertEqual(disabled["encryption_keys"], [{"key_id": 0, "key": KEY_A}, {"key_id": 1, "key": KEY_B}])
+
+    def test_a_new_key_after_encryption_was_off_gets_a_new_id_never_a_used_one(self) -> None:
+        disabled = self._turned_off(_validated({"encryption_enabled": True, "encryption_key": KEY_A}))
+
+        again = _validated({"encryption_enabled": True, "encryption_key": KEY_C}, previous=disabled)
+
+        self.assertEqual(again["encryption_key_id"], 1)
+        self.assertEqual(again["encryption_keys"], [{"key_id": 0, "key": KEY_A}, {"key_id": 1, "key": KEY_C}])
+
+    def test_the_first_key_turned_on_again_gets_its_old_id_back(self) -> None:
+        disabled = self._turned_off(_validated({"encryption_enabled": True, "encryption_key": KEY_A}))
+
+        again = _validated({"encryption_enabled": True, "encryption_key": KEY_A}, previous=disabled)
+
+        self.assertEqual(again["encryption_key_id"], 0)
+        self.assertEqual(again["encryption_keys"], [{"key_id": 0, "key": KEY_A}])
+
+    def test_a_job_that_never_encrypted_gets_no_list(self) -> None:
+        self.assertNotIn("encryption_keys", _validated({"encryption_enabled": False}))
 
 
 class PointKeyIdTests(unittest.TestCase):
@@ -150,17 +182,53 @@ class RestoreKeyResolutionTests(unittest.TestCase):
 
         self.assertEqual(abr_v41._resolve_restore_encryption_key(point), KEY_A)
 
-    def test_the_key_id_is_what_resolves_it_not_the_copy_on_the_point(self) -> None:
+    def test_the_key_the_point_was_written_with_wins_over_a_job_key_that_reused_its_id(self) -> None:
+        JOBS["job-1"] = {
+            "id": "job-1",
+            "name": "turned-off-and-on",
+            "job_type": "backup",
+            "task_parameters": _validated({"encryption_enabled": True, "encryption_key": KEY_C}),
+        }
+        point = {"id": "p5", "job_id": "job-1", "encryption_enabled": True, "encryption_key_id": 0, "encryption_key": KEY_A}
+
+        self.assertEqual(abr_v41._resolve_restore_encryption_key(point), KEY_A)
+
+    def test_a_point_without_its_own_copy_resolves_its_id_while_the_job_no_longer_encrypts(self) -> None:
+        rotated = self._rotated_job()
+        rotated["task_parameters"] = _validated({"encryption_enabled": False}, previous=rotated["task_parameters"])
+        JOBS["job-1"] = rotated
+        point = {"id": "p8", "job_id": "job-1", "encryption_enabled": True, "encryption_key_id": 0}
+
+        self.assertEqual(abr_v41._resolve_restore_encryption_key(point), KEY_A)
+
+    def test_a_copy_that_cannot_be_decrypted_falls_back_to_the_key_id(self) -> None:
         JOBS["job-1"] = self._rotated_job()
         point = {
-            "id": "p5",
+            "id": "p9",
             "job_id": "job-1",
             "encryption_enabled": True,
             "encryption_key_id": 0,
-            "encryption_key": "a-stale-copy-that-must-not-win",
+            "encryption_key": "abr-enc:v1:placeholder-that-cannot-be-decrypted",
         }
 
         self.assertEqual(abr_v41._resolve_restore_encryption_key(point), KEY_A)
+
+    def test_every_point_of_a_job_turned_off_and_on_again_gets_its_own_key(self) -> None:
+        first = _validated({"encryption_enabled": True, "encryption_key": KEY_A})
+        rotated = _validated({"encryption_enabled": True, "encryption_key": KEY_B}, previous=first)
+        disabled = _validated({"encryption_enabled": False}, previous=rotated)
+        again = _validated({"encryption_enabled": True, "encryption_key": KEY_C}, previous=disabled)
+        JOBS["job-1"] = {"id": "job-1", "name": "j", "job_type": "backup", "task_parameters": again}
+        points = {
+            KEY_A: {"id": "a", "job_id": "job-1", "encryption_enabled": True, "encryption_key_id": 0},
+            KEY_B: {"id": "b", "job_id": "job-1", "encryption_enabled": True, "encryption_key_id": 1},
+            KEY_C: {"id": "c", "job_id": "job-1", "encryption_enabled": True, "encryption_key_id": again["encryption_key_id"]},
+        }
+
+        self.assertEqual(again["encryption_key_id"], 2)
+        for key, point in points.items():
+            with self.subTest(point["id"]):
+                self.assertEqual(abr_v41._resolve_restore_encryption_key(point), key)
 
     def test_the_copy_on_the_point_is_the_fallback_when_the_job_is_gone(self) -> None:
         point = {

@@ -31,6 +31,7 @@ import errno
 import json
 import logging
 import re
+import shutil
 import time
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
@@ -47,9 +48,11 @@ from ...core.storage_tool import (
     filesystem_free_bytes,
     is_s3_repository,
     make_durable,
+    remove_empty_parents,
     run_disk_tool,
     write_file_durably,
 )
+from ...core.server_defaults import env_int
 from ...core.subprocess_util import ProcessCancelled
 from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...core.utils import utc_now
@@ -101,6 +104,7 @@ class HyperVBackupError(RuntimeError):
 _WRITE_FAILED = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _NO_SPACE = re.compile(r"no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _FAILED_AT_OFFSET = re.compile(r"at offset (\d+)", re.IGNORECASE)
+NEARLY_FULL_BYTES = 64 * 1024 * 1024
 
 
 def _repository_free_bytes(repository: dict[str, Any]) -> int | None:
@@ -134,6 +138,116 @@ def _out_of_space_error(repository: dict[str, Any], exc: OSError) -> HyperVBacku
     if exc.errno != errno.ENOSPC:
         return None
     return HyperVBackupError(out_of_space_message(repository, _repository_free_bytes(repository)))
+
+
+DISCARD_RETRY_PAUSE_SECONDS = 2
+
+
+def remove_session_folder(folder: Path, seconds: int) -> str:
+    deadline = time.monotonic() + max(0, seconds)
+    while True:
+        try:
+            shutil.rmtree(folder)
+            return ""
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            reason = f"{exc.strerror} ({exc.filename})" if exc.strerror and exc.filename else str(exc)
+        if time.monotonic() >= deadline:
+            return reason
+        time.sleep(DISCARD_RETRY_PAUSE_SECONDS)
+
+
+def _discard_session(
+    repository: dict[str, Any],
+    abr_path: str,
+    written_backup_names: list[str],
+    task_root: Path,
+    destination_root: Path,
+) -> tuple[list[str], str]:
+    stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
+    if is_s3_repository(repository):
+        return stranded, ""
+    reason = remove_session_folder(task_root, env_int("ALTASTOR_HYPERV_DISCARD_RETRY_SECONDS", minimum=0))
+    if not reason:
+        remove_empty_parents(task_root.parent, below=destination_root)
+    return stranded, reason
+
+
+def _left_data_message(task_root: Path, reason: str) -> str:
+    return (
+        f"What this session had written could not be removed from {task_root}: {reason}. "
+        "The next backup of this job removes it"
+    )
+
+
+def _record_left_data(
+    progress_callback: ProgressCallback, repository: dict[str, Any], task_root: Path, reason: str, *, warn: bool
+) -> None:
+    logger.error("Hyper-V backup left %s behind: %s", task_root, reason)
+    if progress_callback is None:
+        return
+    payload: dict[str, object] = {
+        "updated_at": utc_now(),
+        "left_session_data": {"path": str(task_root), "repository_id": str(repository.get("id") or ""), "reason": reason},
+    }
+    if warn:
+        payload.update({"message": _left_data_message(task_root, reason), "log_level": "warn"})
+    else:
+        payload["log_entry"] = False
+    try:
+        progress_callback(payload)
+    except TaskStopRequested:
+        pass
+
+
+def _stopped(
+    progress_callback: ProgressCallback,
+    repository: dict[str, Any],
+    abr_path: str,
+    written_backup_names: list[str],
+    task_root: Path,
+    destination_root: Path,
+) -> str:
+    stranded, reason = _discard_session(repository, abr_path, written_backup_names, task_root, destination_root)
+    message = _stop_message(stranded, abr_path, task_root)
+    if not reason:
+        return message
+    _record_left_data(progress_callback, repository, task_root, reason, warn=False)
+    return f"{message}. {_left_data_message(task_root, reason)}"
+
+
+def _remove_left_session_data(
+    task: dict[str, Any], repository: dict[str, Any], progress_callback: ProgressCallback
+) -> None:
+    from ...services.backup_catalog import forget_left_session_data, left_session_data
+
+    if is_s3_repository(repository):
+        return
+    root = Path(str(repository.get("path") or "")).expanduser().resolve()
+    try:
+        pending = left_session_data(str(task.get("job_id") or ""), exclude_task_id=str(task.get("id") or ""))
+    except Exception:
+        logger.exception("Could not look up what earlier sessions of job %s left in its repository", task.get("job_id"))
+        return
+    for task_id, entry in pending:
+        folder = Path(str(entry.get("path") or ""))
+        if str(entry.get("repository_id") or "") != str(repository.get("id") or ""):
+            continue
+        if folder.name != task_id or root not in folder.resolve().parents:
+            continue
+        reason = remove_session_folder(folder, 0)
+        if reason:
+            _warn(
+                progress_callback,
+                "prepare",
+                6,
+                f"Could not remove what session {task_id} left in {folder}: {reason}. The next backup tries again",
+            )
+            continue
+        remove_empty_parents(folder.parent, below=root)
+        _emit(progress_callback, "prepare", 6, f"Removed what session {task_id} left in {folder} when it ended")
+        forget_left_session_data(task_id)
 
 
 def _make_task_root(repository: dict[str, Any], task_root: Path) -> None:
@@ -353,11 +467,12 @@ def _previous_manifest(
 
 def _change_ids(
     disks: list[dict[str, Any]], parent: dict[str, Any] | None
-) -> tuple[dict[str, str], list[str]]:
-    """Each disk's RCT id from the previous backup, and the disks that have
-    none to chain onto."""
+) -> tuple[dict[str, str], list[str], list[tuple[str, int, int]]]:
+    """Each disk's RCT id from the previous backup, the disks that have
+    none to chain onto, and the disks whose size changed since."""
     found: dict[str, str] = {}
     missing: list[str] = []
+    resized: list[tuple[str, int, int]] = []
     for index, disk in enumerate(disks, start=1):
         entry = None
         if parent is not None:
@@ -368,11 +483,15 @@ def _change_ids(
             except VCenterBackupError:
                 entry = None
         change_id = str((entry or {}).get("change_id") or "").strip()
-        if change_id:
+        recorded = int((entry or {}).get("capacity_bytes") or 0)
+        current = int(disk.get("capacity_bytes") or 0)
+        if change_id and recorded and current and recorded != current:
+            resized.append((disk["slot"], recorded, current))
+        elif change_id:
             found[disk["slot"]] = change_id
         else:
             missing.append(disk["slot"])
-    return found, missing
+    return found, missing, resized
 
 
 def run_hyperv_backup(
@@ -420,6 +539,7 @@ def run_hyperv_backup(
         task=task, vm_name=vm_name, parameters=parameters, repository=repository
     )
     _make_task_root(repository, task_root)
+    _remove_left_session_data(task, repository, progress_callback)
     storage_args, storage_env = vhdx_tool.storage_invocation(repository, abr_path=abr_path)
     repository_label = _repository_label(repository, str(abr_path))
     inventory_name = str(hypervisor.get("name") or task.get("hypervisor_id") or "")
@@ -481,7 +601,7 @@ def run_hyperv_backup(
             tool_path = node.ensure_disk_tool(source_node)
             _emit(progress_callback, "prepare", 10, f"abr-vhdx-tool is ready on {source_node} at {tool_path}")
             _check_repository_access(
-                node, source_node, storage_args, storage_env, repository_label, task_id, progress_callback
+                node, source_node, storage_args, storage_env, repository_label, task_id, progress_callback, repository
             )
 
             # A checkpoint can only be application consistent when there is
@@ -547,8 +667,14 @@ def run_hyperv_backup(
                 if previous is None:
                     _fall_back_to_full(f"No earlier backup of {vm_name} to chain onto; taking a full backup")
                 else:
-                    change_ids, without = _change_ids(disks, previous)
-                    if without:
+                    change_ids, without, resized = _change_ids(disks, previous)
+                    if resized:
+                        _fall_back_to_full(
+                            f"Disk(s) {', '.join(f'{slot} ({_gib(before)} -> {_gib(after)})' for slot, before, after in resized)} "
+                            f"of {vm_name} changed size since the previous backup, and an incremental cannot carry a "
+                            "size change; taking a full backup"
+                        )
+                    elif without:
                         _fall_back_to_full(
                             f"Disk(s) {', '.join(without)} of {vm_name} have no change tracking position from the "
                             "previous backup (a disk added since, a VHD disk, or a VM of configuration version "
@@ -807,12 +933,12 @@ def run_hyperv_backup(
         }
     except ProcessCancelled as exc:
         logger.info("Hyper-V backup session %s of VM %s stopped; discarding what it had written.", task_id, vm_name)
-        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
-        raise TaskStopRequested(_stop_message(stranded, abr_path, task_root)) from exc
+        message = _stopped(progress_callback, repository, abr_path, written_backup_names, task_root, destination_root)
+        raise TaskStopRequested(message) from exc
     except TaskStopRequested:
         logger.info("Hyper-V backup session %s of VM %s stopped; discarding what it had written.", task_id, vm_name)
-        stranded = _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
-        raise TaskStopRequested(_stop_message(stranded, abr_path, task_root)) from None
+        message = _stopped(progress_callback, repository, abr_path, written_backup_names, task_root, destination_root)
+        raise TaskStopRequested(message) from None
     except Exception as exc:
         logger.exception(
             "Hyper-V backup session %s of VM %s (%s) failed after %.1fs: %s",
@@ -822,7 +948,9 @@ def run_hyperv_backup(
             time.time() - start_time,
             exc,
         )
-        _discard_task_backups(repository, abr_path, written_backup_names, task_root, destination_root)
+        _stranded, reason = _discard_session(repository, abr_path, written_backup_names, task_root, destination_root)
+        if reason:
+            _record_left_data(progress_callback, repository, task_root, reason, warn=True)
         lost = lost_host(exc)
         if lost is not None and str(exc) == str(lost):
             raise HyperVBackupError(lost_host_message(lost, vm_name)) from exc
@@ -842,19 +970,52 @@ def _check_repository_access(
     repository_label: str,
     task_id: str,
     progress_callback: ProgressCallback,
+    repository: dict[str, Any] | None = None,
 ) -> None:
-    run = node.run_disk_tool(
-        source_node,
-        ["info", "--json", *storage_args],
-        env=storage_env,
-        should_cancel=lambda: cancel_requested(task_id),
-        timeout=REPOSITORY_CHECK_TIMEOUT_SECONDS,
-    )
-    result = run.get("result") or {}
-    if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
-        detail = vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
+    def tool(args: list[str]) -> tuple[bool, str]:
+        run = node.run_disk_tool(
+            source_node,
+            args,
+            env=storage_env,
+            should_cancel=lambda: cancel_requested(task_id),
+            timeout=REPOSITORY_CHECK_TIMEOUT_SECONDS,
+        )
+        result = run.get("result") or {}
+        if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
+            return False, vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
+        return True, ""
+
+    reached, detail = tool(["info", "--json", *storage_args])
+    if not reached:
         raise HyperVBackupError(f"{source_node} cannot reach repository {repository_label}: {detail}")
-    _emit(progress_callback, "prepare", 12, f"Repository {repository_label} is reachable from {source_node}")
+    if isinstance(repository, dict) and not is_s3_repository(repository):
+        source = f"{node.ensure_host_bundle(source_node)}\\{WRITE_CHECK_SOURCE}"
+        written, detail = tool(["meta_save", "--json", "--name", WRITE_CHECK_NAME, *storage_args, "--source", source])
+        if not written:
+            raise HyperVBackupError(_cannot_write_message(repository, storage_env, source_node, repository_label, detail))
+        removed, detail = tool(["remove", "--json", "--force", "--name", WRITE_CHECK_NAME, *storage_args])
+        if not removed:
+            logger.warning("Could not remove the write check %s from %s: %s", WRITE_CHECK_NAME, repository_label, detail)
+    _emit(progress_callback, "prepare", 12, f"Repository {repository_label} is reachable and writable from {source_node}")
+
+
+WRITE_CHECK_NAME = "abr-write-check"
+WRITE_CHECK_SOURCE = "scripts\\tool_info.ps1"
+
+
+def _cannot_write_message(
+    repository: dict[str, Any], storage_env: dict[str, str], source_node: str, repository_label: str, detail: str
+) -> str:
+    free = _repository_free_bytes(repository)
+    if free is not None and free < NEARLY_FULL_BYTES:
+        return f"{source_node} cannot write to repository {repository_label}: {out_of_space_message(repository, free)}"
+    share = str(storage_env.get("ABR_SMB_SHARE") or vhdx_tool.windows_share(repository) or repository.get("path") or "")
+    account = str(storage_env.get("ABR_SMB_USER") or "")
+    who = f"the account {account}" if account else "the account of the Hyper-V inventory"
+    return (
+        f"{source_node} can read repository {repository_label} but cannot write to it: {who} has no write access "
+        f"to {share}. Give it write access to the share, or set an account that has it ({detail})"
+    )
 
 
 def _back_up_disks(
@@ -938,6 +1099,12 @@ def _back_up_disks(
         result = run.get("result") or {}
         if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
             lines = run.get("lines") or []
+            if vhdx_tool.ended_unexpectedly(run.get("result"), lines, run.get("exit_code")):
+                raise HyperVBackupError(
+                    vhdx_tool.unexpected_end_message(
+                        source_node, run["exit_code"], lines, f"backing up disk {slot} of {vm_name}"
+                    )
+                )
             detail = vhdx_tool.failure_message(result, lines, run.get("exit_code"))
             if change_id and vhdx_tool.change_tracking_lost(result, lines, run.get("exit_code")):
                 raise _ChangeTrackingLost(detail)

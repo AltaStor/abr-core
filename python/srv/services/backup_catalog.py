@@ -540,6 +540,13 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
                     ),
                     component="retention",
                 )
+            if report.get("skipped_reason"):
+                _append_task_log(
+                    task,
+                    level="info",
+                    message=f"Retention skipped this chain: {report['skipped_reason']}",
+                    component="retention",
+                )
             for failure in failures:
                 _record_session_warning(
                     task,
@@ -780,6 +787,38 @@ def stranded_backup_snapshots(
             continue
         pending.append((task_id, snapshot[1]))
     return pending
+
+
+def left_session_data(job_id: str, exclude_task_id: str = "") -> list[tuple[str, dict[str, Any]]]:
+    pending: list[tuple[str, dict[str, Any]]] = []
+    if not job_id:
+        return pending
+    for record in catalog_records(TASKS):
+        task_id = str(record.get("id") or "")
+        if not task_id or task_id == exclude_task_id or str(record.get("job_id") or "") != job_id:
+            continue
+        if str(record.get("status") or "") in _ACTIVE_TASK_STATES:
+            continue
+        result = record.get("result") if isinstance(record.get("result"), dict) else {}
+        entry = result.get("left_session_data")
+        if isinstance(entry, dict) and str(entry.get("path") or "").strip():
+            pending.append((task_id, dict(entry)))
+    return pending
+
+
+def forget_left_session_data(task_id: str) -> None:
+    record = TASKS.get(task_id)
+    if not isinstance(record, dict):
+        return
+    result = record.get("result")
+    if not isinstance(result, dict) or "left_session_data" not in result:
+        return
+    trimmed = dict(result)
+    trimmed.pop("left_session_data", None)
+    updated = dict(record)
+    updated["result"] = trimmed
+    updated["updated_at"] = utc_now()
+    persist_task(updated)
 
 
 MANIFEST_BACKUP_NAME = "manifest"

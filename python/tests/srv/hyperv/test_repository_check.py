@@ -122,6 +122,108 @@ class RepositoryCheckBeforeCheckpointTests(unittest.TestCase):
         self.assertEqual([call[0] for call in node.calls], ["run_disk_tool", "create_recovery_checkpoint"])
 
 
+SMB_ARGS = ["--mode", "file", "--folder", "\\\\nas.example.test\\backups\\vm\\task-1"]
+SMB_ENV = {"ABR_SMB_SHARE": "\\\\nas.example.test\\backups", "ABR_SMB_USER": "NAS\\reader", "ABR_SMB_PASSWORD": "secret"}
+OK_RUN = {"exit_code": 0, "result": {"status": "ok"}, "lines": ["{", "}"]}
+WRITE_REFUSED = {
+    "exit_code": 1,
+    "result": {"status": "error", "error": "failed to save metadata for 'abr-write-check'"},
+    "lines": ["Failed to create file '\\\\nas.example.test\\backups\\vm\\task-1/abr-write-check.abrm'!"],
+}
+
+
+class _ScriptedNode:
+    def __init__(self, runs: dict[str, dict]) -> None:
+        self.runs = runs
+        self.calls: list[list[str]] = []
+
+    def ensure_host_bundle(self, node):
+        return "C:\\ProgramData\\AltaStor\\abr-hyperv\\0123"
+
+    def run_disk_tool(self, node, args, *, env=None, should_cancel=None, timeout=None, **kwargs):
+        self.calls.append(list(args))
+        return self.runs.get(args[0], OK_RUN)
+
+
+SMB_REPOSITORY = {"id": "repo-1", "name": "Shared", "type": "smb", "path": "/mnt/hv"}
+
+
+class RepositoryWriteCheckTests(unittest.TestCase):
+    def _check(self, runs: dict[str, dict], repository: dict | None = None, free: int | None = 50 * 1024**3):
+        node = _ScriptedNode(runs)
+        notes: list[str] = []
+        with patch.object(hyperv_backup, "cancel_requested", return_value=False), patch.object(
+            hyperv_backup, "filesystem_free_bytes", return_value=free
+        ), patch.object(hyperv_backup, "_emit", side_effect=lambda cb, stage, progress, message, **kw: notes.append(message)):
+            try:
+                hyperv_backup._check_repository_access(
+                    node, "NODE-A", SMB_ARGS, SMB_ENV, "Shared", "task-1", None, repository or SMB_REPOSITORY
+                )
+                error = None
+            except hyperv_backup.HyperVBackupError as exc:
+                error = exc
+        return node, error, notes
+
+    def test_a_share_the_account_can_write_passes_and_the_check_file_is_removed(self) -> None:
+        node, error, notes = self._check({})
+
+        self.assertIsNone(error)
+        self.assertEqual(
+            node.calls,
+            [
+                ["info", "--json", *SMB_ARGS],
+                [
+                    "meta_save", "--json", "--name", "abr-write-check", *SMB_ARGS,
+                    "--source", "C:\\ProgramData\\AltaStor\\abr-hyperv\\0123\\scripts\\tool_info.ps1",
+                ],
+                ["remove", "--json", "--force", "--name", "abr-write-check", *SMB_ARGS],
+            ],
+        )
+        self.assertEqual(notes, ["Repository Shared is reachable and writable from NODE-A"])
+
+    def test_an_account_that_may_only_read_fails_before_the_checkpoint_naming_the_account_and_share(self) -> None:
+        node, error, _ = self._check({"meta_save": WRITE_REFUSED})
+
+        self.assertIsNotNone(error)
+        self.assertTrue(
+            str(error).startswith(
+                "NODE-A can read repository Shared but cannot write to it: the account NAS\\reader has no write "
+                "access to \\\\nas.example.test\\backups. Give it write access to the share, or set an account that has it ("
+            ),
+            str(error),
+        )
+        self.assertEqual([call[0] for call in node.calls], ["info", "meta_save"])
+
+    def test_a_share_without_its_own_account_names_the_inventory_account(self) -> None:
+        env = {key: value for key, value in SMB_ENV.items() if key == "ABR_SMB_SHARE"}
+        node = _ScriptedNode({"meta_save": WRITE_REFUSED})
+        with patch.object(hyperv_backup, "cancel_requested", return_value=False), patch.object(
+            hyperv_backup, "filesystem_free_bytes", return_value=50 * 1024**3
+        ), self.assertRaises(hyperv_backup.HyperVBackupError) as raised:
+            hyperv_backup._check_repository_access(node, "NODE-A", SMB_ARGS, env, "Shared", "task-1", None, SMB_REPOSITORY)
+
+        self.assertIn("the account of the Hyper-V inventory has no write access", str(raised.exception))
+
+    def test_a_full_share_is_named_as_out_of_space_not_as_a_permission(self) -> None:
+        _node, error, _ = self._check({"meta_save": WRITE_REFUSED}, free=1024)
+
+        self.assertIn("NODE-A cannot write to repository Shared: The repository 'Shared' at /mnt/hv ran out of space", str(error))
+        self.assertNotIn("write access", str(error))
+
+    def test_a_check_file_that_cannot_be_removed_does_not_fail_the_backup(self) -> None:
+        with self.assertLogs(hyperv_backup.logger, "WARNING"):
+            _node, error, notes = self._check({"remove": {"exit_code": 1, "result": None, "lines": ["Error: busy"]}})
+
+        self.assertIsNone(error)
+        self.assertEqual(notes, ["Repository Shared is reachable and writable from NODE-A"])
+
+    def test_an_s3_repository_is_only_read(self) -> None:
+        node, error, _ = self._check({}, repository={"id": "repo-2", "name": "S3", "type": "s3"})
+
+        self.assertIsNone(error)
+        self.assertEqual([call[0] for call in node.calls], ["info"])
+
+
 class LostHostMessageTests(unittest.TestCase):
     _run = RepositoryCheckBeforeCheckpointTests._run
 

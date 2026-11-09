@@ -7,7 +7,9 @@ import unittest
 from types import SimpleNamespace
 
 from python.srv.core.subprocess_util import describe_process_end
-from python.srv.plugins.vcenter import vcenter_backup
+from python.srv.plugins.vcenter import vcenter_backup, vcenter_restore
+from python.srv.plugins.vcenter.vcenter_backup import VCenterBackupError
+from python.srv.services.internal.replication.replica_update import is_temporary
 
 INFO_LINE = "Disk '[ds] vm/vm.vmdk' opened using transport mode 'nbd'"
 REPOSITORY = {"id": "repo-1", "name": "Local", "type": "local", "path": "/backups"}
@@ -75,6 +77,31 @@ class DiskToolFailureTests(unittest.TestCase):
         self.assertIn("ran out of space", full)
         lost = self._failure(_ended(1, stderr="Error: The server refused connection"), data_host="198.51.100.52")
         self.assertTrue(lost.startswith("Lost the connection to ESXi host 198.51.100.52"))
+
+
+class RestoreFailureTests(unittest.TestCase):
+    TARGET = "[ds] replica-staging-1/01-01-disk.vmdk"
+    SOURCE = "/backups/job/vm/point/01-01-disk.vmdk"
+
+    def _failure(self, completed: SimpleNamespace) -> str:
+        return vcenter_restore._restore_failure(self.TARGET, self.SOURCE, completed)
+
+    def test_a_killed_disk_tool_is_named_and_counts_as_temporary(self) -> None:
+        message = self._failure(_ended(-9, stderr="ERROR - Unknown feature 'VMODL_LIFECYCLE'\nRestoring 40%"))
+
+        self.assertTrue(message.startswith(f".abr disk restore failed to {self.TARGET} from {self.SOURCE}: the data mover ended unexpectedly"))
+        self.assertIn("terminated by signal 9 (SIGKILL)", message)
+        self.assertTrue(message.endswith("Its last output: Restoring 40%"))
+        self.assertTrue(is_temporary(VCenterBackupError(message)))
+
+    def test_an_error_the_tool_reported_stays_as_it_said_and_is_not_retried(self) -> None:
+        message = self._failure(_ended(1, stderr="Error: failed to write disk data"))
+
+        self.assertEqual(message, f".abr disk restore failed to {self.TARGET} from {self.SOURCE}: Error: failed to write disk data")
+        self.assertFalse(is_temporary(VCenterBackupError(message)))
+
+    def test_a_silent_end_keeps_the_exit_code(self) -> None:
+        self.assertTrue(self._failure(_ended(3)).endswith("abr-vmdk-tool exited with code 3. It printed nothing"))
 
 
 if __name__ == "__main__":

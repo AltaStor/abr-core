@@ -37,6 +37,7 @@ from .vcenter_backup import (
     _get_resource,
     _get_vm_resource,
     _sanitize_name,
+    _unexpected_data_mover_end,
 )
 from .vcenter_disk_types import (
     DISK_PLACEMENT_FIELDS,
@@ -553,6 +554,12 @@ def _build_abr_restore_command(
     return command
 
 
+def _restore_failure(target: Any, source: Any, completed: Any) -> str:
+    output = (completed.stderr or completed.stdout or "").strip()
+    detail = _unexpected_data_mover_end(completed) or output or f"exit code {completed.returncode}"
+    return f".abr disk restore failed to {target} from {source}: {detail}"
+
+
 def _run_restore_layer(command: list[str], **kwargs: Any):
     try:
         return run_disk_tool_process(run_capped, command, **kwargs)
@@ -966,14 +973,24 @@ def run_vcenter_restore(
             original_destroyed = False
             original_identity: dict[str, str] = {}
             identity_preserved = False
+            replica_marker = str(parameters.get("replica_marker") or "")
             created_vm: dict[str, Any] = node.create_vm_shell(
                 vm_name=create_vm_name,
                 host_name=target_host_name,
                 datastore_name=target_datastore_name,
-                config_metadata=vm_config,
+                config_metadata={**vm_config, "annotation": replica_marker} if replica_marker else vm_config,
                 disk_layout=disk_layout,
                 disk_placements=disk_placements,
             )
+            if replica_marker:
+                _emit_progress(
+                    progress_callback,
+                    "prepare",
+                    7,
+                    f"Created VM {create_vm_name} on {target_host_name}",
+                    worker_mode="vcenter-abr-vmdk-tool",
+                    created_vm_id=str(created_vm.get("vm_moref") or ""),
+                )
             try:
                 logger.info(
                     "Created VM shell %s on host %s datastore %s with resulting firmware %s, "
@@ -1180,10 +1197,7 @@ def run_vcenter_restore(
                                     layer.get("source"),
                                     stderr or f"exit code {completed.returncode}",
                                 )
-                                raise VCenterBackupError(
-                                    f".abr disk restore failed to {restore_target} from {layer.get('source')}: "
-                                    f"{stderr or f'exit code {completed.returncode}'}"
-                                )
+                                raise VCenterBackupError(_restore_failure(restore_target, layer.get("source"), completed))
                     else:
                         raise VCenterBackupError(
                             f"No .abr restore layers resolved for disk index {index}"
@@ -1367,6 +1381,7 @@ def run_vcenter_restore(
             "processed_bytes": total_read_bytes,
             "transferred_bytes": total_sent_bytes,
             "finished_at": utc_now(),
+            **({"target_vm_id": str(created_vm.get("vm_moref") or "")} if parameters.get("replica_marker") else {}),
         }
 
     if resource_type != "disk":
@@ -1588,10 +1603,7 @@ def run_vcenter_restore(
                             layer.get("source"),
                             stderr or f"exit code {completed.returncode}",
                         )
-                        raise VCenterBackupError(
-                            f".abr disk restore failed to {restored_datastore_path} from {layer.get('source')}: "
-                            f"{stderr or f'exit code {completed.returncode}'}"
-                        )
+                        raise VCenterBackupError(_restore_failure(restored_datastore_path, layer.get("source"), completed))
             else:
                 raise VCenterBackupError(
                     f"No .abr restore layers resolved for {restored_datastore_path}"

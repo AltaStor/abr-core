@@ -124,9 +124,11 @@ It mirrors the VMware backup step for step:
    removed first. The same cleanup runs when the server starts.
 2. abr-vhdx-tool on the node that owns the VM checks that it can reach the
    repository (`info` on the run's folder, with the same storage options and
-   credentials the backup uses). A node that cannot reach it fails the run
-   with the tool's reason before the VM is touched: no checkpoint is taken and
-   the previous backup's reference point stays.
+   credentials the backup uses) and, for an SMB repository, that it can write
+   there (a small `abr-write-check` metadata file it saves and removes again).
+   A node that cannot reach it, or whose share account may only read, fails the
+   run with the reason before the VM is touched: no checkpoint is taken and the
+   previous backup's reference point stays.
 3. The checkpoint freezes the VM's disks: from then on the VM writes to new
    differencing disks, and the files the backup reads no longer change. Taking
    it also turns RCT on for the VM's disks.
@@ -156,7 +158,11 @@ reason `IncrementalFallbackToFull`, when:
   starts over as a full.
 
 Whatever happens, the checkpoint does not outlive the run, and a failed or
-stopped run leaves no disk image in the repository. A failed run keeps the
+stopped run leaves no disk image in the repository: a stop ends abr-vhdx-tool
+on the host, then the session's folder is removed, retried for up to
+`ALTASTOR_HYPERV_DISCARD_RETRY_SECONDS` while the host lets go of its files. A
+folder that still cannot be removed is named in the session's message, and the
+next backup of the job removes it. A failed run keeps the
 previous backup's reference point, so the next incremental still has its
 position. If the checkpoint cannot be turned into a reference point, it is
 removed instead, and the next backup is a full one.
@@ -205,16 +211,43 @@ old TPM (BitLocker keys, for one) need their recovery keys; the session warns
 about it.
 
 **In place** (`abr restore start --in-place --force`, or *Original location*
-with the typed confirmation in the console) keeps the VM itself -- its id,
-network adapters and cluster role -- and replaces its disks. The restored disks
-are written next to the current ones, then the VM is turned off, set back to the
-processor and memory the backup recorded, pointed at the restored files, and only
-then are the replaced files deleted. Its network adapters go back to the virtual
-switches and access VLANs the backup recorded, and the session says which ones
-moved; a switch the backup recorded that the host no longer has refuses the
-restore before anything changes. A VM with checkpoints is refused: replacing
-disks under a checkpoint chain would break it. Its next backup is a full one,
-since the new disks start their change tracking over.
+with the typed confirmation in the console) keeps the VM itself -- its id and
+cluster role -- and replaces its disks. The restored disks are written next to
+the current ones, then the VM is turned off, set back to the configuration the
+backup recorded, pointed at the restored files, and only then are the replaced
+files deleted. A VM with checkpoints is refused: replacing disks under a
+checkpoint chain would break it. Its next backup is a full one, since the new
+disks start their change tracking over.
+
+What an in-place restore sets back to the restore point, and the session lists
+what it changed:
+
+- processor count, reserve, limit and weight, and nested virtualization;
+- memory, dynamic memory with its minimum, maximum and buffer, and memory weight;
+- notes, automatic start and stop actions, and checkpoint type;
+- the boot order, when the VM booted from one of the restored disks (generation
+  2) or always (generation 1);
+- the network adapters: an adapter of the backup that the VM no longer has is
+  created again with its name, switch, access VLAN and, if it had one, its
+  static MAC address; an adapter added after the backup is removed; one moved to
+  another switch or VLAN goes back. Adapters are matched by the id the backup
+  recorded; when that adapter is gone, one that already has its name, switch,
+  VLAN and static MAC address is kept as it is (an adapter an earlier in-place
+  restore recreated, for one). Restore points taken before the id was recorded
+  match adapters by MAC address, then by name. A switch the backup recorded that the host no longer
+  has refuses the restore before anything changes.
+
+What it deliberately leaves as it is, and names in a session warning when it
+differs from the restore point:
+
+- Secure Boot and its template, and the virtual TPM: changing them under an
+  installed guest can stop it from booting or lose the secrets sealed to the TPM
+  (BitLocker keys, for one);
+- DVD drives and the media in them;
+- hard disks attached after the backup: their data is not in the backup, so they
+  stay attached as they are;
+- the configuration version, which cannot go back;
+- the boot order of a generation 2 VM that did not boot from a restored disk.
 
 A failure removes what the restore created and, in place, points the VM back at
 its original disks.
@@ -238,6 +271,8 @@ Lock validation. Credentials and encryption keys are never written to either.
 | --- | --- |
 | `reaches S3 and SMB repositories only` | Point the job at an S3 or SMB repository (`abr repo add --type smb`) |
 | `cannot reach repository` | The reason that follows it: the S3 endpoint, keys and bucket the repository names, or its share, as seen from that node |
+| `can read repository ... but cannot write to it` | Give the account it names write access to the share, or set an account that has it (`abr repo edit --username ... --password`) |
+| `abr-vhdx-tool on ... ended unexpectedly (exit code ...)` | The tool stopped without reporting an error of its own: it was killed, ran out of memory or was stopped by antivirus software on that host (the host's Application event log, and the antivirus log). Its last output is quoted for context only |
 | `cannot open the repository share` | The share's account (the repository's `--username`, else the inventory's), and that every node reaches the share on TCP 445 |
 | `did not answer WinRM over HTTPS on port ...` | No HTTPS listener on that port of the host: set one up, or set the inventory to HTTP (`abr inventory edit --protocol http`) |
 | `the port answers without TLS` | The port is an HTTP listener: give the HTTPS listener's port, or set the inventory to HTTP |

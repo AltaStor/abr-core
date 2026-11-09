@@ -22,6 +22,9 @@ from ..parsing.validators import (
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
 
+RETENTION_TIMEOUT_SECONDS = 21600
+REPLICA_DELETE_TIMEOUT_SECONDS = 1800
+
 
 def _session_failure_exit_code(session: Any) -> int:
     if not isinstance(session, dict):
@@ -72,6 +75,57 @@ def _backup_copy_rows(view: dict[str, Any]) -> dict[str, Any]:
         "copy_window": view.get("copy_window_summary") or "any time",
         "retry": f"{retry.get('count')} time(s), {retry.get('interval_minutes')} minute(s) apart",
     }
+
+
+REPLICATION_HIDDEN_KEYS = frozenset(
+    {
+        "storage_layout",
+        "retention_days",
+        "retention_min_fulls",
+        "gfs",
+        "active_full_days",
+        "synthetic_full_days",
+        "active_full_schedule",
+        "synthetic_full_schedule",
+        "active_full_next_run_at",
+        "synthetic_full_next_run_at",
+        "compression_level",
+        "on_quiesce_failure",
+        "encryption",
+        "guest_consistency",
+        "backup_copy",
+        "source_job",
+    }
+)
+
+
+def _replication_rows(view: dict[str, Any]) -> dict[str, Any]:
+    replica = view.get("replica") if isinstance(view.get("replica"), dict) else {}
+    source_job = view.get("source_job") if isinstance(view.get("source_job"), dict) else {}
+    source_vm = view.get("source_vm") if isinstance(view.get("source_vm"), dict) else {}
+    target = view.get("target_inventory") if isinstance(view.get("target_inventory"), dict) else {}
+    rows = {
+        "source_job": source_job.get("name") or source_job.get("id") or "-",
+        "source_vm": source_vm.get("name") or source_vm.get("id") or "-",
+        "target_inventory": target.get("name") or target.get("id") or "-",
+        "target_host": view.get("target_host") or "-",
+        "target_datastore": view.get("target_datastore") or "-",
+        "network_map": ", ".join(view.get("network_map") or []) or "-",
+        "replica_name": view.get("replica_name") or "-",
+        "run_after_source": "yes" if view.get("run_after_source") else "no",
+        "replica_vm": replica.get("vm_name") or ("not created yet" if not replica.get("vm_id") else replica.get("vm_id")),
+        "replica_point": replica.get("point_id") or "-",
+        "replica_point_created_at": replica.get("point_created_at") or "-",
+        "last_success_at": replica.get("last_success_at") or "-",
+    }
+    if view.get("start_point_id") and not replica.get("vm_id"):
+        rows["start_point"] = view["start_point_id"]
+    if replica.get("pending_name"):
+        rows["pending_rename"] = replica["pending_name"]
+    if view.get("run_pending"):
+        request = view.get("pending_trigger") if isinstance(view.get("pending_trigger"), dict) else {}
+        rows["run_pending"] = f"yes ({request['trigger']} since {request.get('since')})" if request.get("trigger") else "yes"
+    return rows
 
 
 def _last_run_issues(run: dict[str, Any]) -> str:
@@ -166,6 +220,36 @@ class JobCommands:
         self._add_backup_copy_arguments(create_backup_copy, creating=True)
         create_backup_copy.set_defaults(handler=self.create_backup_copy)
 
+        create_replication = commands.add_parser(
+            "create-replication",
+            help="Create a replication job: keeps a powered-off replica VM up to date from a backup job's restore points.",
+            description=(
+                "Create a replication job.\n\n"
+                "It creates a replica VM on the target environment from a restore point of the source backup job, "
+                "and then updates that replica from each newer restore point. It reads stored backups only, never "
+                "the production VM, and never powers the replica on. The source backup job must back up exactly one "
+                "VM, and the target must be the same platform (VMware to VMware, Hyper-V to Hyper-V). After the "
+                "replica is created, the source, target environment, host, datastore, network mapping and start "
+                "restore point cannot change; every later run, scheduled or manual, brings the replica to the newest "
+                "restore point of the source. When the source gets a new active full, the run rebuilds the replica's disks next to the "
+                "current ones, so the datastore needs as much free space again as the replica's disks take.\n\n"
+                "Examples:\n"
+                '  abr job create-replication --name "SQL-DR" --source-job "SQL-nightly" --target-inventory "vCenter-DR" '
+                '--target-host "esx-dr-01" --datastore "ds-dr" --network-map "VM Network=DR Network" '
+                '--replica-name "sql-01-replica" --run-after-source\n'
+                '  abr job create-replication --name "App-DR" --source-job "App-HV" --target-inventory "HV-DR" '
+                '--target-host "HV-DR-01" --datastore "D:\\Replicas" --replica-name "app-01-replica" '
+                "--schedule daily --time 03:00"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        create_replication.add_argument("--name", required=True, help="Job name")
+        create_replication.add_argument("--source-job", dest="source_job", help="The backup job whose restore points update the replica, by name")
+        create_replication.add_argument("--source-job-id", dest="source_job_id", help="The same backup job by ID")
+        self._add_replication_arguments(create_replication, creating=True)
+        self._add_schedule_arguments(create_replication)
+        create_replication.set_defaults(handler=self.create_replication)
+
         list_parser = commands.add_parser(
             "list",
             help="List jobs.",
@@ -203,6 +287,7 @@ class JobCommands:
         edit.add_argument("--new-name", help="Updated job name")
         self._add_common_job_create_arguments(edit, for_copy=False, include_name=False, retention_default=None, gfs_default=None)
         self._add_backup_copy_arguments(edit, creating=False)
+        self._add_replication_arguments(edit, creating=False)
         edit.set_defaults(handler=self.edit)
 
         start = commands.add_parser(
@@ -285,12 +370,19 @@ class JobCommands:
                 "Delete a job.\n\n"
                 "Examples:\n"
                 '  abr job delete --name "Job-SQL-Server"\n'
-                "  abr job delete --id <job-id> --yes"
+                "  abr job delete --id <job-id> --yes\n"
+                '  abr job delete --name "Replica-SQL" --delete-replica\n\n'
+                "Deleting a replication job keeps its replica VM on the target unless --delete-replica is given."
             ),
             formatter_class=CompactHelpFormatter,
         )
         add_name_or_id_selector(delete, name_help="Job name", id_help="Job ID")
         delete.add_argument("--yes", "--force", dest="force", action="store_true", help="Delete without confirmation")
+        delete.add_argument(
+            "--delete-replica",
+            action="store_true",
+            help="Replication jobs only: delete the replica VM and its disks on the target too (refused while it is powered on)",
+        )
         delete.set_defaults(handler=self.delete)
 
     def _add_common_job_create_arguments(
@@ -496,6 +588,61 @@ class JobCommands:
         parser.add_argument("--retry-interval", dest="retry_interval_minutes", type=int, help=f"{only}minutes between those retries, 0-1440 (default 0 for periodic, 10 for immediate)")
 
     @staticmethod
+    def _add_replication_arguments(parser: argparse.ArgumentParser, *, creating: bool) -> None:
+        only = "" if creating else "Replication jobs only: "
+        locked = "" if creating else "; cannot change after the replica is created"
+        parser.add_argument("--source-vm", dest="source_vm", help=f"{only}the VM of the source job, by name or ID; the source job must back up exactly one VM, so this only confirms it{locked}")
+        parser.add_argument("--target-inventory", dest="target_inventory", help=f"{only}the environment the replica lives in, by name; same platform as the source{locked}")
+        parser.add_argument("--target-inventory-id", dest="target_inventory_id", help=f"{only}the same environment by ID{locked}")
+        parser.add_argument("--target-host", dest="target_host", help=f"{only}host the replica is created on, by name or ID{locked}")
+        parser.add_argument("--datastore", "--target-datastore", dest="target_datastore", help=f"{only}datastore (Hyper-V: storage path) of the replica's disks, by name or ID{locked}")
+        parser.add_argument(
+            "--network-map",
+            dest="network_map",
+            action="append",
+            default=[],
+            help=f"{only}network mapping source=target. Repeat as needed{'' if creating else '; none clears it'}{locked}",
+        )
+        parser.add_argument(
+            "--replica-name",
+            dest="replica_name",
+            help=f"{only}name of the replica VM" + (" (required)" if creating else "; an existing replica is renamed on the next run"),
+        )
+        after = parser.add_mutually_exclusive_group()
+        after.add_argument(
+            "--run-after-source",
+            dest="run_after_source",
+            action="store_const",
+            const=True,
+            default=None,
+            help=f"{only}start after each successful (or warning) run of the source backup job",
+        )
+        after.add_argument(
+            "--no-run-after-source",
+            dest="run_after_source",
+            action="store_const",
+            const=False,
+            help=f"{only}do not start after the source backup job",
+        )
+        parser.add_argument(
+            "--restore-point",
+            dest="restore_point_id",
+            help=f"{only}restore point the first run creates the replica from; without it the newest one{locked}",
+        )
+
+    @staticmethod
+    def _add_schedule_arguments(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--schedule", help="Schedule type: daily, weekly, monthly, or periodic; without it the job runs manually or after the source")
+        parser.add_argument("--time", type=parse_strict_hhmm, help="Schedule time in HH:MM")
+        parser.add_argument("--days", type=parse_weekday_csv, help="Weekly schedule days as mon,tue,...")
+        parser.add_argument("--day-of-month", dest="day_of_month", type=parse_day_of_month, help="Monthly schedule day from 1 to 31")
+        parser.add_argument("--every", type=parse_duration, help="Periodic interval like 15m, 1h, 6h, or 1d")
+        schedule_state = parser.add_mutually_exclusive_group()
+        schedule_state.add_argument("--enabled", action="store_true", help="Enable the job")
+        schedule_state.add_argument("--disabled", action="store_true", help="Disable the job")
+        parser.add_argument("--description", help="Job description")
+
+    @staticmethod
     def _resolve_id(deps: CommandDependencies, args: argparse.Namespace) -> str:
         if getattr(args, "id", None):
             if getattr(args, "name", None):
@@ -552,6 +699,10 @@ class JobCommands:
         return [("id", "ID"), ("deleted", "DELETED")]
 
     @staticmethod
+    def _delete_replica_columns() -> list[tuple[str, str]]:
+        return [("id", "ID"), ("deleted", "DELETED"), ("replica_deleted", "REPLICA DELETED"), ("message", "MESSAGE")]
+
+    @staticmethod
     def _start_columns() -> list[tuple[str, str]]:
         return [("id", "SESSION ID"), ("state", "STATE"), ("resolved_backup_type", "TYPE"), ("resolved_backup_reason", "REASON")]
 
@@ -566,6 +717,13 @@ class JobCommands:
         deps = CommandDependencies(args)
         payload = deps.jobs.create_backup_copy_job_payload(args)
         result = self._decorate_job(deps.context.api_client.post("api/v1/jobs/backup-copy", json=payload))
+        deps.context.print_output(result, self._columns())
+        return 0
+
+    def create_replication(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        payload = deps.jobs.create_replication_job_payload(args)
+        result = self._decorate_job(deps.context.api_client.post("api/v1/jobs/replication", json=payload))
         deps.context.print_output(result, self._columns())
         return 0
 
@@ -608,7 +766,14 @@ class JobCommands:
         warnings = [*clock_warnings, *reassignments]
         if deps.context.output == "table":
             shown: dict[str, Any] = {}
+            is_replication = payload.get("job_type") == "replication"
             for key, value in payload.items():
+                if is_replication and key in REPLICATION_HIDDEN_KEYS:
+                    continue
+                if key == "replication":
+                    if isinstance(value, dict):
+                        shown.update(_replication_rows(value))
+                    continue
                 if key == "clock_anomalies" and clock_warnings:
                     shown["clock_warning"] = " ".join(clock_warnings)
                 elif key == "vm_reassignments":
@@ -643,6 +808,14 @@ class JobCommands:
 
     def delete(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
+        if getattr(args, "delete_replica", False):
+            payload = deps.context.api_client.delete(
+                f"api/v1/jobs/{self._resolve_id(deps, args)}",
+                params={"delete_replica": "true"},
+                timeout=REPLICA_DELETE_TIMEOUT_SECONDS,
+            )
+            deps.context.print_output(payload, self._delete_replica_columns())
+            return 0
         payload = deps.context.api_client.delete(f"api/v1/jobs/{self._resolve_id(deps, args)}")
         deps.context.print_output(payload, self._delete_columns())
         return 0
@@ -703,7 +876,9 @@ class JobCommands:
         deps = CommandDependencies(args)
         dry_run = bool(getattr(args, "dry_run", False))
         result = deps.context.api_client.post(
-            f"api/v1/jobs/{self._resolve_id(deps, args)}/retention", json={"dry_run": dry_run}
+            f"api/v1/jobs/{self._resolve_id(deps, args)}/retention",
+            json={"dry_run": dry_run},
+            timeout=RETENTION_TIMEOUT_SECONDS,
         )
         summary = result.get("summary") if isinstance(result, dict) else {}
         summary = summary if isinstance(summary, dict) else {}

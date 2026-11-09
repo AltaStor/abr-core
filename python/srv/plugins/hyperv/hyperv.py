@@ -194,6 +194,14 @@ def _answers_without_tls(exc: BaseException) -> bool:
     return "wrong_version_number" in text or "wrong version number" in text or "record layer failure" in text
 
 
+def tool_location(args: List[str]) -> str:
+    for flag in ("--path", "--folder"):
+        if flag in args:
+            position = args.index(flag) + 1
+            return str(args[position]) if position < len(args) else ""
+    return ""
+
+
 def _stop_pipeline(shell: Any, node: str) -> None:
     try:
         shell.stop()
@@ -1167,9 +1175,8 @@ class HyperVNode(Hypervisor):
         ``NN%`` lines to ``on_progress``.
 
         Returns ``exit_code``, the ``--json`` ``result`` and the other
-        ``lines`` it printed. A stop request or a timeout stops the run,
-        which ends the tool; it discards what it had written itself, and no
-        virtual disk stays attached once it is gone.
+        ``lines`` it printed. A stop request or a timeout stops the run and
+        ends the tool process, so nothing on the host keeps its files open.
         """
         from pypsrp.complex_objects import ObjectMeta, PSInvocationState
         from pypsrp.exceptions import WinRMError
@@ -1223,9 +1230,11 @@ class HyperVNode(Hypervisor):
             while shell.state == PSInvocationState.RUNNING:
                 if should_cancel is not None and should_cancel():
                     _stop_pipeline(shell, node)
+                    self._end_tool(node, args)
                     raise ProcessCancelled("cancellation requested")
                 if timeout and time.monotonic() - started > timeout:
                     _stop_pipeline(shell, node)
+                    self._end_tool(node, args)
                     raise HyperVError(f"abr-vhdx-tool on {node} did not finish within {int(timeout)}s")
                 try:
                     shell.poll_invoke(timeout=2)
@@ -1271,6 +1280,18 @@ class HyperVNode(Hypervisor):
         protocol = "https" if transport.ssl else "http"
         logger.warning("Lost the WinRM connection to %s:%s (%s): %s", transport.server, transport.port, detail, exc)
         return HyperVUnreachableError(transport.server, [transport.port], detail, protocol=protocol)
+
+    def _end_tool(self, node: str, args: List[str]) -> None:
+        location = tool_location(args)
+        if not location:
+            return
+        try:
+            stopped = self.stop_disk_tool(node, [location])
+        except Exception as exc:
+            logger.warning("Could not end abr-vhdx-tool writing %s on %s: %s", location, node, exc)
+            return
+        if stopped:
+            logger.info("Ended %s on %s, which was still working on %s", ", ".join(stopped), node, location)
 
     def stop_disk_tool(self, node: str, paths: list[str]) -> list[str]:
         if not paths:
@@ -1430,8 +1451,21 @@ class HyperVNode(Hypervisor):
     def set_boot_disk(self, vm_name: str, slot: str, boot_order: List[Dict[str, Any]] | None = None) -> None:
         self._run_vm_script(vm_name, "set_boot.ps1", {"slot": slot, "boot_order": boot_order or []})
 
-    def set_vm_hardware(self, vm_name: str, config: Dict[str, Any]) -> None:
-        self._run_vm_script(
+    def set_vm_hardware(self, vm_name: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        optional = (
+            "cpu_reserve",
+            "cpu_limit",
+            "cpu_weight",
+            "nested_virtualization",
+            "memory_buffer",
+            "memory_priority",
+            "notes",
+            "automatic_start_action",
+            "automatic_start_delay",
+            "automatic_stop_action",
+            "checkpoint_type",
+        )
+        rows = self._run_vm_script(
             vm_name,
             "set_hardware.ps1",
             {
@@ -1440,11 +1474,13 @@ class HyperVNode(Hypervisor):
                 "dynamic_memory": bool(config.get("dynamic_memory")),
                 "memory_minimum_mb": int(config.get("memory_minimum_mb") or 0),
                 "memory_maximum_mb": int(config.get("memory_maximum_mb") or 0),
+                **{key: config.get(key) for key in optional},
             },
         )
+        return [dict(item) for item in ((rows[0] if rows else {}).get("changed") or []) if isinstance(item, dict)]
 
-    def connect_vm_adapters(self, vm_name: str, adapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        rows = self._run_vm_script(vm_name, "connect_adapters.ps1", {"adapters": adapters})
+    def restore_vm_adapters(self, vm_name: str, adapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows = self._run_vm_script(vm_name, "restore_adapters.ps1", {"adapters": adapters})
         return [dict(item) for item in rows]
 
     def replace_vm_disks(self, vm_name: str, disks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

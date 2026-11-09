@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import types
+from typing import Any
 from datetime import datetime, timezone
 import unittest
 from unittest.mock import patch
@@ -830,6 +831,65 @@ class VCenterNodeFirmwareTests(unittest.TestCase):
         self.assertEqual(vm_folder.calls[0]["config"].firmware, "efi")
         self.assertEqual(result["requested_firmware"], "efi")
         self.assertEqual(result["restored_firmware"], "efi")
+
+    def _shell_over_folders(self, existing: set[str]) -> tuple[VCenterNode, Any, list[str]]:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        host, datacenter, vm_folder, created_vm = _fake_vm_create_context(resulting_firmware="bios")
+        searched: list[str] = []
+
+        class Browser:
+            def __init__(self, datastore_name: str) -> None:
+                self.datastore_name = datastore_name
+
+            def SearchDatastore_Task(self, datastorePath: str, searchSpec: Any) -> Any:
+                folder = searchSpec.matchPattern[0]
+                searched.append(f"{datastorePath} {folder}")
+                found = [types.SimpleNamespace(path=folder)] if f"[{self.datastore_name}] {folder}" in existing else []
+                return types.SimpleNamespace(info=types.SimpleNamespace(result=types.SimpleNamespace(file=found)))
+
+        host.datastore = [
+            types.SimpleNamespace(name="ds-01", browser=Browser("ds-01")),
+            types.SimpleNamespace(name="ds-02", browser=Browser("ds-02")),
+        ]
+        node._get_host = lambda host_name: host  # type: ignore[method-assign]
+        node._get_vm = lambda vm_name: None  # type: ignore[method-assign]
+        node._get_datacenter = lambda obj: datacenter  # type: ignore[method-assign]
+        node._wait_for_task = lambda task: created_vm  # type: ignore[method-assign]
+        return node, vm_folder, searched
+
+    def _create(self, node: VCenterNode, disks: list[dict]) -> dict:
+        return node.create_vm_shell(
+            vm_name="demo vm",
+            host_name="esx-01.local",
+            datastore_name="ds-01",
+            config_metadata={"guest_id": "otherGuest64", "num_cpu": 1, "memory_mb": 512, "firmware": "bios", "network_adapters": []},
+            disk_layout=disks,
+        )
+
+    def test_create_vm_shell_refuses_a_folder_that_already_exists(self) -> None:
+        node, vm_folder, _searched = self._shell_over_folders({"[ds-01] demo-vm"})
+
+        with self.assertRaisesRegex(ValueError, r"Folder \[ds-01\] demo-vm already exists, so VM 'demo vm' is not created there"):
+            self._create(node, [{"capacity_gb": 1}])
+
+        self.assertEqual(vm_folder.calls, [])
+
+    def test_create_vm_shell_checks_the_folder_on_every_datastore_a_disk_goes_to(self) -> None:
+        node, vm_folder, searched = self._shell_over_folders({"[ds-02] demo-vm"})
+
+        with self.assertRaisesRegex(ValueError, r"Folder \[ds-02\] demo-vm already exists"):
+            self._create(node, [{"capacity_gb": 1}, {"capacity_gb": 1, "datastore_name": "ds-02"}])
+
+        self.assertEqual(searched, ["[ds-01] demo-vm", "[ds-02] demo-vm"])
+        self.assertEqual(vm_folder.calls, [])
+
+    def test_create_vm_shell_goes_ahead_when_no_folder_has_the_name(self) -> None:
+        node, vm_folder, searched = self._shell_over_folders({"[ds-01] other-vm"})
+
+        self._create(node, [])
+
+        self.assertEqual(searched, ["[ds-01] demo-vm"])
+        self.assertEqual(len(vm_folder.calls), 1)
 
     def test_create_vm_shell_sets_bios_firmware_in_config_spec(self) -> None:
         node = VCenterNode("vc.local", "administrator", "secret")
