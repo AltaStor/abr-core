@@ -117,6 +117,48 @@ class ManualStartOnASyntheticDayTests(unittest.TestCase):
         self.assertEqual((caught.exception.status_code, caught.exception.code), (422, "chain_cannot_be_merged"))
         self.assertEqual(TASKS, {})
 
+    def _encrypt(self, *, job_key: str | None, point_key: str | None) -> None:
+        BACKUPS["inc-1"] = _point("inc-1", "Incremental", "2026-10-18T09:00:00+00:00")
+        for point in BACKUPS.values():
+            point["encryption_enabled"] = point_key is not None
+            point["encryption_key"] = point_key
+        JOBS[JOB_ID]["task_parameters"] = (
+            {"encryption_enabled": True, "encryption_key": job_key} if job_key is not None else {"encryption_enabled": False}
+        )
+
+    def test_a_forced_synthetic_after_an_encryption_change_is_refused_with_advice_to_run_an_active_full(self) -> None:
+        cases = {
+            "the key was changed": ("placeholder-key-two", "placeholder-key-one"),
+            "encryption was turned on": ("placeholder-key-one", None),
+            "encryption was turned off": (None, "placeholder-key-one"),
+        }
+        for name, (job_key, point_key) in cases.items():
+            with self.subTest(name):
+                TASKS.clear()
+                self._encrypt(job_key=job_key, point_key=point_key)
+                with patch.object(abr_v41, "_ensure_chain_can_be_merged"), self.assertRaises(ApiError) as caught:
+                    self._start(force_synthetic=True)
+                self.assertEqual((caught.exception.status_code, caught.exception.code), (422, "chain_cannot_be_merged"))
+                self.assertIn("The encryption of job j1 changed since its last backup of this VM (restore point inc-1)", caught.exception.message)
+                self.assertIn("Run an active full instead (abr job start --full)", caught.exception.message)
+                self.assertEqual(TASKS, {})
+
+    def test_a_forced_synthetic_with_the_key_the_chain_was_written_with_still_merges(self) -> None:
+        self._encrypt(job_key="placeholder-key-one", point_key="placeholder-key-one")
+
+        with patch.object(abr_v41, "_ensure_chain_can_be_merged"):
+            sessions = self._start(force_synthetic=True)
+
+        self.assertEqual(self._decisions(sessions), [("SyntheticFull", "ForceSynthetic")])
+
+    def test_a_plain_start_after_a_key_change_still_takes_an_active_full(self) -> None:
+        self._encrypt(job_key="placeholder-key-two", point_key="placeholder-key-one")
+
+        with self._on("sun"):
+            sessions = self._start()
+
+        self.assertEqual(self._decisions(sessions), [("ActiveFull", "EncryptionKeyChanged")])
+
     def test_other_days_and_flags_still_start_one_session(self) -> None:
         cases = {
             "ordinary day": ((), {}, ("Incremental", "StandardIncremental")),

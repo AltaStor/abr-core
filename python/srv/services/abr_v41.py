@@ -5492,6 +5492,17 @@ def resolve_job_execution(
             "so a synthetic full cannot be run against it",
             repository_id=job.get("repo_id"),
         )
+        previous = _latest_successful_point(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
+        _ensure(
+            previous is None or not _encryption_differs_from_point(job, previous),
+            422,
+            "chain_cannot_be_merged",
+            f"The encryption of job {job.get('name')} changed since its last backup of this VM (restore point "
+            f"{(previous or {}).get('id')}), so a synthetic full cannot merge that chain: it was written with the "
+            "earlier encryption setting. Run an active full instead (abr job start --full).",
+            job_id=str(job.get("id") or ""),
+            vm_id=vm_id,
+        )
         return "SyntheticFull", "ForceSynthetic"
     if force_full:
         return "ActiveFull", "ForceFull"
