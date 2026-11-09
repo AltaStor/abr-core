@@ -1287,6 +1287,16 @@ class VCenterNode(Hypervisor):
         finally:
             container.Destroy()
 
+    def _datastore_folder_exists(self, datastore: Any, folder: str) -> bool:
+        browser = getattr(datastore, "browser", None)
+        if browser is None:
+            return False
+        spec = vim.host.DatastoreBrowser.SearchSpec(matchPattern=[folder], query=[vim.host.DatastoreBrowser.FolderQuery()])
+        task = browser.SearchDatastore_Task(datastorePath=f"[{datastore.name}]", searchSpec=spec)
+        self._wait_for_task(task)
+        found = getattr(getattr(task, "info", None), "result", None)
+        return any(str(getattr(item, "path", "")) == folder for item in getattr(found, "file", None) or [])
+
     def create_vm_shell(
         self,
         *,
@@ -1315,6 +1325,14 @@ class VCenterNode(Hypervisor):
             raise ValueError(f"Datastore '{name}' is not accessible from host '{host_name}'.")
 
         datastore = _datastore_on_host(datastore_name)
+        folder = _sanitize_path_segment(vm_name)
+        for used_name in sorted({datastore_name, *(str((disk or {}).get("datastore_name") or "").strip() for disk in disk_layout or [])} - {""}):
+            used = datastore if used_name == datastore_name else _datastore_on_host(used_name)
+            if self._datastore_folder_exists(used, folder):
+                raise ValueError(
+                    f"Folder [{used_name}] {folder} already exists, so VM '{vm_name}' is not created there: it may hold "
+                    "the files of another VM. Choose another name, or remove the folder if nothing uses it."
+                )
 
         compute_resource = getattr(host, "parent", None)
         resource_pool = getattr(compute_resource, "resourcePool", None)
