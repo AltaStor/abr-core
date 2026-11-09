@@ -132,7 +132,7 @@ Examples:
 abr auth login --name abr 
 ABR_USERNAME=abr ABR_PASSWORD='secret' abr auth login 
 
---print-token: print only the token to stdout, for `export ABR_TOKEN=$(abr auth login --print-token)`. 
+--print-token: print only the token to stdout, for `export ABR_TOKEN=$(abr auth login --print-token)`. The session the CLI has cached is left as it was, so fetching a token for another account does not sign the CLI in as that account. 
 
 abr auth logout 
 

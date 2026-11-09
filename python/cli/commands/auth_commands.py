@@ -86,7 +86,10 @@ class AuthCommands:
         login.add_argument(
             "--print-token",
             action="store_true",
-            help=f"Print only the raw token to stdout (for `export {TOKEN_ENV_VAR}=$(...)`), no other output.",
+            help=(
+                f"Print only the raw token to stdout (for `export {TOKEN_ENV_VAR}=$(...)`), no other output. "
+                "The session this CLI has cached is left as it was."
+            ),
         )
         login.set_defaults(handler=self.login)
 
@@ -153,18 +156,15 @@ class AuthCommands:
                 raise
             payload["totp_code"] = _prompt_totp_code()
             result = deps.context.api_client.post("api/v1/auth/login", json=payload)
-        token_store.save_token(deps.context.base_url, result["token"], result["expires_at"])
-
-        role = result["user"].get("role")
-        confirmation = (
-            f"Logged in as {result['user']['name']}{f' ({role})' if role else ''} "
-            f"(session expires {result['expires_at']})."
-        )
         if getattr(args, "print_token", False):
-            print(confirmation, file=sys.stderr)
             print(result["token"])
         else:
-            print(confirmation)
+            token_store.save_token(deps.context.base_url, result["token"], result["expires_at"])
+            role = result["user"].get("role")
+            print(
+                f"Logged in as {result['user']['name']}{f' ({role})' if role else ''} "
+                f"(session expires {result['expires_at']})."
+            )
 
         if result["user"].get("passwordPolicyExempt"):
             print(
