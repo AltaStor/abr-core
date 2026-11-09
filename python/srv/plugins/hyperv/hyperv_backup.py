@@ -467,11 +467,12 @@ def _previous_manifest(
 
 def _change_ids(
     disks: list[dict[str, Any]], parent: dict[str, Any] | None
-) -> tuple[dict[str, str], list[str]]:
-    """Each disk's RCT id from the previous backup, and the disks that have
-    none to chain onto."""
+) -> tuple[dict[str, str], list[str], list[tuple[str, int, int]]]:
+    """Each disk's RCT id from the previous backup, the disks that have
+    none to chain onto, and the disks whose size changed since."""
     found: dict[str, str] = {}
     missing: list[str] = []
+    resized: list[tuple[str, int, int]] = []
     for index, disk in enumerate(disks, start=1):
         entry = None
         if parent is not None:
@@ -482,11 +483,15 @@ def _change_ids(
             except VCenterBackupError:
                 entry = None
         change_id = str((entry or {}).get("change_id") or "").strip()
-        if change_id:
+        recorded = int((entry or {}).get("capacity_bytes") or 0)
+        current = int(disk.get("capacity_bytes") or 0)
+        if change_id and recorded and current and recorded != current:
+            resized.append((disk["slot"], recorded, current))
+        elif change_id:
             found[disk["slot"]] = change_id
         else:
             missing.append(disk["slot"])
-    return found, missing
+    return found, missing, resized
 
 
 def run_hyperv_backup(
@@ -662,8 +667,14 @@ def run_hyperv_backup(
                 if previous is None:
                     _fall_back_to_full(f"No earlier backup of {vm_name} to chain onto; taking a full backup")
                 else:
-                    change_ids, without = _change_ids(disks, previous)
-                    if without:
+                    change_ids, without, resized = _change_ids(disks, previous)
+                    if resized:
+                        _fall_back_to_full(
+                            f"Disk(s) {', '.join(f'{slot} ({_gib(before)} -> {_gib(after)})' for slot, before, after in resized)} "
+                            f"of {vm_name} changed size since the previous backup, and an incremental cannot carry a "
+                            "size change; taking a full backup"
+                        )
+                    elif without:
                         _fall_back_to_full(
                             f"Disk(s) {', '.join(without)} of {vm_name} have no change tracking position from the "
                             "previous backup (a disk added since, a VHD disk, or a VM of configuration version "
