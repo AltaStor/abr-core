@@ -4488,7 +4488,11 @@ def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] |
         result["encryption_keys"] = known
         result["encryption_key_id"] = current_id
     else:
-        result.pop("encryption_keys", None)
+        kept = _normalized_encryption_keys(result.get("encryption_keys") or (previous or {}).get("encryption_keys"))
+        if kept:
+            result["encryption_keys"] = kept
+        else:
+            result.pop("encryption_keys", None)
         result.pop("encryption_key_id", None)
     return result
 
@@ -9938,8 +9942,6 @@ def _job_key_by_id(job_id: str, key_id: Any) -> str | None:
         return None
     source_job = resolve_job(record_id=job_id)
     task_parameters = source_job.get("task_parameters") if isinstance(source_job.get("task_parameters"), dict) else {}
-    if not task_parameters.get("encryption_enabled"):
-        return None
     try:
         wanted = int(key_id)
     except (TypeError, ValueError):
@@ -9970,8 +9972,8 @@ def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
     job_id = str(point.get("job_id") or "")
     found = []
     for lookup in (
-        lambda: _job_key_by_id(job_id, point.get("encryption_key_id")),
         lambda: str(point.get("encryption_key") or "").strip() or None,
+        lambda: _job_key_by_id(job_id, point.get("encryption_key_id")),
         lambda: _job_current_key(job_id),
     ):
         key = lookup()
