@@ -74,6 +74,7 @@ from python.srv.core.storage_tool import (
     IMMUTABILITY_RETENTION_SCOPES,
     STORAGE_LAYOUT_BY_ID,
     STORAGE_LAYOUT_BY_NAME,
+    DiskToolCorruptBackup,
     StorageToolError,
     apply_repository_immutability,
     build_s3_location,
@@ -254,6 +255,7 @@ EXECUTION_REASONS = (
     "EncryptionKeyChanged",
     "IncrementalFallbackToFull",
     "VmConfigurationChanged",
+    "DamagedChain",
 )
 JOB_TYPES = ("backup", "backup-copy", "replication")
 BACKUP_KEEPING_JOB_TYPES = ("backup", "backup-copy")
@@ -4252,6 +4254,12 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
             item[next_run_key] = None
         elif not item.get(next_run_key):
             item[next_run_key] = _execution_schedule_next_run(item.get(schedule_key))
+    item["verify_schedule"] = item.get("verify_schedule") if isinstance(item.get("verify_schedule"), dict) else None
+    item["verify_whole_chain_every"] = int(item.get("verify_whole_chain_every") or DEFAULT_VERIFY_WHOLE_CHAIN_EVERY)
+    if not runs or not _schedule_runs(item["verify_schedule"]):
+        item["verify_next_run_at"] = None
+    elif not item.get("verify_next_run_at"):
+        item["verify_next_run_at"] = _execution_schedule_next_run(item["verify_schedule"])
     item["description"] = str(item.get("description") or metadata.get("description") or "")
     task_parameters = item.get("task_parameters")
     if not isinstance(task_parameters, dict):
@@ -4610,6 +4618,7 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_schedule": _schedule_dto(normalized.get("synthetic_full_schedule")),
         "active_full_next_run_at": normalized.get("active_full_next_run_at"),
         "synthetic_full_next_run_at": normalized.get("synthetic_full_next_run_at"),
+        **verify_schedule_view(normalized),
         "compression_level": compression_level,
         "on_quiesce_failure": str(task_parameters.get("on_quiesce_failure") or "fail"),
         "encryption": {
@@ -4738,6 +4747,61 @@ EXECUTION_SCHEDULE_FIELDS = (
     ("active_full_schedule", "active_full_days", "active_full_next_run_at"),
     ("synthetic_full_schedule", "synthetic_full_days", "synthetic_full_next_run_at"),
 )
+DEFAULT_VERIFY_WHOLE_CHAIN_EVERY = 4
+MAX_VERIFY_WHOLE_CHAIN_EVERY = 100
+VERIFY_SETTING_KEYS = ("verify_schedule", "verify_enabled", "verify_whole_chain_every")
+
+
+def verify_settings_from_request(
+    payload: dict[str, Any], current: dict[str, Any] | None = None, *, job_enabled: bool = True
+) -> dict[str, Any]:
+    stored = current or {}
+    updates: dict[str, Any] = {}
+    schedule = stored.get("verify_schedule") if isinstance(stored.get("verify_schedule"), dict) else None
+    if "verify_schedule" in payload:
+        raw = payload["verify_schedule"]
+        if raw is None or (isinstance(raw, str) and raw.strip().lower() in {"", "none", "off"}):
+            schedule = None
+        else:
+            schedule = _schedule_from_request(raw)
+            _ensure(
+                str((schedule or {}).get("kind") or "") != "weekly" or bool(_schedule_weekdays(schedule)),
+                422,
+                "invalid_job",
+                "A weekly verify schedule needs at least one day (--verify-days)",
+            )
+        updates["verify_schedule"] = schedule
+    if payload.get("verify_enabled") is not None:
+        _ensure(
+            isinstance(schedule, dict),
+            422,
+            "invalid_job",
+            "There is no verify schedule to switch on or off; set one with --verify-schedule",
+        )
+        schedule = dict(schedule, enabled=bool(payload["verify_enabled"]))
+        updates["verify_schedule"] = schedule
+    if payload.get("verify_whole_chain_every") is not None:
+        every = _whole_number(payload["verify_whole_chain_every"])
+        _ensure(
+            every is not None and 1 <= every <= MAX_VERIFY_WHOLE_CHAIN_EVERY,
+            422,
+            "invalid_job",
+            f"verify-whole-chain-every must be a whole number from 1 to {MAX_VERIFY_WHOLE_CHAIN_EVERY}",
+            verify_whole_chain_every=payload["verify_whole_chain_every"],
+        )
+        updates["verify_whole_chain_every"] = every
+    if "verify_schedule" in updates:
+        updates["verify_next_run_at"] = _execution_schedule_next_run(schedule) if job_enabled else None
+    return updates
+
+
+def verify_schedule_view(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "verify_schedule": _schedule_dto(job.get("verify_schedule")),
+        "verify_whole_chain_every": int(job.get("verify_whole_chain_every") or DEFAULT_VERIFY_WHOLE_CHAIN_EVERY),
+        "verify_next_run_at": job.get("verify_next_run_at"),
+        "last_verify": job.get("last_verify") if isinstance(job.get("last_verify"), dict) else None,
+    }
 
 
 def _execution_schedule_next_run(schedule: dict[str, Any] | None) -> str | None:
@@ -4909,6 +4973,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_schedule": synthetic_full_schedule,
         "active_full_next_run_at": _execution_schedule_next_run(active_full_schedule) if base_is_enabled else None,
         "synthetic_full_next_run_at": _execution_schedule_next_run(synthetic_full_schedule) if base_is_enabled else None,
+        **verify_settings_from_request(payload, job_enabled=job_enabled),
         "description": description,
         "task_parameters": dict(task_parameters),
         "storage_layout": STORAGE_LAYOUT_BY_ID,
@@ -5001,6 +5066,7 @@ def create_backup_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_schedule": synthetic_full_schedule,
         "active_full_next_run_at": _execution_schedule_next_run(active_full_schedule) if job_enabled else None,
         "synthetic_full_next_run_at": _execution_schedule_next_run(synthetic_full_schedule) if job_enabled else None,
+        **verify_settings_from_request(payload, job_enabled=job_enabled),
         "description": description,
         "task_parameters": dict(task_parameters),
         "storage_layout": STORAGE_LAYOUT_BY_ID,
@@ -5120,6 +5186,9 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_days": list(source_job.get("synthetic_full_days") or []),
         "active_full_schedule": _json_clone(source_job.get("active_full_schedule")),
         "synthetic_full_schedule": _json_clone(source_job.get("synthetic_full_schedule")),
+        "verify_schedule": _json_clone(source_job.get("verify_schedule")),
+        "verify_whole_chain_every": int(source_job.get("verify_whole_chain_every") or DEFAULT_VERIFY_WHOLE_CHAIN_EVERY),
+        **verify_settings_from_request(payload, source_job, job_enabled=job_enabled),
         "description": description,
         "task_parameters": dict(source_task_parameters),
         "storage_layout": STORAGE_LAYOUT_BY_ID,
@@ -5301,6 +5370,15 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
         updated["description"] = description
         changed = True
+    if any(key in payload and (key == "verify_schedule" or payload[key] is not None) for key in VERIFY_SETTING_KEYS):
+        _ensure(
+            updated["job_type"] in BACKUP_KEEPING_JOB_TYPES,
+            422,
+            "invalid_job",
+            f"A verify schedule applies to backup and backup copy jobs, and {updated.get('name')} is a replication job",
+        )
+        updated.update(verify_settings_from_request(payload, updated, job_enabled=_job_is_enabled(updated)))
+        changed = True
     if "task_parameters" in payload and payload["task_parameters"] is not None:
         _ensure(isinstance(payload["task_parameters"], dict), 422, "invalid_job", "task_parameters must be an object")
         _ensure_encryption_key_strength(payload["task_parameters"])
@@ -5391,10 +5469,12 @@ def _finish_job_edit(updated: dict[str, Any], payload: dict[str, Any], changed: 
     if was_enabled and not is_enabled:
         for _schedule_key, _days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
             updated[next_run_key] = None
+        updated["verify_next_run_at"] = None
     elif is_enabled and not was_enabled:
         for schedule_key, _days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
             updated[next_run_key] = _execution_schedule_next_run(updated.get(schedule_key))
         updated["next_incremental_run_at"] = _execution_schedule_next_run(updated.get("schedule"))
+        updated["verify_next_run_at"] = _execution_schedule_next_run(updated.get("verify_schedule"))
     return job_to_dto(_persist_canonical_job(updated))
 
 
@@ -5603,6 +5683,16 @@ def resolve_job_execution(
             "so a synthetic full cannot be run against it",
             repository_id=job.get("repo_id"),
         )
+        damaged = damaged_chain_points(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
+        _ensure(
+            not damaged,
+            422,
+            "chain_cannot_be_merged",
+            f"Verification found damaged data in the chain of job {job.get('name')} for this VM (restore point "
+            f"{', '.join(damaged)}), so a synthetic full cannot merge it. Run an active full instead (abr job start --full).",
+            job_id=str(job.get("id") or ""),
+            vm_id=vm_id,
+        )
         previous = _latest_successful_point(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
         _ensure(
             previous is None or not _encryption_differs_from_point(job, previous),
@@ -5620,6 +5710,8 @@ def resolve_job_execution(
     previous = _latest_successful_point(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
     if previous is None:
         return "ActiveFull", "FirstRun"
+    if damaged_chain_points(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None):
+        return "ActiveFull", "DamagedChain"
     if _encryption_differs_from_point(job, previous):
         return "ActiveFull", "EncryptionKeyChanged"
     if _chain_base_mismatches(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None):
@@ -5643,6 +5735,18 @@ def resolve_job_execution(
             return "ActiveFull", "RepositorySyntheticUnsupportedEscalatedToActive"
         return "SyntheticFull", "SyntheticFullWindow"
     return "Incremental", "StandardIncremental"
+
+
+def damaged_chain_points(job_id: str, vm_id: str, repository_id: str | None) -> list[str]:
+    points = _points_for_job_vm_repo(job_id, vm_id, repository_id)
+    if not points or points[-1].get("status") != POINT_CORRUPT:
+        return []
+    damaged = [
+        str(point.get("id") or "")
+        for point in points
+        if point.get("status") == POINT_CORRUPT and (point.get("corruption") or {}).get("kind") == "damaged"
+    ]
+    return damaged or [str(points[-1].get("id") or "")]
 
 
 def execution_phases(execution_type: str, execution_reason: str) -> list[tuple[str, str]]:
@@ -5676,6 +5780,21 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
         execution_type, execution_reason = "ActiveFull", "FirstRun"
     else:
         execution_type, execution_reason = queued_type, queued_reason
+    damaged = damaged_chain_points(job_id, vm_id, str(job.get("repo_id") or "") or None)
+    if damaged and execution_type != "ActiveFull":
+        execution_type, execution_reason = "ActiveFull", "DamagedChain"
+    if damaged and execution_reason == "DamagedChain":
+        warnings = task.get("warnings") if isinstance(task.get("warnings"), list) else []
+        if not any(isinstance(item, dict) and item.get("code") == "damaged_chain" for item in warnings):
+            message = (
+                f"Verification found damaged data in restore point {', '.join(damaged)} of this VM's chain, so this run "
+                "takes an active full instead of building on it"
+            )
+            task["warnings"] = [*warnings, {"code": "damaged_chain", "message": message, "restore_point_ids": damaged}]
+            _append_task_log(task, level="warn", message=message, component="session")
+            LOGGER.warning("Backup session %s of job '%s', VM %s: %s", task.get("id"), job.get("name"), vm_id, message)
+            if (execution_type, execution_reason) == (queued_type, queued_reason):
+                persist_task(task)
     mismatched: list[str] = []
     if execution_type in {"Incremental", "SyntheticFull"} or execution_reason == "ChainBaseMismatch":
         mismatched = _chain_base_mismatches(job_id, vm_id, str(job.get("repo_id") or "") or None)
@@ -6031,6 +6150,7 @@ def _point_artifact_locations(point: dict[str, Any]) -> list[tuple[str, str]]:
 POINT_MISSING = "missing"
 POINT_CHAIN_BROKEN = "chain_broken"
 POINT_DELETING = "deleting"
+POINT_CORRUPT = "corrupt"
 
 
 def _missing_ancestor(point: dict[str, Any], by_id: dict[str, dict[str, Any]], gone: set[str], unknown: set[str]) -> str | None:
@@ -6919,6 +7039,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "immutability_expires_at": point.get("immutability_expires_at"),
             "parent_point_id": point.get("parent_point_id"),
             "status": point.get("status"),
+            "corruption": point.get("corruption") if point.get("status") == POINT_CORRUPT and isinstance(point.get("corruption"), dict) else None,
             "deletion_requested_at": point.get("deletion_requested_at"),
             "vm_id": point.get("vm_id"),
             "vm_name": point.get("vm_name"),
@@ -6959,7 +7080,35 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
         "latest_execution_reason": latest.get("execution_reason"),
         "gfs_protected": any(bool(point.get("gfs_protected")) for point in points),
         "pending_deletion": _pending_deletion_summary(points),
+        "corrupt": _corruption_summary(points),
         "restore_points": restore_points,
+    }
+
+
+def corrupt_point_message(point: dict[str, Any]) -> str:
+    corruption = point.get("corruption") if isinstance(point.get("corruption"), dict) else {}
+    found = f"{corruption.get('found_by') or 'verification'} on {corruption.get('found_at')}" if corruption.get("found_at") else "verification"
+    if corruption.get("kind") == "dependent":
+        return (
+            f"Restore point is not available for restore: it builds on restore point {corruption.get('damaged_point_id')}, "
+            f"whose data {found} found damaged. Restore an earlier point; the job's next run takes an active full"
+        )
+    return (
+        f"Restore point is not available for restore: {found} found its data damaged. Restore an earlier point; "
+        "the job's next run takes an active full"
+    )
+
+
+def _corruption_summary(points: list[dict[str, Any]]) -> dict[str, Any] | None:
+    marked = [point for point in points if point.get("status") == POINT_CORRUPT]
+    if not marked:
+        return None
+    damaged = [point for point in marked if (point.get("corruption") or {}).get("kind") == "damaged"]
+    found = [str((point.get("corruption") or {}).get("found_at") or "") for point in marked]
+    return {
+        "restore_point_count": len(marked),
+        "damaged_point_ids": [str(point.get("id") or "") for point in damaged],
+        "found_at": max(found) if any(found) else None,
     }
 
 
@@ -7392,10 +7541,15 @@ def verify_backup_chain(
     encryption_key: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    point_ids: set[str] | None = None,
+    session_id: str | None = None,
+    found_by: str = "backup verify",
 ) -> dict[str, Any]:
     points = grouped_backup_points().get(backup_id)
     if not points:
         raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
+    if point_ids is not None:
+        points = [point for point in points if str(point.get("id") or "") in point_ids]
 
     warnings: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -7437,6 +7591,7 @@ def verify_backup_chain(
     total_items = len(work_items)
     checked_artifacts = 0
     canceled = False
+    outcomes: dict[str, list[dict[str, Any]]] = {}
     _emit(0, f"Verifying {total_items} backup artifact(s)")
 
     if work_items:
@@ -7468,6 +7623,7 @@ def verify_backup_chain(
                     result = future.result()
                 except Exception as exc:
                     result = {"disk_key": None, "status": "failed", "message": str(exc)}
+                outcomes.setdefault(str(point["id"]), []).append(result)
 
                 if result["status"] != "ok":
                     errors.append(
@@ -7475,6 +7631,7 @@ def verify_backup_chain(
                             "point_id": point["id"],
                             "disk_key": result.get("disk_key"),
                             "message": result["message"],
+                            "damaged": result["status"] == "corrupt",
                         }
                     )
 
@@ -7499,11 +7656,116 @@ def verify_backup_chain(
         "errors": errors,
         "checked_restore_points": sum(1 for point in points if point.get("status") != POINT_DELETING),
         "checked_artifacts": checked_artifacts,
+        "corrupt": apply_verify_marks(outcomes, session_id=session_id, found_by=found_by),
     }
     if canceled:
         report["canceled"] = True
     _emit(100, _verify_report_summary(report))
     return report
+
+
+HEALTHY_POINT_STATUSES = {"available", "completed", "healthy"}
+
+
+def _damaged_ancestor(point: dict[str, Any], by_id: dict[str, dict[str, Any]], damaged: set[str]) -> str | None:
+    seen: set[str] = set()
+    parent_id = str(point.get("parent_point_id") or "")
+    while parent_id and parent_id in by_id and parent_id not in seen:
+        if parent_id in damaged:
+            return parent_id
+        seen.add(parent_id)
+        parent_id = str(by_id[parent_id].get("parent_point_id") or "")
+    return None
+
+
+def apply_verify_marks(
+    outcomes: dict[str, list[dict[str, Any]]],
+    *,
+    session_id: str | None,
+    found_by: str,
+) -> dict[str, list[str]]:
+    summary: dict[str, list[str]] = {"damaged": [], "dependent": [], "cleared": [], "corrupt_now": []}
+    if not outcomes:
+        return summary
+    now = utc_now()
+    chains = {
+        str(point.get("chain_id") or "")
+        for point in normalized_backup_points()
+        if str(point.get("id") or "") in outcomes
+    }
+    for chain_id in chains:
+        points = grouped_backup_points().get(chain_id, [])
+        by_id = {str(point.get("id") or ""): point for point in points}
+        cleared_by_check = {
+            point_id
+            for point_id, results in outcomes.items()
+            if point_id in by_id and results and all(result.get("status") == "ok" for result in results)
+        }
+        found: dict[str, dict[str, Any]] = {}
+        damaged: set[str] = set()
+        for point_id, point in by_id.items():
+            corrupt = [result for result in outcomes.get(point_id) or [] if result.get("status") == "corrupt"]
+            corruption = point.get("corruption") if isinstance(point.get("corruption"), dict) else {}
+            if corrupt:
+                found[point_id] = corrupt[0]
+                damaged.add(point_id)
+            elif point.get("status") == POINT_CORRUPT and corruption.get("kind") == "damaged" and point_id not in cleared_by_check:
+                damaged.add(point_id)
+        for point_id, point in by_id.items():
+            status = str(point.get("status") or "available")
+            corruption = point.get("corruption") if isinstance(point.get("corruption"), dict) else {}
+            if point_id in damaged:
+                if point_id not in found or (status not in HEALTHY_POINT_STATUSES and status != POINT_CORRUPT):
+                    continue
+                result = found[point_id]
+                point["status"] = POINT_CORRUPT
+                point["corruption"] = {
+                    "kind": "damaged",
+                    "found_at": now,
+                    "found_by": found_by,
+                    "session_id": session_id,
+                    "message": str(result.get("message") or ""),
+                    "corrupt_ranges": result.get("corrupt_ranges"),
+                    "data_ranges": result.get("data_ranges"),
+                }
+                persist_backup(point)
+                summary["damaged"].append(point_id)
+                LOGGER.warning(
+                    "Verification found damaged data in restore point %s of chain %s (%s); it and the restore points "
+                    "that build on it are marked corrupt and are not offered for restore",
+                    point_id,
+                    chain_id,
+                    condense_disk_tool_message(str(result.get("message") or "")) or "damaged data",
+                )
+                continue
+            ancestor = _damaged_ancestor(point, by_id, damaged)
+            if ancestor:
+                if status not in HEALTHY_POINT_STATUSES and status != POINT_CORRUPT:
+                    continue
+                if status == POINT_CORRUPT and corruption.get("damaged_point_id") == ancestor:
+                    continue
+                point["status"] = POINT_CORRUPT
+                point["corruption"] = {
+                    "kind": "dependent",
+                    "damaged_point_id": ancestor,
+                    "found_at": now,
+                    "found_by": found_by,
+                    "session_id": session_id,
+                }
+                persist_backup(point)
+                summary["dependent"].append(point_id)
+                continue
+            if status != POINT_CORRUPT:
+                continue
+            if corruption.get("kind") == "damaged" and point_id not in cleared_by_check:
+                continue
+            point["status"] = "available"
+            point["corruption"] = None
+            persist_backup(point)
+            summary["cleared"].append(point_id)
+            LOGGER.info("Verification found restore point %s of chain %s intact again; it is no longer marked corrupt", point_id, chain_id)
+        summary["corrupt_now"].extend(point_id for point_id, point in by_id.items() if point.get("status") == POINT_CORRUPT)
+    return summary
 
 
 def _verify_report_summary(report: dict[str, Any]) -> str:
@@ -7527,11 +7789,21 @@ def _verify_artifact_progress_reporter(
     return _report
 
 
-def _create_verify_session(backup_id: str, points: list[dict[str, Any]]) -> dict[str, Any]:
+def _create_verify_session(
+    backup_id: str,
+    points: list[dict[str, Any]],
+    *,
+    job_id: str | None = None,
+    trigger: str | None = None,
+    scope: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
     latest = points[-1] if points else {}
     task = {
         "id": str(uuid4()),
-        "job_id": None,
+        "job_id": job_id,
+        **({"trigger": trigger} if trigger else {}),
+        **({"run_id": run_id} if run_id else {}),
         "task_type": "verify",
         "hypervisor_id": None,
         "resource_type": "virtual_machine",
@@ -7542,13 +7814,22 @@ def _create_verify_session(backup_id: str, points: list[dict[str, Any]]) -> dict
             "vm_name": str(latest.get("vm_name") or "").strip() or None,
             "repository_id": latest.get("repository_id"),
             "repository_name": latest.get("repository_name"),
+            "job_name": latest.get("job_name"),
+            **({"trigger": trigger} if trigger else {}),
+            **({"scope": scope} if scope else {}),
         },
         "result": {"progress": 0},
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "logs": [],
     }
-    _append_task_log(task, level="info", message=f"Started verification of backup {backup_id}", component="session")
+    what = {"newest_points": f"the newest restore point ({latest.get('id')})", "whole_chains": "every restore point"}.get(str(scope or ""), "")
+    _append_task_log(
+        task,
+        level="info",
+        message=f"Started verification of backup {backup_id}" + (f": {what}, {trigger} run of its job's verify schedule" if what else ""),
+        component="session",
+    )
     persist_task(task)
     return task
 
@@ -7580,7 +7861,14 @@ def _verify_session_cancel_requested(task_id: str) -> bool:
         return bool(task and task.get("cancel_requested"))
 
 
-def _run_verify_session(backup_id: str, task_id: str, *, encryption_key: str | None = None) -> dict[str, Any]:
+def _run_verify_session(
+    backup_id: str,
+    task_id: str,
+    *,
+    encryption_key: str | None = None,
+    point_ids: set[str] | None = None,
+    found_by: str = "backup verify",
+) -> dict[str, Any]:
     try:
         report = verify_backup_chain(
             backup_id,
@@ -7590,6 +7878,9 @@ def _run_verify_session(backup_id: str, task_id: str, *, encryption_key: str | N
                 {**update, "log_entry": False},
             ),
             should_cancel=lambda: _verify_session_cancel_requested(task_id),
+            point_ids=point_ids,
+            session_id=task_id,
+            found_by=found_by,
         )
     except ApiError as exc:
         _update_session_result(
@@ -7623,7 +7914,125 @@ def _run_verify_session(backup_id: str, task_id: str, *, encryption_key: str | N
         },
         status=status,
     )
+    from . import notification_detectors
+
+    notification_detectors.verify_finished(dict(TASKS.get(task_id) or {"id": task_id}), report)
     return report
+
+
+_VERIFY_RUNS: set[str] = set()
+_VERIFY_RUNS_LOCK = threading.Lock()
+
+
+def job_verify_running(job_id: str) -> bool:
+    with _VERIFY_RUNS_LOCK:
+        return job_id in _VERIFY_RUNS
+
+
+def _job_verify_targets(job_id: str) -> list[tuple[str, list[dict[str, Any]]]]:
+    targets = []
+    for vm_id, repository_id in _job_chains(job_id):
+        chain_id = _chain_id_for_point(job_id, vm_id, repository_id)
+        points = [point for point in grouped_backup_points().get(chain_id, []) if point.get("status") != POINT_DELETING]
+        if points:
+            targets.append((chain_id, points))
+    return targets
+
+
+def _record_job_verify(job_id: str, run: dict[str, Any]) -> None:
+    with CATALOG_LOCK:
+        stored = JOBS.get(job_id)
+        if not stored:
+            return
+        fresh = dict(stored)
+        fresh["last_verify"] = {**run, "session_ids": list(run.get("session_ids") or [])}
+        persist_job(fresh)
+
+
+def run_job_verify(job_id: str, *, trigger: str = "schedule") -> dict[str, Any] | None:
+    job = resolve_job(record_id=job_id)
+    _ensure(
+        job.get("job_type") in BACKUP_KEEPING_JOB_TYPES,
+        422,
+        "invalid_job",
+        f"{job.get('name')} keeps no restore points of its own to verify",
+    )
+    with _VERIFY_RUNS_LOCK:
+        if job_id in _VERIFY_RUNS:
+            return None
+        _VERIFY_RUNS.add(job_id)
+    try:
+        with CATALOG_LOCK:
+            fresh = dict(JOBS.get(job_id) or job)
+            run_number = int(fresh.get("verify_runs") or 0) + 1
+            every = int(fresh.get("verify_whole_chain_every") or DEFAULT_VERIFY_WHOLE_CHAIN_EVERY)
+            run = {
+                "id": str(uuid4()),
+                "run": run_number,
+                "scope": "whole_chains" if run_number % every == 0 else "newest_points",
+                "trigger": trigger,
+                "started_at": utc_now(),
+                "finished_at": None,
+                "result": "running",
+                "session_ids": [],
+            }
+            fresh["verify_runs"] = run_number
+            fresh["last_verify"] = dict(run)
+            persist_job(fresh)
+        threading.Thread(target=_run_job_verify, args=(job_id, run), name=f"job-verify-{job_id}", daemon=True).start()
+    except Exception:
+        with _VERIFY_RUNS_LOCK:
+            _VERIFY_RUNS.discard(job_id)
+        raise
+    LOGGER.info(
+        "Job %s starts verify run %d (%s, %s): %s",
+        job.get("name"),
+        run["run"],
+        run["scope"].replace("_", " "),
+        trigger,
+        "every restore point of each chain" if run["scope"] == "whole_chains" else "the newest restore point of each chain",
+    )
+    return run
+
+
+def _run_job_verify(job_id: str, run: dict[str, Any]) -> None:
+    results: list[str] = []
+    try:
+        name = str((JOBS.get(job_id) or {}).get("name") or job_id)
+        for chain_id, points in _job_verify_targets(job_id):
+            point_ids = None if run["scope"] == "whole_chains" else {str(points[-1].get("id") or "")}
+            task = _create_verify_session(
+                chain_id, points, job_id=job_id, trigger=str(run["trigger"]), scope=str(run["scope"]), run_id=str(run["id"])
+            )
+            run["session_ids"].append(task["id"])
+            _record_job_verify(job_id, run)
+            try:
+                report = _run_verify_session(
+                    chain_id, str(task["id"]), point_ids=point_ids, found_by=f"the verify schedule of job {name}"
+                )
+                results.append(str(report.get("result") or ""))
+            except Exception:
+                LOGGER.exception("Scheduled verify of chain %s of job %s failed", chain_id, name)
+                results.append("invalid")
+        if not results:
+            run["result"] = "nothing_to_verify"
+        elif "invalid" in results:
+            run["result"] = "failed"
+        elif "canceled" in results:
+            run["result"] = "stopped"
+        elif "warning" in results:
+            run["result"] = "warning"
+        else:
+            run["result"] = "success"
+    except Exception:
+        LOGGER.exception("Verify run %s of job %s failed", run.get("id"), job_id)
+        run["result"] = "failed"
+    finally:
+        run["finished_at"] = utc_now()
+        _record_job_verify(job_id, run)
+        with _VERIFY_RUNS_LOCK:
+            _VERIFY_RUNS.discard(job_id)
+        LOGGER.info("Verify run %d of job %s finished: %s", run.get("run"), job_id, run.get("result"))
 
 
 def verify_backup_chain_request(
@@ -8383,6 +8792,7 @@ def restore_point_to_dto(point: dict[str, Any]) -> dict[str, Any]:
         "consistency_reason": point.get("consistency_reason"),
         "status": point.get("status"),
         "available": _restore_point_is_available(point),
+        "corruption": point.get("corruption") if point.get("status") == POINT_CORRUPT and isinstance(point.get("corruption"), dict) else None,
         "gfs_marks": point.get("gfs_marks"),
         "skipped_disks": _restore_point_artifact(point).get("skipped_disks") or [],
         "immutability_expires_at": point.get("immutability_expires_at"),
@@ -10174,6 +10584,8 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
         if missing_ancestor
         else _deleting_point_message(point)
         if point.get("status") == POINT_DELETING
+        else corrupt_point_message(point)
+        if point.get("status") == POINT_CORRUPT
         else "Restore point is not available for restore",
         point_id=point_id,
         status=point.get("status"),
@@ -10866,6 +11278,14 @@ def _verify_disk_artifact(
             timeout=VERIFY_ARTIFACT_TIMEOUT_SECONDS,
             on_progress=on_progress,
         )
+    except DiskToolCorruptBackup as exc:
+        return {
+            "disk_key": disk_key,
+            "status": "corrupt",
+            "message": str(exc),
+            "corrupt_ranges": exc.corrupt_ranges,
+            "data_ranges": exc.data_ranges,
+        }
     except StorageToolError as exc:
         return {"disk_key": disk_key, "status": "failed", "message": str(exc)}
 
@@ -10923,6 +11343,7 @@ def _verify_repository_backup_health(repository_id: str, *, whole_chains: bool =
         }
 
     errors: list[dict[str, Any]] = []
+    outcomes: dict[str, list[dict[str, Any]]] = {}
     with ThreadPoolExecutor(max_workers=min(VERIFY_CONCURRENCY, len(work_items))) as pool:
         futures = {pool.submit(_verify_disk_artifact, point, disk): 
                    point for point, disk in work_items}
@@ -10934,6 +11355,7 @@ def _verify_repository_backup_health(repository_id: str, *, whole_chains: bool =
                 result = future.result()
             except Exception as exc:
                 result = {"disk_key": None, "status": "failed", "message": str(exc)}
+            outcomes.setdefault(str(point.get("id") or ""), []).append(result)
 
             if result["status"] != "ok":
                 errors.append(
@@ -10942,8 +11364,10 @@ def _verify_repository_backup_health(repository_id: str, *, whole_chains: bool =
                         "point_id": point.get("id"),
                         "disk_key": result.get("disk_key"),
                         "message": result["message"],
+                        "damaged": result["status"] == "corrupt",
                     }
                 )
+    corrupt = apply_verify_marks(outcomes, session_id=None, found_by="repo verify")
 
     status = "failed" if errors else "ok"
     covered = f"{len(checked_points)} restore point(s) across {chain_count} chain(s)"
@@ -10954,11 +11378,16 @@ def _verify_repository_backup_health(repository_id: str, *, whole_chains: bool =
         if errors
         else f"Verified {len(work_items)} backup artifact(s) of {covered}"
     )
-    return {
+    health = {
         "status": status,
         "checked_chains": chain_count,
         "checked_restore_points": len(checked_points),
         "checked_artifacts": len(work_items),
         "errors": errors,
+        "corrupt": corrupt,
         "message": message,
     }
+    from . import notification_detectors
+
+    notification_detectors.repository_verify_failed(REPOSITORIES.get(repository_id) or {"id": repository_id}, health)
+    return health

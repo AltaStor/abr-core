@@ -184,13 +184,16 @@ def _source_chain(job: dict[str, Any], vm_id: str, previous: dict[str, Any] | No
 
 
 def plan_copy(job: dict[str, Any], vm_id: str, *, requested_type: str = "Incremental") -> dict[str, Any] | None:
+    from python.srv.services.abr_v41 import damaged_chain_points
+
     previous_points = destination_points(job, vm_id)
     previous = previous_points[-1] if previous_points else None
     chain = _source_chain(job, vm_id, previous)
     if not chain:
         return None
 
-    full_requested = requested_type in FULL_EXECUTION_TYPES
+    damaged = bool(damaged_chain_points(str(job.get("id") or ""), vm_id, str(job.get("repo_id") or "") or None))
+    full_requested = requested_type in FULL_EXECUTION_TYPES or damaged
     copied_id = str(_copy_source(previous or {}).get("point_id") or "")
     position = {str(point.get("id") or ""): index for index, point in enumerate(chain)}
     if copied_id in position:
@@ -231,6 +234,7 @@ def plan_copy(job: dict[str, Any], vm_id: str, *, requested_type: str = "Increme
         "target": target,
         "parent": previous if continues else None,
         "remaining": len(pending) - pending.index(target) - 1 if target in pending else 0,
+        "damaged": damaged,
     }
 
 
@@ -699,7 +703,9 @@ def _copy_once(
         execution_type = "ActiveFull" if kind == "full" else "Incremental"
         requested_type = str(parameters.get("resolved_backup_type") or "Incremental")
         execution_reason = (
-            "SourceNewChain"
+            "DamagedChain"
+            if kind == "full" and plan.get("damaged")
+            else "SourceNewChain"
             if kind == "full" and requested_type not in FULL_EXECUTION_TYPES
             else str(parameters.get("resolved_backup_reason") or "BackupCopy")
         )

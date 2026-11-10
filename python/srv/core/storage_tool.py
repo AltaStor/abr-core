@@ -60,7 +60,14 @@ STORAGE_LAYOUT_BY_ID = "by_id"
 
 
 class StorageToolError(RuntimeError):
-    pass
+    result_stdout: str = ""
+
+
+class DiskToolCorruptBackup(StorageToolError):
+    def __init__(self, message: str, *, corrupt_ranges: int, data_ranges: int) -> None:
+        super().__init__(message)
+        self.corrupt_ranges = corrupt_ranges
+        self.data_ranges = data_ranges
 
 
 def _coerce_bool(value: Any, *, default: bool) -> bool:
@@ -708,19 +715,45 @@ def verify_disk_tool_backup(
     timeout: int | None = None,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> None:
-    """Block-level integrity check of one stored backup. Raises on damage."""
-    run_disk_tool(
-        [
-            "verify",
-            "--name",
-            backup_name,
-            *(["--key", encryption_key] if encryption_key else []),
-            *disk_tool_storage_args(repository, abr_path=abr_path),
-        ],
-        timeout=timeout,
-        on_progress=on_progress,
-        progress_poll_seconds=VERIFY_PROGRESS_POLL_SECONDS,
-    )
+    try:
+        run_disk_tool(
+            [
+                "verify",
+                "--name",
+                backup_name,
+                *(["--key", encryption_key] if encryption_key else []),
+                *disk_tool_storage_args(repository, abr_path=abr_path),
+                "--json",
+            ],
+            timeout=timeout,
+            on_progress=on_progress,
+            progress_poll_seconds=VERIFY_PROGRESS_POLL_SECONDS,
+        )
+    except DiskToolCorruptBackup:
+        raise
+    except StorageToolError as exc:
+        try:
+            document = parse_disk_tool_json(exc.result_stdout)
+        except StorageToolError:
+            raise exc from None
+        if document.get("intact") is False:
+            raise DiskToolCorruptBackup(
+                str(exc),
+                corrupt_ranges=int(document.get("corrupt_ranges") or 0),
+                data_ranges=int(document.get("data_ranges") or 0),
+            ) from exc
+        if encryption_key:
+            try:
+                verify_disk_tool_backup(repository, abr_path, backup_name, timeout=timeout)
+            except DiskToolCorruptBackup as damaged:
+                raise DiskToolCorruptBackup(
+                    f"{damaged}\n(with the key the check stopped at: {condense_disk_tool_message(str(exc)) or exc})",
+                    corrupt_ranges=damaged.corrupt_ranges,
+                    data_ranges=damaged.data_ranges,
+                ) from exc
+            except StorageToolError:
+                pass
+        raise
 
 
 def remove_disk_tool_backup(
@@ -1387,7 +1420,9 @@ def run_disk_tool(
             elapsed,
             condense_disk_tool_message(stderr) or f"exit code {completed.returncode}",
         )
-        raise StorageToolError(stderr or f"backup tool failed with exit code {completed.returncode}")
+        error = StorageToolError(stderr or f"backup tool failed with exit code {completed.returncode}")
+        error.result_stdout = str(completed.stdout or "")
+        raise error
 
     logger.log(logging.INFO if mutating else logging.DEBUG, "Storage operation %s done in %.1fs", operation, elapsed)
     return completed

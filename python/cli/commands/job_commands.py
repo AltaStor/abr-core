@@ -83,6 +83,10 @@ REPLICATION_HIDDEN_KEYS = frozenset(
         "storage_layout",
         "retention_days",
         "retention_min_fulls",
+        "verify_schedule",
+        "verify_whole_chain_every",
+        "verify_next_run_at",
+        "last_verify",
         "gfs",
         "active_full_days",
         "synthetic_full_days",
@@ -512,7 +516,21 @@ class JobCommands:
                 type=parse_optional_weekday_csv,
                 help="Active full weekdays, comma-separated Mon-Sun, for a weekly schedule only; none turns a weekly one off",
             )
-            for prefix, label in (("active-full", "Active full"), ("synthetic-full", "Synthetic full")):
+            parser.add_argument(
+                "--verify-days",
+                type=parse_optional_weekday_csv,
+                help="Verify weekdays, comma-separated Mon-Sun, for a weekly verify schedule only",
+            )
+            parser.add_argument(
+                "--verify-whole-chain-every",
+                dest="verify_whole_chain_every",
+                type=int,
+                help=(
+                    "Every how many scheduled verify runs check every restore point of each chain instead of the "
+                    "newest one, 1-100 (default 4; 1 checks whole chains every time)"
+                ),
+            )
+            for prefix, label in (("active-full", "Active full"), ("synthetic-full", "Synthetic full"), ("verify", "Verify")):
                 dest = prefix.replace("-", "_")
                 parser.add_argument(
                     f"--{prefix}-schedule",
