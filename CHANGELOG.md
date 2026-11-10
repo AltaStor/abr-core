@@ -132,6 +132,10 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
 - The restore points of a chain in `GET /api/v1/backups` carry `copy_source`,
   as `GET /api/v1/restore/points` does, so a client that reads the chains can
   tell a copy a backup copy job made, and where it was copied from.
+- A replication session in `GET /api/v1/sessions` carries `replication`: whether
+  the run created, updated, rebuilt or found the replica up to date, the
+  restore point it brought the replica to, the incrementals applied, the target
+  host and the replica VM.
 - A schedule's `timezone` in the job DTO is the zone it actually runs on: the
   server's zone for one saved without a zone or with an abbreviation of the
   server's zone, and UTC for a name the server does not know, instead of the

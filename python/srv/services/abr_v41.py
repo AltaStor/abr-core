@@ -6613,6 +6613,25 @@ def _repository_name_for(repository_id: str) -> str | None:
     return str(record.get("name") or "") or None if isinstance(record, dict) else None
 
 
+def _replication_report(task: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """What a replication session did to its replica: ``mode`` is create,
+    incremental, rebuild or up_to_date once it finished, null before."""
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    applied = result.get("applied_point_ids")
+    return {
+        "mode": result.get("mode") if result.get("operation") == "replication" else None,
+        "source_job_id": result.get("source_job_id") or parameters.get("source_job_id"),
+        "source_job_name": result.get("source_job_name") or parameters.get("source_job_name"),
+        "restore_point_id": result.get("restore_point_id"),
+        "restore_point_created_at": result.get("restore_point_created_at"),
+        "applied_point_ids": list(applied) if isinstance(applied, list) else [],
+        "target_inventory_name": result.get("target_inventory_name") or parameters.get("target_inventory_name"),
+        "target_host_name": result.get("target_host_name"),
+        "replica_vm_name": result.get("replica_vm_name") or parameters.get("replica_name"),
+        "attempts": result.get("attempts"),
+    }
+
+
 def _synthetic_full_report(result: dict[str, Any]) -> dict[str, Any] | None:
     if not bool(result.get("synthetic_full")):
         return None
@@ -6681,6 +6700,8 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
         dto["verify"] = result.get("verify")
     if str(task.get("task_type") or "") == "delete":
         dto["delete"] = result.get("delete")
+    if str(task.get("task_type") or "") == "replication":
+        dto["replication"] = _replication_report(task, result)
     # A session's log is the bulk of its DTO (task_pool appends a line per
     # progress update), so list callers that only need the row can drop it and
     # read GET /sessions/{id}/log on demand instead.

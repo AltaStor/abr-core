@@ -648,6 +648,7 @@ class SessionDTO(_LenientModel):
     restore_point_id: DocStr = None
     failure_kind: DocStr = None
     verify: SessionVerifyDTO | DocObject = None
+    replication: DocObject = Field(default=None, description="Replication sessions only: mode (create, incremental, rebuild or up_to_date; null until the run ends), the source job, the restore point the replica was brought to and the incrementals applied, the target environment and host, the replica VM and the attempts made")
     logs: DocObjectArray = None
 
 
