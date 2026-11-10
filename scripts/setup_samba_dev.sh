@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HELPER="${REPO_ROOT}/python/srv/plugins/hyperv/smb_share/abr-samba-helper.sh"
+HELPER="${REPO_ROOT}/scripts/abr-samba-helper.sh"
 RULE=/etc/sudoers.d/abr-samba-helper-dev
 DEV_USER="${SUDO_USER:-$(id -un)}"
 STAGED=""

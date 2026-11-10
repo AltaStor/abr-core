@@ -277,12 +277,13 @@ it off, or removing the Default Repo, removes the share and the account and
 keeps the backups. While it is on, the share, account and password of the
 repository cannot be edited by hand.
 
-The share is made by `python/srv/plugins/hyperv/smb_share/abr-samba-helper.sh`,
-which ships with the server and needs root. The server runs it as
-`sudo -n $ABR_SAMBA_HELPER` (empty by default: the shipped copy,
-`/opt/altastor-backup/python/srv/plugins/hyperv/smb_share/abr-samba-helper.sh`
-on an install), so a package that offers the switch needs a sudo rule that lets
-the service user run that file, and depends on Samba. The script only shares a folder that belongs
+The share is made by `scripts/abr-samba-helper.sh`, which needs root. The
+server runs it as `sudo -n $ABR_SAMBA_HELPER` (empty by default:
+`scripts/abr-samba-helper.sh` under the server's root, so
+`/opt/altastor-backup/scripts/abr-samba-helper.sh` on an install). The server
+package does not install `scripts/`, so a package that offers the switch puts
+the helper there (or points `ABR_SAMBA_HELPER` at it), adds a sudo rule that
+lets the service user run that file, and depends on Samba. The script only shares a folder that belongs
 to the user who asked for it, adds a single `include` line to `smb.conf`, keeps
 that file's owner and mode, refuses an Active Directory domain controller, a
 registry configuration, a passdb other than tdbsam or a share name already
@@ -292,6 +293,27 @@ removing the share leaves `smb.conf` as it was. It also refuses when a Samba
 program it needs (`smbd`, `testparm`, `smbpasswd`, `pdbedit`, `smbcontrol`) is
 missing, and when smbd is installed but not running: it never starts smbd
 itself, since another SMB server may hold port 445 on purpose.
+
+On an install where the server cannot reach root (the service unit's
+`CapabilityBoundingSet` and no sudo rule), an administrator shares local
+repositories by hand with two root scripts instead of the switch:
+
+```bash
+sudo bash scripts/install-samba.sh                       # Samba and smbclient, when they are missing
+sudo python3 python/srv/plugins/hyperv/abr_smb_share.py show          # <path> : <share>|none for each local repository
+sudo python3 python/srv/plugins/hyperv/abr_smb_share.py add <path>    # hidden share + own Samba account, stored encrypted
+sudo python3 python/srv/plugins/hyperv/abr_smb_share.py check <path>  # write, read back and delete a test file through the share
+sudo python3 python/srv/plugins/hyperv/abr_smb_share.py del <path>    # remove the share and account
+```
+
+`abr_smb_share.py` works for any local repository, the Default Repo included,
+and several at once. It keeps its shares in `/etc/samba/altastor-backup-shares.conf`
+(one `include` line in `smb.conf`), writes the share, account and encrypted
+password into that repository so Hyper-V jobs use it, reloads smbd without
+dropping connections and restarts the server only when it runs. It refuses
+while sessions run, `del` refuses while Hyper-V jobs use the repository, and it
+leaves alone a share it did not make, such as the switch's. Run `del` before
+removing a repository it shared.
 
 On a development machine the server runs as your own user from the checkout,
 so the switch needs the two things a package would bring, Samba and a way to run

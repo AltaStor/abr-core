@@ -125,11 +125,11 @@ class RepoDefaultErrorTests(unittest.TestCase):
             503,
             "hyperv_share_not_permitted",
             "The Hyper-V share of the Default Repo could not be created: this server may not run "
-            "/opt/altastor-backup/python/srv/plugins/hyperv/smb_share/abr-samba-helper.sh as root",
+            "/opt/altastor-backup/scripts/abr-samba-helper.sh as root",
         )
 
         self.assertNotEqual(code, 0)
-        self.assertIn("may not run /opt/altastor-backup/python/srv/plugins/hyperv/smb_share/abr-samba-helper.sh as root", stderr)
+        self.assertIn("may not run /opt/altastor-backup/scripts/abr-samba-helper.sh as root", stderr)
 
     def test_a_share_samba_refuses_exits_non_zero_with_the_reason(self) -> None:
         code, stderr = self._fail(500, "hyperv_share_failed", "Samba is not installed (/etc/samba/smb.conf is missing)")
