@@ -257,6 +257,10 @@ class CopyJobSettingsTests(_Catalog):
         self.assertEqual(job["backup_copy"]["source_jobs"], [{"id": "nightly", "name": "Nightly"}])
         self.assertEqual(job["backup_copy"]["retry"], {"count": 2, "interval_minutes": 15})
 
+    def test_a_new_copy_job_keeps_the_two_newest_fulls_unless_told_otherwise(self) -> None:
+        self.assertEqual(self._copy_job()["retention_min_fulls"], 2)
+        self.assertEqual(self._copy_job(name="By age", retention_min_fulls=0)["retention_min_fulls"], 0)
+
     def test_retry_defaults_follow_the_copy_mode(self) -> None:
         self.assertEqual(self._copy_job()["backup_copy"]["retry"], {"count": 5, "interval_minutes": 0})
         immediate = self._copy_job(name="Immediate copy", copy_mode="immediate")
@@ -340,7 +344,7 @@ class CopyRetentionTests(_Catalog):
         old = "2026-01-0{}T01:00:00+00:00"
         for index, (point_id, kind) in enumerate((("f1", "ActiveFull"), ("i1", "Incremental")), start=1):
             self._point(point_id, kind, created_at=old.format(index))
-        self.copy = self._copy_job(retention_days=7)
+        self.copy = self._copy_job(retention_days=7, retention_min_fulls=0)
         self._copied("c1", "i1")
         BACKUPS["c1"]["created_at"] = old.format(3)
         self._copied("c2", "i1")

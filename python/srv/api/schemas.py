@@ -927,7 +927,7 @@ class CreateJobRequest(_LenientModel):
     schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
     enabled: LaxBool | None = Field(default=None, description="Used only when no schedule is given; with a schedule its own enabled decides. null or omitted: true")
     retention_days: RawInt | None = None
-    retention_min_fulls: RawInt | None = Field(default=None, description="How many of the newest full backups of each VM, with their incrementals, retention keeps whatever their age; 0 to 100, null or omitted: 0")
+    retention_min_fulls: RawInt | None = Field(default=None, description="How many of the newest full backups of each VM, with their incrementals, retention keeps whatever their age; 0 to 100, 0 keeps none beyond retention_days; null or omitted: 2")
     gfs: Annotated[SkipValidation[GfsRequest] | None, _checked_booleans(GfsRequest)] = None
     active_full_days: list[Any] | LaxStr | None = Field(default=None, description=LEGACY_FULL_DAYS)
     active_full_days_csv: LaxStr | None = Field(default=None, description=LEGACY_FULL_DAYS)
@@ -988,7 +988,7 @@ class CreateBackupCopyJobRequest(_LenientModel):
     schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="Periodic copies only: when the copy runs")
     enabled: LaxBool | None = Field(default=None, description="Used only when no schedule is given; with a schedule its own enabled decides. null or omitted: true")
     retention_days: RawInt | None = Field(default=None, description="How long the copies are kept, independently of the sources; null or omitted: 14")
-    retention_min_fulls: RawInt | None = None
+    retention_min_fulls: RawInt | None = Field(default=None, description="How many of the newest full copies of each VM, with their incrementals, retention keeps whatever their age; 0 to 100, 0 keeps none beyond retention_days; null or omitted: 2")
     gfs: Annotated[SkipValidation[GfsRequest] | None, _checked_booleans(GfsRequest)] = None
     active_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="When a copy is made as a full backup read from the source")
     synthetic_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="When the copied chain is merged into a new full in the destination")

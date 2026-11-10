@@ -430,7 +430,8 @@ class JobCommands:
             type=int,
             help=(
                 "How many of the newest full backups of each VM, with the incrementals on them, retention always "
-                "keeps whatever their age (0-100; 0, the default, keeps none beyond --retention-days)"
+                "keeps whatever their age (0-100; default 2 for a new job, the source job's for a copied one; "
+                "0 keeps none beyond --retention-days)"
             ),
         )
         if include_compression_encryption_flags:

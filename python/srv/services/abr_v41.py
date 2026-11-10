@@ -4222,7 +4222,7 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
     item["schedule"] = normalize_schedule_payload(raw_schedule)
     item["schedule_summary"] = item.get("schedule_summary") or _render_schedule_summary(item["schedule"])
     item["retention_days"] = int(item.get("retention_days") or metadata.get("retention_days") or 14)
-    item["retention_min_fulls"] = int(item.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS)
+    item["retention_min_fulls"] = stored_retention_min_fulls(item)
     gfs = item.get("gfs") if isinstance(item.get("gfs"), dict) else {}
     if not gfs and isinstance(item.get("gfs_policy"), dict):
         gfs = item["gfs_policy"]
@@ -4293,9 +4293,14 @@ def resolve_job(name: str | None = None, record_id: str | None = None) -> dict[s
 
 
 MAX_RETENTION_DAYS = 3650
-DEFAULT_RETENTION_MIN_FULLS = 0
+DEFAULT_RETENTION_MIN_FULLS = 2
 MAX_RETENTION_MIN_FULLS = 100
 MAX_GFS_COUNTS = {"weekly": 520, "monthly": 120, "yearly": 99}
+
+
+def stored_retention_min_fulls(job: dict[str, Any]) -> int:
+    value = job.get("retention_min_fulls")
+    return int(value) if value not in (None, "") else 0
 
 
 def _whole_number(value: Any) -> int | None:
@@ -5080,7 +5085,7 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("retention_min_fulls") is not None:
         retention_min_fulls = _validate_retention_min_fulls(payload["retention_min_fulls"])
     else:
-        retention_min_fulls = int(source_job.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS)
+        retention_min_fulls = stored_retention_min_fulls(source_job)
     description = str(payload.get("description") or source_job.get("description") or "").strip()
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
@@ -6382,7 +6387,7 @@ def apply_retention_to_chain(
             continue
         if all_expired and not any(point.get("gfs_protected") for point in segment):
             to_delete.extend(segment)
-    min_fulls = int(job.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS)
+    min_fulls = stored_retention_min_fulls(job)
     newest_segments = _segment_points(points)[-min_fulls:] if min_fulls > 0 else []
     newest_fulls = {point["id"] for segment in newest_segments for point in segment}
     floor_kept = [point for point in to_delete if point["id"] in newest_fulls]
@@ -6555,7 +6560,7 @@ def run_job_retention(job_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         "dry_run": bool(dry_run),
         "clock_blocked": clock_guard.retention_block(),
         "retention_days": int(job.get("retention_days") or 0),
-        "retention_min_fulls": int(job.get("retention_min_fulls") or DEFAULT_RETENTION_MIN_FULLS),
+        "retention_min_fulls": stored_retention_min_fulls(job),
         "gfs": dict(job.get("gfs") or {}),
         "summary": summary,
         "chains": chains,

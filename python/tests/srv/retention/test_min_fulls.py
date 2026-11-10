@@ -162,6 +162,34 @@ class RetentionMinFullsTests(MinFullsCase):
         self.assertEqual(normalized["retention_min_fulls"], 0)
         self.assertEqual(abr_v41.normalize_job_record(_job(retention_min_fulls=3))["retention_min_fulls"], 3)
 
+    def test_a_stored_zero_stays_zero_although_new_jobs_default_to_two(self) -> None:
+        self.assertEqual(abr_v41.DEFAULT_RETENTION_MIN_FULLS, 2)
+        self.assertEqual(abr_v41.normalize_job_record(_job(retention_min_fulls=0))["retention_min_fulls"], 0)
+        self.store_three_expired_segments()
+        JOBS["job-1"] = _job(retention_min_fulls=0)
+
+        result = abr_v41.run_job_retention("job-1")
+
+        self.assertEqual(result["retention_min_fulls"], 0)
+        self.assertEqual(BACKUPS, {})
+
+    def test_a_job_from_before_the_setting_still_loses_an_expired_chain_after_a_pause(self) -> None:
+        self.store_three_expired_segments()
+        JOBS["job-1"] = _job()
+
+        result = abr_v41.run_job_retention("job-1")
+
+        self.assertEqual((result["retention_min_fulls"], result["summary"]["removed"]), (0, 6))
+
+    def test_after_a_pause_longer_than_the_window_a_new_full_keeps_the_chain_before_it(self) -> None:
+        self.store_three_expired_segments()
+        self.store(_point("full-d", 0, full=True))
+        JOBS["job-1"] = _job(retention_min_fulls=abr_v41.DEFAULT_RETENTION_MIN_FULLS)
+
+        abr_v41.run_job_retention("job-1")
+
+        self.assertEqual(sorted(BACKUPS), ["full-c", "full-d", "incr-c"])
+
 
 if __name__ == "__main__":
     unittest.main()
