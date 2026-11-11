@@ -44,6 +44,7 @@ MAX_PASSWORD_LENGTH = 128
 _LOCKOUT_LOCK = threading.Lock()
 _FAILED_ATTEMPTS: dict[str, list[float]] = {}
 _SESSION_RENEWAL_LOCK = threading.Lock()
+_USER_CHANGE_LOCK = threading.Lock()
 _SESSION_RENEWALS_IN_FLIGHT: set[str] = set()
 
 
@@ -258,6 +259,13 @@ def create_user(
 def update_user(
     user_id: str, payload: dict[str, Any], *, acting_user_id: str | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    with _USER_CHANGE_LOCK:
+        return _update_user(user_id, payload, acting_user_id=acting_user_id)
+
+
+def _update_user(
+    user_id: str, payload: dict[str, Any], *, acting_user_id: str | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Change a user's name, full name, role, enabled state or password, or
     reset their two-factor sign-in. Answers the user and what changed, as
     ``{field: {"from": old, "to": new}}`` (a new password only as its field,
@@ -343,6 +351,11 @@ def update_user(
 
 
 def remove_user(user_id: str, *, acting_user_id: str | None = None) -> dict[str, Any]:
+    with _USER_CHANGE_LOCK:
+        return _remove_user(user_id, acting_user_id=acting_user_id)
+
+
+def _remove_user(user_id: str, *, acting_user_id: str | None = None) -> dict[str, Any]:
     user = _user_or_404(user_id)
     role_service.ensure_can_manage_user(acting_user_id, function_id="user.delete", target=user)
     _refuse_losing_the_last_administrator(user, "delete")

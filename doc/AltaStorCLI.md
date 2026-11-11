@@ -173,7 +173,7 @@ USER COMMANDS
 
 Manage accounts allowed to authenticate. Requires an existing session. The first user is created at startup from ABR_BOOTSTRAP_ADMIN_USER / ABR_BOOTSTRAP_ADMIN_PASSWORD, not via this command, and holds the administrator role. Every user holds exactly one role: administrator, backup_administrator, backup_operator, restore_operator or auditor. 
 
-At least one enabled Administrator always remains: the last one cannot be demoted, disabled or deleted (exit 4, code last_administrator). 
+At least one enabled Administrator always remains: the last one cannot be demoted, disabled or deleted (exit 4, code last_administrator), even when two Administrators change each other at the same moment: the later change is refused. 
 
 abr user add 
 
