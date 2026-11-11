@@ -41,6 +41,8 @@ class FakeNode:
         self.lock_held = True
         self.consolidations: list[str] = []
         self.raise_on_consolidate: Exception | None = None
+        self.calls: list[tuple[str, str]] = []
+        self.raise_on_wait: Exception | None = None
 
     def __enter__(self) -> "FakeNode":
         self.connected += 1
@@ -49,7 +51,13 @@ class FakeNode:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         return None
 
+    def wait_for_snapshot_creation(self, vm_name: str) -> None:
+        self.calls.append(("wait", vm_name))
+        if self.raise_on_wait is not None:
+            raise self.raise_on_wait
+
     def remove_snapshot(self, vm_name: str, snapshot_name: str) -> None:
+        self.calls.append(("remove", vm_name))
         if self.raise_on_remove is not None:
             raise self.raise_on_remove
         self.removed.append((vm_name, snapshot_name))
@@ -364,6 +372,62 @@ class InterruptedBackupSnapshotTests(SweepTestCase):
         self.build_plugin.assert_not_called()
         self.assertIn("backup_snapshot", TASKS["task-s4"]["result"])
         self.assertEqual(_removed_names(remove_mock), ["01-disk.vmdk", "manifest"])
+
+    @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
+    @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value=set())
+    def test_a_snapshot_still_being_created_is_waited_for_before_it_is_removed(self, list_mock, remove_mock) -> None:
+        TASKS["task-w1"] = self._running_with_snapshot("task-w1")
+
+        backup_catalog.fail_interrupted_tasks()
+
+        self.assertEqual(self.node.calls, [("wait", "web01"), ("remove", "web01")])
+        self.assertNotIn("backup_snapshot", TASKS["task-w1"]["result"])
+        self.assertNotIn("warnings", TASKS["task-w1"])
+
+    @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
+    @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value=set())
+    def test_a_snapshot_that_cannot_be_removed_is_named_in_the_failed_session(self, list_mock, remove_mock) -> None:
+        self.node.raise_on_remove = RuntimeError("vCenter is still booting.")
+        TASKS["task-w2"] = self._running_with_snapshot("task-w2")
+
+        backup_catalog.fail_interrupted_tasks()
+
+        message = (
+            "Backup snapshot FullBackup_1790942477 of VM web01 could not be removed after the server restart: "
+            "vCenter is still booting. The next backup of this VM removes it"
+        )
+        self.assertEqual(
+            TASKS["task-w2"]["warnings"],
+            [{"code": "snapshot_left", "message": message, "vm_name": "web01", "snapshot_name": "FullBackup_1790942477"}],
+        )
+        self.assertIn(("warn", message), [(entry["level"], entry["message"]) for entry in TASKS["task-w2"]["logs"]])
+        self.assertEqual(TASKS["task-w2"]["status"], "failed")
+
+    @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
+    @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value=set())
+    def test_a_creation_that_does_not_finish_in_time_keeps_the_snapshot_and_names_it(self, list_mock, remove_mock) -> None:
+        self.node.raise_on_wait = RuntimeError("vCenter is still creating a snapshot of VM 'web01'")
+        TASKS["task-w3"] = self._running_with_snapshot("task-w3")
+
+        backup_catalog.fail_interrupted_tasks()
+
+        self.assertEqual(self.node.removed, [])
+        self.assertIn("backup_snapshot", TASKS["task-w3"]["result"])
+        self.assertIn("still creating a snapshot", TASKS["task-w3"]["warnings"][0]["message"])
+
+    @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
+    @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value=set())
+    def test_a_snapshot_on_a_hypervisor_that_is_gone_is_named_in_the_failed_session(self, list_mock, remove_mock) -> None:
+        HYPERVISORS.clear()
+        TASKS["task-w4"] = self._running_with_snapshot("task-w4")
+
+        backup_catalog.fail_interrupted_tasks()
+
+        self.assertEqual(
+            TASKS["task-w4"]["warnings"][0]["message"],
+            "Backup snapshot FullBackup_1790942477 of VM web01 could not be removed after the server restart: "
+            "its hypervisor is no longer registered, so remove the snapshot by hand",
+        )
 
     @patch("python.srv.services.backup_catalog.remove_disk_tool_backup")
     @patch("python.srv.services.backup_catalog.list_disk_tool_backups", return_value={"01-disk.vmdk"})

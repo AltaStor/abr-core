@@ -168,11 +168,15 @@ class FakeVCenterNode:
 
         return run_vcenter_restore(task, progress_callback=progress_callback)
 
-    def create_backup_snapshot(self, vm_name: str, *, quiesce: bool = True) -> str:
+    @staticmethod
+    def new_backup_snapshot_name() -> str:
+        return "demo-vm-snapshot"
+
+    def create_backup_snapshot(self, vm_name: str, *, quiesce: bool = True, snapshot_name: str | None = None) -> str:
         self.snapshot_quiesce_requests.append(quiesce)
         if quiesce and self.quiesce_failure is not None:
             raise self.quiesce_failure
-        name = f"{vm_name}-snapshot"
+        name = snapshot_name or f"{vm_name}-snapshot"
         self.snapshots_created.append(name)
         return name
 
@@ -1491,14 +1495,47 @@ class TaskExecutorTests(unittest.TestCase):
         recorded = [update["backup_snapshot"] for update in updates if "backup_snapshot" in update]
         self.assertEqual(recorded, [{"vm_name": "demo-vm", "name": "demo-vm-snapshot"}, None])
 
+    def test_the_snapshot_name_is_in_the_task_before_vcenter_is_asked_to_create_it(self) -> None:
+        self._register_vcenter_hypervisor()
+        updates: list[dict[str, object]] = []
+        progress = self._stop_on("task-name-first", updates, lambda update: False)
+        real_create = FakeVCenterNode.create_backup_snapshot
+        recorded_at_create: list[object] = []
+
+        def create(node, vm_name: str, *, quiesce: bool = True, snapshot_name: str | None = None) -> str:
+            recorded_at_create.extend(update["backup_snapshot"] for update in updates if "backup_snapshot" in update)
+            return real_create(node, vm_name, quiesce=quiesce, snapshot_name=snapshot_name)
+
+        with patch.object(FakeVCenterNode, "create_backup_snapshot", create):
+            self._run_backup("task-name-first", progress)
+
+        self.assertEqual(recorded_at_create, [{"vm_name": "demo-vm", "name": "demo-vm-snapshot"}])
+        self.assertEqual(FakeVCenterNode.snapshots_created, ["demo-vm-snapshot"])
+
+    def test_a_snapshot_that_fails_to_be_created_is_not_left_recorded(self) -> None:
+        self._register_vcenter_hypervisor()
+        updates: list[dict[str, object]] = []
+        progress = self._stop_on("task-create-fails", updates, lambda update: False)
+
+        def refuse(node, vm_name: str, *, quiesce: bool = True, snapshot_name: str | None = None) -> str:
+            raise RuntimeError("vCenter task failed: The operation is not allowed in the current state.")
+
+        with patch.object(FakeVCenterNode, "create_backup_snapshot", refuse):
+            result = self._run_backup("task-create-fails", progress)
+
+        self.assertEqual(result["status"], "failed")
+        recorded = [update["backup_snapshot"] for update in updates if "backup_snapshot" in update]
+        self.assertEqual(recorded, [{"vm_name": "demo-vm", "name": "demo-vm-snapshot"}, None])
+        self.assertEqual(FakeVCenterNode.snapshots_removed, [])
+
     def test_a_stop_that_arrives_while_the_snapshot_is_created_removes_it(self) -> None:
         self._register_vcenter_hypervisor()
         updates: list[dict[str, object]] = []
         progress = self._stop_on("task-stop-create", updates, lambda update: False)
         real_create = FakeVCenterNode.create_backup_snapshot
 
-        def create_then_stop(node, vm_name: str, *, quiesce: bool = True) -> str:
-            name = real_create(node, vm_name, quiesce=quiesce)
+        def create_then_stop(node, vm_name: str, *, quiesce: bool = True, snapshot_name: str | None = None) -> str:
+            name = real_create(node, vm_name, quiesce=quiesce, snapshot_name=snapshot_name)
             TASKS["task-stop-create"]["cancel_requested"] = True
             return name
 
@@ -7888,6 +7925,23 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual([warning["code"] for warning in warnings], ["quiesce_failed"])
         self.assertIn("demo-vm: Custom quiesce script failed. The job", warnings[0]["message"])
         self.assertIn("crash-consistent", warnings[0]["message"])
+
+    def test_the_crash_consistent_retry_creates_the_snapshot_under_the_name_already_recorded(self) -> None:
+        from python.srv.plugins.hypervisor import QuiesceFailedError
+
+        FakeVCenterNode.quiesce_failure = QuiesceFailedError("demo-vm", "Custom quiesce script failed.")
+        names: list[str | None] = []
+        real_create = FakeVCenterNode.create_backup_snapshot
+
+        def create(node, vm_name: str, *, quiesce: bool = True, snapshot_name: str | None = None) -> str:
+            names.append(snapshot_name)
+            return real_create(node, vm_name, quiesce=quiesce, snapshot_name=snapshot_name)
+
+        with patch.object(FakeVCenterNode, "create_backup_snapshot", create):
+            result, _warnings, _manifest = self._run_demo_vcenter_backup(on_quiesce_failure="crash_consistent")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(names, ["demo-vm-snapshot", "demo-vm-snapshot"])
 
     def test_an_independent_disk_is_skipped_with_a_warning_and_the_other_disks_are_backed_up(self) -> None:
         live_disks = [
