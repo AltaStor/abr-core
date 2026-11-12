@@ -356,6 +356,12 @@ def _reported_ip_address(vm: Any, summary: Any) -> str:
     return guest_ip_address([value for nic in nics for value in (getattr(nic, "ipAddress", None) or [])])
 
 
+def _vcenter_disk_uuid(uuid: str) -> str:
+    digits = uuid.replace("-", "").replace(" ", "")
+    pairs = [digits[index:index + 2] for index in range(0, len(digits), 2)]
+    return " ".join(pairs[:8]) + "-" + " ".join(pairs[8:])
+
+
 def _vm_folder_path(folder: Any) -> str:
     names = []
     while folder is not None:
@@ -1371,6 +1377,11 @@ class VCenterNode(Hypervisor):
             name = None
         return str(name) if name else "cluster"
 
+    def compute_resource_name(self, host_name: str) -> str | None:
+        host = self._get_host(host_name)
+        parent = getattr(host, "parent", None) if host is not None else None
+        return str(getattr(parent, "name", "") or "") or None
+
     def clustered_host_name(self) -> Optional[str]:
         """Return the name of the cluster the endpoint's host belongs to.
 
@@ -1415,6 +1426,7 @@ class VCenterNode(Hypervisor):
         config_metadata: Dict[str, Any],
         disk_layout: List[Dict[str, Any]] | None = None,
         disk_placements: list[dict[str, Any]] | None = None,
+        create_disks: bool = True,
     ) -> Dict[str, Any]:
         host = self._get_host(host_name)
         if host is None:
@@ -1498,12 +1510,14 @@ class VCenterNode(Hypervisor):
             )
 
         created_disk_paths: list[str] = []
+        planned_disks: list[dict[str, Any]] = []
         for index, disk in enumerate(disk_layout, start=1):
             if disk_placements:
                 type_name, bus, unit_number = disk_slots[index - 1]
                 controller_key = controller_keys[(type_name, bus)]
             else:
                 controller_key = scsi_controller.key
+                type_name, bus = str(_disk_controller_type_name(scsi_controller) or ""), 0
                 unit_number = index - 1
                 if unit_number >= 7:
                     unit_number += 1
@@ -1541,8 +1555,20 @@ class VCenterNode(Hypervisor):
             virtual_disk.backing = backing
 
             disk_spec.device = virtual_disk
-            device_changes.append(disk_spec)
+            if create_disks:
+                device_changes.append(disk_spec)
             created_disk_paths.append(disk_path)
+            planned_disks.append(
+                {
+                    "path": disk_path,
+                    "controller_type": type_name,
+                    "bus": bus,
+                    "unit": unit_number,
+                    "label": virtual_disk.deviceInfo.label,
+                    "disk_uuid": source_disk_uuid,
+                    "thin_requested": bool(backing.thinProvisioned),
+                }
+            )
 
         vm_path = f"[{datastore_name}]"
         source_firmware = config_metadata.get("firmware")
@@ -1649,6 +1675,7 @@ class VCenterNode(Hypervisor):
             "disk_controllers": disk_controllers,
             "requested_secure_boot": bool(requested_secure_boot) if requested_secure_boot is not None else None,
             "network_adapters": restored_adapters,
+            "planned_disks": planned_disks,
         }
 
     def _vm_holding_access_lock(self, vm_name: str, vm_moref: str | None) -> Optional[Any]:
@@ -2280,6 +2307,97 @@ class VCenterNode(Hypervisor):
         return {
             "uuid": str(getattr(config, "uuid", "") or ""),
             "instance_uuid": str(getattr(config, "instanceUuid", "") or ""),
+        }
+
+    def adopt_restored_disk(self, vm_name: str, planned: dict[str, Any], vm_moref: str | None = None) -> dict[str, Any]:
+        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
+        if vm is None:
+            vm = self._get_vm(vm_name)
+        if not vm:
+            raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
+        devices = list(vm.config.hardware.device)
+        disk = next(
+            (device for device in devices if isinstance(device, vim.vm.device.VirtualDisk) and device.backing.fileName == planned["path"]),
+            None,
+        )
+        if disk is None:
+            raise RuntimeError(f"abr-vmdk-tool restored {planned['path']}, but VM '{vm_name}' has no such disk")
+        target = next(
+            (
+                device
+                for device in devices
+                if _disk_controller_type_name(device) == planned["controller_type"] and getattr(device, "busNumber", None) == planned["bus"]
+            ),
+            None,
+        )
+        if target is None:
+            raise RuntimeError(
+                f"VM '{vm_name}' has no {disk_controller_display_name(planned['controller_type'])} {planned['bus']} to attach {planned['path']} to"
+            )
+        source_uuid = _normalize_disk_uuid(planned.get("disk_uuid"))
+        in_place = disk.controllerKey == target.key and disk.unitNumber == planned["unit"]
+        if in_place and (not source_uuid or _normalize_disk_uuid(disk.backing.uuid) == source_uuid):
+            return self._adopted(disk, target)
+        datastore = disk.backing.datastore
+        original = (disk.controllerKey, disk.unitNumber, disk.deviceInfo.label)
+        self._wait_for_task(vm.ReconfigVM_Task(spec=vim.vm.ConfigSpec(deviceChange=[
+            vim.vm.device.VirtualDeviceSpec(operation=vim.vm.device.VirtualDeviceSpec.Operation.remove, device=disk)
+        ])))
+        try:
+            if source_uuid:
+                self.set_disk_uuid(planned["path"], source_uuid, host=vm.runtime.host)
+            self._attach_disk_file(vm, planned["path"], datastore, target.key, planned["unit"], planned.get("label") or disk.deviceInfo.label)
+        except Exception:
+            try:
+                self._attach_disk_file(self._get_vm_by_moref(vm._moId) or vm, planned["path"], datastore, *original)
+            except Exception:
+                logger.exception("Could not put %s back on VM '%s' after moving it failed", planned["path"], vm_name)
+            raise
+        vm = self._get_vm_by_moref(vm._moId) or vm
+        adopted = next(
+            device for device in vm.config.hardware.device if isinstance(device, vim.vm.device.VirtualDisk) and device.backing.fileName == planned["path"]
+        )
+        logger.info(
+            "Attached restored disk %s of VM '%s' to %s %s unit %s.",
+            planned["path"],
+            vm_name,
+            disk_controller_display_name(planned["controller_type"]),
+            planned["bus"],
+            planned["unit"],
+        )
+        return self._adopted(adopted, target)
+
+    def set_disk_uuid(self, path: str, disk_uuid: Any, *, host: Any = None, vm_name: str | None = None) -> None:
+        uuid = _normalize_disk_uuid(disk_uuid)
+        if not uuid:
+            return
+        if host is None and vm_name:
+            vm = self._get_vm(vm_name)
+            host = getattr(getattr(vm, "runtime", None), "host", None)
+        self.si.RetrieveContent().virtualDiskManager.SetVirtualDiskUuid(
+            name=path, datacenter=self._get_datacenter(host), uuid=_vcenter_disk_uuid(uuid)
+        )
+
+    def _attach_disk_file(self, vm: Any, path: str, datastore: Any, controller_key: int, unit: int, label: str) -> None:
+        disk = vim.vm.device.VirtualDisk(
+            key=-1,
+            controllerKey=controller_key,
+            unitNumber=unit,
+            deviceInfo=vim.Description(label=label, summary=path),
+            backing=vim.vm.device.VirtualDisk.FlatVer2BackingInfo(fileName=path, datastore=datastore, diskMode="persistent"),
+        )
+        self._wait_for_task(vm.ReconfigVM_Task(spec=vim.vm.ConfigSpec(deviceChange=[
+            vim.vm.device.VirtualDeviceSpec(operation=vim.vm.device.VirtualDeviceSpec.Operation.add, device=disk)
+        ])))
+
+    @staticmethod
+    def _adopted(disk: Any, controller: Any) -> dict[str, Any]:
+        return {
+            "path": disk.backing.fileName,
+            "controller": f"{disk_controller_display_name(_disk_controller_type_name(controller))} {controller.busNumber}",
+            "unit": disk.unitNumber,
+            "thin": bool(getattr(disk.backing, "thinProvisioned", False)),
+            "disk_uuid": _normalize_disk_uuid(disk.backing.uuid),
         }
 
     def read_vm_placement(self, vm_name: str, vm_moref: str | None = None) -> dict[str, Any]:

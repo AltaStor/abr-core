@@ -531,6 +531,10 @@ def disk_tool_restores_chains(tool_path: Path | None = None) -> bool:
     return _disk_tool_help_mentions(tool_path, "restore", SOURCE_NAMES_OPTION)
 
 
+def disk_tool_has_soap_api(tool_path: Path | None = None) -> bool:
+    return _disk_tool_help_mentions(tool_path, "backup", "'soap'")
+
+
 def common_storage_path(paths: list[str]) -> str:
     if not paths:
         return ""

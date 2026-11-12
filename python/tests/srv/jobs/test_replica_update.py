@@ -198,6 +198,7 @@ class _UpdateCase(unittest.TestCase):
             ("python.srv.services.internal.replication.replica_config.point_config", lambda _point: copy.deepcopy(self.point_config)),
             ("python.srv.services.internal.replication.replica_update._platform", lambda _inventory: self.platform),
             ("python.srv.services.internal.replication.replica_update._connect", lambda _inventory: FakeNode()),
+            ("python.srv.services.internal.replication.replica_update.transport_problem", lambda _transport: None),
             ("python.srv.services.internal.replication.replication_session.persist_job", lambda job: JOBS.__setitem__(job["id"], job)),
             ("python.srv.services.internal.replication.replica_update.manifest_disks", lambda _point: self.manifest),
             ("python.srv.services.internal.replication.replica_update._repository_and_key", lambda _point: ({"id": "repo", "type": "local"}, "")),
@@ -483,6 +484,64 @@ class UpdateTests(_UpdateCase):
                 with rebuild, self.assertRaisesRegex(ReplicationError, "rebuild chosen"):
                     self._run()
                 self.assertEqual(self.platform.calls, [])
+
+
+    def test_a_target_that_reads_and_writes_over_soap_is_always_rebuilt_and_says_why(self) -> None:
+        TASKS[SESSION_ID] = {"id": SESSION_ID, "job_id": JOB_ID, "task_type": "replication", "status": "running", "created_at": "2026-11-09T00:00:00"}
+        rebuild = patch("python.srv.services.internal.replication.replica_update._update_mode_two", side_effect=ReplicationError("rebuild chosen"))
+        with rebuild, self.assertRaisesRegex(ReplicationError, "rebuild chosen"):
+            run_replication({"id": SESSION_ID, "job_id": JOB_ID, "parameters": {"vsphere_transport": "soap"}}, progress_callback=self.updates.append)
+        self.assertEqual(self.platform.calls, [])
+        self.assertTrue(any("over the vSphere SOAP API" in str(update.get("message")) for update in self.updates))
+
+    def test_a_vddk_target_still_applies_incrementals(self) -> None:
+        TASKS[SESSION_ID] = {"id": SESSION_ID, "job_id": JOB_ID, "task_type": "replication", "status": "running", "created_at": "2026-11-09T00:00:00"}
+        rebuild = patch("python.srv.services.internal.replication.replica_update._update_mode_two", side_effect=AssertionError("rebuild chosen"))
+        with rebuild:
+            run_replication({"id": SESSION_ID, "job_id": JOB_ID, "parameters": {"vsphere_transport": "vddk"}}, progress_callback=self.updates.append)
+        self.assertTrue(self.platform.calls)
+
+    def test_a_transport_the_server_cannot_use_fails_the_run_before_the_target_is_touched(self) -> None:
+        TASKS[SESSION_ID] = {"id": SESSION_ID, "job_id": JOB_ID, "task_type": "replication", "status": "running", "created_at": "2026-11-09T00:00:00"}
+        asked: list[str] = []
+        connected: list[str] = []
+
+        def problem(transport: str) -> str:
+            asked.append(transport)
+            return "The VDDK transport is not available: the VMware VDDK is not installed"
+
+        cases = {"the update of a replica": None, "the first run": {}}
+        for label, replica in cases.items():
+            with self.subTest(label):
+                asked.clear()
+                if replica is not None:
+                    JOBS[JOB_ID]["replica"] = replica
+                with (
+                    patch("python.srv.services.internal.replication.replica_update.transport_problem", problem),
+                    patch("python.srv.services.internal.replication.replica_update._connect", lambda inventory: connected.append(inventory["id"])),
+                    self.assertRaisesRegex(ReplicationError, "The VDDK transport is not available") as caught,
+                ):
+                    run_replication({"id": SESSION_ID, "job_id": JOB_ID, "parameters": {}}, progress_callback=self.updates.append)
+                self.assertEqual(asked, ["vddk"])
+                self.assertNotIsInstance(caught.exception, ReplicationValidationError)
+                self.assertFalse(replica_update.is_temporary(caught.exception))
+        self.assertEqual(connected, [])
+        self.assertEqual(self.platform.calls, [])
+
+    def test_the_transport_of_the_session_is_the_one_checked_and_hyper_v_targets_are_not_checked(self) -> None:
+        TASKS[SESSION_ID] = {"id": SESSION_ID, "job_id": JOB_ID, "task_type": "replication", "status": "running", "created_at": "2026-11-09T00:00:00"}
+        asked: list[str] = []
+        checked = patch("python.srv.services.internal.replication.replica_update.transport_problem", lambda transport: asked.append(transport))
+        rebuild = patch("python.srv.services.internal.replication.replica_update._update_mode_two", side_effect=ReplicationError("rebuild chosen"))
+        with checked, rebuild, self.assertRaisesRegex(ReplicationError, "rebuild chosen"):
+            run_replication({"id": SESSION_ID, "job_id": JOB_ID, "parameters": {"vsphere_transport": "soap"}}, progress_callback=self.updates.append)
+        self.assertEqual(asked, ["soap"])
+
+        asked.clear()
+        HYPERVISORS["dr"] = {"id": "dr", "name": "hv-dr", "kind": "hyperv", "type": "hyperv"}
+        with checked:
+            self._run()
+        self.assertEqual(asked, [])
 
 
 class KeepaliveTests(_UpdateCase):

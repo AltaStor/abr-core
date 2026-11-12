@@ -96,6 +96,8 @@ REPLICATION_HIDDEN_KEYS = frozenset(
         "synthetic_full_next_run_at",
         "compression_level",
         "on_quiesce_failure",
+        "transport",
+        "effective_transport",
         "encryption",
         "guest_consistency",
         "backup_copy",
@@ -445,6 +447,15 @@ class JobCommands:
                 help="Backup compression level: 0 disables compression, 1-9 select Zstd levels (higher compresses smaller but slower). Default: 3.",
             )
         if include_compression_encryption_flags and include_capture_flags:
+            parser.add_argument(
+                "--transport",
+                dest="vsphere_transport",
+                choices=("vddk", "soap", "inventory"),
+                help=(
+                    "How a backup of a VMware VM reads its disks: vddk or soap overrides the inventory's transport; "
+                    "inventory (the default) uses it. A session keeps the transport it started with."
+                ),
+            )
             parser.add_argument(
                 "--on-quiesce-failure",
                 dest="on_quiesce_failure",

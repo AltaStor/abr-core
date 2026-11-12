@@ -65,6 +65,11 @@ class InventoryCommands:
         add_secret_argument(add, "--password", env_var=INVENTORY_PASSWORD_ENV_VAR, help_text="Inventory password")
         add_secret_argument(add, "--token", env_var=INVENTORY_TOKEN_ENV_VAR, help_text="Inventory token")
         add.add_argument("--insecure", action="store_true", help="Disable SSL verification")
+        add.add_argument(
+            "--transport",
+            choices=("vddk", "soap"),
+            help="vSphere only: how disks are read and written, vddk (the VMware VDDK, the default) or soap (the vSphere SOAP API)",
+        )
         add.set_defaults(handler=self.add)
 
         list_parser = commands.add_parser(
@@ -137,6 +142,11 @@ class InventoryCommands:
         add_secret_argument(edit, "--password", env_var=INVENTORY_PASSWORD_ENV_VAR, help_text="Updated password")
         add_secret_argument(edit, "--token", env_var=INVENTORY_TOKEN_ENV_VAR, help_text="Updated token")
         edit.add_argument("--insecure", action="store_true", help="Disable SSL verification")
+        edit.add_argument(
+            "--transport",
+            choices=("vddk", "soap"),
+            help="vSphere only: how disks are read and written from now on; running sessions keep the one they started with",
+        )
         edit.add_argument("--secure", action="store_true", help="Enable SSL verification")
         edit.set_defaults(handler=self.edit)
 
@@ -178,6 +188,7 @@ class InventoryCommands:
             "password": password,
             "token": token,
             "insecure": args.insecure,
+            **({"transport": args.transport} if args.transport else {}),
         })
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("endpoint", "ENDPOINT"), ("status", "STATUS")])
         return 0
@@ -202,6 +213,7 @@ class InventoryCommands:
             "username": args.username,
             "password": resolve_secret(args.password, env_var=INVENTORY_PASSWORD_ENV_VAR, prompt="Inventory password"),
             "token": resolve_secret(args.token, env_var=INVENTORY_TOKEN_ENV_VAR, prompt="Inventory token"),
+            "transport": args.transport,
         }.items() if value is not None}
         if args.insecure and args.secure:
             raise ValueError("Use only one of --insecure or --secure")

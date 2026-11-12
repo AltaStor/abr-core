@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from python.srv.core.mongo_db_wrapper import (
     CATALOG_LOCK,
+    HYPERVISORS,
     JOBS,
     TASKS,
     catalog_records,
@@ -67,6 +68,12 @@ def marker_session(marker_text: str, job_id: str) -> str:
     return ""
 
 
+def _transport_parameters(inventory_id: str) -> dict[str, str]:
+    from python.srv.services.abr_v41 import session_transport_parameters
+
+    return session_transport_parameters(HYPERVISORS.get(inventory_id))
+
+
 def create_replication_session(job: dict[str, Any], *, trigger: str, run_id: str) -> dict[str, Any]:
     from python.srv.services.abr_v41 import _append_task_log
 
@@ -88,6 +95,7 @@ def create_replication_session(job: dict[str, Any], *, trigger: str, run_id: str
             "source_job_name": settings["source_job_name"],
             "target_inventory_name": settings["target_inventory_name"],
             "replica_name": settings["replica_name"],
+            **_transport_parameters(settings["target_inventory_id"]),
         },
         "result": {"progress": 0, "worker_mode": WORKER_MODE},
         "created_at": now,

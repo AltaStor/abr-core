@@ -386,3 +386,130 @@ class RestorePlacementTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SoapShellTests(unittest.TestCase):
+    def test_a_shell_for_soap_gets_its_controllers_and_a_plan_but_no_disks(self) -> None:
+        node, folder = _shell_node()
+
+        result = node.create_vm_shell(
+            vm_name="demo-vm-restored",
+            host_name="esx-01.local",
+            datastore_name="ds-01",
+            config_metadata={"firmware": "bios", "network_adapters": []},
+            disk_layout=[{"label": f"Hard disk {index}", "capacity_gb": 1, "disk_uuid": "6000C29a-0000-1111-2222-33334444555" + str(index)} for index in (1, 2)],
+            disk_placements=SOURCE_PLACEMENTS[:2],
+            create_disks=False,
+        )
+
+        controllers, disks = _split_changes(folder.configs[0])
+        self.assertEqual(disks, [])
+        self.assertEqual(len(controllers), 2)
+        self.assertEqual(
+            [(disk["controller_type"], disk["bus"], disk["unit"], disk["label"]) for disk in result["planned_disks"]],
+            [("paravirtual", 0, 3, "Hard disk 1"), ("lsilogic", 1, 2, "Hard disk 2")],
+        )
+        self.assertEqual(result["disk_paths"], [disk["path"] for disk in result["planned_disks"]])
+        self.assertEqual(result["planned_disks"][0]["disk_uuid"], "6000C29a-0000-1111-2222-333344445551")
+
+
+class _AdoptVm:
+    def __init__(self, devices: list[object]) -> None:
+        self._moId = "vm-77"
+        self.config = types.SimpleNamespace(hardware=types.SimpleNamespace(device=devices))
+        self.runtime = types.SimpleNamespace(host=object())
+        self.reconfigs: list[list[tuple[str, object]]] = []
+        self.refuse_add = False
+
+    def ReconfigVM_Task(self, spec: object) -> object:
+        changes = [(str(change.operation), change.device) for change in spec.deviceChange]
+        self.reconfigs.append(changes)
+        for operation, device in changes:
+            if operation == "remove":
+                self.config.hardware.device = [d for d in self.config.hardware.device if d is not device]
+            elif operation == "add":
+                if self.refuse_add and device.controllerKey != 200:
+                    raise RuntimeError("vCenter task failed: Incompatible device backing")
+                device.key = 3000 + len(self.reconfigs)
+                device.backing.uuid = device.backing.uuid or "6000C294-826d-716f-df7a-c889150b6ac4"
+                self.config.hardware.device = [*self.config.hardware.device, device]
+        return object()
+
+
+ADOPT_PATH = "[ds-01] demo/01-disk.vmdk"
+ADOPT_PLAN = {"path": ADOPT_PATH, "controller_type": "paravirtual", "bus": 0, "unit": 3, "label": "Hard disk 1", "disk_uuid": "6000C29a-0000-1111-2222-333344445555"}
+
+
+class AdoptRestoredDiskTests(unittest.TestCase):
+    PATH = ADOPT_PATH
+
+    def _node(self, vm: _AdoptVm) -> tuple[VCenterNode, list]:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        node._get_vm = lambda name: vm  # type: ignore[method-assign]
+        node._get_vm_by_moref = lambda moref: vm  # type: ignore[method-assign]
+        node._wait_for_task = lambda task: None  # type: ignore[method-assign]
+        uuids: list = []
+        node.set_disk_uuid = lambda path, uuid, **kwargs: uuids.append((path, uuid, [op for change in vm.reconfigs for op, _ in change]))  # type: ignore[method-assign]
+        return node, uuids
+
+    def _vm_with_disk_on_ide(self) -> _AdoptVm:
+        ide = D.VirtualIDEController(key=200, busNumber=0)
+        pvscsi = D.ParaVirtualSCSIController(key=1000, busNumber=0)
+        disk = D.VirtualDisk(
+            key=3000, controllerKey=200, unitNumber=0, capacityInKB=1 << 20,
+            deviceInfo=vim.Description(label="Hard disk 1", summary=self.PATH),
+            backing=D.VirtualDisk.FlatVer2BackingInfo(fileName=self.PATH, diskMode="persistent", thinProvisioned=True, uuid="6000C294-826d-716f-df7a-c889150b6ac4"),
+        )
+        return _AdoptVm([ide, pvscsi, disk])
+
+    def test_a_disk_the_tool_put_on_ide_moves_to_its_slot_with_its_uuid_set_while_detached(self) -> None:
+        vm = self._vm_with_disk_on_ide()
+        node, uuids = self._node(vm)
+
+        adopted = node.adopt_restored_disk("demo", dict(ADOPT_PLAN))
+
+        self.assertEqual([[op for op, _ in change] for change in vm.reconfigs], [["remove"], ["add"]])
+        self.assertEqual(uuids, [(self.PATH, "6000C29a-0000-1111-2222-333344445555", ["remove"])])
+        added = vm.reconfigs[1][0][1]
+        self.assertEqual((added.controllerKey, added.unitNumber, added.backing.fileName), (1000, 3, self.PATH))
+        self.assertEqual((adopted["controller"], adopted["unit"]), ("PVSCSI 0", 3))
+
+    def test_a_disk_already_in_its_slot_with_its_uuid_is_left_alone(self) -> None:
+        vm = self._vm_with_disk_on_ide()
+        node, _uuids = self._node(vm)
+
+        adopted = node.adopt_restored_disk("demo", {**dict(ADOPT_PLAN), "controller_type": "ide", "unit": 0, "disk_uuid": "6000C294-826d-716f-df7a-c889150b6ac4"})
+
+        self.assertEqual(vm.reconfigs, [])
+        self.assertEqual(adopted["unit"], 0)
+
+    def test_a_move_that_fails_puts_the_disk_back_where_the_tool_left_it(self) -> None:
+        vm = self._vm_with_disk_on_ide()
+        vm.refuse_add = True
+        node, _uuids = self._node(vm)
+
+        with self.assertRaisesRegex(RuntimeError, "Incompatible device backing"):
+            node.adopt_restored_disk("demo", dict(ADOPT_PLAN))
+
+        back = [device for device in vm.config.hardware.device if isinstance(device, D.VirtualDisk)]
+        self.assertEqual([(disk.controllerKey, disk.unitNumber) for disk in back], [(200, 0)])
+
+    def test_a_disk_the_tool_did_not_create_is_named(self) -> None:
+        node, _uuids = self._node(_AdoptVm([D.ParaVirtualSCSIController(key=1000, busNumber=0)]))
+
+        with self.assertRaisesRegex(RuntimeError, "has no such disk"):
+            node.adopt_restored_disk("demo", dict(ADOPT_PLAN))
+
+
+class DiskUuidTests(unittest.TestCase):
+    def test_vcenter_is_given_the_uuid_in_its_own_spaced_form(self) -> None:
+        calls: list = []
+        node = VCenterNode("vc.local", "administrator", "secret")
+        manager = types.SimpleNamespace(SetVirtualDiskUuid=lambda **kwargs: calls.append(kwargs))
+        node.si = types.SimpleNamespace(RetrieveContent=lambda: types.SimpleNamespace(virtualDiskManager=manager))
+        node._get_datacenter = lambda host: "dc"  # type: ignore[method-assign]
+
+        node.set_disk_uuid("[ds] vm/01-disk.vmdk", "6000C29a-0000-1111-2222-333344445555", host=object())
+        node.set_disk_uuid("[ds] vm/02-disk.vmdk", None, host=object())
+
+        self.assertEqual(calls, [{"name": "[ds] vm/01-disk.vmdk", "datacenter": "dc", "uuid": "60 00 C2 9a 00 00 11 11-22 22 33 33 44 44 55 55"}])

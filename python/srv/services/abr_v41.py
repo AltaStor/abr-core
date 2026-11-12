@@ -132,6 +132,7 @@ from python.srv.services import clock_guard
 from python.srv.services.share_mount import share_mount_check, unmounted_share_message
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.hyperv.vhdx_tool import VhdxToolError, ensure_hyperv_repository
+from python.srv.plugins.vcenter import disk_transport
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
 
 from .api_errors import ApiError, api_error
@@ -1164,6 +1165,8 @@ def normalize_inventory_record(record: dict[str, Any]) -> dict[str, Any]:
         "insecure": not bool(metadata.get("verify_ssl", True)),
         "protocol": metadata.get("protocol"),
     }
+    if item["type"] == "vsphere":
+        item["transport"] = disk_transport.inventory_transport(item)
     refs = inventory_references(str(item.get("id") or ""))
     referenced_jobs = refs["jobs"] if isinstance(refs.get("jobs"), list) else []
     active_sessions = refs["tasks"] if isinstance(refs.get("tasks"), list) else []
@@ -1637,6 +1640,37 @@ def _inventory_endpoint_key(record: dict[str, Any]) -> tuple[str, int]:
     return host.strip().lower(), port
 
 
+def _inventory_transport_or_422(inventory_type: str, value: Any) -> str | None:
+    try:
+        transport = disk_transport.parse_transport(value)
+    except ValueError as exc:
+        raise api_error(422, "invalid_inventory", f"Inventory {exc}") from exc
+    if transport is None:
+        return None
+    _ensure(
+        inventory_type == "vsphere",
+        422,
+        "invalid_inventory",
+        "transport applies to vSphere inventories (vCenter or ESXi) only",
+    )
+    problem = disk_transport.transport_problem(transport)
+    _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=transport)
+    return transport
+
+
+def backfill_inventory_transports() -> int:
+    changed = 0
+    for record in catalog_records(HYPERVISORS):
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        if inventory_type_from_record(record) != "vsphere" or metadata.get("vsphere_transport"):
+            continue
+        updated = dict(record)
+        updated["metadata"] = {**metadata, "vsphere_transport": disk_transport.VDDK}
+        persist_hypervisor(updated)
+        changed += 1
+    return changed
+
+
 def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
     requested_type = str(payload.get("type") or "").strip()
     supported_types = ", ".join(creatable_inventory_types())
@@ -1666,6 +1700,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
         protocol = inventory_protocol(inventory_type, payload.get("protocol"))
     except ValueError as exc:
         raise api_error(422, "invalid_inventory", str(exc)) from exc
+    transport = _inventory_transport_or_422(inventory_type, payload.get("transport"))
     _ensure(bool(name.strip()), 422, "invalid_inventory", "Inventory name is required")
     _ensure_ascii_name(name, field="Inventory name", code="invalid_inventory")
     _validate_text_fields(payload, INVENTORY_TEXT_FIELDS, code="invalid_inventory")
@@ -1723,6 +1758,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             "port": effective_port,
             "port_explicit": port is not None,
             **({"protocol": protocol} if protocol else {}),
+            **({"vsphere_transport": transport or disk_transport.VDDK} if inventory_type == "vsphere" else {}),
             "verify_ssl": not insecure,
             "credentials": {
                 "username": username or None,
@@ -1850,6 +1886,12 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
         metadata["verify_ssl"] = not bool(payload["insecure"])
         normalized["metadata"] = metadata
         normalized["updated_at"] = utc_now()
+    if "transport" in payload and payload["transport"] is not None:
+        transport = _inventory_transport_or_422(inventory_type_from_record(normalized), payload["transport"])
+        metadata = dict(normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {})
+        metadata["vsphere_transport"] = transport or disk_transport.VDDK
+        normalized["metadata"] = metadata
+        normalized["updated_at"] = utc_now()
     if "token" in payload and payload["token"] is not None:
         metadata = dict(normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {})
         metadata["token"] = str(payload["token"] or "") or None
@@ -1861,7 +1903,7 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
             _ensure(bool(new_name.strip()), 422, "invalid_inventory", "Inventory name must not be empty")
             _ensure_ascii_name(new_name, field="Inventory name", code="invalid_inventory")
         normalized = apply_inventory_updates(normalized, updates)
-    _ensure(any(key in payload for key in ("name", "address", "port", "protocol", "username", "password", "description", "token", "insecure")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
+    _ensure(any(key in payload for key in ("name", "address", "port", "protocol", "username", "password", "description", "token", "insecure", "transport")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
     if connection_fields_changed(payload):
         try:
             normalized = _recheck_inventory_connection(normalized)
@@ -4475,6 +4517,16 @@ def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] |
         )
         result["compression_level"] = level
 
+    if "vsphere_transport" in result:
+        try:
+            transport = disk_transport.parse_transport(result["vsphere_transport"], inventory_allowed=True)
+        except ValueError as exc:
+            raise api_error(422, "invalid_job", f"task_parameters.vsphere_{exc}") from exc
+        if transport is None:
+            result.pop("vsphere_transport")
+        else:
+            result["vsphere_transport"] = transport
+
     if "on_quiesce_failure" in result and result["on_quiesce_failure"] is not None:
         action = str(result["on_quiesce_failure"]).strip().lower().replace("-", "_")
         _ensure(
@@ -4565,6 +4617,22 @@ def _earliest_next_run(job: dict[str, Any]) -> str | None:
     return earliest[1] if earliest else None
 
 
+def _job_transport_view(job: dict[str, Any]) -> dict[str, Any]:
+    if str(job.get("job_type") or "backup") == replication_service.REPLICATION_JOB_TYPE:
+        settings = job.get("replication") if isinstance(job.get("replication"), dict) else {}
+        target = HYPERVISORS.get(str(settings.get("target_inventory_id") or ""))
+        if isinstance(target, dict) and inventory_type_from_record(target) == "vsphere":
+            return {"transport": disk_transport.FROM_INVENTORY, "effective_transport": disk_transport.inventory_transport(target)}
+        return {}
+    inventory = HYPERVISORS.get(str(job.get("inventory_id") or ""))
+    if not isinstance(inventory, dict) or inventory_type_from_record(inventory) != "vsphere":
+        return {}
+    return {
+        "transport": disk_transport.job_transport(job) or disk_transport.FROM_INVENTORY,
+        "effective_transport": disk_transport.session_transport(job, inventory),
+    }
+
+
 def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_job_record(job)
     active_sessions = _active_sessions_for_job(str(normalized["id"]))
@@ -4621,6 +4689,7 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         **verify_schedule_view(normalized),
         "compression_level": compression_level,
         "on_quiesce_failure": str(task_parameters.get("on_quiesce_failure") or "fail"),
+        **_job_transport_view(normalized),
         "encryption": {
             "enabled": encryption_enabled,
             "key_set": has_encryption_key,
@@ -4985,6 +5054,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "last_run_at": None,
         "last_session_id": None,
     }
+    _ensure_job_transport(job)
     return job_to_dto(_persist_canonical_job(job))
 
 
@@ -5448,8 +5518,37 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return _finish_job_edit(updated, payload, changed, was_enabled)
 
 
+def session_transport_parameters(inventory: dict[str, Any] | None, job: dict[str, Any] | None = None) -> dict[str, str]:
+    if not isinstance(inventory, dict) or inventory_type_from_record(inventory) != "vsphere":
+        return {}
+    return {"vsphere_transport": disk_transport.session_transport(job, inventory)}
+
+
+def _ensure_job_transport(job: dict[str, Any]) -> None:
+    override = disk_transport.job_transport(job)
+    if override is None:
+        return
+    _ensure(
+        str(job.get("job_type") or "backup") == "backup",
+        422,
+        "invalid_job",
+        f"transport applies to backup jobs; {job.get('name')} uses the transport of its target inventory",
+    )
+    inventory = HYPERVISORS.get(str(job.get("inventory_id") or ""))
+    _ensure(
+        isinstance(inventory, dict) and inventory_type_from_record(inventory) == "vsphere",
+        422,
+        "invalid_job",
+        f"transport applies to jobs of a vSphere inventory, and {job.get('inventory_name')} is not one",
+    )
+    problem = disk_transport.transport_problem(override)
+    _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=override)
+
+
 def _finish_job_edit(updated: dict[str, Any], payload: dict[str, Any], changed: bool, was_enabled: bool) -> dict[str, Any]:
     _ensure(changed, 422, "invalid_job", "job edit requires at least one editable option")
+    if "vsphere_transport" in (payload.get("task_parameters") or {}) or payload.get("inventory") or payload.get("inventory_id"):
+        _ensure_job_transport(updated)
     updated["updated_at"] = utc_now()
     if updated.get("schedule"):
         updated["schedule_summary"] = _render_schedule_summary(updated["schedule"])
@@ -6813,6 +6912,9 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
         "errors": error or ([] if not message or _session_state(task) == "completed" else [{"message": message}]),
         "warnings": task.get("warnings") if isinstance(task.get("warnings"), list) else [],
     }
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    if parameters.get("vsphere_transport"):
+        dto["transport"] = parameters["vsphere_transport"]
     if result.get("failure_kind"):
         dto["failure_kind"] = result.get("failure_kind")
     if result.get("restore_point_id"):
@@ -10273,6 +10375,8 @@ def _create_backup_session(
             "active_full": execution_type == "ActiveFull",
         }
     )
+    parameters.pop("vsphere_transport", None)
+    parameters.update(session_transport_parameters(HYPERVISORS.get(str(job.get("inventory_id") or "")), job))
     if requires_task_id:
         parameters["requires_task_id"] = requires_task_id
     task = {
@@ -10857,6 +10961,10 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
         unreadable_encryption_key_message("of this restore point"),
         point_id=point_id,
     )
+    transport_parameters = session_transport_parameters(target_inventory)
+    if transport_parameters:
+        problem = disk_transport.transport_problem(transport_parameters["vsphere_transport"])
+        _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=transport_parameters["vsphere_transport"])
     task = {
         "id": str(uuid4()),
         "job_id": None,
@@ -10897,6 +11005,7 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
             "firmware": requested_firmware,
             **({"disk_type": disk_provisioning} if disk_provisioning else {}),
             **({"encryption_key": encryption_key} if encryption_key else {}),
+            **session_transport_parameters(target_inventory),
         },
         "result": {
             "progress": 0,

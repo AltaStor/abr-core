@@ -115,6 +115,9 @@ class JobService:
         on_quiesce_failure = getattr(args, "on_quiesce_failure", None)
         if on_quiesce_failure is not None:
             updates["on_quiesce_failure"] = str(on_quiesce_failure).replace("-", "_")
+        vsphere_transport = getattr(args, "vsphere_transport", None)
+        if vsphere_transport is not None:
+            updates["vsphere_transport"] = str(vsphere_transport)
 
         if set_encryption:
             updates["encryption_enabled"] = True
@@ -494,6 +497,7 @@ class JobService:
         ("inventory", "--inventory"),
         ("inventory_id", "--inventory-id"),
         ("on_quiesce_failure", "--on-quiesce-failure"),
+        ("vsphere_transport", "--transport"),
         ("guest_consistency", "--guest-consistency"),
     )
 
