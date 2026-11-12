@@ -213,7 +213,11 @@ the server refuses the request either way.
   allowing functions their own role does not.
 - At least one enabled Administrator always remains. Demoting, disabling or
   deleting the last one is refused with `409 last_administrator`, and so is a
-  catalog import (`system import`) that would leave none. Only the built-in
+  catalog import (`system import`) that would leave none. This holds when two
+  Administrators change or delete each other at the same moment too: user
+  changes and deletions are applied one at a time, so the second one sees the
+  first and is refused (`409 last_administrator`, or `403 permission_denied`
+  when the first took its caller's Administrator role). Only the built-in
   Administrator role counts: a custom role that allows every function does not
   stand in for it.
 - Users from before roles existed become enabled Administrators when the

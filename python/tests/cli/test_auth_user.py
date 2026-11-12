@@ -267,9 +267,54 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
                 exit_code = AuthCommands().login(args)
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(out.getvalue().strip(), "tok-abc")
-        self.assertIn("Logged in as admin", err.getvalue())
-        self.assertEqual(token_store.load_token("http://example.test"), "tok-abc")
+        self.assertEqual(out.getvalue(), "tok-abc\n")
+        self.assertEqual(err.getvalue(), "")
+
+    @patch("python.cli.api.client.requests.request")
+    def test_print_token_leaves_the_cached_session_of_another_account_alone(self, request_mock) -> None:
+        token_store.save_token("http://example.test", "tok-admin", "2099-01-01T00:00:00+00:00")
+        request_mock.return_value = _FakeResponse(
+            {"token": "tok-auditor", "expires_at": "2099-01-01T00:00:00+00:00", "user": {"id": "u2", "name": "auditor", "role": "auditor"}}
+        )
+        with patch.dict(os.environ, {PASSWORD_ENV_VAR: "Sup3rSecretPW"}), redirect_stdout(io.StringIO()):
+            AuthCommands().login(_args(name="auditor", print_token=True))
+
+        self.assertEqual(token_store.load_token("http://example.test"), "tok-admin")
+
+    @patch("python.cli.api.client.requests.request")
+    def test_print_token_without_a_cached_session_caches_none(self, request_mock) -> None:
+        request_mock.return_value = _FakeResponse(
+            {"token": "tok-abc", "expires_at": "2099-01-01T00:00:00+00:00", "user": {"id": "u1", "name": "admin"}}
+        )
+        with patch.dict(os.environ, {PASSWORD_ENV_VAR: "Sup3rSecretPW"}), redirect_stdout(io.StringIO()):
+            AuthCommands().login(_args(name="admin", print_token=True))
+
+        self.assertIsNone(token_store.load_token("http://example.test"))
+
+    @patch("python.cli.api.client.requests.request")
+    def test_print_token_still_warns_about_a_bootstrap_password_on_stderr_only(self, request_mock) -> None:
+        request_mock.return_value = _FakeResponse(
+            {"token": "tok-abc", "expires_at": "2099-01-01T00:00:00+00:00", "user": {"id": "u1", "name": "admin", "passwordPolicyExempt": True}}
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {PASSWORD_ENV_VAR: "Sup3rSecretPW"}), redirect_stdout(out), redirect_stderr(err):
+            AuthCommands().login(_args(name="admin", print_token=True))
+
+        self.assertEqual(out.getvalue(), "tok-abc\n")
+        self.assertIn("default/bootstrap password", err.getvalue())
+
+    @patch("python.cli.api.client.requests.request")
+    def test_a_plain_login_still_caches_the_session_and_says_who_is_signed_in(self, request_mock) -> None:
+        token_store.save_token("http://example.test", "tok-admin", "2099-01-01T00:00:00+00:00")
+        request_mock.return_value = _FakeResponse(
+            {"token": "tok-auditor", "expires_at": "2099-01-01T00:00:00+00:00", "user": {"id": "u2", "name": "auditor", "role": "auditor"}}
+        )
+        out = io.StringIO()
+        with patch.dict(os.environ, {PASSWORD_ENV_VAR: "Sup3rSecretPW"}), redirect_stdout(out):
+            AuthCommands().login(_args(name="auditor"))
+
+        self.assertEqual(token_store.load_token("http://example.test"), "tok-auditor")
+        self.assertIn("Logged in as auditor (auditor)", out.getvalue())
 
     @patch("python.cli.api.client.requests.request")
     def test_logout_calls_api_and_clears_stored_token(self, request_mock) -> None:

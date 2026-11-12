@@ -21,6 +21,7 @@ from ..parsing.validators import (
 )
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
+from .inventory_commands import INVENTORY_SCAN_TIMEOUT_SECONDS
 
 RETENTION_TIMEOUT_SECONDS = 21600
 REPLICA_DELETE_TIMEOUT_SECONDS = 1800
@@ -82,6 +83,10 @@ REPLICATION_HIDDEN_KEYS = frozenset(
         "storage_layout",
         "retention_days",
         "retention_min_fulls",
+        "verify_schedule",
+        "verify_whole_chain_every",
+        "verify_next_run_at",
+        "last_verify",
         "gfs",
         "active_full_days",
         "synthetic_full_days",
@@ -429,7 +434,8 @@ class JobCommands:
             type=int,
             help=(
                 "How many of the newest full backups of each VM, with the incrementals on them, retention always "
-                "keeps whatever their age (0-100; 0, the default, keeps none beyond --retention-days)"
+                "keeps whatever their age (0-100; default 2 for a new job, the source job's for a copied one; "
+                "0 keeps none beyond --retention-days)"
             ),
         )
         if include_compression_encryption_flags:
@@ -510,7 +516,21 @@ class JobCommands:
                 type=parse_optional_weekday_csv,
                 help="Active full weekdays, comma-separated Mon-Sun, for a weekly schedule only; none turns a weekly one off",
             )
-            for prefix, label in (("active-full", "Active full"), ("synthetic-full", "Synthetic full")):
+            parser.add_argument(
+                "--verify-days",
+                type=parse_optional_weekday_csv,
+                help="Verify weekdays, comma-separated Mon-Sun, for a weekly verify schedule only",
+            )
+            parser.add_argument(
+                "--verify-whole-chain-every",
+                dest="verify_whole_chain_every",
+                type=int,
+                help=(
+                    "Every how many scheduled verify runs check every restore point of each chain instead of the "
+                    "newest one, 1-100 (default 4; 1 checks whole chains every time)"
+                ),
+            )
+            for prefix, label in (("active-full", "Active full"), ("synthetic-full", "Synthetic full"), ("verify", "Verify")):
                 dest = prefix.replace("-", "_")
                 parser.add_argument(
                     f"--{prefix}-schedule",
@@ -709,7 +729,9 @@ class JobCommands:
     def create(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
         payload = deps.jobs.create_backup_job_payload(args)
-        result = self._decorate_job(deps.context.api_client.post("api/v1/jobs", json=payload))
+        result = self._decorate_job(
+            deps.context.api_client.post("api/v1/jobs", json=payload, timeout=INVENTORY_SCAN_TIMEOUT_SECONDS)
+        )
         deps.context.print_output(result, self._columns())
         return 0
 
@@ -802,7 +824,9 @@ class JobCommands:
         job_id = self._resolve_id(deps, args)
         current = deps.context.api_client.get(f"api/v1/jobs/{job_id}")
         payload = deps.jobs.build_edit_payload(current, args)
-        result = self._decorate_job(deps.context.api_client.patch(f"api/v1/jobs/{job_id}", json=payload))
+        result = self._decorate_job(
+            deps.context.api_client.patch(f"api/v1/jobs/{job_id}", json=payload, timeout=INVENTORY_SCAN_TIMEOUT_SECONDS)
+        )
         deps.context.print_output(result, self._columns())
         return 0
 

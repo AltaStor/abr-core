@@ -22,12 +22,34 @@ def _announce_session(session_id: object) -> None:
 
 def _chain_status(chain: dict[str, Any]) -> str:
     status = str(chain.get("status") or "")
+    notes = []
+    corrupt = chain.get("corrupt") if isinstance(chain.get("corrupt"), dict) else None
+    if corrupt:
+        notes.append(f"{corrupt.get('restore_point_count')} point(s) corrupt")
     pending = chain.get("pending_deletion") if isinstance(chain.get("pending_deletion"), dict) else None
-    if not pending:
+    if pending:
+        after = pending.get("delete_after")
+        notes.append(f"{pending.get('restore_point_count')} point(s) deleting" + (f" after {after}" if after else ""))
+    if not notes:
         return status
-    after = pending.get("delete_after")
-    waiting = f"{pending.get('restore_point_count')} point(s) deleting" + (f" after {after}" if after else "")
-    return waiting if status == "deleting" else f"{status}, {waiting}"
+    if status == "deleting" and pending and not corrupt:
+        return notes[-1]
+    return f"{status}, {', '.join(notes)}"
+
+
+def _print_corruption_marks(marks: object) -> None:
+    if not isinstance(marks, dict):
+        return
+    corrupt_now = [str(item) for item in marks.get("corrupt_now") or []]
+    cleared = [str(item) for item in marks.get("cleared") or []]
+    if corrupt_now:
+        print(
+            f"Marked corrupt: {len(corrupt_now)} restore point(s), those with damaged data and the ones that build on "
+            "them. They are not offered for restore, and the job's next run takes an active full.",
+            file=sys.stderr,
+        )
+    if cleared:
+        print(f"No longer corrupt: {len(cleared)} restore point(s) verified intact again ({', '.join(cleared)}).", file=sys.stderr)
 
 
 RESTORE_POINT_COLUMNS = [
@@ -211,6 +233,7 @@ class BackupCommands:
             return INVALID_STATE
 
         deps.context.print_output(result, [("id", "ID"), ("result", "RESULT"), ("checked_restore_points", "POINTS"), ("checked_artifacts", "ARTIFACTS"), ("warnings", "WARNINGS"), ("errors", "ERRORS")])
+        _print_corruption_marks(result.get("corrupt"))
         if result.get("result") != "valid":
             return INVALID_STATE
         if session is not None and not session_watch_succeeded(session):

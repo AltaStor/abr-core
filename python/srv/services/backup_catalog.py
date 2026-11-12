@@ -975,11 +975,20 @@ def _remove_interrupted_task_snapshot(task: dict[str, Any]) -> None:
             snapshot_name,
             vm_name,
         )
+        _note_snapshot_left(
+            task_id,
+            vm_name,
+            snapshot_name,
+            "its hypervisor is no longer registered, so remove the snapshot by hand",
+        )
         return
     from python.srv.plugins import build_hypervisor_plugin
 
     try:
         with build_hypervisor_plugin(hypervisor) as node:
+            wait_for_creation = getattr(node, "wait_for_snapshot_creation", None)
+            if callable(wait_for_creation):
+                wait_for_creation(vm_name)
             node.remove_snapshot(vm_name, snapshot_name)
             _consolidate_after_interrupted_task(node, task_id, vm_name)
     except Exception as exc:
@@ -991,6 +1000,8 @@ def _remove_interrupted_task_snapshot(task: dict[str, Any]) -> None:
             vm_name,
             exc,
         )
+        reason = str(exc).rstrip(". ") or type(exc).__name__
+        _note_snapshot_left(task_id, vm_name, snapshot_name, f"{reason}. The next backup of this VM removes it")
         return
     forget_task_backup_snapshot(task_id)
     logger.info(
@@ -999,6 +1010,20 @@ def _remove_interrupted_task_snapshot(task: dict[str, Any]) -> None:
         task_id,
         vm_name,
     )
+
+
+def _note_snapshot_left(task_id: str, vm_name: str, snapshot_name: str, reason: str) -> None:
+    message = f"Backup snapshot {snapshot_name} of VM {vm_name} could not be removed after the server restart: {reason}"
+
+    def change(record: dict[str, Any]) -> None:
+        warnings = record.get("warnings") if isinstance(record.get("warnings"), list) else []
+        record["warnings"] = [
+            *warnings,
+            {"code": "snapshot_left", "message": message, "vm_name": vm_name, "snapshot_name": snapshot_name},
+        ]
+        _append_task_log(record, level="warn", message=message, component="engine")
+
+    _update_finished_task(task_id, change)
 
 
 def _consolidate_after_interrupted_task(node: Any, task_id: str, vm_name: str) -> None:

@@ -8,6 +8,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
+from python.cli.commands.inventory_commands import INVENTORY_SCAN_TIMEOUT_SECONDS
 from python.cli.exit_codes import GENERAL_ERROR, INVALID_STATE
 from python.cli.parsing.parser_builder import AltaStorParserBuilder
 from python.cli.services.job_service import JobService
@@ -157,3 +158,29 @@ class RetentionMinFullsFlagTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JobSaveWaitsForDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def _parse(*argv: str):
+        return AltaStorParserBuilder().build().parse_args(["--base-url", "http://example.test", *argv])
+
+    def _requests(self, *argv: str) -> list:
+        args = self._parse(*argv)
+        job = {"id": "job-1", "name": "nightly", "job_type": "backup", "items": []}
+        with patch("python.cli.api.client.requests.request", return_value=_FakeResponse(job)) as request, redirect_stdout(
+            io.StringIO()
+        ), redirect_stderr(io.StringIO()):
+            self.assertEqual(args.handler(args), 0)
+        return [(call.args[0], call.args[1].removeprefix("http://example.test/"), call.kwargs["timeout"]) for call in request.call_args_list]
+
+    def test_job_create_waits_for_the_first_scan_of_a_new_inventory_as_long_as_a_rescan(self) -> None:
+        sent = self._requests(*CREATE)
+
+        self.assertIn(("POST", "api/v1/jobs", INVENTORY_SCAN_TIMEOUT_SECONDS), sent)
+
+    def test_job_edit_of_the_vms_waits_as_long_as_a_rescan_too(self) -> None:
+        sent = self._requests("job", "edit", "--id", "job-1", "--vm", "vm-2")
+
+        self.assertIn(("PATCH", "api/v1/jobs/job-1", INVENTORY_SCAN_TIMEOUT_SECONDS), sent)
+        self.assertIn(("GET", "api/v1/jobs/job-1", 30), sent)

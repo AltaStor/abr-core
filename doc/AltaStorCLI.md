@@ -132,7 +132,7 @@ Examples:
 abr auth login --name abr 
 ABR_USERNAME=abr ABR_PASSWORD='secret' abr auth login 
 
---print-token: print only the token to stdout, for `export ABR_TOKEN=$(abr auth login --print-token)`. 
+--print-token: print only the token to stdout, for `export ABR_TOKEN=$(abr auth login --print-token)`. The session the CLI has cached is left as it was, so fetching a token for another account does not sign the CLI in as that account. 
 
 abr auth logout 
 
@@ -173,7 +173,7 @@ USER COMMANDS
 
 Manage accounts allowed to authenticate. Requires an existing session. The first user is created at startup from ABR_BOOTSTRAP_ADMIN_USER / ABR_BOOTSTRAP_ADMIN_PASSWORD, not via this command, and holds the administrator role. Every user holds exactly one role: administrator, backup_administrator, backup_operator, restore_operator or auditor. 
 
-At least one enabled Administrator always remains: the last one cannot be demoted, disabled or deleted (exit 4, code last_administrator). 
+At least one enabled Administrator always remains: the last one cannot be demoted, disabled or deleted (exit 4, code last_administrator), even when two Administrators change each other at the same moment: the later change is refused. 
 
 abr user add 
 
@@ -447,6 +447,8 @@ abr repo verify --name <name> [--id <id>]
 
 For an immutable s3 repository, verify also reports Object Lock state without writing anything. 
 
+The block check marks the restore points whose data it finds damaged, and the points that build on them, corrupt, as abr backup verify does, and sends the backup.verify_failed event when it fails. 
+
 abr repo verify-immutability 
 
 Description: Validate that an s3 repository can hold immutable backups - Object Lock, versioning and the required permissions - proven by writing a small locked test backup and confirming the storage refuses to delete it. Each check is reported by name, with the storage's own message on failure; exits non-zero unless the verdict is clean. The test backup sits under .abr-immutability-probe, locked for a day; the next run clears expired ones. 
@@ -477,7 +479,9 @@ abr inventory add --name Prod-vCenter --type vsphere --address 192.168.1.10 --us
 Note:
 VM discovery is not required up front. It runs automatically the first time you
 reference VM names in job create, so no manual inventory rescan is needed after
-inventory add.
+inventory add. job create, and job edit with new VMs, waits for that discovery
+as long as inventory rescan does (up to 15 minutes), so it reports the outcome
+the server reaches instead of failing while the job is still being created.
 
 A hyper-v inventory speaks WinRM over HTTPS on port 5986 unless --protocol
 http is given (port 5985). --port moves the port and keeps the protocol, so
@@ -552,7 +556,7 @@ abr job create
 
 Description: Create a backup job for one or more virtual machines and optionally attach an enabled or disabled schedule. Supported schedule types are daily, weekly, monthly, and periodic. Each VM may be listed once. --retention-days is a whole number from 1 to 3650 (14 when omitted); the GFS counts are whole numbers up to 520 weekly, 120 monthly and 99 yearly; a schedule's time zone, when given through the API, must be an IANA name such as Europe/Kyiv or UTC. 
 
-abr job create --name <name> (--repository <name> | --repository-id <id>) [--inventory <name> | --inventory-id <id>] (--vm <vm> ... | --vms "<vm1,vm2,...>") [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] [--on-quiesce-failure <fail|crash-consistent>] 
+abr job create --name <name> (--repository <name> | --repository-id <id>) [--inventory <name> | --inventory-id <id>] (--vm <vm> ... | --vms "<vm1,vm2,...>") [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] [--verify-schedule <daily|weekly|monthly|periodic|none>] [--verify-time <HH:MM>] [--verify-days <mon,tue,...>] [--verify-day-of-month <1..31>] [--verify-every <15m|1h|6h|1d>] [--verify-enabled | --verify-disabled] [--verify-whole-chain-every <1..100>] [--on-quiesce-failure <fail|crash-consistent>] 
 
 Examples: 
 abr job create --name "Production VMs" --inventory "vcenter-main" --vm "vm-101" --vm "vm-102" --repository "repo-local-01" --schedule daily --time "23:00" --enabled 
@@ -570,12 +574,15 @@ abr job edit --name "Nightly with Fulls" --synthetic-full-disabled
 abr job edit --name "Nightly with Fulls" --synthetic-full-enabled 
 
 abr job edit --name "Nightly with Fulls" --synthetic-full-schedule none 
+
+abr job edit --name "Nightly with Fulls" --verify-schedule weekly --verify-days sat --verify-time "06:00" --verify-whole-chain-every 4 
  
 
 Notes & Behavior: 
 --retention-days = operational rolling retention affecting non-GFS points 
---retention-min-fulls = how many of the newest full backups of each VM, with the incrementals on them, retention keeps whatever their age. 0, the default, keeps nothing beyond --retention-days, as jobs did before the setting: a chain whose points are all older than --retention-days (a VM that left the job, a job that has not run that long) goes entirely on abr job retention. With 1 the newest full and its incrementals always stay, so a VM never loses its last restore point to retention; 2 keeps the two newest, up to 100. It only adds to what --retention-days, GFS and Object Lock already keep. A copied job takes the source job's value unless --retention-min-fulls is given; abr job edit --retention-min-fulls 0 switches it off. 
+--retention-min-fulls = how many of the newest full backups of each VM, with the incrementals on them, retention keeps whatever their age. A new backup or backup copy job keeps 2 unless the option is given: the newest full and the one before it, each with its incrementals, always stay. So after a pause in backups longer than --retention-days (the job disabled, the VM off, the repository or the server down) the first full that follows keeps the chain from before the pause instead of removing it, and a problem that started during the pause can still be undone. 1 keeps only the newest full and its incrementals, so a VM never loses its last restore point to retention, but right after such a pause the newest full is the one just made; up to 100. 0 keeps nothing beyond --retention-days, as jobs did before the setting: a chain whose points are all older than --retention-days goes entirely, and the first full after such a pause leaves the VM with that one restore point. Jobs created before 2 became the default keep the value they have, 0 included, until abr job edit changes it. It only adds to what --retention-days, GFS and Object Lock already keep. A copied job takes the source job's value unless --retention-min-fulls is given; abr job edit --retention-min-fulls 0 switches it off. 
 --gfs-* = extended lifecycle marks enforced during automated block evaluation. 
+--verify-schedule = when the job's backups are verified, set like a full schedule (--verify-time, --verify-days, --verify-day-of-month, --verify-every, --verify-enabled / --verify-disabled; none removes it). Each run checks the newest restore point of every chain the job wrote (each VM in each repository), and every --verify-whole-chain-every-th run (4 by default, 1 for every run) checks every restore point of each chain. A run waits while the job backs up, and a backup the job is due to take waits while it verifies. Each chain gets a verify session of its own in the job's history (abr session list --job <name>), and job info shows the next run (verify_next_run_at) and the last one (last_verify: its number, scope, result and sessions). Like the full schedules it rides along with the job: a disabled job verifies nothing. A backup copy job takes the same options for its own chains; job create-copy copies the source job's verify schedule. A new job has none until one is set. 
 A job carries three independent schedules: the base --schedule produces incrementals, --active-full-schedule reads the full VM again, and --synthetic-full-schedule takes an incremental and merges it into a new full on the repository. When more than one is due at the same moment the job runs a single session, with active full taking priority over synthetic full and synthetic full over the incremental. Each full schedule takes either form of switch-off: --active-full-schedule none / --synthetic-full-schedule none removes it and forgets its settings, while --active-full-disabled / --synthetic-full-disabled suspends it and keeps them for a later --active-full-enabled / --synthetic-full-enabled. 
 A backup job cannot be created without at least one enabled full backup schedule - an active full, a synthetic full, or the legacy day lists - because operational retention can only free a chain once a newer full starts the next one, and a job that only ever takes incrementals keeps a chain that retention can never prune. The same check runs on edit whenever retention or a full schedule is touched, so the last remaining full schedule cannot be removed or suspended. 
 The full schedules ride along with the job: a job whose base schedule is disabled, or which has no base schedule at all, runs nothing until it is enabled again. 
@@ -602,7 +609,7 @@ abr job create-backup-copy
 
 Description: Create a backup copy job. It copies the restore points of its sources - backup jobs (--source-job) or whole repositories, every job's points in them (--source-repo) - into another repository (--repository), where it keeps a chain of its own for each VM with its own retention, GFS, Object Lock dates and encryption key, independently of the sources. It reads stored backups only and never touches the VMs, vCenter or the Hyper-V hosts, so it runs whether a VM is on, off or gone. Copies are restored like any other restore point (abr restore list --job <name>). 
 
-abr job create-backup-copy --name <name> (--source-job <name> ... | --source-job-id <id> ... | --source-repo <name> ... | --source-repo-id <id> ...) (--repository <name> | --repository-id <id>) [--mode <periodic|immediate>] [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--run-after-job <name> | --run-after-job-id <id>] [--copy-window "<[days] HH:MM-HH:MM>" ...] [--retry-count <0..20>] [--retry-interval <minutes>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--gfs-weekly <n>] [--gfs-monthly <n>] [--gfs-yearly <n>] [--active-full-schedule ...] [--synthetic-full-schedule ...] [--compression-level <0..9>] [--set-encryption [--encryption-key]] 
+abr job create-backup-copy --name <name> (--source-job <name> ... | --source-job-id <id> ... | --source-repo <name> ... | --source-repo-id <id> ...) (--repository <name> | --repository-id <id>) [--mode <periodic|immediate>] [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--run-after-job <name> | --run-after-job-id <id>] [--copy-window "<[days] HH:MM-HH:MM>" ...] [--retry-count <0..20>] [--retry-interval <minutes>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--gfs-weekly <n>] [--gfs-monthly <n>] [--gfs-yearly <n>] [--active-full-schedule ...] [--synthetic-full-schedule ...] [--verify-schedule ...] [--compression-level <0..9>] [--set-encryption [--encryption-key]] 
 
 Notes: 
 • --mode periodic (the default) copies on the job's own schedule (daily, weekly, monthly, periodic or cron, as for backup jobs), by hand with abr job start, or each time a run of another job ends (--run-after-job). Each run copies the newest state of every VM and merges whatever is new since the last copy into one restore point. 
@@ -660,7 +667,7 @@ abr job edit
 
 Description: Update job configuration binding, scheduling, schedule state, or protected targets. 
 
-abr job edit --name <name> [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--repository <repo_name>] [--inventory <inventory_name>] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] [--on-quiesce-failure <fail|crash-consistent>] 
+abr job edit --name <name> [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--repository <repo_name>] [--inventory <inventory_name>] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] [--verify-schedule <daily|weekly|monthly|periodic|none>] [--verify-time <HH:MM>] [--verify-days <mon,tue,...>] [--verify-day-of-month <1..31>] [--verify-every <15m|1h|6h|1d>] [--verify-enabled | --verify-disabled] [--verify-whole-chain-every <1..100>] [--on-quiesce-failure <fail|crash-consistent>] 
 
 A backup copy job takes the options of job create-backup-copy as well: --mode, --source-job, --source-job-id, --source-repo, --source-repo-id (each replaces that list; none empties it), --run-after-job (none clears it), --copy-window (replaces the rules; none means any time), --retry-count, --retry-interval and --all-vms (copy every VM of the sources again). They are refused on a backup job, and --inventory, --on-quiesce-failure and --guest-consistency on a backup copy job, with the reason. 
 
@@ -774,6 +781,13 @@ abr backup verify
 Description: Verify backup chain readability, logical dependency, and integrity. Exits non-zero unless the result is a clean "valid", so `abr backup verify --id <id> || alert ...` reacts to a "warning" or "invalid" verdict instead of always seeing exit 0. 
 
 abr backup verify --id <id> 
+
+Notes: 
+• A restore point whose data the disk tool finds damaged (a data range that fails its checksum) is marked corrupt, and so is every point that builds on it; the points it builds on and the older chains stay as they were. A check that could not be made (a file it could not read, a repository it could not reach, a missing key) fails the verify without marking anything. 
+• A corrupt point is not offered for restore: abr backup list shows the chain as "corrupt, N point(s) corrupt", backup info and restore list show each point's status, and abr restore start refuses it, naming the damaged point and when it was found. 
+• The job's next run for that VM takes an active full (reason DamagedChain) instead of building on the damaged chain, and a forced --synthetic is refused until then; a backup copy job copies a full. Scheduled synthetic fulls become active fulls the same way. 
+• A later verify that finds the data intact again (the file restored, the storage repaired) clears the marks. Retention deletes corrupt points by age like any other. 
+• The same marks come from a job's verify schedule and from abr repo verify. A verify that found damage or could not check every point sends the backup.verify_failed event (see doc/Notifications.md). 
 
 abr backup import 
 

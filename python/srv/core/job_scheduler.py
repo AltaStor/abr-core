@@ -22,9 +22,11 @@ from python.srv.services.abr_v41 import (
     execution_phases,
     job_clock_anomalies,
     job_run_record,
+    job_verify_running,
     normalize_job_record,
     resolve_job_execution,
     schedule_latest_next_run,
+    run_job_verify,
     schedule_next_run,
     stored_slot_next_run,
 )
@@ -157,12 +159,13 @@ class JobScheduler:
             if not self._is_supported_backup_job(job):
                 continue
 
-            if self._has_pending_task(job, now):
+            if self._has_pending_task(job, now) or job_verify_running(str(job["id"])):
                 continue
 
             normalized_job = normalize_job_record(job)
             due_slots = self._due_slots(normalized_job, job, now)
             if not due_slots:
+                self._dispatch_due_verify(job, normalized_job, now)
                 continue
 
             run_id = str(uuid4())
@@ -195,6 +198,34 @@ class JobScheduler:
                 len(tasks),
                 tasks[-1]["id"],
             )
+
+    def _dispatch_due_verify(self, job: dict[str, Any], normalized_job: dict[str, Any], now: datetime) -> None:
+        schedule = normalized_job.get("verify_schedule")
+        if not isinstance(schedule, dict) or not bool(schedule.get("enabled", True)):
+            return
+        job_id = str(job["id"])
+        due_at = _parse_timestamp(job.get("verify_next_run_at"))
+        if due_at is None:
+            planned = normalized_job.get("verify_next_run_at")
+            if planned:
+                with CATALOG_LOCK:
+                    fresh = dict(JOBS.get(job_id) or job)
+                    fresh["verify_next_run_at"] = planned
+                    persist_job(fresh)
+            return
+        if now < due_at:
+            return
+        with CATALOG_LOCK:
+            fresh = dict(JOBS.get(job_id) or job)
+            fresh["verify_next_run_at"] = schedule_next_run(schedule, after=now).isoformat()
+            persist_job(fresh)
+        try:
+            run = run_job_verify(job_id, trigger="schedule")
+        except Exception:
+            logger.exception("Job '%s' could not start its scheduled verify run", job_id)
+            return
+        if run is not None:
+            logger.info("Job '%s' started scheduled verify run %s (%s).", job_id, run["run"], run["scope"])
 
     def _dispatch_replication(self, job: dict[str, Any], now: datetime) -> None:
         job_id = str(job["id"])
@@ -346,7 +377,7 @@ class JobScheduler:
         return any(
             self._schedule_can_fire(normalized_job.get(schedule_key))
             for schedule_key, _execution_type, _next_run_key in self.EXECUTION_SLOTS
-        )
+        ) or self._schedule_can_fire(normalized_job.get("verify_schedule"))
 
     def _get_interval_minutes(self, job: dict[str, Any]) -> int:
         schedule = job.get("schedule", {})

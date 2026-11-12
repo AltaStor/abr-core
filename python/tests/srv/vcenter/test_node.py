@@ -580,6 +580,86 @@ _GUEST_REASON = (
 )
 
 
+class VCenterNodeSnapshotNameTests(unittest.TestCase):
+    def test_a_given_name_is_used_for_the_snapshot_and_for_its_cbt_retry(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        fake_vm = _FakeSnapshotVm()
+        node._get_vm = lambda vm_name: fake_vm  # type: ignore[method-assign]
+        node.remove_snapshot = lambda vm_name, snapshot_name: None  # type: ignore[method-assign]
+        node.ensure_cbt_enabled = lambda vm_name: False  # type: ignore[method-assign]
+        failed = {"done": False}
+
+        def fake_wait_for_task(task: object) -> object:
+            if isinstance(task, _FakeSnapshotTask) and task.name == "FullBackup_42" and not failed["done"]:
+                failed["done"] = True
+                raise RuntimeError(_CBT_CORRUPTION_ERROR)
+            return None
+
+        node._wait_for_task = fake_wait_for_task  # type: ignore[method-assign]
+
+        self.assertEqual(node.create_backup_snapshot("demo-vm", snapshot_name="FullBackup_42"), "FullBackup_42")
+        self.assertEqual([fake_vm.created_snapshots[0], fake_vm.created_snapshots[2]], ["FullBackup_42", "FullBackup_42"])
+
+    def test_without_a_name_the_snapshot_gets_a_new_backup_name(self) -> None:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        fake_vm = _FakeSnapshotVm()
+        node._get_vm = lambda vm_name: fake_vm  # type: ignore[method-assign]
+        node._wait_for_task = lambda task: None  # type: ignore[method-assign]
+
+        with patch("python.srv.plugins.vcenter.vcenter.time.time", return_value=1794386036.7):
+            self.assertEqual(node.create_backup_snapshot("demo-vm"), "FullBackup_1794386036")
+
+
+class _RecentTask:
+    def __init__(self, description_id: str, states: list[object]) -> None:
+        self._states = states
+        self._description_id = description_id
+
+    @property
+    def info(self) -> object:
+        state = self._states.pop(0) if len(self._states) > 1 else self._states[0]
+        return types.SimpleNamespace(descriptionId=self._description_id, state=state)
+
+
+class VCenterNodeSnapshotCreationWaitTests(unittest.TestCase):
+    def _node(self, tasks: list[_RecentTask]) -> VCenterNode:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        vm = types.SimpleNamespace(recentTask=tasks)
+        node._get_vm = lambda vm_name: vm if vm_name == "demo-vm" else None  # type: ignore[method-assign]
+        return node
+
+    def test_it_returns_once_vcenter_has_finished_creating_the_snapshot(self) -> None:
+        running, done = vim.TaskInfo.State.running, vim.TaskInfo.State.success
+        task = _RecentTask("VirtualMachine.createSnapshot", [running, running, done])
+        node = self._node([task])
+
+        with patch("python.srv.plugins.vcenter.vcenter.time.sleep") as sleep:
+            node.wait_for_snapshot_creation("demo-vm")
+
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_other_tasks_on_the_vm_are_not_waited_for(self) -> None:
+        node = self._node([_RecentTask("VirtualMachine.reconfigure", [vim.TaskInfo.State.running])])
+
+        with patch("python.srv.plugins.vcenter.vcenter.time.sleep") as sleep:
+            node.wait_for_snapshot_creation("demo-vm")
+
+        sleep.assert_not_called()
+
+    def test_a_creation_that_never_finishes_is_given_up_on(self) -> None:
+        node = self._node([_RecentTask("VirtualMachine.createSnapshot", [vim.TaskInfo.State.queued])])
+
+        with (
+            patch("python.srv.plugins.vcenter.vcenter.time.sleep"),
+            patch("python.srv.plugins.vcenter.vcenter.env_int", return_value=0),
+            self.assertRaisesRegex(RuntimeError, "still creating a snapshot of VM 'demo-vm'"),
+        ):
+            node.wait_for_snapshot_creation("demo-vm")
+
+    def test_a_vm_that_is_gone_has_nothing_to_wait_for(self) -> None:
+        self._node([]).wait_for_snapshot_creation("other-vm")
+
+
 class _FailingSnapshotTask:
     def __init__(self, error: object) -> None:
         self.info = types.SimpleNamespace(error=error, startTime=datetime(2026, 10, 14, tzinfo=timezone.utc))

@@ -66,6 +66,7 @@ nothing.
 | `job.failed` | on | A backup job's run finished and the backup of at least one VM failed. |
 | `job.warning` | on | A run finished, every VM was backed up, and at least one backup reported a warning. |
 | `job.succeeded` | off | A run finished and every VM was backed up without a warning. |
+| `backup.verify_failed` | on | A backup verification - abr backup verify, a job's verify schedule or abr repo verify - found damaged data, which marks those restore points and the ones that build on them corrupt, or could not check every restore point. |
 | `restore.failed` | on | A VM restore failed. |
 | `restore.succeeded` | off | A VM restore finished. |
 | `repository.low_space` | on | After a run, the disk of the job's local or SMB repository is filled to `repository_space_threshold_percent` (85 by default) or beyond. Object storage has no fixed size and is not checked. Sent again only after the disk has dropped below the threshold and filled up again (kept in memory: a restart may send it once more). |

@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 from python.srv.core.mongo_db_wrapper import USERS
 from python.srv.services import auth_service, rbac
@@ -101,6 +104,75 @@ class LastAdministratorTests(RbacApiCase):
         response = self.client.post("/api/v1/auth/login", json={"name": "admin", "password": ADMIN_PASSWORD})
         self.assertEqual(response.json()["user"]["role"], rbac.ADMINISTRATOR)
         self.assertEqual(response.json()["permissions"], rbac.allowed_functions(rbac.ADMINISTRATOR))
+
+
+class SimultaneousAdministratorChangeTests(RbacApiCase):
+    def _race(self, first, second) -> list[object]:
+        real_persist = auth_service.persist_user
+        start = threading.Barrier(2)
+        outcomes: list[object] = [None, None]
+
+        def slow_persist(record):
+            time.sleep(0.2)
+            real_persist(record)
+
+        def run(index, change):
+            start.wait()
+            try:
+                outcomes[index] = change()
+            except ApiError as exc:
+                outcomes[index] = exc
+
+        with patch.object(auth_service, "persist_user", slow_persist):
+            threads = [threading.Thread(target=run, args=(index, change)) for index, change in enumerate((first, second))]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        return outcomes
+
+    def _two_administrators(self) -> tuple[str, str]:
+        self.create_user("second", rbac.ADMINISTRATOR)
+        return self.user_id("admin"), self.user_id("second")
+
+    def assert_one_administrator_left(self, outcomes: list[object], *codes: str) -> None:
+        refused = [outcome for outcome in outcomes if isinstance(outcome, ApiError)]
+        self.assertEqual(len(refused), 1, outcomes)
+        self.assertIn(refused[0].code, codes)
+        self.assertEqual(len(rbac.active_administrators(USERS.values())), 1)
+
+    def test_two_administrators_disabling_each_other_at_once_leave_one_enabled(self) -> None:
+        admin, second = self._two_administrators()
+        outcomes = self._race(
+            lambda: auth_service.update_user(second, {"enabled": False}, acting_user_id=admin),
+            lambda: auth_service.update_user(admin, {"enabled": False}, acting_user_id=second),
+        )
+        self.assert_one_administrator_left(outcomes, "last_administrator")
+
+    def test_two_administrators_demoting_each_other_at_once_leave_one_administrator(self) -> None:
+        admin, second = self._two_administrators()
+        outcomes = self._race(
+            lambda: auth_service.update_user(second, {"role": rbac.AUDITOR}, acting_user_id=admin),
+            lambda: auth_service.update_user(admin, {"role": rbac.AUDITOR}, acting_user_id=second),
+        )
+        self.assert_one_administrator_left(outcomes, "permission_denied")
+
+    def test_two_administrators_deleting_each_other_at_once_leave_one(self) -> None:
+        admin, second = self._two_administrators()
+        outcomes = self._race(
+            lambda: auth_service.remove_user(second, acting_user_id=admin),
+            lambda: auth_service.remove_user(admin, acting_user_id=second),
+        )
+        self.assertEqual(len(rbac.active_administrators(USERS.values())), 1, outcomes)
+        self.assertEqual(sum(isinstance(outcome, ApiError) for outcome in outcomes), 1, outcomes)
+
+    def test_a_disable_and_a_delete_at_once_leave_one_enabled_administrator(self) -> None:
+        admin, second = self._two_administrators()
+        outcomes = self._race(
+            lambda: auth_service.update_user(second, {"enabled": False}, acting_user_id=admin),
+            lambda: auth_service.remove_user(admin, acting_user_id=second),
+        )
+        self.assertEqual(len(rbac.active_administrators(USERS.values())), 1, outcomes)
 
 
 class RoleImmutabilityApiTests(RbacApiCase):

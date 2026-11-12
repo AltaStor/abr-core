@@ -193,6 +193,89 @@ def _restore_finished(task: dict[str, Any]) -> None:
     )
 
 
+def verify_finished(task: dict[str, Any], report: dict[str, Any]) -> None:
+    try:
+        if report.get("canceled") or report.get("result") != "invalid":
+            return
+        params = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+        marks = report.get("corrupt") if isinstance(report.get("corrupt"), dict) else {}
+        damaged = sorted({str(item.get("point_id")) for item in report.get("errors") or [] if isinstance(item, dict) and item.get("damaged")})
+        corrupt_now = [str(item) for item in marks.get("corrupt_now") or []]
+        errors = [item for item in report.get("errors") or [] if isinstance(item, dict)]
+        vm = params.get("vm_name") or task.get("resource_external_id") or "-"
+        job = JOBS.get(str(task.get("job_id") or "")) or {}
+        found = "found damaged data" if damaged else "could not check every restore point"
+        lines = [
+            f"The verification of the backup of {vm} {found}.",
+            "",
+            f"Backup chain:  {params.get('backup_id') or report.get('id') or '-'}",
+            f"Repository:    {params.get('repository_name') or '-'}",
+            f"Job:           {job.get('name') or params.get('job_name') or '-'}",
+            f"Started by:    {params.get('trigger') or 'hand'}",
+            f"Checked:       {report.get('checked_artifacts')} artifact(s) of {report.get('checked_restore_points')} restore point(s)",
+            f"Finished:      {when(datetime.now(timezone.utc).isoformat())}",
+        ]
+        if damaged:
+            lines += [
+                "",
+                f"Damaged data in: {', '.join(damaged)}.",
+                f"{len(corrupt_now)} restore point(s) of the chain are marked corrupt, these and the ones that build on them.",
+                "They are not offered for restore, and the job's next run takes an active full.",
+            ]
+        lines += ["", "Problems:"]
+        for error in errors[:10]:
+            lines.append(f"  {error.get('point_id')}: {str(error.get('message') or '').strip().splitlines()[-1] if error.get('message') else '-'}")
+        lines += ["", f"Session ID: {task.get('id')}. Log: abr session log --id {task.get('id')}"]
+        notify(
+            "backup.verify_failed",
+            f"Backup verification of {vm} {found}",
+            "\n".join(lines) + "\n",
+            severity="error",
+            details={
+                "session_id": task.get("id"),
+                "backup_id": params.get("backup_id") or report.get("id"),
+                "vm_name": vm,
+                "job_name": job.get("name") or params.get("job_name"),
+                "repository_name": params.get("repository_name"),
+                "damaged_restore_point_ids": damaged,
+                "corrupt_restore_point_ids": corrupt_now,
+                "errors": len(errors),
+            },
+        )
+    except Exception:
+        LOGGER.exception("Could not work out the notification for verify session %s", task.get("id"))
+
+
+def repository_verify_failed(repository: dict[str, Any], health: dict[str, Any]) -> None:
+    try:
+        if health.get("status") != "failed":
+            return
+        marks = health.get("corrupt") if isinstance(health.get("corrupt"), dict) else {}
+        damaged = sorted({str(item.get("point_id")) for item in health.get("errors") or [] if isinstance(item, dict) and item.get("damaged")})
+        found = "found damaged data" if damaged else "could not check every restore point"
+        name = repository.get("name") or repository.get("id")
+        lines = [
+            f"Repo verify of repository {name} {found}.",
+            "",
+            str(health.get("message") or ""),
+        ]
+        if damaged:
+            lines += [
+                "",
+                f"Damaged data in: {', '.join(damaged)}. {len(marks.get('corrupt_now') or [])} restore point(s) are marked corrupt, these and the ones that build on them.",
+                "They are not offered for restore, and their jobs' next runs take an active full.",
+            ]
+        notify(
+            "backup.verify_failed",
+            f"Repo verify of {name} {found}",
+            "\n".join(lines) + "\n",
+            severity="error",
+            details={"repository_id": repository.get("id"), "repository_name": name, "damaged_restore_point_ids": damaged},
+        )
+    except Exception:
+        LOGGER.exception("Could not work out the notification for repo verify of %s", repository.get("id"))
+
+
 def _check_repository_space(repository_id: str) -> None:
     repository = REPOSITORIES.get(repository_id)
     if not isinstance(repository, dict) or str(repository.get("type") or "") == "s3":

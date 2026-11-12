@@ -348,3 +348,70 @@ class LoggerConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThirdPartyLogLevelTests(unittest.TestCase):
+    SCRIPT = (
+        "import logging, sys\n"
+        "from python.srv.core import logger_conf\n"
+        "logger_conf.setup_logging(component='srv', console_level=sys.argv[1], file_level=sys.argv[2])\n"
+        "logging.getLogger('pypsrp.client').info(\"Executing PowerShell script 'Get-VM -Id $Id'\")\n"
+        "logging.getLogger('pypsrp.powershell').info('Opening a new Runspace Pool on remote host')\n"
+        "logging.getLogger('pypsrp.powershell').debug('runspace debug detail')\n"
+        "logging.getLogger('pypsrp.wsman').warning('pypsrp warning kept')\n"
+        "logging.getLogger('pypsrp.client').error('pypsrp error kept')\n"
+        "logging.getLogger('pyVmomi').info('pyvmomi info dropped')\n"
+        "logging.getLogger('python.srv.plugins.hyperv.hyperv_backup').info('own event kept')\n"
+    )
+    DETAIL = ("Executing PowerShell script 'Get-VM -Id $Id'", "Opening a new Runspace Pool on remote host", "runspace debug detail")
+
+    def _run(self, console_level: str = "INFO", file_level: str = "INFO") -> dict[str, str]:
+        with tempfile.TemporaryDirectory() as log_dir:
+            proc = subprocess.run(
+                [sys.executable, "-c", self.SCRIPT, console_level, file_level],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env={**os.environ, "ALTASTOR_LOG_DIR": log_dir},
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return {"journal": proc.stdout, "server.log": Path(log_dir, "server.log").read_text(encoding="utf8")}
+
+    def _assert_detail(self, text: str, shown: bool) -> None:
+        for line in self.DETAIL:
+            (self.assertIn if shown else self.assertNotIn)(line, text)
+        self.assertNotIn("pyvmomi info dropped", text)
+        self.assertIn("pypsrp warning kept", text)
+        self.assertIn("pypsrp error kept", text)
+        self.assertIn("own event kept", text)
+
+    def test_the_winrm_library_reaches_the_journal_and_the_server_log_only_from_warning_up(self) -> None:
+        for where, text in self._run().items():
+            with self.subTest(where=where):
+                self._assert_detail(text, shown=False)
+
+    def test_script_bodies_and_runspace_messages_appear_where_logging_is_at_debug(self) -> None:
+        cases = {
+            ("DEBUG", "DEBUG"): {"journal": True, "server.log": True},
+            ("INFO", "DEBUG"): {"journal": False, "server.log": True},
+            ("DEBUG", "INFO"): {"journal": True, "server.log": False},
+        }
+        for (console_level, file_level), expected in cases.items():
+            for where, text in self._run(console_level, file_level).items():
+                with self.subTest(console=console_level, file=file_level, where=where):
+                    self._assert_detail(text, shown=expected[where])
+
+    def test_a_journal_at_warning_keeps_the_library_warnings_and_drops_info(self) -> None:
+        texts = self._run("WARNING", "INFO")
+
+        self.assertNotIn("own event kept", texts["journal"])
+        self.assertIn("pypsrp warning kept", texts["journal"])
+        self._assert_detail(texts["server.log"], shown=False)
+
+    def test_every_spelling_of_a_level_is_understood(self) -> None:
+        spellings = {"WARNING": "WARNING", "warning": "WARNING", "WARN": "WARNING", "warn": "WARNING", " info ": "INFO", "debug": "DEBUG"}
+        for given, expected in spellings.items():
+            with self.subTest(given=given):
+                self.assertEqual(logger_conf.normalize_log_level(given), expected)

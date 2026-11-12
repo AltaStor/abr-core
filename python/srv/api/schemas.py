@@ -347,6 +347,10 @@ class JobDTO(_LenientModel):
     synthetic_full_schedule: ScheduleDTO | DocObject = None
     active_full_next_run_at: str | None = None
     synthetic_full_next_run_at: str | None = None
+    verify_schedule: ScheduleDTO | DocObject = None
+    verify_whole_chain_every: int | None = None
+    verify_next_run_at: str | None = None
+    last_verify: DocObject = None
     compression_level: int | None = None
     on_quiesce_failure: str | None = None
     encryption: JobEncryptionDTO | DocObject = None
@@ -917,6 +921,16 @@ class UpdateRepositoryRequest(_LenientModel):
     create_bucket: LaxBool | None = Field(default=None, description=CREATE_BUCKET)
 
 
+VERIFY_SCHEDULE = (
+    "When the job's backups are verified, in the form of a full schedule; each run checks the newest restore point of "
+    "every chain the job wrote, and every verify_whole_chain_every-th run checks whole chains. A run waits while the "
+    "job backs up. null, none or omitted on create: no scheduled verify"
+)
+VERIFY_SCHEDULE_EDIT = "As on create; null or none removes it, omitted keeps it"
+VERIFY_STATE = "true or false switches the verify schedule on or off, keeping its settings; it needs a verify schedule"
+VERIFY_WHOLE_CHAIN_EVERY = "Every how many scheduled verify runs check whole chains instead of the newest restore point, 1 to 100; null or omitted on create: 4"
+
+
 class CreateJobRequest(_LenientModel):
     name: LaxStr | None = None
     vms: list[LaxStr] | LaxStr | None = Field(default=None, description=JOB_VMS)
@@ -927,7 +941,7 @@ class CreateJobRequest(_LenientModel):
     schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
     enabled: LaxBool | None = Field(default=None, description="Used only when no schedule is given; with a schedule its own enabled decides. null or omitted: true")
     retention_days: RawInt | None = None
-    retention_min_fulls: RawInt | None = Field(default=None, description="How many of the newest full backups of each VM, with their incrementals, retention keeps whatever their age; 0 to 100, null or omitted: 0")
+    retention_min_fulls: RawInt | None = Field(default=None, description="How many of the newest full backups of each VM, with their incrementals, retention keeps whatever their age; 0 to 100, 0 keeps none beyond retention_days; null or omitted: 2")
     gfs: Annotated[SkipValidation[GfsRequest] | None, _checked_booleans(GfsRequest)] = None
     active_full_days: list[Any] | LaxStr | None = Field(default=None, description=LEGACY_FULL_DAYS)
     active_full_days_csv: LaxStr | None = Field(default=None, description=LEGACY_FULL_DAYS)
@@ -937,6 +951,9 @@ class CreateJobRequest(_LenientModel):
     synthetic_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
     active_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE)
     synthetic_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE)
+    verify_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description=VERIFY_SCHEDULE)
+    verify_enabled: LaxBool | None = Field(default=None, description=VERIFY_STATE)
+    verify_whole_chain_every: RawInt | None = Field(default=None, description=VERIFY_WHOLE_CHAIN_EVERY)
     description: LaxStr | None = None
     task_parameters: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = None
     backup_options: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = Field(default=None, description="Older spelling of task_parameters, read only when task_parameters is absent")
@@ -956,6 +973,9 @@ class CreateCopyJobRequest(_LenientModel):
     enabled: LaxBool | None = Field(default=None, description="true or false switches the copy's schedule on or off; null or omitted keeps the copied schedule's state")
     retention_days: RawInt | None = Field(default=None, description="null or omitted: the source job's")
     retention_min_fulls: RawInt | None = Field(default=None, description="0 to 100; null or omitted: the source job's")
+    verify_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="As for a new job; omitted: the source job's")
+    verify_enabled: LaxBool | None = Field(default=None, description=VERIFY_STATE)
+    verify_whole_chain_every: RawInt | None = Field(default=None, description="1 to 100; null or omitted: the source job's")
     description: LaxStr | None = None
 
 
@@ -988,12 +1008,15 @@ class CreateBackupCopyJobRequest(_LenientModel):
     schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="Periodic copies only: when the copy runs")
     enabled: LaxBool | None = Field(default=None, description="Used only when no schedule is given; with a schedule its own enabled decides. null or omitted: true")
     retention_days: RawInt | None = Field(default=None, description="How long the copies are kept, independently of the sources; null or omitted: 14")
-    retention_min_fulls: RawInt | None = None
+    retention_min_fulls: RawInt | None = Field(default=None, description="How many of the newest full copies of each VM, with their incrementals, retention keeps whatever their age; 0 to 100, 0 keeps none beyond retention_days; null or omitted: 2")
     gfs: Annotated[SkipValidation[GfsRequest] | None, _checked_booleans(GfsRequest)] = None
     active_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="When a copy is made as a full backup read from the source")
     synthetic_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="When the copied chain is merged into a new full in the destination")
     active_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE)
     synthetic_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE)
+    verify_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description=VERIFY_SCHEDULE)
+    verify_enabled: LaxBool | None = Field(default=None, description=VERIFY_STATE)
+    verify_whole_chain_every: RawInt | None = Field(default=None, description=VERIFY_WHOLE_CHAIN_EVERY)
     description: LaxStr | None = None
     task_parameters: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = Field(default=None, description="Compression and encryption of the copies; encrypted sources need an encryption key here")
 
@@ -1044,6 +1067,9 @@ class UpdateJobRequest(_LenientModel):
     synthetic_full_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
     active_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE_EDIT)
     synthetic_full_enabled: LaxBool | None = Field(default=None, description=FULL_SCHEDULE_STATE_EDIT)
+    verify_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description=VERIFY_SCHEDULE_EDIT)
+    verify_enabled: LaxBool | None = Field(default=None, description=VERIFY_STATE)
+    verify_whole_chain_every: RawInt | None = Field(default=None, description="1 to 100; omitted keeps it")
     description: LaxStr | None = None
     task_parameters: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = Field(default=None, description="Merged into the stored ones: a key set to null goes back to its default, keys left out are kept")
     repo: LaxStr | None = Field(default=None, description=REPOSITORY_NAME)

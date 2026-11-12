@@ -801,13 +801,18 @@ class VCenterNode(Hypervisor):
         except Exception:
             return None
 
-    def create_backup_snapshot(self, vm_name: str, *, quiesce: bool = True) -> str:
+    @staticmethod
+    def new_backup_snapshot_name() -> str:
+        return f"FullBackup_{int(time.time())}"
+
+    def create_backup_snapshot(self, vm_name: str, *, quiesce: bool = True, snapshot_name: str | None = None) -> str:
         vm = self._get_vm(vm_name)
         if not vm:
             raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
 
+        snapshot_name = snapshot_name or self.new_backup_snapshot_name()
         try:
-            return self._create_snapshot(vm, vm_name, quiesce=quiesce)
+            return self._create_snapshot(vm, vm_name, snapshot_name, quiesce=quiesce)
         except RuntimeError as exc:
             if self._CBT_CORRUPTION_FAULT not in str(exc):
                 raise
@@ -819,7 +824,7 @@ class VCenterNode(Hypervisor):
             )
             self._reset_change_tracking(vm, vm_name)
             try:
-                return self._create_snapshot(vm, vm_name, quiesce=quiesce)
+                return self._create_snapshot(vm, vm_name, snapshot_name, quiesce=quiesce)
             except RuntimeError as retry_exc:
                 if self._CBT_CORRUPTION_FAULT not in str(retry_exc):
                     raise
@@ -831,8 +836,7 @@ class VCenterNode(Hypervisor):
                     f"backups can succeed again. Original error: {retry_exc}"
                 ) from retry_exc
 
-    def _create_snapshot(self, vm: Any, vm_name: str, *, quiesce: bool = True) -> str:
-        snapshot_name = f"FullBackup_{int(time.time())}"
+    def _create_snapshot(self, vm: Any, vm_name: str, snapshot_name: str, *, quiesce: bool = True) -> str:
         logger.info(
             "Creating %s snapshot '%s' for VM '%s'...",
             "quiesced" if quiesce else "non-quiesced",
@@ -876,6 +880,26 @@ class VCenterNode(Hypervisor):
             if time.monotonic() >= deadline:
                 return None
             time.sleep(1)
+
+    def wait_for_snapshot_creation(self, vm_name: str) -> None:
+        vm = self._get_vm(vm_name)
+        if not vm:
+            return
+        pending = (vim.TaskInfo.State.queued, vim.TaskInfo.State.running)
+        deadline = time.monotonic() + env_int("BACKUPSERVER_SNAPSHOT_CREATION_WAIT_SECONDS")
+        while True:
+            infos = [task.info for task in list(getattr(vm, "recentTask", None) or [])]
+            creating = [
+                info
+                for info in infos
+                if getattr(info, "descriptionId", "") == "VirtualMachine.createSnapshot" and info.state in pending
+            ]
+            if not creating:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"vCenter is still creating a snapshot of VM '{vm_name}'")
+            logger.info("Waiting for vCenter to finish creating a snapshot of VM '%s'.", vm_name)
+            time.sleep(2)
 
     def snapshot_consistency(self, vm_name: str, snapshot_name: str) -> dict[str, str | None]:
         vm = self._get_vm(vm_name)

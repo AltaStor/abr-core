@@ -152,6 +152,16 @@ COMPONENT_LOGGER_NAMES = {"srv": "python.srv", "cli": "python.cli"}
 COMPONENT_LOG_FILENAMES = {"srv": "server.log", "cli": "cli.log"}
 
 
+def normalize_log_level(level: str) -> str:
+    name = str(level).strip().upper()
+    return "WARNING" if name == "WARN" else name
+
+
+class WinrmDetailFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING or not (record.name == "pypsrp" or record.name.startswith("pypsrp."))
+
+
 def _build_logging_config(log_dir: str, component: str, file_level: str = "DEBUG"):
     component_logger_name = COMPONENT_LOGGER_NAMES.get(component, f"python.{component}")
     log_filename = COMPONENT_LOG_FILENAMES.get(component, f"{component}.log")
@@ -197,6 +207,11 @@ def _build_logging_config(log_dir: str, component: str, file_level: str = "DEBUG
                 "propagate": False,
             },
             "pyVmomi": {
+                "level": "WARNING",
+                "handlers": ["console", "file"],
+                "propagate": False,
+            },
+            "pypsrp": {
                 "level": "WARNING",
                 "handlers": ["console", "file"],
                 "propagate": False,
@@ -270,15 +285,20 @@ def setup_logging(
     console_level: str = "INFO",
     file_level: str = "DEBUG",
 ):
-    normalized_file_level = str(file_level).upper().replace("WARN", "WARNING")
+    normalized_file_level = normalize_log_level(file_level)
     notes: list[str] = []
     log_dir = _resolve_log_dir(component, notes=notes)
     config = _build_logging_config(log_dir, component, file_level=normalized_file_level)
     config["handlers"]["console"]["stream"] = f"ext://sys.{console_stream}"
-    config["handlers"]["console"]["level"] = (
-        str(console_level).upper().replace("WARN", "WARNING")
-    )
-    config["root"]["level"] = str(console_level).upper().replace("WARN", "WARNING")
+    config["handlers"]["console"]["level"] = normalize_log_level(console_level)
+    config["root"]["level"] = normalize_log_level(console_level)
+    debug_handlers = [name for name in ("console", "file") if config["handlers"][name]["level"] == "DEBUG"]
+    if debug_handlers:
+        config["loggers"]["pypsrp"]["level"] = "DEBUG"
+        config["filters"] = {"winrm_detail": {"()": WinrmDetailFilter}}
+        for name in ("console", "file"):
+            if name not in debug_handlers:
+                config["handlers"][name]["filters"] = ["winrm_detail"]
     logging.config.dictConfig(config)
 
     _enable_crash_reporting(log_dir, component)

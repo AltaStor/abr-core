@@ -256,6 +256,15 @@ class ReplicationJobSettingsTests(unittest.TestCase):
                 self.assertIn("do not apply to replication job", error.message)
         self.assertIn("apply to backup copy jobs only", self._refused(abr_v41.edit_job_record, job["id"], {"copy_mode": "immediate"}).message)
 
+    def test_a_verify_schedule_is_refused_on_a_replication_job(self) -> None:
+        job = self._create()
+        schedule = {"type": "daily", "time": "05:00"}
+        for payload in ({"verify_schedule": schedule}, {"verify_schedule": None}, {"verify_whole_chain_every": 2}):
+            with self.subTest(payload=payload):
+                error = self._refused(abr_v41.edit_job_record, job["id"], payload)
+                self.assertIn("applies to backup and backup copy jobs", error.message)
+        self.assertIn("do not apply to replication job", self._refused(self._create, name="rep-verify", verify_schedule=schedule).message)
+
     def test_replication_settings_are_refused_on_other_jobs(self) -> None:
         error = self._refused(abr_v41.edit_job_record, self.source["id"], {"replica_name": "x"})
         self.assertIn("apply to replication jobs only", error.message)

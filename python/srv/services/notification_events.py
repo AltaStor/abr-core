@@ -32,6 +32,13 @@ EVENTS: tuple[Event, ...] = (
         True,
     ),
     Event("job.succeeded", "Backup job succeeded", "A backup job's run finished and every VM was backed up without a warning.", False),
+    Event(
+        "backup.verify_failed",
+        "Backup verification failed",
+        "A backup verification - started by hand, by a job's verify schedule or by repo verify - found damaged data in "
+        "restore points, which are then marked corrupt, or could not check them.",
+        True,
+    ),
     Event("restore.failed", "Restore failed", "A VM restore failed.", True),
     Event("restore.succeeded", "Restore finished", "A VM restore finished.", False),
     Event(

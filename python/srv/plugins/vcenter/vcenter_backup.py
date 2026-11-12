@@ -347,10 +347,11 @@ def _take_backup_snapshot(
     task: dict[str, Any],
     vm_name: str,
     progress_callback: ProgressCallback,
+    planned_name: str,
 ) -> tuple[str, dict[str, str | None]]:
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     try:
-        snapshot_name = node.create_backup_snapshot(vm_name)
+        snapshot_name = node.create_backup_snapshot(vm_name, snapshot_name=planned_name)
     except QuiesceFailedError as exc:
         if str(parameters.get("on_quiesce_failure") or "fail") != "crash_consistent":
             raise VCenterBackupError(str(exc)) from exc
@@ -368,7 +369,7 @@ def _take_backup_snapshot(
             vm_name=vm_name,
             warning={"code": "quiesce_failed", "message": message, "vm_name": vm_name},
         )
-        snapshot_name = node.create_backup_snapshot(vm_name, quiesce=False)
+        snapshot_name = node.create_backup_snapshot(vm_name, quiesce=False, snapshot_name=planned_name)
         return snapshot_name, {"consistency": "crash_consistent", "consistency_reason": "quiesce_failed"}
     try:
         state = node.snapshot_consistency(vm_name, snapshot_name)
@@ -1929,8 +1930,17 @@ def run_vcenter_backup(
                 watch_since = node.server_time()
             except Exception:
                 logger.debug("Could not read the vCenter time at the start of backup %s", task.get("id"), exc_info=True)
-            snapshot_name, snapshot_consistency = _take_backup_snapshot(node, task, vm_name, progress_callback)
-            _record_backup_snapshot(progress_callback, vm_name, snapshot_name)
+            planned_snapshot = node.new_backup_snapshot_name()
+            _record_backup_snapshot(progress_callback, vm_name, planned_snapshot)
+            try:
+                snapshot_name, snapshot_consistency = _take_backup_snapshot(
+                    node, task, vm_name, progress_callback, planned_snapshot
+                )
+            except Exception:
+                _record_backup_snapshot(progress_callback, vm_name, None)
+                raise
+            if snapshot_name != planned_snapshot:
+                _record_backup_snapshot(progress_callback, vm_name, snapshot_name)
             backup_params = node.get_backup_parameters(vm_name, snapshot_name)
             vm_moref = str(backup_params.get("vm_moref") or "")
             watch_moref = vm_moref
