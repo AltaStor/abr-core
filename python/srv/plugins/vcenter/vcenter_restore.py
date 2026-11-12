@@ -139,6 +139,91 @@ def _restore_original_identity(
     return True
 
 
+def _note_after_swap(progress_callback: ProgressCallback, *args: Any, **extra: Any) -> None:
+    try:
+        _emit_progress(progress_callback, *args, **extra)
+    except TaskStopRequested:
+        pass
+
+
+def _read_original_placement(node: Any, vm_name: str) -> dict[str, Any]:
+    try:
+        return node.read_vm_placement(vm_name)
+    except Exception:
+        logger.warning(
+            "Could not read the VM folder, MAC addresses, notes, tags, custom attributes, permissions and alarms "
+            "of '%s' before replacing it; the restored VM goes without them.",
+            vm_name,
+            exc_info=True,
+        )
+        return {}
+
+
+def _kept_summary(applied: dict[str, Any]) -> str:
+    adapters = ", ".join(f"{item['label']} {item['mac']}" for item in applied.get("network_adapters") or [])
+    parts = [f"VM folder {applied.get('folder') or '(root)'}", f"MAC addresses ({adapters or 'none'})"]
+    if applied.get("notes"):
+        parts.append("notes")
+    for key, label in (("tags", "tags"), ("custom_attributes", "custom attributes"), ("permissions", "permissions"), ("alarms", "alarms")):
+        names = applied.get(key) or []
+        if names:
+            parts.append(f"{label} ({', '.join(names)})")
+    return ", ".join(parts)
+
+
+def _restore_original_placement(
+    node: Any,
+    progress_callback: ProgressCallback,
+    vm_name: str,
+    placement: dict[str, Any],
+    *,
+    vm_moref: str = "",
+) -> bool:
+    if not placement:
+        message = (
+            f"VM {vm_name} was restored, but could not be given back its original VM folder, MAC addresses, notes, "
+            "tags, custom attributes, permissions and alarms: they could not be read from the VM it replaced"
+        )
+        _note_after_swap(
+            progress_callback,
+            "finalize",
+            88,
+            message,
+            worker_mode="vcenter-abr-vmdk-tool",
+            warning={"code": "placement_not_restored", "message": message, "vm_name": vm_name},
+        )
+        return False
+    try:
+        applied = node.apply_vm_placement(vm_name, placement, vm_moref=vm_moref or None)
+    except Exception as exc:
+        applied = {"failed": {"VM folder, MAC addresses, notes, tags, custom attributes, permissions and alarms": str(exc).rstrip(". ") or type(exc).__name__}}
+        logger.warning("Could not give VM '%s' back what the VM it replaced had", vm_name, exc_info=True)
+    failed = applied.get("failed") or {}
+    if "network_adapters" in applied:
+        _note_after_swap(
+            progress_callback,
+            "finalize",
+            88,
+            f"VM {vm_name} kept its {_kept_summary(applied)}",
+            worker_mode="vcenter-abr-vmdk-tool",
+        )
+    if failed:
+        message = f"VM {vm_name} was restored, but could not be given back its original " + "; ".join(
+            f"{part}: {reason}" for part, reason in failed.items()
+        )
+        logger.warning("%s", message)
+        _note_after_swap(
+            progress_callback,
+            "finalize",
+            88,
+            message,
+            worker_mode="vcenter-abr-vmdk-tool",
+            warning={"code": "placement_not_restored", "message": message, "vm_name": vm_name, "parts": sorted(failed)},
+        )
+        return False
+    return True
+
+
 def _build_staging_vm_name(target_vm_name: str, task_id: str) -> str:
     return _name_with_suffix(
         target_vm_name, f"-restoring-{task_id[:8]}", VSPHERE_VM_NAME_LIMIT
@@ -973,6 +1058,8 @@ def run_vcenter_restore(
             original_destroyed = False
             original_identity: dict[str, str] = {}
             identity_preserved = False
+            original_placement: dict[str, Any] = {}
+            placement_preserved = False
             replica_marker = str(parameters.get("replica_marker") or "")
             created_vm: dict[str, Any] = node.create_vm_shell(
                 vm_name=create_vm_name,
@@ -1256,6 +1343,7 @@ def run_vcenter_restore(
                         target_vm_name,
                     )
                     original_identity = _read_original_identity(node, target_vm_name)
+                    original_placement = _read_original_placement(node, target_vm_name)
                     node.power_off_vm(target_vm_name)
                     node.destroy_vm(target_vm_name)
                     original_destroyed = True  # point of no return: the original is gone
@@ -1264,6 +1352,13 @@ def run_vcenter_restore(
                         node,
                         target_vm_name,
                         original_identity,
+                        vm_moref=str(created_vm.get("vm_moref") or ""),
+                    )
+                    placement_preserved = _restore_original_placement(
+                        node,
+                        progress_callback,
+                        target_vm_name,
+                        original_placement,
                         vm_moref=str(created_vm.get("vm_moref") or ""),
                     )
                     try:
@@ -1353,6 +1448,8 @@ def run_vcenter_restore(
             "restore_mode": restore_mode,
             "identity_preserved": identity_preserved,
             "original_identity": original_identity or None,
+            "placement_preserved": placement_preserved if is_in_place else None,
+            "original_placement": original_placement or None,
             "source_vm_name": source_vm_name,
             "target_vm_name": target_vm_name,
             "target_host_name": target_host_name,

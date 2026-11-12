@@ -92,6 +92,11 @@ class FakeVCenterNode:
     original_identity: dict = {"uuid": "42200000-1111-2222-3333-444455556666", "instance_uuid": "50200000-1111-2222-3333-444455556666"}
     identity_reads: list = []
     applied_identities: list = []
+    placement_reads: list = []
+    applied_placements: list = []
+    original_placement: dict = {}
+    raise_on_read_placement: Exception | None = None
+    raise_on_apply_placement: Exception | None = None
     changed_area_queries: list[dict[str, object]] = []
     service_type: str = "VirtualCenter"
     vm_firmware: str | None = "bios"
@@ -412,6 +417,18 @@ class FakeVCenterNode:
         FakeVCenterNode.identity_reads.append(vm_name)
         return dict(FakeVCenterNode.original_identity)
 
+    def read_vm_placement(self, vm_name: str, vm_moref: str | None = None) -> dict[str, object]:
+        if FakeVCenterNode.raise_on_read_placement is not None:
+            raise FakeVCenterNode.raise_on_read_placement
+        FakeVCenterNode.placement_reads.append(vm_name)
+        return dict(FakeVCenterNode.original_placement)
+
+    def apply_vm_placement(self, vm_name: str, placement: dict, vm_moref: str | None = None) -> dict[str, object]:
+        if FakeVCenterNode.raise_on_apply_placement is not None:
+            raise FakeVCenterNode.raise_on_apply_placement
+        FakeVCenterNode.applied_placements.append({"vm_name": vm_name, "placement": placement, "vm_moref": vm_moref})
+        return {"network_adapters": placement.get("network_adapters") or [], "folder": (placement.get("folder") or {}).get("path")}
+
     def set_vm_identity(
         self,
         vm_name: str,
@@ -483,6 +500,14 @@ class TaskExecutorTests(unittest.TestCase):
         FakeVCenterNode.raise_on_set_identity = None
         FakeVCenterNode.identity_reads.clear()
         FakeVCenterNode.applied_identities.clear()
+        FakeVCenterNode.placement_reads.clear()
+        FakeVCenterNode.applied_placements.clear()
+        FakeVCenterNode.raise_on_read_placement = None
+        FakeVCenterNode.raise_on_apply_placement = None
+        FakeVCenterNode.original_placement = {
+            "folder": {"moref": "group-v42", "path": "/Datacenter/vm/Apps"},
+            "network_adapters": [{"label": "Network adapter 1", "mac": "00:50:56:b8:ba:eb", "address_type": "assigned"}],
+        }
         FakeVCenterNode.original_identity = {
             "uuid": "42200000-1111-2222-3333-444455556666",
             "instance_uuid": "50200000-1111-2222-3333-444455556666",
@@ -5165,6 +5190,142 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertFalse(result["result"]["identity_preserved"])
         self.assertEqual(FakeVCenterNode.applied_identities, [])
         self.assertEqual(FakeVCenterNode.renamed_vms[0]["to"], "demo-vm")
+
+    def _run_in_place_restore(self, task_id: str, progress=None) -> tuple[dict, list[dict]]:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {"num_cpu": 2, "memory_mb": 4096},
+            }
+        }
+        updates: list[dict] = []
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (pathlib.Path(temp_dir) / "01-demo-vm.vmdk").write_text("fake-vmdk", encoding="utf-8")
+            task = self._in_place_restore_task(temp_dir, point_id=f"point-{task_id}", task_id=task_id)
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch(
+                    "python.srv.plugins.vcenter.vcenter_restore.run_capped",
+                    side_effect=lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok"),
+                ),
+            ):
+                result = run_task(task, progress_callback=progress or updates.append)
+        return result, updates
+
+    def test_an_in_place_restore_gives_the_replacement_the_original_folder_and_mac_addresses(self) -> None:
+        result, updates = self._run_in_place_restore("task-in-place-placement")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["result"]["placement_preserved"])
+        self.assertEqual(FakeVCenterNode.placement_reads, ["demo-vm"])
+        self.assertEqual(
+            FakeVCenterNode.applied_placements,
+            [{"vm_name": "demo-vm", "placement": FakeVCenterNode.original_placement, "vm_moref": "vm-restore-001"}],
+        )
+        self.assertIn(
+            "VM demo-vm kept its VM folder /Datacenter/vm/Apps, MAC addresses (Network adapter 1 00:50:56:b8:ba:eb)",
+            [update.get("message") for update in updates],
+        )
+
+    def test_the_folder_and_mac_addresses_are_read_before_the_original_is_destroyed_and_applied_after_the_rename(self) -> None:
+        order: list[str] = []
+        original_read = FakeVCenterNode.read_vm_placement
+        original_apply = FakeVCenterNode.apply_vm_placement
+        original_destroy = FakeVCenterNode.destroy_vm
+        original_rename = FakeVCenterNode.rename_vm
+
+        def track(name, real):
+            def tracked(self, *args, **kwargs):
+                order.append(name)
+                return real(self, *args, **kwargs)
+
+            return tracked
+
+        with (
+            patch.object(FakeVCenterNode, "read_vm_placement", track("read", original_read)),
+            patch.object(FakeVCenterNode, "apply_vm_placement", track("apply", original_apply)),
+            patch.object(FakeVCenterNode, "destroy_vm", track("destroy", original_destroy)),
+            patch.object(FakeVCenterNode, "rename_vm", track("rename", original_rename)),
+        ):
+            self._run_in_place_restore("task-in-place-placement-order")
+
+        self.assertEqual(order, ["read", "destroy", "rename", "apply"])
+
+    def test_an_in_place_restore_survives_a_folder_or_mac_address_that_cannot_be_applied(self) -> None:
+        FakeVCenterNode.raise_on_apply_placement = RuntimeError("Permission to perform this operation was denied.")
+
+        result, updates = self._run_in_place_restore("task-in-place-placement-fail")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["result"]["placement_preserved"])
+        self.assertEqual(FakeVCenterNode.renamed_vms[0]["to"], "demo-vm")
+        warnings = [update["warning"] for update in updates if (update.get("warning") or {}).get("code") == "placement_not_restored"]
+        self.assertEqual(
+            warnings[0]["message"],
+            "VM demo-vm was restored, but could not be given back its original VM folder, MAC addresses, notes, tags, "
+            "custom attributes, permissions and alarms: Permission to perform this operation was denied",
+        )
+
+    def test_a_part_that_could_not_be_given_back_is_named_and_the_rest_is_reported_kept(self) -> None:
+        def partial(self, vm_name, placement, vm_moref=None):
+            return {
+                "network_adapters": placement["network_adapters"],
+                "folder": "/Datacenter/vm/Apps",
+                "notes": True,
+                "tags": ["prod"],
+                "failed": {"permissions": "Permission to perform this operation was denied"},
+            }
+
+        with patch.object(FakeVCenterNode, "apply_vm_placement", partial):
+            result, updates = self._run_in_place_restore("task-in-place-placement-partial")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["result"]["placement_preserved"])
+        messages = [update.get("message") for update in updates]
+        self.assertIn(
+            "VM demo-vm kept its VM folder /Datacenter/vm/Apps, MAC addresses (Network adapter 1 00:50:56:b8:ba:eb), notes, tags (prod)",
+            messages,
+        )
+        [warning] = [update["warning"] for update in updates if (update.get("warning") or {}).get("code") == "placement_not_restored"]
+        self.assertEqual(
+            warning["message"],
+            "VM demo-vm was restored, but could not be given back its original permissions: Permission to perform this operation was denied",
+        )
+        self.assertEqual(warning["parts"], ["permissions"])
+
+    def test_an_in_place_restore_survives_a_folder_and_mac_addresses_that_cannot_be_read(self) -> None:
+        FakeVCenterNode.raise_on_read_placement = RuntimeError("VM is orphaned; config unavailable")
+
+        result, updates = self._run_in_place_restore("task-in-place-placement-read")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["result"]["placement_preserved"])
+        self.assertEqual(FakeVCenterNode.applied_placements, [])
+        codes = [(update.get("warning") or {}).get("code") for update in updates]
+        self.assertIn("placement_not_restored", codes)
+
+    def test_a_stop_requested_after_the_original_is_gone_does_not_break_the_finish(self) -> None:
+        def stop_after_the_swap(update: dict) -> None:
+            if "kept its VM folder" in str(update.get("message")):
+                raise TaskStopRequested("Session stop requested")
+
+        result, _updates = self._run_in_place_restore("task-in-place-placement-stop", progress=stop_after_the_swap)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["result"]["placement_preserved"])
 
     def test_a_restore_to_a_new_name_leaves_identity_alone(self) -> None:
         HYPERVISORS["hv-vc"] = {
