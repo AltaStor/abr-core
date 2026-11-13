@@ -12,6 +12,8 @@ from ..exit_codes import GENERAL_ERROR, INVALID_STATE, VALIDATION_FAILED
 from ..parsing.common_arguments import add_name_or_id_selector
 from ..parsing.secret_arguments import ENCRYPTION_KEY_ENV_VAR, add_secret_argument
 from ..parsing.validators import (
+    day_of_month_type,
+    duration_type,
     parse_compression_level,
     parse_day_of_month,
     parse_duration,
@@ -566,13 +568,13 @@ class JobCommands:
                 parser.add_argument(
                     f"--{prefix}-day-of-month",
                     dest=f"{dest}_day_of_month",
-                    type=parse_day_of_month,
+                    type=day_of_month_type(f"--{prefix}-day-of-month"),
                     help=f"{label} monthly schedule day from 1 to 31",
                 )
                 parser.add_argument(
                     f"--{prefix}-every",
                     dest=f"{dest}_every",
-                    type=parse_duration,
+                    type=duration_type(f"--{prefix}-every"),
                     help=f"{label} periodic interval like 15m, 1h, 6h, or 1d",
                 )
                 full_state = parser.add_mutually_exclusive_group()

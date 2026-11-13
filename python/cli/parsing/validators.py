@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 WEEKDAY_NAME_MAP = {
@@ -96,14 +97,21 @@ def parse_positive_int(value: str) -> int:
     return parsed
 
 
-def parse_day_of_month(value: str) -> int:
+def parse_day_of_month(value: str, option: str = "--day-of-month") -> int:
     try:
         parsed = int(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("`--day-of-month` must be an integer from 1 to 31") from exc
+        raise argparse.ArgumentTypeError(f"`{option}` must be an integer from 1 to 31") from exc
     if parsed < 1 or parsed > 31:
-        raise argparse.ArgumentTypeError("`--day-of-month` must be an integer from 1 to 31")
+        raise argparse.ArgumentTypeError(f"`{option}` must be an integer from 1 to 31")
     return parsed
+
+
+def day_of_month_type(option: str) -> Callable[[str], int]:
+    def parse(value: str) -> int:
+        return parse_day_of_month(value, option)
+
+    return parse
 
 
 def parse_compression_level(value: str) -> int:
@@ -116,8 +124,15 @@ def parse_compression_level(value: str) -> int:
     return parsed
 
 
-def parse_duration(value: str) -> str:
+def parse_duration(value: str, option: str = "--every") -> str:
     normalized = str(value or "").strip().lower()
     if not DURATION_PATTERN.fullmatch(normalized):
-        raise argparse.ArgumentTypeError("`--every` must use a duration like 15m, 1h, 6h, or 1d")
+        raise argparse.ArgumentTypeError(f"`{option}` must use a duration like 15m, 1h, 6h, or 1d")
     return normalized
+
+
+def duration_type(option: str) -> Callable[[str], str]:
+    def parse(value: str) -> str:
+        return parse_duration(value, option)
+
+    return parse
