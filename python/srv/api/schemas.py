@@ -81,6 +81,7 @@ class JobEncryptionDTO(_LenientModel):
 class TaskParametersDTO(_LenientModel):
     compression_level: DocInt = None
     on_quiesce_failure: DocStr = None
+    vsphere_transport: DocStr = Field(default=None, description="vSphere backup jobs: vddk or soap overrides the inventory's transport; inventory (or omitted) uses it")
     encryption_enabled: DocBool = None
     encryption_key: DocStr = None
     encryption_key_id: DocStr = None
@@ -324,6 +325,8 @@ class JobDTO(_LenientModel):
     id: str
     name: str
     job_type: str
+    transport: DocStr = Field(default=None, description="vSphere jobs: vddk, soap, or inventory when the job uses its inventory's transport")
+    effective_transport: DocStr = Field(default=None, description="vSphere jobs: the transport its sessions use, vddk or soap")
     description: str | None = None
     inventory: _Ref
     vm_ids: list[str] = []
@@ -399,6 +402,7 @@ class InventoryDTO(_LenientModel):
     name: str
     type: str
     status: str
+    transport: DocStr = Field(default=None, description="vSphere only: vddk or soap, how disks are read and written")
     created_at: str
     updated_at: str
     last_scan_at: str | None = None
@@ -630,6 +634,7 @@ class SessionDTO(_LenientModel):
     id: str
     state: str
     type: str | None = None
+    transport: DocStr = Field(default=None, description="vSphere sessions: vddk or soap, the transport the session reads or writes disks over; it keeps the one it started with")
     job: _Ref | DocObject = None
     vm_id: str | None = None
     started_at: str | None = None
@@ -860,6 +865,7 @@ class CreateInventoryRequest(_LenientModel):
     token: LaxStr | None = None
     insecure: LaxBool | None = Field(default=None, description="true accepts the server's certificate without checking it; false, null or omitted checks it")
     description: LaxStr | None = None
+    transport: LaxStr | None = Field(default=None, description="vSphere only: how disks are read and written, vddk (the VMware VDDK, the default) or soap (the vSphere SOAP API through abr-vmdk-tool)")
 
 
 class UpdateInventoryRequest(_LenientModel):
@@ -872,6 +878,7 @@ class UpdateInventoryRequest(_LenientModel):
     token: LaxStr | None = None
     insecure: LaxBool | None = Field(default=None, description=f"{INSECURE}; {OMITTED_KEEPS}")
     description: LaxStr | None = None
+    transport: LaxStr | None = Field(default=None, description=f"vSphere only: vddk or soap; {OMITTED_KEEPS}")
 
 
 class CreateRepositoryRequest(_LenientModel):

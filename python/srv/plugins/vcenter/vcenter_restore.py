@@ -13,6 +13,7 @@ from typing import Any, Callable
 from ...core.subprocess_util import ProcessCancelled, run_capped
 from ...core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES, catalog_records
 from ...core.task_executor import TaskStopRequested, cancel_requested
+from .disk_transport import SOAP, TRANSPORT_NAMES, VDDK, transport_problem
 from ...core.storage_tool import (
     build_s3_location,
     chain_source_names,
@@ -134,6 +135,91 @@ def _restore_original_identity(
             "identity will not recognise this VM until it is corrected.",
             vm_name,
             exc_info=True,
+        )
+        return False
+    return True
+
+
+def _note_after_swap(progress_callback: ProgressCallback, *args: Any, **extra: Any) -> None:
+    try:
+        _emit_progress(progress_callback, *args, **extra)
+    except TaskStopRequested:
+        pass
+
+
+def _read_original_placement(node: Any, vm_name: str) -> dict[str, Any]:
+    try:
+        return node.read_vm_placement(vm_name)
+    except Exception:
+        logger.warning(
+            "Could not read the VM folder, MAC addresses, notes, tags, custom attributes, permissions and alarms "
+            "of '%s' before replacing it; the restored VM goes without them.",
+            vm_name,
+            exc_info=True,
+        )
+        return {}
+
+
+def _kept_summary(applied: dict[str, Any]) -> str:
+    adapters = ", ".join(f"{item['label']} {item['mac']}" for item in applied.get("network_adapters") or [])
+    parts = [f"VM folder {applied.get('folder') or '(root)'}", f"MAC addresses ({adapters or 'none'})"]
+    if applied.get("notes"):
+        parts.append("notes")
+    for key, label in (("tags", "tags"), ("custom_attributes", "custom attributes"), ("permissions", "permissions"), ("alarms", "alarms")):
+        names = applied.get(key) or []
+        if names:
+            parts.append(f"{label} ({', '.join(names)})")
+    return ", ".join(parts)
+
+
+def _restore_original_placement(
+    node: Any,
+    progress_callback: ProgressCallback,
+    vm_name: str,
+    placement: dict[str, Any],
+    *,
+    vm_moref: str = "",
+) -> bool:
+    if not placement:
+        message = (
+            f"VM {vm_name} was restored, but could not be given back its original VM folder, MAC addresses, notes, "
+            "tags, custom attributes, permissions and alarms: they could not be read from the VM it replaced"
+        )
+        _note_after_swap(
+            progress_callback,
+            "finalize",
+            88,
+            message,
+            worker_mode="vcenter-abr-vmdk-tool",
+            warning={"code": "placement_not_restored", "message": message, "vm_name": vm_name},
+        )
+        return False
+    try:
+        applied = node.apply_vm_placement(vm_name, placement, vm_moref=vm_moref or None)
+    except Exception as exc:
+        applied = {"failed": {"VM folder, MAC addresses, notes, tags, custom attributes, permissions and alarms": str(exc).rstrip(". ") or type(exc).__name__}}
+        logger.warning("Could not give VM '%s' back what the VM it replaced had", vm_name, exc_info=True)
+    failed = applied.get("failed") or {}
+    if "network_adapters" in applied:
+        _note_after_swap(
+            progress_callback,
+            "finalize",
+            88,
+            f"VM {vm_name} kept its {_kept_summary(applied)}",
+            worker_mode="vcenter-abr-vmdk-tool",
+        )
+    if failed:
+        message = f"VM {vm_name} was restored, but could not be given back its original " + "; ".join(
+            f"{part}: {reason}" for part, reason in failed.items()
+        )
+        logger.warning("%s", message)
+        _note_after_swap(
+            progress_callback,
+            "finalize",
+            88,
+            message,
+            worker_mode="vcenter-abr-vmdk-tool",
+            warning={"code": "placement_not_restored", "message": message, "vm_name": vm_name, "parts": sorted(failed)},
         )
         return False
     return True
@@ -528,6 +614,8 @@ def _build_abr_restore_command(
     encryption_key: str = "",
     force: bool = False,
     source_names: list[str] | None = None,
+    api: str | None = None,
+    cluster: str | None = None,
 ) -> list[str]:
     command = [
         str(tool_path),
@@ -549,9 +637,21 @@ def _build_abr_restore_command(
             thumbprint=thumbprint,
             vm_spec=vm_moref,
             transport_mode=transport_mode,
+            api=api,
         )
     )
+    if api == SOAP and cluster:
+        command.extend(["--cluster", cluster])
     return command
+
+
+def _soap_chain_refusal(index: int, layers: list[dict[str, Any]]) -> str:
+    return (
+        f"Disk {index} cannot be restored over the vSphere SOAP API: SOAP writes a whole disk in one run of its "
+        f"chain, and the {len(layers)} backups of this disk cannot be handed to abr-vmdk-tool as one chain "
+        "(they are in different places, or this abr-vmdk-tool has no --source-names). Use the VDDK transport "
+        "for this restore"
+    )
 
 
 def _restore_failure(target: Any, source: Any, completed: Any) -> str:
@@ -805,6 +905,19 @@ def run_vcenter_restore(
     else:
         requested_transport_mode = str(transport_mode_value).strip()
         transport_mode = None if requested_transport_mode.lower() in {"auto", "none", "omit"} else requested_transport_mode
+    vsphere_transport = str(parameters.get("vsphere_transport") or VDDK)
+    over_soap = vsphere_transport == SOAP
+    transport_issue = transport_problem(vsphere_transport, tool_path)
+    if transport_issue:
+        raise VCenterBackupError(transport_issue)
+    _emit_progress(
+        progress_callback,
+        "prepare",
+        5,
+        f"Disks are written over {TRANSPORT_NAMES.get(vsphere_transport, vsphere_transport)}",
+        worker_mode="vcenter-abr-vmdk-tool",
+        vsphere_transport=vsphere_transport,
+    )
 
     resource_type = str(resource.get("resource_type") or "")
     if resource_type == "virtual_machine":
@@ -966,13 +1079,15 @@ def run_vcenter_restore(
                     provisioning=disk_provisioning,
                     disk_targets=disk_targets,
                 )
-                if is_virtual_center
+                if is_virtual_center or over_soap
                 else None
             )
             disk_placements = _disk_placements(disk_entries)
             original_destroyed = False
             original_identity: dict[str, str] = {}
             identity_preserved = False
+            original_placement: dict[str, Any] = {}
+            placement_preserved = False
             replica_marker = str(parameters.get("replica_marker") or "")
             created_vm: dict[str, Any] = node.create_vm_shell(
                 vm_name=create_vm_name,
@@ -981,7 +1096,10 @@ def run_vcenter_restore(
                 config_metadata={**vm_config, "annotation": replica_marker} if replica_marker else vm_config,
                 disk_layout=disk_layout,
                 disk_placements=disk_placements,
+                **({"create_disks": False} if over_soap else {}),
             )
+            soap_cluster = node.compute_resource_name(target_host_name) if over_soap else None
+            thick_kept_thin: list[int] = []
             if replica_marker:
                 _emit_progress(
                     progress_callback,
@@ -1066,7 +1184,7 @@ def run_vcenter_restore(
                     disk_datastore_name = _disk_target_datastore_name(disk, datastore_map, target_datastore_name, disk_targets, index)
                     restore_target = (
                         str(created_disk_paths[index - 1])
-                        if is_virtual_center and len(created_disk_paths) >= index
+                        if (is_virtual_center or over_soap) and len(created_disk_paths) >= index
                         else _build_new_vm_disk_target_path(
                             disk_datastore_name,
                             create_vm_name,
@@ -1086,7 +1204,9 @@ def run_vcenter_restore(
                     resolved_disk_type_code = provisioning["code"]
 
                     attachment: dict[str, Any] | None = None
-                    if not is_virtual_center:
+                    if over_soap and not provisioning["thin_provisioned"]:
+                        thick_kept_thin.append(index)
+                    if not is_virtual_center and not over_soap:
                         node.create_managed_disk(
                             datastore_name=disk_datastore_name,
                             disk_path=restore_target,
@@ -1117,6 +1237,8 @@ def run_vcenter_restore(
                     )
                     if abr_layers:
                         restore_runs = _abr_restore_runs(abr_layers, tool_path=tool_path, repository=repository)
+                        if over_soap and len(restore_runs) > 1:
+                            raise VCenterBackupError(_soap_chain_refusal(index, abr_layers))
                         layer_count = len(restore_runs)
                         for layer_index, layer in enumerate(restore_runs, start=1):
                             # A disk's .abr chain restores as several sequential
@@ -1162,6 +1284,8 @@ def run_vcenter_restore(
                                 encryption_key=encryption_key,
                                 force=str(layer.get("store_mode") or "").strip().lower() != "full",
                                 source_names=layer.get("source_names"),
+                                api=vsphere_transport,
+                                cluster=soap_cluster,
                             )
                             logger.info(
                                 ".abr restore command preview for task %s disk %d/%d layer %d/%d: %s",
@@ -1202,6 +1326,17 @@ def run_vcenter_restore(
                         raise VCenterBackupError(
                             f"No .abr restore layers resolved for disk index {index}"
                         )
+                    if over_soap:
+                        attachment = node.adopt_restored_disk(
+                            create_vm_name, created_vm["planned_disks"][index - 1], vm_moref=str(created_vm.get("vm_moref") or "")
+                        )
+                        _emit_progress(
+                            progress_callback,
+                            "transfer",
+                            min(20 + int(index * 55 / max(len(disk_entries), 1)), 80),
+                            f"Disk {index}/{len(disk_entries)} attached to {attachment['controller']} unit {attachment['unit']}",
+                            worker_mode="vcenter-abr-vmdk-tool",
+                        )
                     disk_duration = time.time() - disk_start_time
                     logger.info("Successfully restored disk %d in %.2f seconds.", index, disk_duration)
                     total_read_bytes = base_read_bytes + disk_read_bytes
@@ -1227,6 +1362,20 @@ def run_vcenter_restore(
                         }
                     )
 
+                if thick_kept_thin:
+                    message = (
+                        f"Over the vSphere SOAP API restored disks are thin: disk(s) {', '.join(str(i) for i in thick_kept_thin)} "
+                        "asked for thick provisioning and stay thin"
+                    )
+                    logger.warning("%s (task %s)", message, task.get("id"))
+                    _emit_progress(
+                        progress_callback,
+                        "transfer",
+                        80,
+                        message,
+                        worker_mode="vcenter-abr-vmdk-tool",
+                        warning={"code": "soap_thin_disks", "message": message, "disks": thick_kept_thin},
+                    )
                 source_boot_order = vm_config.get("boot_order")
                 if isinstance(source_boot_order, list) and source_boot_order:
                     boot_order_report = node.apply_boot_order(
@@ -1256,6 +1405,7 @@ def run_vcenter_restore(
                         target_vm_name,
                     )
                     original_identity = _read_original_identity(node, target_vm_name)
+                    original_placement = _read_original_placement(node, target_vm_name)
                     node.power_off_vm(target_vm_name)
                     node.destroy_vm(target_vm_name)
                     original_destroyed = True  # point of no return: the original is gone
@@ -1264,6 +1414,13 @@ def run_vcenter_restore(
                         node,
                         target_vm_name,
                         original_identity,
+                        vm_moref=str(created_vm.get("vm_moref") or ""),
+                    )
+                    placement_preserved = _restore_original_placement(
+                        node,
+                        progress_callback,
+                        target_vm_name,
+                        original_placement,
                         vm_moref=str(created_vm.get("vm_moref") or ""),
                     )
                     try:
@@ -1353,6 +1510,8 @@ def run_vcenter_restore(
             "restore_mode": restore_mode,
             "identity_preserved": identity_preserved,
             "original_identity": original_identity or None,
+            "placement_preserved": placement_preserved if is_in_place else None,
+            "original_placement": original_placement or None,
             "source_vm_name": source_vm_name,
             "target_vm_name": target_vm_name,
             "target_host_name": target_host_name,
@@ -1374,7 +1533,8 @@ def run_vcenter_restore(
             "network_map": network_map if isinstance(network_map, dict) else None,
             "network_adapters": restored_network_adapters,
             "boot_order": boot_order_report,
-            "transport_mode": transport_mode,
+            "transport_mode": transport_mode if vsphere_transport != SOAP else None,
+            "vsphere_transport": vsphere_transport,
             "service_type": service_type,
             "power_on": bool(parameters.get("power_on")),
             "power_state": power_state,
@@ -1478,20 +1638,31 @@ def run_vcenter_restore(
 
         restore_target_datastore_name, _, _ = _parse_datastore_path(restored_datastore_path)
         capacity_gb = _disk_capacity_gb(disk_type_source)
-        node.create_managed_disk(
-            datastore_name=restore_target_datastore_name,
-            disk_path=restored_datastore_path,
-            capacity_gb=capacity_gb,
-            disk_type_code=resolved_disk_type_code,
-            eager_zeroed=disk_provisioning["eager_zeroed"],
-        )
+        soap_cluster = None
+        if over_soap:
+            if attach_to_vm and str(getattr(vm.runtime, "powerState", "")) != "poweredOff":
+                raise VCenterBackupError(
+                    f"VM {vm_name} is running: over the vSphere SOAP API a disk is restored into a powered-off VM only. "
+                    "Power it off, restore the disk unattached, or use the VDDK transport"
+                )
+            soap_cluster = node.compute_resource_name(str(getattr(vm.runtime.host, "name", "") or ""))
+        else:
+            node.create_managed_disk(
+                datastore_name=restore_target_datastore_name,
+                disk_path=restored_datastore_path,
+                capacity_gb=capacity_gb,
+                disk_type_code=resolved_disk_type_code,
+                eager_zeroed=disk_provisioning["eager_zeroed"],
+            )
 
         try:
             attachment: dict[str, Any] | None = None
             # The VM spec stays set even for a detached restore: abr-vmdk-tool
             # needs --vm to open a VMDK through a host.
             restore_vm_spec = _format_vm_spec(vm_moref, service_type)
-            if attach_to_vm:
+            if over_soap and not attach_to_vm:
+                restore_vm_spec = None
+            if attach_to_vm and not over_soap:
                 attachment = node.attach_existing_disk(
                     vm_name,
                     restored_datastore_path,
@@ -1544,6 +1715,8 @@ def run_vcenter_restore(
                 # whole band, which snaps the bar back to 30% each time a layer
                 # finishes and the next one starts.
                 restore_runs = _abr_restore_runs(abr_layers, tool_path=tool_path, repository=repository)
+                if over_soap and len(restore_runs) > 1:
+                    raise VCenterBackupError(_soap_chain_refusal(1, abr_layers))
                 layer_count = len(restore_runs)
                 for layer_index, layer in enumerate(restore_runs, start=1):
                     layer_base = 30 + int((layer_index - 1) * 50 / layer_count)
@@ -1570,6 +1743,8 @@ def run_vcenter_restore(
                         encryption_key=encryption_key,
                         force=str(layer.get("store_mode") or "").strip().lower() != "full",
                         source_names=layer.get("source_names"),
+                        api=vsphere_transport,
+                        cluster=soap_cluster,
                     )
                     logger.info(
                         ".abr disk restore command preview for task %s layer %d/%d: %s",
@@ -1610,6 +1785,21 @@ def run_vcenter_restore(
                 )
             disk_duration = time.time() - disk_start_time
             logger.info("Disk cloning to %s completed in %.2f seconds.", restored_datastore_path, disk_duration)
+            if over_soap and attach_to_vm:
+                node.detach_disk(vm_name, restored_datastore_path)
+                node.set_disk_uuid(restored_datastore_path, (manifest_disk_entry or {}).get("uuid"), vm_name=vm_name)
+                attachment = node.attach_existing_disk(vm_name, restored_datastore_path, thin_provisioned=True)
+            if over_soap and not disk_provisioning["thin_provisioned"]:
+                message = "Over the vSphere SOAP API restored disks are thin: this disk asked for thick provisioning and stays thin"
+                logger.warning("%s (task %s)", message, task.get("id"))
+                _emit_progress(
+                    progress_callback,
+                    "attach",
+                    80,
+                    message,
+                    worker_mode="vcenter-abr-vmdk-tool",
+                    warning={"code": "soap_thin_disks", "message": message, "disks": [1]},
+                )
 
             if attach_to_vm:
                 logger.info("Attached restored disk %s to VM %s before clone", restored_datastore_path, vm_name)
@@ -1668,7 +1858,8 @@ def run_vcenter_restore(
                 disk_provisioning["eager_zeroed"],
             ),
             "disk_type": requested_disk_type,
-            "transport_mode": transport_mode,
+            "transport_mode": transport_mode if vsphere_transport != SOAP else None,
+            "vsphere_transport": vsphere_transport,
             "service_type": service_type,
             "processed_bytes": read_bytes,
             "transferred_bytes": sent_bytes,

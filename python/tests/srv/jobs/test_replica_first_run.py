@@ -232,6 +232,7 @@ class FirstRunTests(unittest.TestCase):
             ("python.srv.services.internal.replication.replica_config.point_config", lambda _point: copy.deepcopy(self.point_config)),
             ("python.srv.services.internal.replication.replica_update._platform", lambda _inventory: self.platform),
             ("python.srv.services.internal.replication.replica_update._connect", lambda _inventory: FakeNode()),
+            ("python.srv.services.internal.replication.replica_update.transport_problem", lambda _transport: None),
             ("python.srv.services.internal.replication.replication_session.persist_job", lambda job: JOBS.__setitem__(job["id"], job)),
             ("python.srv.services.internal.replication.replica_update.save_replica", record_save),
             ("python.srv.services.internal.replication.replica_leftovers.save_replica", record_save),

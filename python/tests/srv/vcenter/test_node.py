@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 import threading
 import time
 import types
+from contextlib import contextmanager
 from typing import Any
 from datetime import datetime, timezone
 import unittest
@@ -2115,3 +2117,288 @@ class VCenterNodeConsolidationTests(unittest.TestCase):
         node._get_vm = lambda vm_name: None  # type: ignore[method-assign]
 
         self.assertFalse(node.consolidate_disks("gone-vm"))
+
+
+class _FakeTask:
+    pass
+
+
+class _FakePlacementVm:
+    def __init__(self, nics: list[object], parent: object, *, moref: str = "vm-2728", notes: str = "", values: list | None = None) -> None:
+        self._moId = moref
+        self.config = types.SimpleNamespace(hardware=types.SimpleNamespace(device=nics), annotation=notes)
+        self.parent = parent
+        self.customValue = values or []
+        self.reconfigs: list[object] = []
+
+    def ReconfigVM_Task(self, spec: object) -> object:
+        self.reconfigs.append(spec)
+        if getattr(spec, "annotation", None) is not None:
+            self.config.annotation = spec.annotation
+        return _FakeTask()
+
+
+class _FakePlacementContent:
+    def __init__(self, vm: object, *, permissions: list | None = None, alarms: list | None = None, api_type: str = "VirtualCenter") -> None:
+        self.about = types.SimpleNamespace(apiType=api_type)
+        self.set_fields: list[tuple] = []
+        self.set_permissions: list[tuple] = []
+        self.created_alarms: list[tuple] = []
+        self.raise_on_permissions: Exception | None = None
+        content = self
+
+        class Fields:
+            field = (types.SimpleNamespace(key=101, name="Owner"),)
+
+            def SetField(self, entity, key, value):
+                content.set_fields.append((entity, key, value))
+
+        class Authorization:
+            def RetrieveEntityPermissions(self, entity, inherited):
+                return permissions or []
+
+            def SetEntityPermissions(self, entity, permission):
+                if content.raise_on_permissions is not None:
+                    raise content.raise_on_permissions
+                content.set_permissions.append((entity, permission))
+
+        class Alarms:
+            def GetAlarm(self, entity):
+                return alarms or []
+
+            def CreateAlarm(self, entity, spec):
+                content.created_alarms.append((entity, spec))
+
+        self.customFieldsManager = Fields()
+        self.authorizationManager = Authorization()
+        self.alarmManager = Alarms()
+
+
+def _nic(label: str, mac: str, address_type: str = "assigned") -> object:
+    return vim.vm.device.VirtualVmxnet3(deviceInfo=vim.Description(label=label, summary="VM Network"), macAddress=mac, addressType=address_type)
+
+
+def _alarm(vm: object, name: str) -> object:
+    expression = vim.alarm.StateAlarmExpression(operator="isEqual", type=vim.VirtualMachine, statePath="runtime.powerState", red="poweredOn")
+    info = types.SimpleNamespace(
+        name=name, description="", enabled=True, entity=vm, expression=vim.alarm.OrAlarmExpression(expression=[expression]),
+        action=None, actionFrequency=0, setting=None,
+    )
+    return types.SimpleNamespace(info=info)
+
+
+class _FakeVapi:
+    def __init__(self, attached: list[str] | None = None) -> None:
+        self.attached = attached or []
+        self.calls: list[tuple] = []
+
+    @contextmanager
+    def session(self):
+        def call(method, path, body=None, **kwargs):
+            self.calls.append((method, path, body))
+            if "list-attached-tags" in path:
+                return self.attached
+            if path.startswith("cis/tagging/tag/"):
+                return {"name": {"tag-1": "prod"}.get(path.rsplit("/", 1)[1], "other")}
+            return None
+
+        yield call
+
+
+class VCenterNodePlacementTests(unittest.TestCase):
+    def _node(self, vm: object, content: _FakePlacementContent, vapi: _FakeVapi | None = None) -> VCenterNode:
+        node = VCenterNode("vc.local", "administrator", "secret")
+        node._get_vm = lambda vm_name: vm  # type: ignore[method-assign]
+        node._wait_for_task = lambda task: None  # type: ignore[method-assign]
+        node.si = types.SimpleNamespace(_stub=None, RetrieveContent=lambda: content)
+        node._vapi_session = (vapi or _FakeVapi()).session  # type: ignore[method-assign]
+        return node
+
+    def _original(self) -> tuple[_FakePlacementVm, _FakePlacementContent]:
+        vm = _FakePlacementVm(
+            [_nic("Network adapter 1", "00:50:56:b8:ba:eb"), _nic("Network adapter 2", "00:50:56:01:02:03", "manual")],
+            vim.Folder("group-v42", None),
+            notes="web tier, owner team-a",
+            values=[types.SimpleNamespace(key=101, value="team-a")],
+        )
+        permission = types.SimpleNamespace(principal="VSPHERE.LOCAL\\ReadOnlyUsers", group=True, roleId=-2, propagate=False)
+        content = _FakePlacementContent(vm, permissions=[permission], alarms=[])
+        content.alarmManager.GetAlarm = lambda entity: [_alarm(vm, "web down")]
+        return vm, content
+
+    def test_everything_the_vm_being_replaced_has_is_read(self) -> None:
+        vm, content = self._original()
+        node = self._node(vm, content, _FakeVapi(["tag-1"]))
+
+        with patch("python.srv.plugins.vcenter.vcenter._vm_folder_path", return_value="/Datacenter/vm/Apps"):
+            placement = node.read_vm_placement("vm1")
+
+        self.assertEqual(placement["folder"], {"moref": "group-v42", "path": "/Datacenter/vm/Apps"})
+        self.assertEqual(
+            placement["network_adapters"],
+            [
+                {"label": "Network adapter 1", "mac": "00:50:56:b8:ba:eb", "address_type": "assigned"},
+                {"label": "Network adapter 2", "mac": "00:50:56:01:02:03", "address_type": "manual"},
+            ],
+        )
+        self.assertEqual(placement["notes"], "web tier, owner team-a")
+        self.assertEqual(placement["custom_attributes"], [{"key": 101, "name": "Owner", "value": "team-a"}])
+        self.assertEqual(placement["permissions"], [{"principal": "VSPHERE.LOCAL\\ReadOnlyUsers", "group": True, "role_id": -2, "propagate": False}])
+        self.assertEqual(placement["alarms"], ["web down"])
+        self.assertEqual(placement["tags"], [{"id": "tag-1", "name": "prod"}])
+        self.assertEqual(placement["unreadable"], {})
+        json.dumps(placement)
+
+    def test_a_part_that_cannot_be_read_is_named_and_the_rest_is_still_read(self) -> None:
+        vm, content = self._original()
+        node = self._node(vm, content)
+
+        def refuse(*args, **kwargs):
+            raise RuntimeError("vCenter API POST session answered 503")
+
+        node._vapi_session = refuse  # type: ignore[method-assign]
+        with patch("python.srv.plugins.vcenter.vcenter._vm_folder_path", return_value="/Datacenter/vm/Apps"):
+            placement = node.read_vm_placement("vm1")
+
+        self.assertEqual(placement["unreadable"], {"tags": "vCenter API POST session answered 503"})
+        self.assertEqual(placement["alarms"], ["web down"])
+
+    def test_a_host_without_vcenter_has_no_tags_to_read(self) -> None:
+        vm, content = self._original()
+        content.about.apiType = "HostAgent"
+        vapi = _FakeVapi(["tag-1"])
+
+        with patch("python.srv.plugins.vcenter.vcenter._vm_folder_path", return_value="/ha-datacenter/vm"):
+            placement = self._node(vm, content, vapi).read_vm_placement("vm1")
+
+        self.assertEqual(placement["tags"], [])
+        self.assertEqual(vapi.calls, [])
+
+    def test_a_host_without_alarms_or_custom_attributes_reads_none_and_warns_of_nothing(self) -> None:
+        vm, content = self._original()
+        content.about.apiType = "HostAgent"
+        content.alarmManager = None
+        content.customFieldsManager = None
+
+        with patch("python.srv.plugins.vcenter.vcenter._vm_folder_path", return_value="/ha-datacenter/vm"):
+            placement = self._node(vm, content).read_vm_placement("vm1")
+
+        self.assertEqual((placement["alarms"], placement["custom_attributes"], placement["unreadable"]), ([], [], {}))
+
+    def test_the_restored_vm_gets_everything_back(self) -> None:
+        moved: list[tuple[str, list[object]]] = []
+
+        class FakeFolder:
+            def __init__(self, moref: str, stub: object) -> None:
+                self.moref = moref
+
+            def MoveIntoFolder_Task(self, entities: list[object]) -> object:
+                moved.append((self.moref, entities))
+                return _FakeTask()
+
+        original, content = self._original()
+        vapi = _FakeVapi(["tag-1"])
+        node = self._node(original, content, vapi)
+        with patch("python.srv.plugins.vcenter.vcenter._vm_folder_path", return_value="/Datacenter/vm/Apps"):
+            placement = node.read_vm_placement("vm1")
+        first, second = _nic("Network adapter 1", "00:50:56:b8:cf:5f"), _nic("Network adapter 2", "00:50:56:b8:11:11")
+        restored = _FakePlacementVm([first, second], types.SimpleNamespace(_moId="group-v3"), moref="vm-2730", notes="Restored from backup on vc.local")
+        node._get_vm = lambda vm_name: restored  # type: ignore[method-assign]
+        content.alarmManager.GetAlarm = lambda entity: []
+
+        with patch.object(vim, "Folder", FakeFolder):
+            applied = node.apply_vm_placement("vm1", placement)
+
+        self.assertEqual(applied["failed"], {})
+        self.assertEqual((first.macAddress, first.addressType), ("00:50:56:b8:ba:eb", "assigned"))
+        self.assertEqual((second.macAddress, second.addressType), ("00:50:56:01:02:03", "manual"))
+        self.assertEqual(moved, [("group-v42", [restored])])
+        self.assertEqual(restored.config.annotation, "web tier, owner team-a")
+        self.assertEqual(content.set_fields, [(restored, 101, "team-a")])
+        [(entity, permissions)] = content.set_permissions
+        self.assertEqual((entity, permissions[0].principal, permissions[0].group, permissions[0].roleId), (restored, "VSPHERE.LOCAL\\ReadOnlyUsers", True, -2))
+        [(entity, spec)] = content.created_alarms
+        self.assertEqual((entity, spec.name), (restored, "web down"))
+        self.assertIn(
+            ("POST", "cis/tagging/tag-association?action=attach-multiple-tags-to-object", {"object_id": {"type": "VirtualMachine", "id": "vm-2730"}, "tag_ids": ["tag-1"]}),
+            vapi.calls,
+        )
+        self.assertEqual(
+            (applied["tags"], applied["custom_attributes"], applied["permissions"], applied["alarms"], applied["notes"]),
+            (["prod"], ["Owner"], ["VSPHERE.LOCAL\\ReadOnlyUsers"], ["web down"], True),
+        )
+
+    def test_one_part_that_fails_does_not_stop_the_others(self) -> None:
+        original, content = self._original()
+        node = self._node(original, content)
+        with patch("python.srv.plugins.vcenter.vcenter._vm_folder_path", return_value="/Datacenter/vm/Apps"):
+            placement = node.read_vm_placement("vm1")
+        placement["folder"] = None
+        restored = _FakePlacementVm([_nic("Network adapter 1", "00:50:56:b8:00:01")], types.SimpleNamespace(_moId="group-v42"), moref="vm-2730")
+        node._get_vm = lambda vm_name: restored  # type: ignore[method-assign]
+        content.alarmManager.GetAlarm = lambda entity: []
+        content.raise_on_permissions = RuntimeError("Permission to perform this operation was denied.")
+        placement["unreadable"] = {"tags": "vCenter API POST session answered 503"}
+
+        applied = node.apply_vm_placement("vm1", placement)
+
+        self.assertEqual(
+            applied["failed"],
+            {
+                "tags": "it could not be read from the VM that was replaced (vCenter API POST session answered 503)",
+                "permissions": "Permission to perform this operation was denied",
+            },
+        )
+        self.assertEqual(content.set_fields, [(restored, 101, "team-a")])
+        self.assertEqual(len(content.created_alarms), 1)
+
+    def test_alarms_whose_definitions_were_not_kept_are_reported(self) -> None:
+        original, content = self._original()
+        node = self._node(original, content)
+        placement = {"source_moref": "vm-other", "alarms": ["web down"], "network_adapters": []}
+        restored = _FakePlacementVm([], types.SimpleNamespace(_moId="group-v42"), moref="vm-2730")
+        node._get_vm = lambda vm_name: restored  # type: ignore[method-assign]
+        content.alarmManager.GetAlarm = lambda entity: []
+
+        applied = node.apply_vm_placement("vm1", placement)
+
+        self.assertEqual(applied["failed"], {"alarms": "the definitions of web down were not kept"})
+
+    def test_adapters_without_a_matching_label_are_paired_in_order(self) -> None:
+        from python.srv.plugins.vcenter.vcenter import _paired_network_adapters
+
+        restored = [_nic("Network adapter 1", "00:50:56:b8:00:01"), _nic("Network adapter 2", "00:50:56:b8:00:02")]
+        originals = [{"label": "NIC A", "mac": "00:50:56:b8:aa:01"}, {"label": "Network adapter 2", "mac": "00:50:56:b8:aa:02"}]
+
+        pairs = _paired_network_adapters(originals, restored)
+
+        self.assertEqual([(original["mac"], device.deviceInfo.label) for original, device in pairs],
+                         [("00:50:56:b8:aa:02", "Network adapter 2"), ("00:50:56:b8:aa:01", "Network adapter 1")])
+
+    def test_nothing_is_changed_when_the_vm_already_matches(self) -> None:
+        vm = _FakePlacementVm([_nic("Network adapter 1", "00:50:56:b8:ba:eb")], types.SimpleNamespace(_moId="group-v42"), notes="same")
+        content = _FakePlacementContent(vm)
+        placement = {
+            "folder": {"moref": "group-v42", "path": "/Datacenter/vm/Apps"},
+            "network_adapters": [{"label": "Network adapter 1", "mac": "00:50:56:b8:ba:eb", "address_type": "assigned"}],
+            "notes": "same",
+        }
+
+        applied = self._node(vm, content).apply_vm_placement("vm1", placement)
+
+        self.assertEqual(vm.reconfigs, [])
+        self.assertEqual(applied["failed"], {})
+
+    def test_a_vm_that_had_more_adapters_than_the_restored_one_gives_only_what_fits(self) -> None:
+        vm = _FakePlacementVm([_nic("Network adapter 1", "00:50:56:b8:00:01")], types.SimpleNamespace(_moId="group-v42"))
+        placement = {
+            "folder": None,
+            "network_adapters": [
+                {"label": "Network adapter 1", "mac": "00:50:56:b8:aa:01", "address_type": "assigned"},
+                {"label": "Network adapter 2", "mac": "00:50:56:b8:aa:02", "address_type": "assigned"},
+            ],
+        }
+
+        applied = self._node(vm, _FakePlacementContent(vm)).apply_vm_placement("vm1", placement)
+
+        self.assertEqual(applied["network_adapters"], [{"label": "Network adapter 1", "mac": "00:50:56:b8:aa:01"}])

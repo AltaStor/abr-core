@@ -14,6 +14,7 @@ from python.srv.core.utils import utc_now
 from python.srv.plugins import build_hypervisor_plugin
 from python.srv.plugins.hyperv import hyperv_replica
 from python.srv.plugins.vcenter import vcenter_replica
+from python.srv.plugins.vcenter.disk_transport import SOAP, VDDK, transport_problem
 from python.srv.services.api_errors import ApiError
 from python.srv.services.internal.replication.replica_config import settle_replica
 from python.srv.services.internal.replication.replica_leftovers import (
@@ -747,6 +748,16 @@ def _update_replica(
     if str(target["id"]) == str(replica.get("point_id") or ""):
         return {"mode": "up_to_date", "state": state, "point": target, "written_bytes": 0, "applied": []}
     repository, encryption_key = _repository_and_key(target)
+    if str((task.get("parameters") or {}).get("vsphere_transport") or "") == SOAP:
+        report_progress(
+            progress_callback,
+            5,
+            f"{settings.get('target_inventory_name') or 'The target inventory'} reads and writes disks over the vSphere SOAP API, "
+            "which cannot write into a disk that has a snapshot, so the replica is rebuilt from the restore point instead "
+            "of updated with its incrementals",
+            stage="rebuild",
+        )
+        return _update_mode_two(task, job, settings, state, target, node, platform, progress_callback)
     plan = _plan(target, replica, repository, encryption_key)
     if plan is None:
         return _update_mode_two(task, job, settings, state, target, node, platform, progress_callback)
@@ -885,6 +896,10 @@ def _attempt(
     settings = with_current_source_names(settings_of(job))
     inventory = _target(settings)
     platform = _platform(inventory)
+    if str(inventory.get("kind") or "") == "vcenter":
+        problem = transport_problem(str((task.get("parameters") or {}).get("vsphere_transport") or VDDK))
+        if problem:
+            raise ReplicationError(problem)
     report_progress(progress_callback, 1, f"Connecting to the target environment {settings['target_inventory_name']}", stage="prepare")
     node = _connect(inventory)
     try:

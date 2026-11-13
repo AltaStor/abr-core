@@ -21,6 +21,7 @@ from ...core.credential_encryption import is_encrypted, unreadable_encryption_ke
 from ...core.server_defaults import env_int
 from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...services.share_mount import ensure_share_mounted
+from .disk_transport import SOAP, TRANSPORT_NAMES, VDDK, tool_api_args, transport_problem
 from ...core.storage_tool import (
     StorageToolError,
     apply_repository_immutability,
@@ -940,6 +941,7 @@ def _build_vddk_args(
     vm_spec: str | None,
     snapshot_moref: str | None = None,
     transport_mode: str | None = None,
+    api: str | None = None,
 ) -> list[str]:
     """VMDK (VDDK) options shared by every abr-vmdk-tool disk command.
 
@@ -950,7 +952,7 @@ def _build_vddk_args(
     The tool rejects --host without --vm, so callers must resolve a VM spec
     before they get here.
     """
-    if not vm_spec:
+    if not vm_spec and api != SOAP:
         raise VCenterBackupError(
             f"A VM spec is required to reach {vmdk_path} on {host}; "
             "abr-vmdk-tool cannot open a remote VMDK without --vm"
@@ -966,14 +968,14 @@ def _build_vddk_args(
         password,
         "--port",
         str(port),
-        "--vm",
-        vm_spec,
+        *(["--vm", vm_spec] if vm_spec else []),
     ]
     if snapshot_moref:
         args.extend(["--snapshot", snapshot_moref])
     if thumbprint:
         args.extend(["--thumbprint", thumbprint])
-    if transport_mode:
+    args.extend(tool_api_args(api))
+    if transport_mode and api != SOAP:
         args.extend(["--transport", transport_mode])
     return args
 
@@ -993,6 +995,7 @@ def _build_backup_command(
     vm_moref: str | None,
     snapshot_moref: str | None,
     transport_mode: str | None,
+    api: str | None = None,
     change_id: str | None = None,
     compression_level: int = DEFAULT_COMPRESSION_LEVEL,
     encryption_key: str = "",
@@ -1031,6 +1034,7 @@ def _build_backup_command(
             vm_spec=vm_moref,
             snapshot_moref=snapshot_moref,
             transport_mode=transport_mode,
+            api=api,
         )
     )
     return command
@@ -1758,6 +1762,7 @@ def run_vcenter_backup(
     else:
         requested_transport_mode = str(transport_mode_value).strip()
         transport_mode = None if requested_transport_mode.lower() in {"auto", "none", "omit"} else requested_transport_mode
+    vsphere_transport = str(parameters.get("vsphere_transport") or VDDK)
     tool_timeout_seconds = _resolve_tool_timeout_seconds(parameters)
     # Live "transferred" probe for the per-disk progress reporter. Only a local
     # repository has a directory whose size IS what has landed so far; an S3
@@ -1826,6 +1831,10 @@ def run_vcenter_backup(
     )
     if not query_changed_areas_only and not tool_path.exists():
         raise VCenterBackupError(f"Backup tool not found: {tool_path}")
+    if not query_changed_areas_only:
+        transport_issue = transport_problem(vsphere_transport, tool_path)
+        if transport_issue:
+            raise VCenterBackupError(transport_issue)
 
     logger.info(
         "Preparing VMware backup for VM %s (task=%s) using destination %s",
@@ -1841,6 +1850,14 @@ def run_vcenter_backup(
         worker_mode="vcenter-abr-vmdk-tool",
         vm_name=vm_name,
         backup_root=str(task_root),
+    )
+    _emit_progress(
+        progress_callback,
+        "prepare",
+        5,
+        f"Disks are read over {TRANSPORT_NAMES.get(vsphere_transport, vsphere_transport)}",
+        worker_mode="vcenter-abr-vmdk-tool",
+        vsphere_transport=vsphere_transport,
     )
 
     snapshot_name: str | None = None
@@ -1870,6 +1887,12 @@ def run_vcenter_backup(
         with VCenterNode(host, username, password, port=port, verify_ssl=verify_ssl) as node, node.session_keepalive():
             service_type = node.get_service_type()
             is_virtual_center = service_type == "VirtualCenter"
+            if vsphere_transport == SOAP and not is_virtual_center and not query_changed_areas_only:
+                raise VCenterBackupError(
+                    f"{host} is an ESXi host without vCenter, which cannot export the backup snapshot that a backup over "
+                    "the vSphere SOAP API reads: back up this VM over the VDDK (job edit --transport vddk) or through "
+                    "the vCenter that manages the host. Restores to this host over SOAP work"
+                )
             logger.info(
                 "Connected to vCenter host %s service_type=%s for VM %s",
                 host,
@@ -2507,6 +2530,7 @@ def run_vcenter_backup(
                                 transport_mode=transport_mode if is_virtual_center else None,
                                 compression_level=compression_level,
                                 encryption_key=encryption_key,
+                                api=vsphere_transport,
                             )
                             command = no_cbt_command
                             logger.info(
@@ -2575,6 +2599,7 @@ def run_vcenter_backup(
                                 transport_mode=transport_mode if is_virtual_center else None,
                                 compression_level=compression_level,
                                 encryption_key=encryption_key,
+                                api=vsphere_transport,
                             )
                             logger.info(
                                 "Incremental disk command parameters for task %s: datastore_path=%s utility_datastore_path=%s parent_path=%s change_id=%s utility_change_id=%s utility_change_id_format=%s service_type=%s snapshot_moref=%s vm_moref=%s",
@@ -2913,6 +2938,7 @@ def run_vcenter_backup(
                         transport_mode=transport_mode if is_virtual_center else None,
                         compression_level=compression_level,
                         encryption_key=encryption_key,
+                        api=vsphere_transport,
                     )
                     logger.info(
                         "Full disk command parameters for task %s: datastore_path=%s live_snapshot_datastore_path=%s transfer_datastore_path=%s service_type=%s is_virtual_center=%s snapshot_moref=%s raw_vm_moref=%s formatted_vm_moref=%s host=%s port=%s transport_mode=%s tool_path=%s destination_path=%s timeout_seconds=%s",
@@ -3085,6 +3111,7 @@ def run_vcenter_backup(
                                 transport_mode=None,
                                 compression_level=compression_level,
                                 encryption_key=encryption_key,
+                                api=vsphere_transport,
                             )
                             logger.info(
                                 "HostAgent retry command parameters for task %s variant=%s: datastore_path=%s transfer_datastore_path=%s service_type=%s snapshot_moref=%s raw_vm_moref=%s host=%s port=%s tool_path=%s abr_backup_name=%s",
@@ -3314,7 +3341,8 @@ def run_vcenter_backup(
                 "vm_name": vm_name,
                 "vm_external_id": vm_resource["external_id"],
                 "vm_config": vm_config,
-                "transport_mode": transport_mode,
+                "transport_mode": transport_mode if vsphere_transport != SOAP else None,
+                "vsphere_transport": vsphere_transport,
                 "compression_level": compression_level,
                 "encryption_enabled": bool(encryption_algorithm),
                 "encryption_algorithm": encryption_algorithm,
@@ -3459,7 +3487,8 @@ def run_vcenter_backup(
             "disks": disk_outputs,
             "skipped_disks": skipped_disks,
             "storage_layout": storage_layout,
-            "transport_mode": transport_mode,
+            "transport_mode": transport_mode if vsphere_transport != SOAP else None,
+            "vsphere_transport": vsphere_transport,
             "compression_level": compression_level,
             "encryption_enabled": bool(encryption_algorithm),
             "encryption_algorithm": encryption_algorithm,

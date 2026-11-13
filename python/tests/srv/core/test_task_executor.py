@@ -92,6 +92,13 @@ class FakeVCenterNode:
     original_identity: dict = {"uuid": "42200000-1111-2222-3333-444455556666", "instance_uuid": "50200000-1111-2222-3333-444455556666"}
     identity_reads: list = []
     applied_identities: list = []
+    placement_reads: list = []
+    applied_placements: list = []
+    adopted_disks: list = []
+    disk_uuids_set: list = []
+    original_placement: dict = {}
+    raise_on_read_placement: Exception | None = None
+    raise_on_apply_placement: Exception | None = None
     changed_area_queries: list[dict[str, object]] = []
     service_type: str = "VirtualCenter"
     vm_firmware: str | None = "bios"
@@ -324,10 +331,15 @@ class FakeVCenterNode:
         config_metadata: dict[str, object],
         disk_layout: list[dict[str, object]] | None = None,
         disk_placements: list[dict[str, object]] | None = None,
+        create_disks: bool = True,
     ) -> dict[str, object]:
         disk_paths = [
             f"[{datastore_name}] {vm_name}/{disk['file_name']}"
             for disk in (disk_layout or [])
+        ]
+        planned_disks = [
+            {"path": path, "controller_type": "pvscsi", "bus": 0, "unit": index, "label": f"Hard disk {index + 1}", "disk_uuid": None, "thin_requested": True}
+            for index, path in enumerate(disk_paths)
         ]
         requested_firmware = str(config_metadata.get("firmware") or "bios")
         restored_firmware = self.created_vm_firmware or requested_firmware
@@ -340,11 +352,23 @@ class FakeVCenterNode:
             "disk_layout": disk_layout or [],
             "disk_placements": disk_placements,
             "disk_paths": disk_paths,
+            "planned_disks": planned_disks,
+            "create_disks": create_disks,
             "requested_firmware": requested_firmware,
             "restored_firmware": restored_firmware,
         }
         self.created_vms.append(payload)
         return payload
+
+    def compute_resource_name(self, host_name: str) -> str | None:
+        return "Cluster-A"
+
+    def adopt_restored_disk(self, vm_name: str, planned: dict[str, object], vm_moref: str | None = None) -> dict[str, object]:
+        FakeVCenterNode.adopted_disks.append({"vm_name": vm_name, "path": planned["path"], "vm_moref": vm_moref})
+        return {"path": planned["path"], "controller": "PVSCSI 0", "unit": planned["unit"], "thin": True, "disk_uuid": None}
+
+    def set_disk_uuid(self, path: str, disk_uuid: object, *, host: object = None, vm_name: str | None = None) -> None:
+        FakeVCenterNode.disk_uuids_set.append({"path": path, "uuid": disk_uuid, "vm_name": vm_name})
 
     def apply_boot_order(
         self,
@@ -411,6 +435,18 @@ class FakeVCenterNode:
             raise FakeVCenterNode.raise_on_read_identity
         FakeVCenterNode.identity_reads.append(vm_name)
         return dict(FakeVCenterNode.original_identity)
+
+    def read_vm_placement(self, vm_name: str, vm_moref: str | None = None) -> dict[str, object]:
+        if FakeVCenterNode.raise_on_read_placement is not None:
+            raise FakeVCenterNode.raise_on_read_placement
+        FakeVCenterNode.placement_reads.append(vm_name)
+        return dict(FakeVCenterNode.original_placement)
+
+    def apply_vm_placement(self, vm_name: str, placement: dict, vm_moref: str | None = None) -> dict[str, object]:
+        if FakeVCenterNode.raise_on_apply_placement is not None:
+            raise FakeVCenterNode.raise_on_apply_placement
+        FakeVCenterNode.applied_placements.append({"vm_name": vm_name, "placement": placement, "vm_moref": vm_moref})
+        return {"network_adapters": placement.get("network_adapters") or [], "folder": (placement.get("folder") or {}).get("path")}
 
     def set_vm_identity(
         self,
@@ -483,6 +519,16 @@ class TaskExecutorTests(unittest.TestCase):
         FakeVCenterNode.raise_on_set_identity = None
         FakeVCenterNode.identity_reads.clear()
         FakeVCenterNode.applied_identities.clear()
+        FakeVCenterNode.placement_reads.clear()
+        FakeVCenterNode.applied_placements.clear()
+        FakeVCenterNode.adopted_disks.clear()
+        FakeVCenterNode.disk_uuids_set.clear()
+        FakeVCenterNode.raise_on_read_placement = None
+        FakeVCenterNode.raise_on_apply_placement = None
+        FakeVCenterNode.original_placement = {
+            "folder": {"moref": "group-v42", "path": "/Datacenter/vm/Apps"},
+            "network_adapters": [{"label": "Network adapter 1", "mac": "00:50:56:b8:ba:eb", "address_type": "assigned"}],
+        }
         FakeVCenterNode.original_identity = {
             "uuid": "42200000-1111-2222-3333-444455556666",
             "instance_uuid": "50200000-1111-2222-3333-444455556666",
@@ -1371,7 +1417,7 @@ class TaskExecutorTests(unittest.TestCase):
                     raise TaskStopRequested("Session stop requested")
 
         fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
-        progress = _StoppingProgress(stop_after=4)
+        progress = _StoppingProgress(stop_after=5)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             task = {
@@ -1422,7 +1468,7 @@ class TaskExecutorTests(unittest.TestCase):
             }
         }
 
-    def _run_backup(self, task_id: str, progress_callback) -> dict[str, object]:
+    def _run_backup(self, task_id: str, progress_callback, **parameters) -> dict[str, object]:
         fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
         with tempfile.TemporaryDirectory() as temp_dir:
             task = {
@@ -1435,15 +1481,46 @@ class TaskExecutorTests(unittest.TestCase):
                 "parameters": {
                     "destination_dir": temp_dir,
                     "tool_path": EXISTING_TOOL_PATH,
+                    **parameters,
                 },
             }
 
             def fake_run(command: list[str], **kwargs) -> FakeCompletedProcess:
+                self.tool_commands.append(list(command))
                 return FakeCompletedProcess(returncode=0, stdout="ok")
 
+            self.tool_commands: list[list[str]] = []
             with patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}):
                 with patch("python.srv.plugins.vcenter.vcenter_backup.run_capped", side_effect=fake_run):
                     return run_task(task, progress_callback=progress_callback)
+
+    def test_a_backup_over_soap_reads_its_disks_through_the_soap_api(self) -> None:
+        self._register_vcenter_hypervisor()
+        updates: list[dict[str, object]] = []
+
+        result = self._run_backup("task-soap-backup", updates.append, vsphere_transport="soap")
+
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["result"]["vsphere_transport"], "soap")
+        self.assertIsNone(result["result"]["transport_mode"])
+        [command] = [command for command in self.tool_commands if "backup" in command]
+        self.assertEqual(command[command.index("--api") + 1], "soap")
+        self.assertNotIn("--transport", command)
+        self.assertIn("--snapshot", command)
+        self.assertIn("Disks are read over the vSphere SOAP API", [update.get("message") for update in updates])
+
+    def test_a_backup_over_vddk_keeps_its_command_as_it_was(self) -> None:
+        self._register_vcenter_hypervisor()
+        updates: list[dict[str, object]] = []
+
+        result = self._run_backup("task-vddk-backup", updates.append)
+
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["result"]["vsphere_transport"], "vddk")
+        [command] = [command for command in self.tool_commands if "backup" in command]
+        self.assertNotIn("--api", command)
+        self.assertEqual(command[command.index("--transport") + 1], "nbdssl")
+        self.assertIn("Disks are read over VDDK", [update.get("message") for update in updates])
 
     def test_a_backup_puts_its_snapshot_name_on_the_task_and_takes_it_off_again(self) -> None:
         self._register_vcenter_hypervisor()
@@ -1494,6 +1571,29 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertEqual(FakeVCenterNode.snapshots_removed, ["demo-vm-snapshot"])
         recorded = [update["backup_snapshot"] for update in updates if "backup_snapshot" in update]
         self.assertEqual(recorded, [{"vm_name": "demo-vm", "name": "demo-vm-snapshot"}, None])
+
+    def test_a_soap_backup_on_an_esxi_host_without_vcenter_is_refused_before_any_snapshot(self) -> None:
+        self._register_vcenter_hypervisor()
+        updates: list[dict[str, object]] = []
+        progress = self._stop_on("task-soap-esxi", updates, lambda update: False)
+
+        with patch.object(FakeVCenterNode, "service_type", "HostAgent"):
+            result = self._run_backup("task-soap-esxi", progress, vsphere_transport="soap")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("ESXi host without vCenter", result["result"]["message"])
+        self.assertIn("job edit --transport vddk", result["result"]["message"])
+        self.assertEqual(FakeVCenterNode.snapshots_created, [])
+
+    def test_a_vddk_backup_on_an_esxi_host_still_runs(self) -> None:
+        self._register_vcenter_hypervisor()
+        updates: list[dict[str, object]] = []
+        progress = self._stop_on("task-vddk-esxi", updates, lambda update: False)
+
+        with patch.object(FakeVCenterNode, "service_type", "HostAgent"):
+            result = self._run_backup("task-vddk-esxi", progress, vsphere_transport="vddk")
+
+        self.assertNotIn("ESXi host without vCenter", str(result["result"].get("message")))
 
     def test_the_snapshot_name_is_in_the_task_before_vcenter_is_asked_to_create_it(self) -> None:
         self._register_vcenter_hypervisor()
@@ -5165,6 +5265,228 @@ class TaskExecutorTests(unittest.TestCase):
         self.assertFalse(result["result"]["identity_preserved"])
         self.assertEqual(FakeVCenterNode.applied_identities, [])
         self.assertEqual(FakeVCenterNode.renamed_vms[0]["to"], "demo-vm")
+
+    def _run_in_place_restore(self, task_id: str, progress=None) -> tuple[dict, list[dict]]:
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {
+                "host": "vc.local",
+                "port": 443,
+                "verify_ssl": False,
+                "credentials": {"username": "administrator", "password": "secret"},
+            },
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {"num_cpu": 2, "memory_mb": 4096},
+            }
+        }
+        updates: list[dict] = []
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (pathlib.Path(temp_dir) / "01-demo-vm.vmdk").write_text("fake-vmdk", encoding="utf-8")
+            task = self._in_place_restore_task(temp_dir, point_id=f"point-{task_id}", task_id=task_id)
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch(
+                    "python.srv.plugins.vcenter.vcenter_restore.run_capped",
+                    side_effect=lambda command, **kwargs: FakeCompletedProcess(returncode=0, stdout="ok"),
+                ),
+            ):
+                result = run_task(task, progress_callback=progress or updates.append)
+        return result, updates
+
+    def test_an_in_place_restore_gives_the_replacement_the_original_folder_and_mac_addresses(self) -> None:
+        result, updates = self._run_in_place_restore("task-in-place-placement")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["result"]["placement_preserved"])
+        self.assertEqual(FakeVCenterNode.placement_reads, ["demo-vm"])
+        self.assertEqual(
+            FakeVCenterNode.applied_placements,
+            [{"vm_name": "demo-vm", "placement": FakeVCenterNode.original_placement, "vm_moref": "vm-restore-001"}],
+        )
+        self.assertIn(
+            "VM demo-vm kept its VM folder /Datacenter/vm/Apps, MAC addresses (Network adapter 1 00:50:56:b8:ba:eb)",
+            [update.get("message") for update in updates],
+        )
+
+    def test_the_folder_and_mac_addresses_are_read_before_the_original_is_destroyed_and_applied_after_the_rename(self) -> None:
+        order: list[str] = []
+        original_read = FakeVCenterNode.read_vm_placement
+        original_apply = FakeVCenterNode.apply_vm_placement
+        original_destroy = FakeVCenterNode.destroy_vm
+        original_rename = FakeVCenterNode.rename_vm
+
+        def track(name, real):
+            def tracked(self, *args, **kwargs):
+                order.append(name)
+                return real(self, *args, **kwargs)
+
+            return tracked
+
+        with (
+            patch.object(FakeVCenterNode, "read_vm_placement", track("read", original_read)),
+            patch.object(FakeVCenterNode, "apply_vm_placement", track("apply", original_apply)),
+            patch.object(FakeVCenterNode, "destroy_vm", track("destroy", original_destroy)),
+            patch.object(FakeVCenterNode, "rename_vm", track("rename", original_rename)),
+        ):
+            self._run_in_place_restore("task-in-place-placement-order")
+
+        self.assertEqual(order, ["read", "destroy", "rename", "apply"])
+
+    def test_an_in_place_restore_survives_a_folder_or_mac_address_that_cannot_be_applied(self) -> None:
+        FakeVCenterNode.raise_on_apply_placement = RuntimeError("Permission to perform this operation was denied.")
+
+        result, updates = self._run_in_place_restore("task-in-place-placement-fail")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["result"]["placement_preserved"])
+        self.assertEqual(FakeVCenterNode.renamed_vms[0]["to"], "demo-vm")
+        warnings = [update["warning"] for update in updates if (update.get("warning") or {}).get("code") == "placement_not_restored"]
+        self.assertEqual(
+            warnings[0]["message"],
+            "VM demo-vm was restored, but could not be given back its original VM folder, MAC addresses, notes, tags, "
+            "custom attributes, permissions and alarms: Permission to perform this operation was denied",
+        )
+
+    def test_a_part_that_could_not_be_given_back_is_named_and_the_rest_is_reported_kept(self) -> None:
+        def partial(self, vm_name, placement, vm_moref=None):
+            return {
+                "network_adapters": placement["network_adapters"],
+                "folder": "/Datacenter/vm/Apps",
+                "notes": True,
+                "tags": ["prod"],
+                "failed": {"permissions": "Permission to perform this operation was denied"},
+            }
+
+        with patch.object(FakeVCenterNode, "apply_vm_placement", partial):
+            result, updates = self._run_in_place_restore("task-in-place-placement-partial")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["result"]["placement_preserved"])
+        messages = [update.get("message") for update in updates]
+        self.assertIn(
+            "VM demo-vm kept its VM folder /Datacenter/vm/Apps, MAC addresses (Network adapter 1 00:50:56:b8:ba:eb), notes, tags (prod)",
+            messages,
+        )
+        [warning] = [update["warning"] for update in updates if (update.get("warning") or {}).get("code") == "placement_not_restored"]
+        self.assertEqual(
+            warning["message"],
+            "VM demo-vm was restored, but could not be given back its original permissions: Permission to perform this operation was denied",
+        )
+        self.assertEqual(warning["parts"], ["permissions"])
+
+    def test_an_in_place_restore_survives_a_folder_and_mac_addresses_that_cannot_be_read(self) -> None:
+        FakeVCenterNode.raise_on_read_placement = RuntimeError("VM is orphaned; config unavailable")
+
+        result, updates = self._run_in_place_restore("task-in-place-placement-read")
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["result"]["placement_preserved"])
+        self.assertEqual(FakeVCenterNode.applied_placements, [])
+        codes = [(update.get("warning") or {}).get("code") for update in updates]
+        self.assertIn("placement_not_restored", codes)
+
+    def test_a_stop_requested_after_the_original_is_gone_does_not_break_the_finish(self) -> None:
+        def stop_after_the_swap(update: dict) -> None:
+            if "kept its VM folder" in str(update.get("message")):
+                raise TaskStopRequested("Session stop requested")
+
+        result, _updates = self._run_in_place_restore("task-in-place-placement-stop", progress=stop_after_the_swap)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["result"]["placement_preserved"])
+
+    def _run_soap_in_place_restore(self, task_id: str, **parameters) -> tuple[dict, list[dict], list[list[str]]]:
+        commands: list[list[str]] = []
+        original = self._in_place_restore_task
+
+        def with_soap(temp_dir, point_id, task_id):
+            task = original(temp_dir, point_id=point_id, task_id=task_id)
+            task["parameters"].update({"vsphere_transport": "soap", **parameters})
+            return task
+
+        def record(command, **kwargs):
+            commands.append(list(command))
+            return FakeCompletedProcess(returncode=0, stdout="ok")
+
+        updates: list[dict] = []
+        HYPERVISORS["hv-vc"] = {
+            "id": "hv-vc",
+            "kind": "vcenter",
+            "metadata": {"host": "vc.local", "port": 443, "verify_ssl": False, "credentials": {"username": "administrator", "password": "secret"}},
+        }
+        RESOURCES_BY_HV["hv-vc"] = {
+            ("virtual_machine", "vm-uuid-1"): {
+                "resource_type": "virtual_machine",
+                "external_id": "vm-uuid-1",
+                "name": "demo-vm",
+                "payload": {"num_cpu": 2, "memory_mb": 4096},
+            }
+        }
+        fake_module = types.SimpleNamespace(VCenterNode=FakeVCenterNode)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (pathlib.Path(temp_dir) / "01-demo-vm.vmdk").write_text("fake-vmdk", encoding="utf-8")
+            task = with_soap(temp_dir, f"point-{task_id}", task_id)
+            with (
+                patch.dict(sys.modules, {"python.srv.plugins.vcenter.vcenter": fake_module}),
+                patch("python.srv.plugins.vcenter.vcenter_restore.run_capped", side_effect=record),
+            ):
+                result = run_task(task, progress_callback=updates.append)
+        return result, updates, commands
+
+    def test_a_soap_restore_lets_the_tool_create_each_disk_and_moves_it_to_its_slot(self) -> None:
+        result, updates, commands = self._run_soap_in_place_restore("task-soap-restore")
+
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["result"]["vsphere_transport"], "soap")
+        self.assertIsNone(result["result"]["transport_mode"])
+        [shell] = FakeVCenterNode.created_vms
+        self.assertFalse(shell["create_disks"])
+        [command] = [command for command in commands if "restore" in command]
+        self.assertIn("--api", command)
+        self.assertEqual(command[command.index("--api") + 1], "soap")
+        self.assertEqual(command[command.index("--cluster") + 1], "Cluster-A")
+        self.assertNotIn("--transport", command)
+        self.assertEqual([disk["path"] for disk in FakeVCenterNode.adopted_disks], shell["disk_paths"])
+        self.assertIn("Disk 1/1 attached to PVSCSI 0 unit 0", [update.get("message") for update in updates])
+        self.assertIn("Disks are written over the vSphere SOAP API", [update.get("message") for update in updates])
+
+    def test_a_soap_restore_keeps_disks_thin_and_says_so_when_thick_was_asked_for(self) -> None:
+        result, updates, _commands = self._run_soap_in_place_restore("task-soap-thick", disk_type="thick")
+
+        self.assertEqual(result["status"], "completed", result)
+        [warning] = [update["warning"] for update in updates if (update.get("warning") or {}).get("code") == "soap_thin_disks"]
+        self.assertEqual(warning["disks"], [1])
+        self.assertIn("asked for thick provisioning and stay thin", warning["message"])
+
+    def test_a_chain_that_cannot_go_to_the_tool_in_one_run_is_refused_over_soap(self) -> None:
+        two_runs = [{"abr_path": "/a", "abr_backup_name": "full", "store_mode": "full", "source": "full"},
+                    {"abr_path": "/b", "abr_backup_name": "inc", "store_mode": "incremental", "source": "inc"}]
+        with patch("python.srv.plugins.vcenter.vcenter_restore._abr_restore_runs", return_value=two_runs):
+            result, _updates, commands = self._run_soap_in_place_restore("task-soap-chain")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("cannot be restored over the vSphere SOAP API", result["result"]["message"])
+        self.assertIn("Use the VDDK transport", result["result"]["message"])
+        self.assertEqual([command for command in commands if "restore" in command], [])
+
+    def test_a_vddk_restore_still_creates_the_disks_and_passes_its_transport(self) -> None:
+        result, updates, commands = self._run_soap_in_place_restore("task-vddk-restore", vsphere_transport="vddk")
+
+        self.assertEqual(result["status"], "completed", result)
+        self.assertIn("Disks are written over VDDK", [update.get("message") for update in updates])
+        [shell] = FakeVCenterNode.created_vms
+        self.assertTrue(shell["create_disks"])
+        [command] = [command for command in commands if "restore" in command]
+        self.assertNotIn("--api", command)
+        self.assertNotIn("--cluster", command)
+        self.assertEqual(FakeVCenterNode.adopted_disks, [])
 
     def test_a_restore_to_a_new_name_leaves_identity_alone(self) -> None:
         HYPERVISORS["hv-vc"] = {

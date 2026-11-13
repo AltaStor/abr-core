@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright © 2026 Norvitex OÜ
 
+import base64
 import functools
+import json
 import re
 import socket
 import hashlib
@@ -9,6 +11,8 @@ import logging
 import ssl
 import threading
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar
@@ -352,6 +356,92 @@ def _reported_ip_address(vm: Any, summary: Any) -> str:
     return guest_ip_address([value for nic in nics for value in (getattr(nic, "ipAddress", None) or [])])
 
 
+def _vcenter_disk_uuid(uuid: str) -> str:
+    digits = uuid.replace("-", "").replace(" ", "")
+    pairs = [digits[index:index + 2] for index in range(0, len(digits), 2)]
+    return " ".join(pairs[:8]) + "-" + " ".join(pairs[8:])
+
+
+def _vm_folder_path(folder: Any) -> str:
+    names = []
+    while folder is not None:
+        names.append(str(getattr(folder, "name", "") or ""))
+        if isinstance(folder, vim.Datacenter):
+            break
+        folder = getattr(folder, "parent", None)
+    return "/" + "/".join(reversed(names))
+
+
+def _paired_network_adapters(originals: list[dict[str, Any]], restored: list[Any]) -> list[tuple[dict[str, Any], Any]]:
+    by_label = {str(getattr(device.deviceInfo, "label", "") or ""): device for device in restored}
+    pairs: list[tuple[dict[str, Any], Any]] = []
+    unmatched_originals = []
+    used: set[int] = set()
+    for original in originals:
+        device = by_label.get(str(original.get("label") or ""))
+        if device is not None and id(device) not in used:
+            pairs.append((original, device))
+            used.add(id(device))
+        else:
+            unmatched_originals.append(original)
+    remaining = [device for device in restored if id(device) not in used]
+    pairs.extend(zip(unmatched_originals, remaining))
+    return pairs
+
+
+def _custom_attributes(content: Any, vm: Any) -> list[dict[str, Any]]:
+    manager = getattr(content, "customFieldsManager", None)
+    if manager is None:
+        return []
+    names = {field.key: field.name for field in manager.field or []}
+    return [
+        {"key": int(value.key), "name": str(names.get(value.key, value.key)), "value": str(value.value)}
+        for value in getattr(vm, "customValue", None) or []
+        if str(getattr(value, "value", "") or "")
+    ]
+
+
+def _entity_permissions(content: Any, vm: Any) -> list[dict[str, Any]]:
+    return [
+        {"principal": str(item.principal), "group": bool(item.group), "role_id": int(item.roleId), "propagate": bool(item.propagate)}
+        for item in content.authorizationManager.RetrieveEntityPermissions(entity=vm, inherited=False) or []
+    ]
+
+
+def _alarm_spec(info: Any) -> Any:
+    return vim.alarm.AlarmSpec(
+        name=info.name,
+        description=info.description,
+        enabled=info.enabled,
+        expression=info.expression,
+        action=info.action,
+        actionFrequency=info.actionFrequency,
+        setting=info.setting,
+    )
+
+
+def _give_back_custom_attributes(content: Any, vm: Any, placement: dict[str, Any], applied: dict[str, Any]) -> None:
+    attributes = list(placement.get("custom_attributes") or [])
+    for attribute in attributes:
+        content.customFieldsManager.SetField(entity=vm, key=int(attribute["key"]), value=str(attribute["value"]))
+    applied["custom_attributes"] = [attribute["name"] for attribute in attributes]
+
+
+def _give_back_permissions(content: Any, vm: Any, placement: dict[str, Any], applied: dict[str, Any]) -> None:
+    permissions = list(placement.get("permissions") or [])
+    if permissions:
+        content.authorizationManager.SetEntityPermissions(
+            entity=vm,
+            permission=[
+                vim.AuthorizationManager.Permission(
+                    principal=item["principal"], group=item["group"], roleId=item["role_id"], propagate=item["propagate"]
+                )
+                for item in permissions
+            ],
+        )
+    applied["permissions"] = [item["principal"] for item in permissions]
+
+
 class VCenterNode(Hypervisor):
     def __init__(
         self,
@@ -370,6 +460,7 @@ class VCenterNode(Hypervisor):
         # Guards the connection itself (re-login / reconnect), so the keepalive
         # thread below can never swap self.si out from under a caller.
         self._session_lock = threading.RLock()
+        self._carried_alarms: dict[str, list[Any]] = {}
 
     def _named_objects(self, object_types: Any, root: Any = None) -> List[tuple]:
         types = list(object_types) if isinstance(object_types, (list, tuple)) else [object_types]
@@ -1286,6 +1377,11 @@ class VCenterNode(Hypervisor):
             name = None
         return str(name) if name else "cluster"
 
+    def compute_resource_name(self, host_name: str) -> str | None:
+        host = self._get_host(host_name)
+        parent = getattr(host, "parent", None) if host is not None else None
+        return str(getattr(parent, "name", "") or "") or None
+
     def clustered_host_name(self) -> Optional[str]:
         """Return the name of the cluster the endpoint's host belongs to.
 
@@ -1330,6 +1426,7 @@ class VCenterNode(Hypervisor):
         config_metadata: Dict[str, Any],
         disk_layout: List[Dict[str, Any]] | None = None,
         disk_placements: list[dict[str, Any]] | None = None,
+        create_disks: bool = True,
     ) -> Dict[str, Any]:
         host = self._get_host(host_name)
         if host is None:
@@ -1413,12 +1510,14 @@ class VCenterNode(Hypervisor):
             )
 
         created_disk_paths: list[str] = []
+        planned_disks: list[dict[str, Any]] = []
         for index, disk in enumerate(disk_layout, start=1):
             if disk_placements:
                 type_name, bus, unit_number = disk_slots[index - 1]
                 controller_key = controller_keys[(type_name, bus)]
             else:
                 controller_key = scsi_controller.key
+                type_name, bus = str(_disk_controller_type_name(scsi_controller) or ""), 0
                 unit_number = index - 1
                 if unit_number >= 7:
                     unit_number += 1
@@ -1456,8 +1555,20 @@ class VCenterNode(Hypervisor):
             virtual_disk.backing = backing
 
             disk_spec.device = virtual_disk
-            device_changes.append(disk_spec)
+            if create_disks:
+                device_changes.append(disk_spec)
             created_disk_paths.append(disk_path)
+            planned_disks.append(
+                {
+                    "path": disk_path,
+                    "controller_type": type_name,
+                    "bus": bus,
+                    "unit": unit_number,
+                    "label": virtual_disk.deviceInfo.label,
+                    "disk_uuid": source_disk_uuid,
+                    "thin_requested": bool(backing.thinProvisioned),
+                }
+            )
 
         vm_path = f"[{datastore_name}]"
         source_firmware = config_metadata.get("firmware")
@@ -1564,6 +1675,7 @@ class VCenterNode(Hypervisor):
             "disk_controllers": disk_controllers,
             "requested_secure_boot": bool(requested_secure_boot) if requested_secure_boot is not None else None,
             "network_adapters": restored_adapters,
+            "planned_disks": planned_disks,
         }
 
     def _vm_holding_access_lock(self, vm_name: str, vm_moref: str | None) -> Optional[Any]:
@@ -2196,6 +2308,279 @@ class VCenterNode(Hypervisor):
             "uuid": str(getattr(config, "uuid", "") or ""),
             "instance_uuid": str(getattr(config, "instanceUuid", "") or ""),
         }
+
+    def adopt_restored_disk(self, vm_name: str, planned: dict[str, Any], vm_moref: str | None = None) -> dict[str, Any]:
+        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
+        if vm is None:
+            vm = self._get_vm(vm_name)
+        if not vm:
+            raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
+        devices = list(vm.config.hardware.device)
+        disk = next(
+            (device for device in devices if isinstance(device, vim.vm.device.VirtualDisk) and device.backing.fileName == planned["path"]),
+            None,
+        )
+        if disk is None:
+            raise RuntimeError(f"abr-vmdk-tool restored {planned['path']}, but VM '{vm_name}' has no such disk")
+        target = next(
+            (
+                device
+                for device in devices
+                if _disk_controller_type_name(device) == planned["controller_type"] and getattr(device, "busNumber", None) == planned["bus"]
+            ),
+            None,
+        )
+        if target is None:
+            raise RuntimeError(
+                f"VM '{vm_name}' has no {disk_controller_display_name(planned['controller_type'])} {planned['bus']} to attach {planned['path']} to"
+            )
+        source_uuid = _normalize_disk_uuid(planned.get("disk_uuid"))
+        in_place = disk.controllerKey == target.key and disk.unitNumber == planned["unit"]
+        if in_place and (not source_uuid or _normalize_disk_uuid(disk.backing.uuid) == source_uuid):
+            return self._adopted(disk, target)
+        datastore = disk.backing.datastore
+        original = (disk.controllerKey, disk.unitNumber, disk.deviceInfo.label)
+        self._wait_for_task(vm.ReconfigVM_Task(spec=vim.vm.ConfigSpec(deviceChange=[
+            vim.vm.device.VirtualDeviceSpec(operation=vim.vm.device.VirtualDeviceSpec.Operation.remove, device=disk)
+        ])))
+        try:
+            if source_uuid:
+                self.set_disk_uuid(planned["path"], source_uuid, host=vm.runtime.host)
+            self._attach_disk_file(vm, planned["path"], datastore, target.key, planned["unit"], planned.get("label") or disk.deviceInfo.label)
+        except Exception:
+            try:
+                self._attach_disk_file(self._get_vm_by_moref(vm._moId) or vm, planned["path"], datastore, *original)
+            except Exception:
+                logger.exception("Could not put %s back on VM '%s' after moving it failed", planned["path"], vm_name)
+            raise
+        vm = self._get_vm_by_moref(vm._moId) or vm
+        adopted = next(
+            device for device in vm.config.hardware.device if isinstance(device, vim.vm.device.VirtualDisk) and device.backing.fileName == planned["path"]
+        )
+        logger.info(
+            "Attached restored disk %s of VM '%s' to %s %s unit %s.",
+            planned["path"],
+            vm_name,
+            disk_controller_display_name(planned["controller_type"]),
+            planned["bus"],
+            planned["unit"],
+        )
+        return self._adopted(adopted, target)
+
+    def set_disk_uuid(self, path: str, disk_uuid: Any, *, host: Any = None, vm_name: str | None = None) -> None:
+        uuid = _normalize_disk_uuid(disk_uuid)
+        if not uuid:
+            return
+        if host is None and vm_name:
+            vm = self._get_vm(vm_name)
+            host = getattr(getattr(vm, "runtime", None), "host", None)
+        self.si.RetrieveContent().virtualDiskManager.SetVirtualDiskUuid(
+            name=path, datacenter=self._get_datacenter(host), uuid=_vcenter_disk_uuid(uuid)
+        )
+
+    def _attach_disk_file(self, vm: Any, path: str, datastore: Any, controller_key: int, unit: int, label: str) -> None:
+        disk = vim.vm.device.VirtualDisk(
+            key=-1,
+            controllerKey=controller_key,
+            unitNumber=unit,
+            deviceInfo=vim.Description(label=label, summary=path),
+            backing=vim.vm.device.VirtualDisk.FlatVer2BackingInfo(fileName=path, datastore=datastore, diskMode="persistent"),
+        )
+        self._wait_for_task(vm.ReconfigVM_Task(spec=vim.vm.ConfigSpec(deviceChange=[
+            vim.vm.device.VirtualDeviceSpec(operation=vim.vm.device.VirtualDeviceSpec.Operation.add, device=disk)
+        ])))
+
+    @staticmethod
+    def _adopted(disk: Any, controller: Any) -> dict[str, Any]:
+        return {
+            "path": disk.backing.fileName,
+            "controller": f"{disk_controller_display_name(_disk_controller_type_name(controller))} {controller.busNumber}",
+            "unit": disk.unitNumber,
+            "thin": bool(getattr(disk.backing, "thinProvisioned", False)),
+            "disk_uuid": _normalize_disk_uuid(disk.backing.uuid),
+        }
+
+    def read_vm_placement(self, vm_name: str, vm_moref: str | None = None) -> dict[str, Any]:
+        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
+        if vm is None:
+            vm = self._get_vm(vm_name)
+        if not vm:
+            raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
+        content = self.si.RetrieveContent()
+        parent = getattr(vm, "parent", None)
+        placement: dict[str, Any] = {
+            "source_moref": str(vm._moId),
+            "folder": {"moref": str(parent._moId), "path": _vm_folder_path(parent)} if isinstance(parent, vim.Folder) else None,
+            "network_adapters": [
+                {
+                    "label": str(getattr(getattr(device, "deviceInfo", None), "label", "") or ""),
+                    "mac": str(device.macAddress),
+                    "address_type": str(getattr(device, "addressType", "") or ""),
+                }
+                for device in vm.config.hardware.device
+                if isinstance(device, vim.vm.device.VirtualEthernetCard) and getattr(device, "macAddress", None)
+            ],
+            "notes": str(getattr(vm.config, "annotation", "") or ""),
+            "unreadable": {},
+        }
+        readers = {
+            "custom attributes": lambda: _custom_attributes(content, vm),
+            "permissions": lambda: _entity_permissions(content, vm),
+            "alarms": lambda: self._remember_alarms(content, vm),
+            "tags": lambda: self._attached_tags(content, vm),
+        }
+        for part, read in readers.items():
+            try:
+                placement[part.replace(" ", "_")] = read()
+            except Exception as exc:
+                placement[part.replace(" ", "_")] = []
+                placement["unreadable"][part] = str(exc).rstrip(". ") or type(exc).__name__
+                logger.warning("Could not read the %s of VM '%s' on %s: %s", part, vm_name, self.host, exc)
+        return placement
+
+    def _remember_alarms(self, content: Any, vm: Any) -> list[str]:
+        manager = getattr(content, "alarmManager", None)
+        alarms = [alarm for alarm in manager.GetAlarm(entity=vm) or [] if alarm.info.entity == vm] if manager else []
+        self._carried_alarms[str(vm._moId)] = [_alarm_spec(alarm.info) for alarm in alarms]
+        return [str(alarm.info.name) for alarm in alarms]
+
+    def _attached_tags(self, content: Any, vm: Any) -> list[dict[str, str]]:
+        if getattr(content.about, "apiType", "") != "VirtualCenter":
+            return []
+        with self._vapi_session() as call:
+            object_id = {"type": "VirtualMachine", "id": str(vm._moId)}
+            tag_ids = call("POST", "cis/tagging/tag-association?action=list-attached-tags", {"object_id": object_id}) or []
+            return [{"id": tag_id, "name": str((call("GET", f"cis/tagging/tag/{tag_id}") or {}).get("name") or tag_id)} for tag_id in tag_ids]
+
+    @contextmanager
+    def _vapi_session(self) -> Iterator[Callable[..., Any]]:
+        context = ssl.create_default_context() if self.verify_ssl else ssl._create_unverified_context()
+        base = f"https://{self.host}:{self.port}/api"
+
+        def call(method: str, path: str, body: Any = None, *, headers: dict[str, str] | None = None) -> Any:
+            request = urllib.request.Request(
+                f"{base}/{path}",
+                data=None if body is None else json.dumps(body).encode(),
+                headers={"Content-Type": "application/json", **(headers or session)},
+                method=method,
+            )
+            try:
+                with urllib.request.urlopen(request, context=context, timeout=60) as response:
+                    raw = response.read()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode(errors="replace")[:300]
+                raise RuntimeError(f"vCenter API {method} {path} answered {exc.code}: {detail}") from exc
+            return json.loads(raw) if raw else None
+
+        session: dict[str, str] = {}
+        basic = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
+        session["vmware-api-session-id"] = call("POST", "session", headers={"Authorization": f"Basic {basic}"})
+        try:
+            yield call
+        finally:
+            try:
+                call("DELETE", "session")
+            except Exception:
+                logger.debug("Could not end the vCenter API session on %s", self.host, exc_info=True)
+
+    def apply_vm_placement(
+        self, vm_name: str, placement: dict[str, Any], vm_moref: str | None = None
+    ) -> dict[str, Any]:
+        vm = self._get_vm_by_moref(vm_moref or "") if vm_moref else None
+        if vm is None:
+            vm = self._get_vm(vm_name)
+        if not vm:
+            raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
+        content = self.si.RetrieveContent()
+        applied: dict[str, Any] = {"network_adapters": [], "folder": (placement.get("folder") or {}).get("path")}
+        failed: dict[str, str] = {
+            part: f"it could not be read from the VM that was replaced ({reason})"
+            for part, reason in (placement.get("unreadable") or {}).items()
+        }
+        steps = {
+            "MAC addresses": lambda: self._give_back_macs(vm, placement, applied),
+            "VM folder": lambda: self._move_back(vm, placement),
+            "notes": lambda: self._give_back_notes(vm, placement, applied),
+            "custom attributes": lambda: _give_back_custom_attributes(content, vm, placement, applied),
+            "permissions": lambda: _give_back_permissions(content, vm, placement, applied),
+            "alarms": lambda: self._give_back_alarms(content, vm, placement, applied),
+            "tags": lambda: self._give_back_tags(content, vm, placement, applied),
+        }
+        for part, step in steps.items():
+            if part in failed:
+                continue
+            try:
+                step()
+            except Exception as exc:
+                failed[part] = str(exc).rstrip(". ") or type(exc).__name__
+                logger.warning("Could not give VM '%s' on %s back its original %s: %s", vm_name, self.host, part, exc)
+        applied["failed"] = failed
+        logger.info(
+            "Gave VM '%s' on %s back what the VM it replaced had: folder %s, MAC addresses (%s), %d tag(s), "
+            "%d custom attribute(s), %d permission(s), %d alarm(s)%s.",
+            vm_name,
+            self.host,
+            applied["folder"] or "(root)",
+            ", ".join(f"{item['label']} {item['mac']}" for item in applied["network_adapters"]) or "none",
+            len(applied.get("tags") or []),
+            len(applied.get("custom_attributes") or []),
+            len(applied.get("permissions") or []),
+            len(applied.get("alarms") or []),
+            f"; not given back: {', '.join(failed)}" if failed else "",
+        )
+        return applied
+
+    def _give_back_macs(self, vm: Any, placement: dict[str, Any], applied: dict[str, Any]) -> None:
+        restored = [device for device in vm.config.hardware.device if isinstance(device, vim.vm.device.VirtualEthernetCard)]
+        changes = []
+        for original, device in _paired_network_adapters(placement.get("network_adapters") or [], restored):
+            address_type = original.get("address_type") or "manual"
+            applied["network_adapters"].append({"label": str(device.deviceInfo.label), "mac": original["mac"]})
+            if device.macAddress == original["mac"] and device.addressType == address_type:
+                continue
+            device.macAddress = original["mac"]
+            device.addressType = address_type
+            changes.append(
+                vim.vm.device.VirtualDeviceSpec(operation=vim.vm.device.VirtualDeviceSpec.Operation.edit, device=device)
+            )
+        if changes:
+            self._wait_for_task(vm.ReconfigVM_Task(spec=vim.vm.ConfigSpec(deviceChange=changes)))
+
+    def _move_back(self, vm: Any, placement: dict[str, Any]) -> None:
+        folder = placement.get("folder") or {}
+        if folder.get("moref") and str(getattr(vm.parent, "_moId", "")) != folder["moref"]:
+            self._wait_for_task(vim.Folder(folder["moref"], self.si._stub).MoveIntoFolder_Task([vm]))
+
+    def _give_back_notes(self, vm: Any, placement: dict[str, Any], applied: dict[str, Any]) -> None:
+        notes = str(placement.get("notes") or "")
+        if str(getattr(vm.config, "annotation", "") or "") != notes:
+            self._wait_for_task(vm.ReconfigVM_Task(spec=vim.vm.ConfigSpec(annotation=notes)))
+        applied["notes"] = bool(notes)
+
+    def _give_back_alarms(self, content: Any, vm: Any, placement: dict[str, Any], applied: dict[str, Any]) -> None:
+        names = list(placement.get("alarms") or [])
+        if not names:
+            return
+        specs = self._carried_alarms.get(str(placement.get("source_moref") or ""))
+        if specs is None:
+            raise RuntimeError(f"the definitions of {', '.join(names)} were not kept")
+        existing = {str(alarm.info.name) for alarm in content.alarmManager.GetAlarm(entity=vm) or [] if alarm.info.entity == vm}
+        for spec in specs:
+            if spec.name not in existing:
+                content.alarmManager.CreateAlarm(entity=vm, spec=spec)
+        applied["alarms"] = names
+
+    def _give_back_tags(self, content: Any, vm: Any, placement: dict[str, Any], applied: dict[str, Any]) -> None:
+        tags = list(placement.get("tags") or [])
+        if not tags:
+            return
+        with self._vapi_session() as call:
+            call(
+                "POST",
+                "cis/tagging/tag-association?action=attach-multiple-tags-to-object",
+                {"object_id": {"type": "VirtualMachine", "id": str(vm._moId)}, "tag_ids": [tag["id"] for tag in tags]},
+            )
+        applied["tags"] = [tag["name"] for tag in tags]
 
     def set_vm_identity(
         self,
