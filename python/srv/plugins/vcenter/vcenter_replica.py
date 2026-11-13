@@ -275,7 +275,9 @@ def write_increments(
     report: Any,
     should_cancel: Any,
     timeout_seconds: float | None,
+    tool_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """Write each layer into the replica's disk; ``tool_env`` is the replication session's abr-vmdk-tool environment."""
     tool_path = Path(_default_tool_path()).expanduser()
     service_type, thumbprint = _connection_details(node)
     written = 0
@@ -299,6 +301,7 @@ def write_increments(
         )
         completed = _run_restore_layer(
             command,
+            env=tool_env,
             check=False,
             capture_output=True,
             text=True,
