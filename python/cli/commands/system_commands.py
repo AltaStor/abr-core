@@ -100,6 +100,60 @@ class SystemCommands:
         )
         clock_confirm.set_defaults(handler=self.clock_confirm)
 
+        vsphere = commands.add_parser(
+            "vsphere",
+            help="Show or change the server-wide vSphere transport and VDDK library.",
+            description=(
+                "Every vSphere inventory without its own transport or VDDK library uses these (inventory "
+                "add/edit --transport and --vddk-library set its own). Sessions keep what they started with."
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        vsphere_commands = vsphere.add_subparsers(dest="vsphere_command", required=True)
+        vsphere_show = vsphere_commands.add_parser(
+            "show",
+            help="Show the server-wide vSphere transport and VDDK library.",
+            description=(
+                "Show the server-wide transport and VDDK library, the VDDK directory a library left at its "
+                "default follows, the file the library resolves to, whether this server can use each transport, "
+                "and which vSphere inventories have their own values.\n\n"
+                "Examples:\n  abr system vsphere show"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        vsphere_show.set_defaults(handler=self.vsphere_show)
+        vsphere_set = vsphere_commands.add_parser(
+            "set",
+            help="Change the server-wide vSphere transport and VDDK library.",
+            description=(
+                "Change the server-wide transport and VDDK library. The library is checked on the backup server: "
+                "a full path to a readable file that exports VixDiskLib_InitEx. Options left out keep their value.\n\n"
+                "Examples:\n"
+                "  abr system vsphere set --vddk-library /opt/vmware-vix-disklib/lib64/libvixDiskLib.so.9.1.0.0\n"
+                "  abr system vsphere set --vddk-library default\n"
+                "  abr system vsphere set --transport soap --update-all-inventories"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        vsphere_set.add_argument(
+            "--transport",
+            choices=("vddk", "soap"),
+            help="vddk (the VMware VDDK) or soap (the vSphere SOAP API)",
+        )
+        vsphere_set.add_argument(
+            "--vddk-library",
+            metavar="PATH|default",
+            help="The full path of the VDDK library file; default makes it follow the VDDK directory again "
+            "(<directory>/lib64/libvixDiskLib.so)",
+        )
+        vsphere_set.add_argument(
+            "--update-all-inventories",
+            action="store_true",
+            help="Remove the transport and VDDK library of every vSphere inventory that has its own, so all of them "
+            "use the server-wide values from now on",
+        )
+        vsphere_set.set_defaults(handler=self.vsphere_set)
+
         export = commands.add_parser(
             "export",
             help="Export DB catalog + configuration to an encrypted archive",
@@ -190,6 +244,29 @@ class SystemCommands:
                 print(f"Server time {payload.get('server_time')} confirmed; retention was not blocked.")
             return 0
         deps.context.print_output(payload)
+        return 0
+
+    def vsphere_show(self, args) -> int:
+        deps = CommandDependencies(args)
+        deps.context.print_output(deps.context.api_client.get("api/v1/system/vsphere"))
+        return 0
+
+    def vsphere_set(self, args) -> int:
+        deps = CommandDependencies(args)
+        changes: dict = {}
+        if args.transport:
+            changes["transport"] = args.transport
+        if args.vddk_library is not None:
+            changes["vddk_library"] = None if args.vddk_library.strip().lower() == "default" else args.vddk_library
+        if args.update_all_inventories:
+            changes["apply_to_existing_inventories"] = True
+        if not changes:
+            raise CliStructuredError(
+                code="invalid_argument",
+                message="Give --transport, --vddk-library or --update-all-inventories",
+                exit_code=INVALID_USAGE,
+            )
+        deps.context.print_output(deps.context.api_client.put("api/v1/system/vsphere", json=changes))
         return 0
 
     def export(self, args) -> int:

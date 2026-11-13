@@ -67,8 +67,15 @@ class InventoryCommands:
         add.add_argument("--insecure", action="store_true", help="Disable SSL verification")
         add.add_argument(
             "--transport",
-            choices=("vddk", "soap"),
-            help="vSphere only: how disks are read and written, vddk (the VMware VDDK, the default) or soap (the vSphere SOAP API)",
+            choices=("vddk", "soap", "inherit"),
+            help="vSphere only: how disks are read and written, vddk (the VMware VDDK) or soap (the vSphere SOAP API); "
+            "inherit (the default) uses the server-wide transport (abr system vsphere)",
+        )
+        add.add_argument(
+            "--vddk-library",
+            metavar="PATH|inherit",
+            help="vSphere only: the full path of the VDDK library file on the backup server; inherit (the default) "
+            "uses the server-wide one",
         )
         add.set_defaults(handler=self.add)
 
@@ -144,8 +151,15 @@ class InventoryCommands:
         edit.add_argument("--insecure", action="store_true", help="Disable SSL verification")
         edit.add_argument(
             "--transport",
-            choices=("vddk", "soap"),
-            help="vSphere only: how disks are read and written from now on; running sessions keep the one they started with",
+            choices=("vddk", "soap", "inherit"),
+            help="vSphere only: how disks are read and written from now on, or inherit to use the server-wide transport; "
+            "running sessions keep the one they started with",
+        )
+        edit.add_argument(
+            "--vddk-library",
+            metavar="PATH|inherit",
+            help="vSphere only: the full path of the VDDK library file on the backup server, or inherit to use the "
+            "server-wide one",
         )
         edit.add_argument("--secure", action="store_true", help="Enable SSL verification")
         edit.set_defaults(handler=self.edit)
@@ -189,6 +203,7 @@ class InventoryCommands:
             "token": token,
             "insecure": args.insecure,
             **({"transport": args.transport} if args.transport else {}),
+            **({"vddk_library": args.vddk_library} if args.vddk_library else {}),
         })
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("endpoint", "ENDPOINT"), ("status", "STATUS")])
         return 0
@@ -214,6 +229,7 @@ class InventoryCommands:
             "password": resolve_secret(args.password, env_var=INVENTORY_PASSWORD_ENV_VAR, prompt="Inventory password"),
             "token": resolve_secret(args.token, env_var=INVENTORY_TOKEN_ENV_VAR, prompt="Inventory token"),
             "transport": args.transport,
+            "vddk_library": args.vddk_library,
         }.items() if value is not None}
         if args.insecure and args.secure:
             raise ValueError("Use only one of --insecure or --secure")

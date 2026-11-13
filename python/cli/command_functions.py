@@ -74,6 +74,8 @@ COMMAND_FUNCTIONS: dict[str, str] = {
     "system version": "system.view",
     "system health": "system.view",
     "system clock show": "system.view",
+    "system vsphere show": "inventory.view",
+    "system vsphere set": "inventory.edit",
     "system clock confirm": "system.clock_confirm",
     "system export": "system.export",
     "system import": "system.import",
