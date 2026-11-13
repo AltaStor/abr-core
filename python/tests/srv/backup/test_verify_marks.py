@@ -212,6 +212,94 @@ class VerifyMarkTests(_Catalog):
         self.assertEqual((dto["available"], dto["corruption"]["kind"]), (False, "dependent"))
         self.assertIsNone(abr_v41.restore_point_to_dto(BACKUPS["inc-b1"])["corruption"])
 
+    def _refusal(self, payload: dict) -> ApiError:
+        with self.assertRaises(ApiError) as caught:
+            abr_v41.restore_start(payload)
+        return caught.exception
+
+    def test_restore_by_backup_of_a_chain_whose_only_point_is_corrupt_says_why_like_restore_by_point(self) -> None:
+        self.store(_point("full-a", parent=None, day=1))
+        self.mark({"full-a": "corrupt"})
+
+        by_backup = self._refusal({"backup": BACKUPS["full-a"]["chain_id"], "vm": "VM-1"})
+        by_point = self._refusal({"point_id": "full-a"})
+
+        self.assertEqual((by_backup.status_code, by_backup.code), (409, "restore_point_unavailable"))
+        self.assertEqual(by_backup.message, by_point.message)
+        self.assertIn("found its data damaged", by_backup.message)
+        self.assertEqual(by_backup.details["point_id"], "full-a")
+
+    def test_restore_by_backup_when_every_point_is_corrupt_names_the_newest_points_reason(self) -> None:
+        self.store(_point("full-a", parent=None, day=1), _point("inc-a1", parent="full-a", day=2))
+        self.mark({"full-a": "corrupt"})
+
+        refusal = self._refusal({"backup": BACKUPS["full-a"]["chain_id"]})
+
+        self.assertEqual((refusal.status_code, refusal.details["point_id"]), (409, "inc-a1"))
+        self.assertIn("builds on restore point full-a", refusal.message)
+
+    def test_restore_by_backup_gives_the_reason_of_other_unavailable_points_too(self) -> None:
+        cases = {
+            "deleting": ({"status": "deleting", "deletion_requested_at": "2026-06-02T12:00:00+00:00"}, "being deleted"),
+            "chain_broken": ({"status": "chain_broken", "missing_ancestor_id": "full-0"}, "builds on restore point full-0"),
+        }
+        for label, (fields, expected) in cases.items():
+            with self.subTest(label):
+                BACKUPS.clear()
+                self.store(_point("full-a", parent=None, day=1))
+                BACKUPS["full-a"].update(fields)
+
+                by_backup = self._refusal({"backup": BACKUPS["full-a"]["chain_id"]})
+                by_point = self._refusal({"point_id": "full-a"})
+
+                self.assertEqual((by_backup.status_code, by_backup.message), (409, by_point.message))
+                self.assertIn(expected, by_backup.message)
+
+    def test_restore_by_backup_still_takes_the_newest_restorable_point_and_still_finds_nothing_for_an_unknown_chain(self) -> None:
+        self.chain()
+        self.mark({"inc-b3": "corrupt"})
+        chain_id = BACKUPS["full-a"]["chain_id"]
+
+        self.assertEqual(abr_v41._resolve_restore_source_point({"backup": chain_id})["id"], "inc-b2")
+        for payload in ({"backup": "backup::no-such-chain"}, {"backup": chain_id, "vm": "another-vm"}):
+            with self.subTest(payload=payload):
+                refusal = self._refusal(payload)
+                self.assertEqual((refusal.status_code, refusal.code), (404, "restore_point_not_found"))
+
+    def test_a_restore_by_backup_that_skips_newer_points_warns_naming_each_and_why(self) -> None:
+        self.chain()
+        self.mark({"inc-b2": "corrupt"})
+        payload = {"backup": BACKUPS["full-a"]["chain_id"]}
+        point = abr_v41._resolve_restore_source_point(payload)
+
+        skipped = abr_v41._skipped_newer_points(payload, point)
+        warning = abr_v41.newer_points_warning(skipped, point)
+
+        self.assertEqual(point["id"], "inc-b1")
+        self.assertEqual((warning["code"], warning["restore_point_ids"]), ("newer_points_unavailable", ["inc-b3", "inc-b2"]))
+        self.assertIn("Restoring restore point inc-b1", warning["message"])
+        self.assertIn("2 newer restore point(s) cannot be restored", warning["message"])
+        self.assertIn("inc-b3 (2026-06-06T12:00:00+00:00): it builds on restore point inc-b2, whose data is damaged", warning["message"])
+        self.assertIn("inc-b2 (2026-06-05T12:00:00+00:00): backup verify on ", warning["message"])
+
+    def test_the_reasons_of_skipped_points_that_are_not_corrupt(self) -> None:
+        deleting = {"id": "p1", "status": "deleting"}
+        broken = {"id": "p2", "status": "chain_broken", "missing_ancestor_id": "p0"}
+
+        self.assertEqual(abr_v41._unavailable_reason(deleting), "it is being deleted")
+        self.assertEqual(abr_v41._unavailable_reason(broken), "it builds on restore point p0, whose data is missing from the repository")
+
+    def test_no_warning_when_the_newest_point_is_restored_or_a_point_is_named(self) -> None:
+        self.chain()
+        chain_id = BACKUPS["full-a"]["chain_id"]
+        newest = abr_v41._resolve_restore_source_point({"backup": chain_id})
+
+        self.assertEqual(newest["id"], "inc-b3")
+        self.assertEqual(abr_v41._skipped_newer_points({"backup": chain_id}, newest), [])
+        self.mark({"inc-b3": "corrupt"})
+        self.assertEqual(abr_v41._skipped_newer_points({"point_id": "inc-b1"}, BACKUPS["inc-b1"]), [])
+        self.assertEqual(abr_v41._skipped_newer_points({"backup": chain_id, "vm": "VM-1"}, BACKUPS["inc-b2"])[0]["id"], "inc-b3")
+
     def test_the_chain_shows_how_many_points_are_corrupt(self) -> None:
         self.chain()
         self.mark({"inc-b2": "corrupt"})

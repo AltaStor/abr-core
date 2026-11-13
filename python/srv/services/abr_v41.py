@@ -10594,11 +10594,8 @@ def _resolve_restore_source_point(payload: dict[str, Any]) -> dict[str, Any]:
         return point
 
     _ensure(bool(backup_id), 422, "invalid_restore", "restore start requires --point-id/--restore-point or --backup")
-    candidates = [point for point in normalized_backup_points() if _restore_point_matches_backup(point, backup_id)]
-    if vm_selector:
-        candidates = [point for point in candidates if _restore_point_matches_vm(point, vm_selector)]
-    candidates = [point for point in candidates if _restore_point_is_available(point)]
-    if not candidates:
+    matching = _backup_points_newest_first(backup_id, vm_selector)
+    if not matching:
         raise api_error(
             404,
             "restore_point_not_found",
@@ -10606,8 +10603,52 @@ def _resolve_restore_source_point(payload: dict[str, Any]) -> dict[str, Any]:
             backup_id=backup_id,
             vm=vm_selector or None,
         )
-    candidates.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")), reverse=True)
-    return candidates[0]
+    available = [point for point in matching if _restore_point_is_available(point)]
+    return available[0] if available else matching[0]
+
+
+def _backup_points_newest_first(backup_id: str, vm_selector: str) -> list[dict[str, Any]]:
+    matching = [point for point in normalized_backup_points() if _restore_point_matches_backup(point, backup_id)]
+    if vm_selector:
+        matching = [point for point in matching if _restore_point_matches_vm(point, vm_selector)]
+    return sorted(matching, key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")), reverse=True)
+
+
+def _skipped_newer_points(payload: dict[str, Any], point: dict[str, Any]) -> list[dict[str, Any]]:
+    if str(payload.get("point_id") or payload.get("restore_point_id") or "").strip():
+        return []
+    backup_id = str(payload.get("backup") or payload.get("backup_id") or "").strip()
+    newest_first = _backup_points_newest_first(backup_id, str(payload.get("vm") or "").strip())
+    ids = [str(item.get("id") or "") for item in newest_first]
+    point_id = str(point.get("id") or "")
+    return newest_first[: ids.index(point_id)] if point_id in ids else []
+
+
+def _unavailable_reason(point: dict[str, Any]) -> str:
+    status = str(point.get("status") or "")
+    corruption = point.get("corruption") if isinstance(point.get("corruption"), dict) else {}
+    if status == POINT_CORRUPT and corruption.get("kind") == "dependent":
+        return f"it builds on restore point {corruption.get('damaged_point_id')}, whose data is damaged"
+    if status == POINT_CORRUPT:
+        found = f"{corruption.get('found_by') or 'verification'} on {corruption.get('found_at')}" if corruption.get("found_at") else "verification"
+        return f"{found} found its data damaged"
+    if status == POINT_CHAIN_BROKEN:
+        return f"it builds on restore point {point.get('missing_ancestor_id')}, whose data is missing from the repository"
+    if status == POINT_DELETING:
+        return "it is being deleted"
+    return f"its status is {status or 'unknown'}"
+
+
+def newer_points_warning(skipped: list[dict[str, Any]], point: dict[str, Any]) -> dict[str, Any]:
+    details = "; ".join(f"{item.get('id')} ({item.get('created_at')}): {_unavailable_reason(item)}" for item in skipped)
+    return {
+        "code": "newer_points_unavailable",
+        "message": (
+            f"Restoring restore point {point.get('id')} ({point.get('created_at')}), the newest of this backup that can "
+            f"be restored; {len(skipped)} newer restore point(s) cannot be restored: {details}"
+        ),
+        "restore_point_ids": [str(item.get("id") or "") for item in skipped],
+    }
 
 
 def _inventory_vm_name_exists(inventory_id: str, vm_name: str) -> bool:
@@ -11015,6 +11056,9 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
         "updated_at": utc_now(),
         "logs": [],
     }
+    skipped = _skipped_newer_points(payload, point)
+    if skipped:
+        task["warnings"] = [newer_points_warning(skipped, point)]
     mode_label = "In-place" if restore_mode == "in_place" else "Out-of-place"
     placement_text = ", ".join(f"{source} -> {target}" for source, target in sorted((datastore_placement or {}).items()))
     network_text = ", ".join(f"{source} -> {target}" for source, target in sorted((network_map or {}).items()))
@@ -11037,6 +11081,9 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     )
     _append_task_log(task, level="info", message=restore_summary, component="session")
     LOGGER.info("Restore session %s queued: %s", task["id"], restore_summary)
+    for warning in task.get("warnings") or []:
+        _append_task_log(task, level="warn", message=warning["message"], component="session")
+        LOGGER.warning("Restore session %s: %s", task["id"], warning["message"])
     persist_task(task)
     session = session_to_dto(task)
     return {
