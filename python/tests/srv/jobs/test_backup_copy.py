@@ -209,6 +209,70 @@ class CopyPlanTests(_Catalog):
         self.assertEqual([target["vm_id"] for target in backup_copy.copy_targets(job)], [VM])
 
 
+class SeveralJobsOfOneVmTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        JOBS["nightly"]["created_at"] = "2026-01-01T00:00:00+00:00"
+        JOBS["weekly"] = abr_v41.normalize_job_record(
+            {**JOBS["nightly"], "id": "weekly", "name": "Weekly", "created_at": "2026-02-01T00:00:00+00:00"}
+        )
+        self._point("n1", "ActiveFull")
+        self._point("w1", "ActiveFull", job_id="weekly")
+
+    def _followed(self, **payload) -> tuple[str, str, list[str]]:
+        self.copy = self._copy_job(**payload)
+        job = abr_v41.normalize_job_record(JOBS[self.copy["id"]])
+        plan = backup_copy.plan_copy(job, VM, requested_type="ActiveFull")
+        followed, others = backup_copy.followed_source_job(job, VM)
+        return plan["target"]["job_id"], followed, others
+
+    def test_from_a_repository_the_job_created_first_is_copied_even_when_another_has_the_newest_point(self) -> None:
+        self.assertEqual(self._followed(source_jobs=None, source_repositories=["Source"]), ("nightly", "Nightly", ["Weekly"]))
+
+    def test_the_order_of_the_source_jobs_comes_first(self) -> None:
+        self.assertEqual(self._followed(source_jobs=["Weekly", "Nightly"])[0], "weekly")
+        self.assertEqual(self._followed(name="Mixed copy", source_jobs=["Weekly"], source_repositories=["Source"])[0], "weekly")
+
+    def test_a_job_that_no_longer_exists_comes_after_every_job_that_does(self) -> None:
+        self._point("g1", "ActiveFull", job_id="gone", job_name="Gone")
+        JOBS["nightly"]["created_at"] = "2026-03-01T00:00:00+00:00"
+
+        self.assertEqual(self._followed(source_jobs=None, source_repositories=["Source"])[:2], ("weekly", "Weekly"))
+
+    def test_the_copy_stays_on_the_job_it_has_copied_from(self) -> None:
+        self.copy = self._copy_job(source_jobs=None, source_repositories=["Source"])
+        self._point("c1", "ActiveFull", job_id=self.copy["id"], repo="dst", copy_source={"job_id": "weekly", "repository_id": "src", "point_id": "w1"})
+        self._point("n2", "Incremental")
+        job = abr_v41.normalize_job_record(JOBS[self.copy["id"]])
+
+        self.assertIsNone(backup_copy.plan_copy(job, VM))
+        self.assertEqual(backup_copy.followed_source_job(job, VM), ("Weekly", ["Nightly"]))
+
+    def test_nothing_new_names_the_job_it_follows_and_the_jobs_it_does_not_copy(self) -> None:
+        self.copy = self._copy_job(source_jobs=None, source_repositories=["Source"])
+        self._point("c1", "ActiveFull", job_id=self.copy["id"], repo="dst", copy_source={"job_id": "nightly", "repository_id": "src", "point_id": "n1"})
+        self._point("w2", "Incremental", job_id="weekly")
+        task = backup_copy.create_copy_sessions(JOBS[self.copy["id"]], trigger="manual", include_idle=True)[0]
+
+        result = backup_copy.run_backup_copy(task)
+
+        self.assertTrue(result["nothing_copied"])
+        self.assertTrue(result["message"].startswith("Nothing new to copy for sql-01: the newest restore point of job Nightly is already in Offsite. "))
+        self.assertIn("Job(s) Weekly also back up sql-01 in the sources, and their restore points of it are not copied", result["message"])
+        self.assertNotIn("its newest restore point", result["message"])
+
+    def test_nothing_new_with_one_source_job_has_no_note(self) -> None:
+        del BACKUPS["w1"]
+        self.copy = self._copy_job(source_jobs=None, source_repositories=["Source"])
+        self._point("c1", "ActiveFull", job_id=self.copy["id"], repo="dst", copy_source={"job_id": "nightly", "repository_id": "src", "point_id": "n1"})
+        task = backup_copy.create_copy_sessions(JOBS[self.copy["id"]], trigger="manual", include_idle=True)[0]
+
+        self.assertEqual(
+            backup_copy.run_backup_copy(task)["message"],
+            "Nothing new to copy for sql-01: the newest restore point of job Nightly is already in Offsite",
+        )
+
+
 class CopiedDiskTests(unittest.TestCase):
     def test_a_copied_disk_tells_restore_whether_it_starts_a_chain_or_continues_one(self) -> None:
         merge = {

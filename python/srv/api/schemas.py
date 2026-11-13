@@ -987,9 +987,9 @@ class CreateCopyJobRequest(_LenientModel):
 
 
 COPY_MODE = "periodic copies the newest restore point of each VM on the job's schedule, merging what is new into one; immediate copies every new restore point as soon as a backup of a source creates it. null or omitted on create: periodic"
-COPY_SOURCE_JOBS = "Backup jobs whose restore points are copied, by name (case-insensitive); with source_job_ids, source_repositories and source_repository_ids, at least one source"
+COPY_SOURCE_JOBS = "Backup jobs whose restore points are copied, by name (case-insensitive), in order: a VM that several of them back up is copied from the first; with source_job_ids, source_repositories and source_repository_ids, at least one source"
 COPY_SOURCE_JOB_IDS = "Backup jobs whose restore points are copied, by ID"
-COPY_SOURCE_REPOSITORIES = "Repositories whose restore points are copied, every job's, by name (case-insensitive)"
+COPY_SOURCE_REPOSITORIES = "Repositories whose restore points are copied, by name (case-insensitive); a VM that several jobs back up is copied from one job: the first source job that backs it up, else the job created first"
 COPY_SOURCE_REPOSITORY_IDS = "Repositories whose restore points are copied, by ID"
 COPY_RUN_AFTER = "Periodic copies only: start the copy each time a run of this job finishes, by name or with run_after_job_id by ID; empty clears it"
 COPY_RETRY_COUNT = "Retries of a VM whose copy failed, 0 to 20, within the same session; null or omitted: 5 for periodic, 3 for immediate"

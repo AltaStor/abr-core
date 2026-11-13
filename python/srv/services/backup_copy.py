@@ -162,11 +162,27 @@ def _segments(points: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return _segment_points(points)
 
 
-def _source_chain(job: dict[str, Any], vm_id: str, previous: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _vm_source_chains(job: dict[str, Any], vm_id: str) -> dict[str, list[dict[str, Any]]]:
     by_source: dict[str, list[dict[str, Any]]] = {}
     for point in source_points(job):
         if str(point.get("vm_id") or "") == vm_id:
             by_source.setdefault(f"{point.get('job_id')}::{point.get('repository_id')}", []).append(point)
+    return by_source
+
+
+def _source_rank(job: dict[str, Any]) -> Callable[[list[dict[str, Any]]], tuple[int, str, str]]:
+    order = {job_id: position for position, job_id in enumerate(source_job_ids(job))}
+
+    def rank(points: list[dict[str, Any]]) -> tuple[int, str, str]:
+        job_id = str(points[-1].get("job_id") or "")
+        source_job = JOBS.get(job_id) if isinstance(JOBS.get(job_id), dict) else {}
+        return order.get(job_id, len(order)), str(source_job.get("created_at") or "") or "~", job_id
+
+    return rank
+
+
+def _source_chain(job: dict[str, Any], vm_id: str, previous: dict[str, Any] | None) -> list[dict[str, Any]]:
+    by_source = _vm_source_chains(job, vm_id)
     if not by_source:
         return []
 
@@ -175,12 +191,32 @@ def _source_chain(job: dict[str, Any], vm_id: str, previous: dict[str, Any] | No
     if kept:
         return kept
 
-    order = {job_id: position for position, job_id in enumerate(source_job_ids(job))}
-    first_rank = min(order.get(str(points[-1].get("job_id") or ""), len(order)) for points in by_source.values())
-    candidates = [
-        points for points in by_source.values() if order.get(str(points[-1].get("job_id") or ""), len(order)) == first_rank
-    ]
+    rank = _source_rank(job)
+    first = min(rank(points) for points in by_source.values())
+    candidates = [points for points in by_source.values() if rank(points) == first]
     return max(candidates, key=lambda points: _point_order(points[-1]))
+
+
+def followed_source_job(job: dict[str, Any], vm_id: str) -> tuple[str, list[str]]:
+    previous_points = destination_points(job, vm_id)
+    chain = _source_chain(job, vm_id, previous_points[-1] if previous_points else None)
+    if not chain:
+        return "", []
+    followed = str(chain[-1].get("job_id") or "")
+    others = {
+        str(points[-1].get("job_name") or points[-1].get("job_id") or "")
+        for points in _vm_source_chains(job, vm_id).values()
+        if str(points[-1].get("job_id") or "") != followed
+    }
+    return str(chain[-1].get("job_name") or followed), sorted(others)
+
+
+def other_jobs_note(vm_name: str, others: list[str]) -> str:
+    return (
+        f"Job(s) {', '.join(others)} also back up {vm_name} in the sources, and their restore points of it are not copied: "
+        "a backup copy job keeps one chain per VM, from the first of its --source-job jobs that backs the VM up, else "
+        "from the job created first, and stays on the job it has copied from"
+    )
 
 
 def plan_copy(job: dict[str, Any], vm_id: str, *, requested_type: str = "Incremental") -> dict[str, Any] | None:
@@ -850,12 +886,19 @@ def run_backup_copy(
             progress_callback({"progress": max(0, min(100, progress)), "message": message, **extra})
 
     plan = plan_copy(job, vm_id, requested_type=str(parameters.get("resolved_backup_type") or "Incremental"))
+    followed, others = followed_source_job(job, vm_id)
+    note = other_jobs_note(vm_name, others) if others else ""
     if plan is None:
+        message = (
+            f"Nothing new to copy for {vm_name}: the newest restore point of job {followed} is already in {destination.get('name')}"
+            if followed
+            else f"Nothing new to copy for {vm_name}: the sources hold no restore point of it that can be copied"
+        )
         return {
             "operation": "backup",
             "worker_mode": "backup-copy",
             "nothing_copied": True,
-            "message": f"Nothing new to copy for {vm_name}: its newest restore point is already in {destination.get('name')}",
+            "message": f"{message}. {note}" if note else message,
             "vm_name": vm_name,
             "vm_external_id": vm_id,
         }
@@ -870,6 +913,8 @@ def run_backup_copy(
         f"from repository {target.get('repository_name')} into repository {destination.get('name')} "
         f"as {'a full backup' if plan['kind'] == 'full' else 'an incremental backup'}",
     )
+    if note:
+        emit(0, note)
 
     attempt = 0
     while True:

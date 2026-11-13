@@ -598,9 +598,9 @@ class JobCommands:
                 "new into one restore point; immediate copies every new restore point as soon as its backup ends"
             ),
         )
-        parser.add_argument("--source-job", dest="source_jobs", action="append", default=[], help=f"{only}a backup job whose restore points are copied, by name. Repeat as needed{replaces}")
+        parser.add_argument("--source-job", dest="source_jobs", action="append", default=[], help=f"{only}a backup job whose restore points are copied, by name. Repeat as needed; for a VM that several source jobs back up, the job given first is copied{replaces}")
         parser.add_argument("--source-job-id", dest="source_job_ids", action="append", default=[], help=f"{only}a source backup job by ID. Repeat as needed")
-        parser.add_argument("--source-repo", dest="source_repositories", action="append", default=[], help=f"{only}a repository whose restore points are copied, every job's, by name. Repeat as needed{replaces}")
+        parser.add_argument("--source-repo", dest="source_repositories", action="append", default=[], help=f"{only}a repository whose restore points are copied, by name; a VM that several of its jobs back up is copied from one of them: a --source-job job if given, else the job created first. Repeat as needed{replaces}")
         parser.add_argument("--source-repo-id", dest="source_repository_ids", action="append", default=[], help=f"{only}a source repository by ID. Repeat as needed")
         parser.add_argument("--run-after-job", dest="run_after_job", help=f"{only}start the copy each time a run of this job ends (periodic only), by name; none clears it")
         parser.add_argument("--run-after-job-id", dest="run_after_job_id", help=f"{only}the same job by ID")
