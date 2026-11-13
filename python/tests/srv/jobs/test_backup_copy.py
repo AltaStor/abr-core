@@ -672,6 +672,47 @@ class MissingCopySourceTests(_Catalog):
         self.assertNotIn("missing", backup_copy.copy_job_view(JOBS[copy["id"]])["source_jobs"][0])
 
 
+class DoubleStartTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        self._point("f1", "ActiveFull")
+        self.copy = self._copy_job()
+
+    def test_a_second_start_while_a_copy_session_is_queued_or_running_is_refused(self) -> None:
+        first = abr_v41.start_job_record(self.copy["id"])["items"][0]
+        for status in ("queued", "running"):
+            with self.subTest(status=status):
+                TASKS[first["id"]]["status"] = status
+                refused = self._refused(lambda: abr_v41.start_job_record(self.copy["id"]))
+                self.assertEqual((refused.status_code, refused.code), (409, "job_already_running"))
+                self.assertEqual(refused.details["session_id"], first["id"])
+                self.assertIn("Backup copy job Offsite copy already has a session queued or running", refused.message)
+
+        TASKS[first["id"]]["status"] = "completed"
+        self.assertEqual(len(abr_v41.start_job_record(self.copy["id"])["items"]), 1)
+
+    def test_a_session_queued_as_a_first_run_that_starts_after_the_first_copy_copies_nothing(self) -> None:
+        late = backup_copy.create_copy_sessions(JOBS[self.copy["id"]], trigger="schedule", include_idle=True)[0]
+        self.assertEqual(late["parameters"]["resolved_backup_reason"], "FirstRun")
+        self._copied("c1", "f1")
+
+        started = abr_v41.refresh_queued_backup_decision(late)
+        result = backup_copy.run_backup_copy(started)
+
+        self.assertEqual((started["parameters"]["resolved_backup_type"], started["parameters"]["resolved_backup_reason"]), ("Incremental", "StandardIncremental"))
+        self.assertTrue(result["nothing_copied"])
+        self.assertEqual([point["id"] for point in BACKUPS.values() if point["job_id"] == self.copy["id"]], ["c1"])
+
+    def test_a_forced_full_queued_behind_a_copy_still_copies_a_full(self) -> None:
+        self._copied("c1", "f1")
+        forced = backup_copy.create_copy_sessions(JOBS[self.copy["id"]], trigger="manual", force_full=True, include_idle=True)[0]
+
+        started = abr_v41.refresh_queued_backup_decision(forced)
+
+        self.assertEqual((started["parameters"]["resolved_backup_type"], started["parameters"]["resolved_backup_reason"]), ("ActiveFull", "ForceFull"))
+        self.assertEqual(backup_copy.plan_copy(abr_v41.normalize_job_record(JOBS[self.copy["id"]]), VM, requested_type="ActiveFull")["kind"], "full")
+
+
 class CopyToggleTests(_Catalog):
     def test_a_periodic_copy_switched_off_skips_its_slot_and_resumes_its_chain_once_back_on(self) -> None:
         self._point("f1", "ActiveFull")

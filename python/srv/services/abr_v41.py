@@ -5886,7 +5886,7 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
         return task
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     job_id = str(task.get("job_id") or "")
-    if not job_id or job_id not in JOBS or parameters.get("copy_job") or parameters.get("requires_task_id"):
+    if not job_id or job_id not in JOBS or parameters.get("requires_task_id"):
         return task
     queued_type = str(parameters.get("resolved_backup_type") or "")
     queued_reason = str(parameters.get("resolved_backup_reason") or "")
@@ -5895,6 +5895,13 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
     job = resolve_job(record_id=job_id)
     vm_id = str(task.get("resource_external_id") or "")
     has_point = _latest_successful_point(job_id, vm_id, str(job.get("repo_id") or "") or None) is not None
+    if parameters.get("copy_job"):
+        if queued_reason != "FirstRun" or not has_point:
+            return task
+        execution_type, execution_reason = resolve_job_execution(job, vm_id=vm_id, force_full=False)
+        if execution_type == "SyntheticFull":
+            execution_type, execution_reason = "Incremental", "StandardIncremental"
+        return _record_refreshed_decision(task, parameters, (queued_type, queued_reason), (execution_type, execution_reason))
     if queued_reason == "FirstRun" and has_point:
         execution_type, execution_reason = resolve_job_execution(job, vm_id=vm_id, force_full=False)
         if execution_type == "SyntheticFull":
@@ -5931,7 +5938,15 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
         LOGGER.warning("Backup session %s of job '%s', VM %s: %s", task.get("id"), job.get("name"), vm_id, message)
         if (execution_type, execution_reason) == (queued_type, queued_reason):
             persist_task(task)
-    if (execution_type, execution_reason) == (queued_type, queued_reason):
+    return _record_refreshed_decision(task, parameters, (queued_type, queued_reason), (execution_type, execution_reason))
+
+
+def _record_refreshed_decision(
+    task: dict[str, Any], parameters: dict[str, Any], queued: tuple[str, str], decided: tuple[str, str]
+) -> dict[str, Any]:
+    queued_type, queued_reason = queued
+    execution_type, execution_reason = decided
+    if decided == queued:
         return task
     parameters.update(
         {
@@ -5958,6 +5973,7 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
     )
     persist_task(task)
     return task
+
 
 def bind_backup_parent(task: dict[str, Any]) -> dict[str, Any]:
     if str(task.get("task_type") or "") != "backup":
@@ -10542,6 +10558,15 @@ def start_job_record(
     if force_synthetic and job["job_type"] not in ("backup-copy", replication_service.REPLICATION_JOB_TYPE):
         _ensure_chain_can_be_merged(job)
     if job["job_type"] == "backup-copy":
+        active = _active_sessions_for_job(str(job["id"]))
+        _ensure(
+            not active,
+            409,
+            "job_already_running",
+            f"Backup copy job {job.get('name')} already has a session queued or running (session "
+            f"{active[0]['id'] if active else ''}); start it again once that ends",
+            session_id=active[0]["id"] if active else None,
+        )
         missing = missing_copy_sources(job)
         _ensure(
             not has_no_source_left(job, missing),
