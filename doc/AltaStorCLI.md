@@ -429,7 +429,7 @@ abr repo edit --name MyWorm --immutable none
 
 abr repo remove 
 
-Description: Remove a repository reference from management. Rule: repo remove NEVER deletes physical data, it only unlinks it from ABR. 
+Description: Remove a repository reference from management. Rule: repo remove NEVER deletes physical data, it only unlinks it from ABR. It is refused while a job writes into the repository (409 repository_in_use), while backup chains are in it (409 repository_has_backups), and while a backup copy job reads from it (--source-repo; 409 backup_copy_source_in_use, naming those copy jobs): take it out of their sources with abr job edit --source-repo, or delete them first. 
 
 abr repo remove --name <name> [--id <id>] 
 
@@ -653,6 +653,7 @@ Notes:
 • A full schedule (--active-full-schedule or --synthetic-full-schedule) is required, as for backup jobs, so retention can drop old chains. An active full copies the newest state from the source again; a scheduled synthetic full first copies whatever is new in the source, then merges the copied chain inside the destination without reading the source again. When there is nothing to merge - the newest copy is already a full and the source has nothing new - the scheduled synthetic full completes with "Nothing to merge" and makes no restore point; abr job start --synthetic still refuses such a chain. 
 • --copy-window limits when copies move data. A rule is "[days] HH:MM-HH:MM": days separated by commas in week order (mon,wed,fri), each day once; without days, every day. The end may be past midnight (22:00-06:00 runs from the evening of each day given into the next morning). Repeat the option for more rules; none means any time. A copy started outside the window waits in the queue (its log says when the window opens). A copy still running when the window closes is stopped, what it wrote is discarded, and it is queued again for the next opening. 
 • A VM whose copy fails is retried within the same session --retry-count times, --retry-interval minutes apart: 5 times right away for periodic, 3 times 10 minutes apart for immediate, unless set. Configuration errors and a stop are not retried. 
+• A source job or repository cannot be deleted or removed while the copy job uses it (see abr job delete and abr repo remove). A copy job whose source or run-after job was deleted before that check existed shows it as "(missing)" in job info (missing: true in --output json). Each of its copy sessions then warns (copy_source_missing), naming what is gone, so the run ends as Warning; when no source is left at all, abr job start is refused (409 backup_copy_no_source, exit 4) and a scheduled run is recorded as Failed with that reason, without sessions. 
 • A failed or stopped copy leaves the source and the copies made so far as they were. Each copy session logs the source job and repository, the VM, the destination, the restore points copied, the bytes and the time. 
 
 Examples: 
@@ -727,6 +728,9 @@ abr job delete
 Description: Delete a job record. Its restore points stay in the catalog and in the repository. Deleting a replication job keeps its replica VM on the target as an ordinary powered-off VM that AltaStor no longer manages; --delete-replica deletes the replica VM and its disks too, with any temporary VM an interrupted run of the job left. --delete-replica is refused, and the job kept, while the replica is powered on (it may be in use after a failover), when the target environment cannot be reached or is no longer registered, or when the VM cannot be deleted; the answer says why. It applies to replication jobs only. A job with a session queued or running cannot be deleted. 
 
 abr job delete --name <name> [--id <id>] [--yes] [--delete-replica] 
+
+Notes: 
+• A job that a backup copy job uses as a source (--source-job) or as its --run-after-job cannot be deleted (409 backup_copy_source_in_use); the refusal names those copy jobs and what each uses the job for. Take it out of them with abr job edit (--source-job, --run-after-job none), or delete them first. A backup job a replication job reads from is refused the same way (409 replication_source_in_use). 
 
 abr job start 
 

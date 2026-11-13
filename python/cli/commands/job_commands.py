@@ -52,6 +52,8 @@ def _last_run_text(run: object) -> str:
         return ""
     result = str(run["result"])
     total = int(run.get("vm_count") or 0)
+    if result == "failed" and not total:
+        return "Failed (no source left)" if "no source left" in str(run.get("message") or "") else "Failed"
     if result == "running":
         return f"Running ({total - int(run.get('running') or 0)}/{total} VMs done)"
     if result == "success":
@@ -62,7 +64,14 @@ def _last_run_text(run: object) -> str:
 
 
 def _names(items: Any) -> str:
-    return ", ".join(str(item.get("name") or item.get("id")) for item in items or [] if isinstance(item, dict)) or "-"
+    return (
+        ", ".join(
+            f"{item.get('name') or item.get('id')}{' (missing)' if item.get('missing') else ''}"
+            for item in items or []
+            if isinstance(item, dict)
+        )
+        or "-"
+    )
 
 
 def _backup_copy_rows(view: dict[str, Any]) -> dict[str, Any]:
@@ -72,7 +81,7 @@ def _backup_copy_rows(view: dict[str, Any]) -> dict[str, Any]:
         "copy_mode": view.get("copy_mode"),
         "source_jobs": _names(view.get("source_jobs")),
         "source_repositories": _names(view.get("source_repositories")),
-        "run_after_job": (run_after or {}).get("name") or "-",
+        "run_after_job": (f"{run_after.get('name') or run_after.get('id')}{' (missing)' if run_after.get('missing') else ''}" if run_after else "-"),
         "copy_window": view.get("copy_window_summary") or "any time",
         "retry": f"{retry.get('count')} time(s), {retry.get('interval_minutes')} minute(s) apart",
     }

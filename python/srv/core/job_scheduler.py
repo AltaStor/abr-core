@@ -17,7 +17,7 @@ from .server_defaults import env_int
 from .time_zones import load_zone
 from .utils import utc_now
 from python.srv.services import clock_guard, notification_detectors, replication_service
-from python.srv.services.backup_copy import create_copy_sessions
+from python.srv.services.backup_copy import create_copy_sessions, has_no_source_left, missing_copy_sources, no_source_left_message
 from python.srv.services.abr_v41 import (
     execution_phases,
     job_clock_anomalies,
@@ -170,6 +170,17 @@ class JobScheduler:
 
             run_id = str(uuid4())
             if normalized_job.get("job_type") == "backup-copy":
+                missing = missing_copy_sources(normalized_job)
+                if has_no_source_left(normalized_job, missing):
+                    self._advance_due_slots(job, due_slots)
+                    message = no_source_left_message(normalized_job, missing)
+                    now_text = utc_now()
+                    job["last_run_at"] = now_text
+                    job["last_run"] = {"id": run_id, "trigger": "schedule", "started_at": now_text, "session_ids": [], "error": message}
+                    job["updated_at"] = now_text
+                    persist_job(dict(job))
+                    logger.warning("Scheduled run of backup copy job '%s' failed: %s", job["id"], message)
+                    continue
                 tasks = create_copy_sessions(
                     normalized_job, trigger="schedule", run_id=run_id, scheduled_type=due_slots[0][1]
                 )

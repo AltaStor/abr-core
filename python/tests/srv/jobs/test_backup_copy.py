@@ -556,6 +556,122 @@ class CopyScheduleTests(_Catalog):
         self.assertEqual([task for task in TASKS.values() if task.get("job_id") == job["id"]], [])
 
 
+class CopySourceInUseTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        self._point("f1", "ActiveFull")
+        JOBS["weekly"] = abr_v41.normalize_job_record({**JOBS["nightly"], "id": "weekly", "name": "Weekly"})
+        REPOSITORIES["spare"] = {"id": "spare", "name": "Spare", "type": "local", "path": tempfile.mkdtemp()}
+
+    def test_a_source_or_run_after_job_of_a_copy_cannot_be_deleted_and_the_refusal_names_the_copies(self) -> None:
+        self._copy_job(name="Offsite copy", run_after_job="Weekly")
+        self._copy_job(name="Second copy", source_jobs=["Weekly", "Nightly"], repo="Spare")
+
+        nightly = self._refused(lambda: abr_v41.delete_job_record("nightly"))
+        weekly = self._refused(lambda: abr_v41.delete_job_record("weekly"))
+
+        self.assertEqual((nightly.status_code, nightly.code), (409, "backup_copy_source_in_use"))
+        self.assertIn("Job Nightly is used by backup copy job(s) Offsite copy (source), Second copy (source)", nightly.message)
+        self.assertIn("Offsite copy (run after), Second copy (source)", weekly.message)
+        self.assertEqual(weekly.details["backup_copy_jobs"], ["Offsite copy", "Second copy"])
+        self.assertIn("nightly", JOBS)
+
+    def test_a_copy_job_itself_and_a_job_no_copy_uses_can_still_be_deleted(self) -> None:
+        copy = self._copy_job()
+
+        self.assertTrue(abr_v41.delete_job_record("weekly")["deleted"])
+        self.assertTrue(abr_v41.delete_job_record(copy["id"])["deleted"])
+        self.assertTrue(abr_v41.delete_job_record("nightly")["deleted"])
+
+    def test_a_source_repository_of_a_copy_cannot_be_removed(self) -> None:
+        copy = self._copy_job(source_jobs=None, source_repositories=["Spare", "Source"])
+
+        refused = self._refused(lambda: abr_v41.remove_repository_record("spare"))
+
+        self.assertEqual((refused.status_code, refused.code), (409, "backup_copy_source_in_use"))
+        self.assertIn("Repository Spare is a source of backup copy job(s) Offsite copy", refused.message)
+        abr_v41.edit_job_record(copy["id"], {"source_repositories": ["Source"]})
+        self.assertTrue(abr_v41.remove_repository_record("spare")["removed"])
+
+    def test_a_repository_a_job_writes_into_is_still_refused_as_before(self) -> None:
+        self._copy_job()
+
+        refused = self._refused(lambda: abr_v41.remove_repository_record("dst"))
+
+        self.assertEqual(refused.code, "repository_in_use")
+
+
+class MissingCopySourceTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        self._point("f1", "ActiveFull")
+        JOBS["weekly"] = abr_v41.normalize_job_record({**JOBS["nightly"], "id": "weekly", "name": "Weekly"})
+
+    def test_a_copy_whose_only_source_is_gone_is_marked_and_refuses_to_start(self) -> None:
+        copy = self._copy_job()
+        JOBS.pop("nightly")
+
+        view = backup_copy.copy_job_view(JOBS[copy["id"]])
+        refused = self._refused(lambda: abr_v41.start_job_record(copy["id"]))
+
+        self.assertEqual(view["source_jobs"], [{"id": "nightly", "name": "Nightly", "missing": True}])
+        self.assertEqual((refused.status_code, refused.code), (409, "backup_copy_no_source"))
+        self.assertIn("Backup copy job Offsite copy: source job Nightly was deleted. It has no source left", refused.message)
+        self.assertEqual([task for task in TASKS.values() if task.get("job_id") == copy["id"]], [])
+
+    def test_a_removed_source_repository_is_marked_and_refuses_to_start(self) -> None:
+        REPOSITORIES["spare"] = {"id": "spare", "name": "Spare", "type": "local", "path": tempfile.mkdtemp()}
+        copy = self._copy_job(source_jobs=None, source_repositories=["Spare"])
+        REPOSITORIES.pop("spare")
+
+        refused = self._refused(lambda: abr_v41.start_job_record(copy["id"]))
+
+        self.assertEqual(backup_copy.copy_job_view(JOBS[copy["id"]])["source_repositories"][0]["missing"], True)
+        self.assertIn("source repository Spare was removed", refused.message)
+
+    def test_a_scheduled_run_with_no_source_left_is_recorded_as_failed_with_the_reason(self) -> None:
+        copy = self._copy_job(schedule={"type": "daily", "time": "03:00"})
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        JOBS[copy["id"]].update({"created_at": past, "next_incremental_run_at": past})
+        JOBS.pop("nightly")
+
+        JobScheduler(poll_interval_seconds=0.1)._dispatch_due_jobs()
+
+        summary = abr_v41.job_run_summary(JOBS[copy["id"]])
+        self.assertEqual([task for task in TASKS.values() if task.get("job_id") == copy["id"]], [])
+        self.assertEqual((summary["result"], summary["vm_count"]), ("failed", 0))
+        self.assertIn("source job Nightly was deleted", summary["message"])
+        self.assertGreater(datetime.fromisoformat(JOBS[copy["id"]]["next_incremental_run_at"]), datetime.now(timezone.utc))
+
+    def test_a_copy_that_lost_one_of_its_sources_runs_and_every_session_warns(self) -> None:
+        copy = self._copy_job(source_jobs=["Weekly", "Nightly"])
+        JOBS.pop("weekly")
+
+        started = abr_v41.start_job_record(copy["id"])
+
+        warnings = [task.get("warnings") for task in started["items"]]
+        self.assertEqual([[item["code"] for item in found] for found in warnings], [["copy_source_missing"]])
+        self.assertIn("source job Weekly was deleted", warnings[0][0]["message"])
+        self.assertEqual(warnings[0][0]["source_jobs"], ["Weekly"])
+
+    def test_a_deleted_run_after_job_is_named_but_the_copy_still_runs(self) -> None:
+        copy = self._copy_job(run_after_job="Weekly")
+        JOBS.pop("weekly")
+
+        started = abr_v41.start_job_record(copy["id"])
+
+        self.assertEqual(backup_copy.copy_job_view(JOBS[copy["id"]])["run_after_job"]["missing"], True)
+        self.assertIn("run-after job Weekly was deleted, so nothing starts this job after it", started["items"][0]["warnings"][0]["message"])
+
+    def test_a_copy_with_every_source_in_place_carries_no_warning(self) -> None:
+        copy = self._copy_job()
+
+        started = abr_v41.start_job_record(copy["id"])
+
+        self.assertNotIn("warnings", started["items"][0])
+        self.assertNotIn("missing", backup_copy.copy_job_view(JOBS[copy["id"]])["source_jobs"][0])
+
+
 class CopyToggleTests(_Catalog):
     def test_a_periodic_copy_switched_off_skips_its_slot_and_resumes_its_chain_once_back_on(self) -> None:
         self._point("f1", "ActiveFull")

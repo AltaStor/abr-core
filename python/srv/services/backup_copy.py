@@ -320,6 +320,16 @@ def create_copy_sessions(
     run_id = run_id or str(uuid4())
     destination = REPOSITORIES.get(str(normalized.get("repo_id") or "")) or {}
     sessions: list[dict[str, Any]] = []
+    missing = missing_copy_sources(normalized)
+    missing_warning = (
+        {
+            "code": "copy_source_missing",
+            "message": f"{missing_sources_text(normalized, missing)}. Edit the job (abr job edit --name {normalized.get('name')}) or delete it",
+            **missing,
+        }
+        if any(missing.values())
+        else None
+    )
 
     for target in copy_targets(normalized):
         vm_id = target["vm_id"]
@@ -378,6 +388,10 @@ def create_copy_sessions(
                 "updated_at": now,
                 "logs": [],
             }
+
+            if missing_warning is not None:
+                task["warnings"] = [dict(missing_warning)]
+                _append_task_log(task, level="warn", message=missing_warning["message"], component="session")
 
             what = "synthetic full of the copied chain" if synthetic else "backup copy"
             window = copy_window_state(normalized)
@@ -1262,9 +1276,94 @@ def _named(ids: list[str], names: list[Any], store: dict[str, dict[str, Any]]) -
         {
             "id": record_id,
             "name": (store.get(record_id) or {}).get("name") or (stored_names[index] if index < len(stored_names) else None),
+            **({} if isinstance(store.get(record_id), dict) else {"missing": True}),
         }
         for index, record_id in enumerate(ids)
     ]
+
+
+def _all_copy_jobs() -> list[dict[str, Any]]:
+    return sorted(
+        (record for record in catalog_records(JOBS) if record.get("job_type") == "backup-copy"),
+        key=lambda record: (str(record.get("name") or "").lower(), str(record.get("id") or "")),
+    )
+
+
+def copy_jobs_using_job(job_id: str) -> list[dict[str, Any]]:
+    found = []
+    for record in _all_copy_jobs():
+        if str(record.get("id") or "") == job_id:
+            continue
+        roles = [role for role, used in (("source", job_id in source_job_ids(record)), ("run after", str(record.get("run_after_job_id") or "") == job_id)) if used]
+        if roles:
+            found.append({"id": record.get("id"), "name": record.get("name"), "roles": roles})
+    return found
+
+
+def copy_jobs_using_repository(repository_id: str) -> list[dict[str, Any]]:
+    return [
+        {"id": record.get("id"), "name": record.get("name"), "roles": ["source"]}
+        for record in _all_copy_jobs()
+        if repository_id in source_repository_ids(record)
+    ]
+
+
+def ensure_job_not_used_by_copies(job: dict[str, Any]) -> None:
+    users = copy_jobs_using_job(str(job.get("id") or ""))
+    if not users:
+        return
+    listed = ", ".join(f"{user['name']} ({' and '.join(user['roles'])})" for user in users)
+    raise api_error(
+        409,
+        "backup_copy_source_in_use",
+        f"Job {job.get('name')} is used by backup copy job(s) {listed}. Take it out of them with abr job edit "
+        "(--source-job, --run-after-job none) or delete them first",
+        backup_copy_jobs=[user["name"] for user in users],
+    )
+
+
+def ensure_repository_not_used_by_copies(repository: dict[str, Any]) -> None:
+    users = copy_jobs_using_repository(str(repository.get("id") or ""))
+    if not users:
+        return
+    raise api_error(
+        409,
+        "backup_copy_source_in_use",
+        f"Repository {repository.get('name')} is a source of backup copy job(s) {', '.join(user['name'] for user in users)}. "
+        "Take it out of their sources with abr job edit (--source-repo) or delete them first",
+        backup_copy_jobs=[user["name"] for user in users],
+    )
+
+
+def missing_copy_sources(job: dict[str, Any]) -> dict[str, list[str]]:
+    view = copy_job_view(job)
+    run_after = view.get("run_after_job")
+    return {
+        "source_jobs": [str(item.get("name") or item.get("id")) for item in view["source_jobs"] if item.get("missing")],
+        "source_repositories": [str(item.get("name") or item.get("id")) for item in view["source_repositories"] if item.get("missing")],
+        "run_after_job": [str(run_after.get("name") or run_after.get("id"))] if isinstance(run_after, dict) and run_after.get("missing") else [],
+    }
+
+
+def missing_sources_text(job: dict[str, Any], missing: dict[str, list[str]]) -> str:
+    parts = [
+        *(f"source job {name} was deleted" for name in missing["source_jobs"]),
+        *(f"source repository {name} was removed" for name in missing["source_repositories"]),
+        *(f"run-after job {name} was deleted, so nothing starts this job after it" for name in missing["run_after_job"]),
+    ]
+    return f"Backup copy job {job.get('name')}: {'; '.join(parts)}"
+
+
+def has_no_source_left(job: dict[str, Any], missing: dict[str, list[str]]) -> bool:
+    listed = len(source_job_ids(job)) + len(source_repository_ids(job))
+    return listed > 0 and len(missing["source_jobs"]) + len(missing["source_repositories"]) == listed
+
+
+def no_source_left_message(job: dict[str, Any], missing: dict[str, list[str]]) -> str:
+    return (
+        f"{missing_sources_text(job, missing)}. It has no source left to copy from: give it one with abr job edit "
+        f"--name {job.get('name')} --source-job/--source-repo, or delete it"
+    )
 
 
 def copy_job_view(job: dict[str, Any]) -> dict[str, Any]:

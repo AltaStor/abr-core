@@ -335,7 +335,7 @@ class JobDTO(_LenientModel):
     vms: list[_Ref] | DocArray = []
     repository: _Ref
     source_job: _Ref | DocObject = None
-    backup_copy: DocObject = Field(default=None, description="Backup copy jobs only: copy_mode, source_jobs, source_repositories, run_after_job and retry")
+    backup_copy: DocObject = Field(default=None, description="Backup copy jobs only: copy_mode, source_jobs, source_repositories, run_after_job and retry; a source or run-after job that no longer exists carries missing: true")
     replication: DocObject = Field(default=None, description="Replication jobs only: source job and VM, target environment, host, datastore, network map, replica name, run_after_source, the replica: its VM, the restore point it is at and the time of the last successful update, and run_pending with pending_trigger (what asked for the next run and since when) when a trigger arrived while a run was going")
     schedule: ScheduleDTO | DocObject = None
     schedule_summary: str | None = None

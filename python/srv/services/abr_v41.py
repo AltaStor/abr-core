@@ -126,7 +126,16 @@ from python.srv.services.inventory_management import (
     normalize_inventory_type,
 )
 from python.srv.services import replication_service
-from python.srv.services.backup_copy import apply_copy_settings, copy_job_view, create_copy_sessions
+from python.srv.services.backup_copy import (
+    apply_copy_settings,
+    copy_job_view,
+    create_copy_sessions,
+    ensure_job_not_used_by_copies,
+    ensure_repository_not_used_by_copies,
+    has_no_source_left,
+    missing_copy_sources,
+    no_source_left_message,
+)
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
 from python.srv.services.share_mount import share_mount_check, unmounted_share_message
@@ -4089,6 +4098,7 @@ def remove_repository_record(record_id: str) -> dict[str, Any]:
     linked_jobs = _jobs_referencing_repository_id(record_id)
     if linked_jobs:
         raise api_error(409, "repository_in_use", "Repository cannot be removed while jobs still reference it", jobs=linked_jobs)
+    ensure_repository_not_used_by_copies(repository)
     repo_points = [point for point in normalized_backup_points() if str(point.get("repository_id") or "") == record_id]
     if repo_points:
         raise api_error(409, "repository_has_backups", "Repository cannot be removed while backup chains still reference it", restore_point_count=len(repo_points))
@@ -4765,6 +4775,19 @@ def job_run_summary(job: dict[str, Any]) -> dict[str, Any] | None:
             entry["message"] = session.get("message") or (errors[0].get("message") if errors and isinstance(errors[0], dict) else None)
         if session.get("finished_at"):
             finished.append(str(session["finished_at"]))
+    if not vms and run.get("error"):
+        return {
+            "id": run["id"],
+            "trigger": run.get("trigger"),
+            "started_at": run.get("started_at"),
+            "finished_at": run.get("started_at"),
+            "result": "failed",
+            "message": run["error"],
+            "vm_count": 0,
+            "succeeded": 0,
+            **{name: 0 for name in ("warning", "failed", "stopped", "running")},
+            "vms": [],
+        }
     if not vms:
         return None
     counts = {name: sum(1 for vm in vms.values() if vm["result"] == name) for name in RUN_RESULTS_WORST_FIRST}
@@ -5598,6 +5621,7 @@ def delete_job_record(job_id: str, *, delete_replica: bool = False) -> dict[str,
         )
     if str(job.get("job_type") or "backup") == "backup":
         replication_service.ensure_source_job_free(job)
+    ensure_job_not_used_by_copies(job)
     removed = replication_service.delete_replica(normalize_job_record(job)) if delete_replica else None
     delete_job(job_id)
     result: dict[str, Any] = {"id": str(job.get("id") or job_id), "deleted": True}
@@ -10517,6 +10541,16 @@ def start_job_record(
         )
     if force_synthetic and job["job_type"] not in ("backup-copy", replication_service.REPLICATION_JOB_TYPE):
         _ensure_chain_can_be_merged(job)
+    if job["job_type"] == "backup-copy":
+        missing = missing_copy_sources(job)
+        _ensure(
+            not has_no_source_left(job, missing),
+            409,
+            "backup_copy_no_source",
+            no_source_left_message(job, missing),
+            missing_source_jobs=missing["source_jobs"],
+            missing_source_repositories=missing["source_repositories"],
+        )
     sessions = []
     run_id = str(uuid4())
     run_started_at = utc_now()
