@@ -265,6 +265,52 @@ class DamagedChainRunTests(_Catalog):
         self.assertEqual(abr_v41.damaged_chain_points("job-1", "vm-1", "repo-1"), ["inc-b2"])
         self.assertEqual(abr_v41.resolve_job_execution(job, vm_id="vm-1", force_full=False), ("ActiveFull", "DamagedChain"))
 
+    def test_a_chain_damaged_from_its_only_full_is_repaired_as_damaged_chain_not_a_first_run(self) -> None:
+        self.store(_point("full-a", parent=None, day=1), _point("inc-a1", parent="full-a", day=2))
+        job = abr_v41.normalize_job_record(JOBS["job-1"])
+        self.assertEqual(abr_v41.resolve_job_execution(job, vm_id="vm-1", force_full=False), ("Incremental", "StandardIncremental"))
+
+        self.mark({"full-a": "corrupt"})
+
+        self.assertEqual(self.statuses(), {"full-a": "corrupt", "inc-a1": "corrupt"})
+        for scheduled in (None, "Incremental", "SyntheticFull", "ActiveFull"):
+            with self.subTest(scheduled=scheduled):
+                self.assertEqual(
+                    abr_v41.resolve_job_execution(job, vm_id="vm-1", force_full=False, scheduled_type=scheduled),
+                    ("ActiveFull", "DamagedChain"),
+                )
+        self.assertEqual(abr_v41.resolve_job_execution(job, vm_id="vm-1", force_full=True), ("ActiveFull", "ForceFull"))
+
+    def test_a_job_without_points_and_a_repaired_chain_are_not_taken_for_damage(self) -> None:
+        job = abr_v41.normalize_job_record(JOBS["job-1"])
+        self.assertEqual(abr_v41.resolve_job_execution(job, vm_id="vm-1", force_full=False), ("ActiveFull", "FirstRun"))
+
+        self.store(_point("full-a", parent=None, day=1), _point("inc-a1", parent="full-a", day=2))
+        self.mark({"full-a": "corrupt"})
+        self.store(_point("full-b", parent=None, day=3))
+
+        self.assertEqual(abr_v41.resolve_job_execution(job, vm_id="vm-1", force_full=False), ("Incremental", "StandardIncremental"))
+
+    def test_a_session_queued_as_a_first_run_starts_as_damaged_chain_with_the_warning(self) -> None:
+        self.store(_point("full-a", parent=None, day=1), _point("inc-a1", parent="full-a", day=2))
+        self.mark({"full-a": "corrupt"})
+        task = {
+            "id": "task-1",
+            "task_type": "backup",
+            "job_id": "job-1",
+            "resource_external_id": "vm-1",
+            "parameters": {"resolved_backup_type": "ActiveFull", "resolved_backup_reason": "FirstRun"},
+            "logs": [],
+        }
+        TASKS["task-1"] = task
+
+        refreshed = abr_v41.refresh_queued_backup_decision(task)
+
+        params = refreshed["parameters"]
+        self.assertEqual((params["resolved_backup_type"], params["resolved_backup_reason"]), ("ActiveFull", "DamagedChain"))
+        self.assertEqual([(w["code"], w["restore_point_ids"]) for w in refreshed["warnings"]], [("damaged_chain", ["full-a"])])
+        self.assertEqual(refreshed["result"]["resolved_backup_reason"], "DamagedChain")
+
     def test_a_forced_synthetic_full_on_a_damaged_chain_is_refused(self) -> None:
         self.chain()
         self.mark({"inc-b3": "corrupt"})

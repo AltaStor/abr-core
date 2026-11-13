@@ -5806,11 +5806,11 @@ def resolve_job_execution(
         return "SyntheticFull", "ForceSynthetic"
     if force_full:
         return "ActiveFull", "ForceFull"
+    if damaged_chain_points(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None):
+        return "ActiveFull", "DamagedChain"
     previous = _latest_successful_point(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
     if previous is None:
         return "ActiveFull", "FirstRun"
-    if damaged_chain_points(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None):
-        return "ActiveFull", "DamagedChain"
     if _encryption_differs_from_point(job, previous):
         return "ActiveFull", "EncryptionKeyChanged"
     if _chain_base_mismatches(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None):
@@ -5880,7 +5880,7 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
     else:
         execution_type, execution_reason = queued_type, queued_reason
     damaged = damaged_chain_points(job_id, vm_id, str(job.get("repo_id") or "") or None)
-    if damaged and execution_type != "ActiveFull":
+    if damaged and (execution_type != "ActiveFull" or execution_reason == "FirstRun"):
         execution_type, execution_reason = "ActiveFull", "DamagedChain"
     if damaged and execution_reason == "DamagedChain":
         warnings = task.get("warnings") if isinstance(task.get("warnings"), list) else []
