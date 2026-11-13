@@ -105,8 +105,9 @@ class TransportHelpTests(unittest.TestCase):
 
     def test_help_names_the_choices_and_what_they_mean(self) -> None:
         inventory = self._help("inventory", "add")
-        self.assertIn("--transport {vddk,soap}", inventory)
-        self.assertIn("the VMware VDDK, the default", inventory)
+        self.assertIn("--transport {vddk,soap,inherit}", inventory)
+        self.assertIn("inherit (the default) uses the server-wide transport", inventory)
+        self.assertIn("--vddk-library PATH|inherit", inventory)
         job = self._help("job", "create")
         self.assertIn("--transport {vddk,soap,inventory}", job)
         self.assertIn("inventory (the default) uses it", job)

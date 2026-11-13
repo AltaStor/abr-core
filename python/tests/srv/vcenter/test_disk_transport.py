@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import struct
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from python.srv.core.mongo_db_wrapper import (
     JOBS,
     REPOSITORIES,
     RESOURCES_BY_HV,
+    SYSTEM_STATE,
     TASKS,
 )
 from python.srv.plugins.vcenter import disk_transport
@@ -24,14 +26,14 @@ from python.srv.plugins.vcenter.vcenter_backup import (
     _build_vddk_args,
 )
 from python.srv.plugins.vcenter.vcenter_restore import _build_abr_restore_command
-from python.srv.services import abr_v41
+from python.srv.services import abr_v41, vsphere_access
 from python.srv.services.api_errors import ApiError
 
 
-def _launcher(root: Path, *, with_vddk: bool) -> Path:
+def _launcher(root: Path, *, with_vddk: bool, takes_library_file: bool = False) -> Path:
     tool = root / "tools" / "abr-vmdk-tool" / "abr-vmdk-tool.sh"
     tool.parent.mkdir(parents=True)
-    tool.write_text("#!/bin/sh\n")
+    tool.write_text("#!/bin/sh\n" + (': "${ABR_VMDK_TOOL_VDDK_LIB:-}"\n' if takes_library_file else ""))
     if with_vddk:
         library = root / "tools" / "vddk" / "lib64" / "libvixDiskLib.so"
         library.parent.mkdir(parents=True)
@@ -162,7 +164,7 @@ class ToolArgumentTests(unittest.TestCase):
 
 class _Catalog(unittest.TestCase):
     def setUp(self) -> None:
-        for store in (BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS):
+        for store in (BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, SYSTEM_STATE, TASKS):
             store.clear()
             self.addCleanup(store.clear)
         registrable = patch.object(abr_v41, "assert_inventory_registrable", return_value={})
@@ -207,15 +209,26 @@ class InventoryTransportTests(_Catalog):
             edited = abr_v41.edit_inventory_record(inventory["id"], {"transport": "soap"})
         self.assertEqual(edited["transport"], "soap")
 
-    def test_inventories_from_before_transports_get_vddk_once(self) -> None:
-        inventory = self._vsphere()
-        HYPERVISORS[inventory["id"]]["metadata"].pop("vsphere_transport")
+    def test_the_first_start_hands_the_old_vddk_default_back_to_the_server_wide_one(self) -> None:
+        vddk = self._vsphere()
+        soap = self._vsphere("vc2", transport="soap")
+        HYPERVISORS[vddk["id"]]["metadata"]["vsphere_transport"] = "vddk"
         HYPERVISORS["hv"] = {"id": "hv", "name": "hv", "type": "hyper-v", "metadata": {}}
-        with patch.object(abr_v41, "persist_hypervisor", side_effect=lambda record: HYPERVISORS.__setitem__(record["id"], record)):
-            self.assertEqual(abr_v41.backfill_inventory_transports(), 1)
-            self.assertEqual(abr_v41.backfill_inventory_transports(), 0)
-        self.assertEqual(HYPERVISORS[inventory["id"]]["metadata"]["vsphere_transport"], "vddk")
-        self.assertNotIn("vsphere_transport", HYPERVISORS["hv"]["metadata"])
+        with patch.object(vsphere_access, "persist_hypervisor", side_effect=lambda record: HYPERVISORS.__setitem__(record["id"], record)):
+            self.assertEqual(vsphere_access.initialise(), 1)
+            self.assertEqual(vsphere_access.initialise(), 0)
+        self.assertEqual(disk_transport.global_settings()["transport"], "vddk")
+        self.assertIsNone(disk_transport.global_settings()["vddk_library"])
+        self.assertNotIn("vsphere_transport", HYPERVISORS[vddk["id"]]["metadata"])
+        self.assertEqual(HYPERVISORS[soap["id"]]["metadata"]["vsphere_transport"], "soap")
+        self.assertEqual(abr_v41.resolve_inventory(record_id=vddk["id"])["transport"], "vddk")
+
+    def test_inherit_hands_the_transport_back_to_the_server_wide_one(self) -> None:
+        inventory = self._vsphere(transport="soap")
+        self.assertEqual((inventory["transport_setting"], inventory["transport_source"]), ("soap", "inventory"))
+        edited = abr_v41.edit_inventory_record(inventory["id"], {"transport": "inherit"})
+        self.assertEqual((edited["transport"], edited["transport_setting"], edited["transport_source"]), ("vddk", "inherit", "global"))
+        self.assertNotIn("vsphere_transport", HYPERVISORS[inventory["id"]]["metadata"])
 
 
 class JobTransportTests(_Catalog):
@@ -278,6 +291,219 @@ class SessionViewTests(unittest.TestCase):
         hyperv = {"id": "t2", "task_type": "backup", "status": "completed", "parameters": {}, "result": {}}
         self.assertEqual(abr_v41.session_to_dto(soap)["transport"], "soap")
         self.assertNotIn("transport", abr_v41.session_to_dto(hyperv))
+
+
+def _shared_library(path: Path, symbols: dict[str, bool]) -> Path:
+    """A minimal ELF64 file with a dynamic symbol table: name -> defined (True) or only imported (False)."""
+    names = b"\0" + b"".join(name.encode() + b"\0" for name in symbols)
+    table = bytes(24)
+    offset = 1
+    for name, defined in symbols.items():
+        table += struct.pack("<IBBHQQ", offset, 0x12, 0, 7 if defined else 0, 0, 0)
+        offset += len(name) + 1
+    sections_at = 64 + len(names) + len(table)
+    header = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9)
+    header += struct.pack("<HHIQQQIHHHHHH", 3, 62, 1, 0, 0, sections_at, 0, 64, 0, 0, 64, 3, 0)
+    sections = bytes(64)
+    sections += struct.pack("<IIQQQQIIQQ", 0, 3, 0, 0, 64, len(names), 0, 0, 1, 0)
+    sections += struct.pack("<IIQQQQIIQQ", 0, 11, 0, 0, 64 + len(names), len(table), 1, 1, 8, 24)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(header + names + table + sections)
+    return path
+
+
+class LibraryFileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+
+    def test_a_vddk_library_is_one_that_defines_vixdisklib_initex(self) -> None:
+        vddk = _shared_library(self.root / "libvixDiskLib.so.9.1.0.0", {"VixDiskLib_Open": True, "VixDiskLib_InitEx": True})
+        user = _shared_library(self.root / "libvixMntapi.so", {"VixDiskLib_InitEx": False})
+        self.assertIsNone(disk_transport.library_problem(str(vddk)))
+        self.assertIn("does not export 'VixDiskLib_InitEx'", disk_transport.library_problem(str(user)))
+        text = self.root / "notes.txt"
+        text.write_text("not a library")
+        self.assertIn("is not a shared library", disk_transport.library_problem(str(text)))
+
+    def test_a_library_must_be_a_full_path_to_a_file_that_is_there(self) -> None:
+        self.assertIn("full path", disk_transport.library_problem("lib64/libvixDiskLib.so"))
+        self.assertIn("There is no file", disk_transport.library_problem(str(self.root / "missing.so")))
+        self.assertIn("is not a file", disk_transport.library_problem(str(self.root)))
+
+    def test_the_resolved_file_name_follows_the_links(self) -> None:
+        real = _shared_library(self.root / "libvixDiskLib.so.9.1.0.0", {"VixDiskLib_InitEx": True})
+        (self.root / "libvixDiskLib.so").symlink_to(real.name)
+        self.assertEqual(disk_transport.resolved_file_name(self.root / "libvixDiskLib.so"), "libvixDiskLib.so.9.1.0.0")
+        self.assertIsNone(disk_transport.resolved_file_name(self.root / "missing.so"))
+
+
+class AccessResolutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        environment = patch.dict(os.environ, {}, clear=False)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("ABR_VMDK_TOOL_VDDK_DIR", None)
+        SYSTEM_STATE.clear()
+        self.addCleanup(SYSTEM_STATE.clear)
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        self.tool = _launcher(self.root, with_vddk=True, takes_library_file=True)
+        located = patch.object(disk_transport, "default_disk_tool_path", return_value=self.tool)
+        located.start()
+        self.addCleanup(located.stop)
+        self.directory = self.root / "tools" / "vddk"
+        self.default = str(self.directory / "lib64" / "libvixDiskLib.so")
+        self.own = str(_shared_library(self.root / "own" / "libvixDiskLib.so.9.1.0.0", {"VixDiskLib_InitEx": True}))
+        self.server = str(_shared_library(self.root / "ovddk" / "libvixDiskLib.so.8.0.3", {"VixDiskLib_InitEx": True}))
+
+    def _inventory(self, **metadata) -> dict:
+        return {"id": "vc", "type": "vsphere", "metadata": metadata}
+
+    def _library(self, inventory: dict) -> tuple[str, str]:
+        access = disk_transport.resolve_access(inventory)
+        return access["vddk_library"], access["vddk_library_source"]
+
+    def test_nothing_set_falls_back_to_the_vddk_directory(self) -> None:
+        self.assertEqual(self._library(self._inventory()), (self.default, "vddk_directory"))
+        self.assertEqual(disk_transport.resolve_access(self._inventory())["transport_source"], "global")
+
+    def test_the_server_wide_library_applies_to_inventories_without_their_own(self) -> None:
+        disk_transport.store_global_settings("vddk", self.server, updated_by="admin")
+        self.assertEqual(self._library(self._inventory()), (self.server, "global"))
+
+    def test_the_inventory_library_wins_over_the_server_wide_one(self) -> None:
+        own = self._inventory(vddk_library=self.own)
+        self.assertEqual(self._library(own), (self.own, "inventory"))
+        disk_transport.store_global_settings("vddk", self.server, updated_by="admin")
+        self.assertEqual(self._library(own), (self.own, "inventory"))
+
+    def test_the_transport_comes_from_the_job_then_the_inventory_then_the_server(self) -> None:
+        disk_transport.store_global_settings("soap", None, updated_by="admin")
+        inventory = self._inventory()
+        self.assertEqual(disk_transport.resolve_access(inventory)["transport"], "soap")
+        inventory["metadata"]["vsphere_transport"] = "vddk"
+        self.assertEqual(disk_transport.resolve_access(inventory)["transport_source"], "inventory")
+        job = {"task_parameters": {"vsphere_transport": "soap"}}
+        self.assertEqual(
+            {key: disk_transport.resolve_access(inventory, job)[key] for key in ("transport", "transport_source")},
+            {"transport": "soap", "transport_source": "job"},
+        )
+
+    def test_a_library_passes_only_the_library_variable_whatever_the_service_has(self) -> None:
+        parameters = disk_transport.session_parameters(self._inventory(vddk_library=self.own))
+        service = {"ABR_VMDK_TOOL_VDDK_DIR": "/opt/vddk", "ABR_VMDK_TOOL_VDDK_LIB": "/old.so", "PATH": "/usr/bin"}
+        environment = disk_transport.tool_environment(parameters, base=service)
+        self.assertEqual(environment["ABR_VMDK_TOOL_VDDK_LIB"], self.own)
+        self.assertNotIn("ABR_VMDK_TOOL_VDDK_DIR", environment)
+        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(parameters["vddk_library_file"], "libvixDiskLib.so.9.1.0.0")
+
+    def test_the_default_library_passes_only_the_directory(self) -> None:
+        service = {"ABR_VMDK_TOOL_VDDK_LIB": "/old.so"}
+        for inventory in (self._inventory(), self._inventory(vddk_library=self.default)):
+            with self.subTest(inventory=inventory):
+                environment = disk_transport.tool_environment(disk_transport.session_parameters(inventory), base=service)
+                self.assertEqual(environment, {"ABR_VMDK_TOOL_VDDK_DIR": str(self.directory)})
+
+    def test_soap_passes_neither_and_a_session_from_before_keeps_the_service_environment(self) -> None:
+        parameters = disk_transport.session_parameters(self._inventory(vsphere_transport="soap", vddk_library=self.own))
+        self.assertEqual(parameters, {"vsphere_transport": "soap", "vsphere_transport_source": "inventory"})
+        service = {"ABR_VMDK_TOOL_VDDK_DIR": "/opt/vddk", "ABR_VMDK_TOOL_VDDK_LIB": "/old.so"}
+        self.assertEqual(disk_transport.tool_environment(parameters, base=service), {})
+        self.assertIsNone(disk_transport.tool_environment({"vsphere_transport": "vddk"}, base=service))
+
+    def test_a_library_the_launcher_does_not_know_is_refused(self) -> None:
+        old = _launcher(self.root / "old", with_vddk=True)
+        problem = disk_transport.transport_problem("vddk", old, library=self.own)
+        self.assertIn("does not take a VDDK library file", problem)
+        self.assertIsNone(disk_transport.transport_problem("vddk", self.tool, library=self.own))
+        self.assertIn("There is no file", disk_transport.transport_problem("vddk", self.tool, library="/gone/lib.so"))
+
+
+class ServerWideSettingsTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        self.problem.stop()
+        environment = patch.dict(os.environ, {}, clear=False)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("ABR_VMDK_TOOL_VDDK_DIR", None)
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        located = patch.object(disk_transport, "default_disk_tool_path", return_value=_launcher(self.root, with_vddk=True, takes_library_file=True))
+        located.start()
+        self.addCleanup(located.stop)
+        soap = patch.object(disk_transport, "disk_tool_has_soap_api", return_value=True)
+        soap.start()
+        self.addCleanup(soap.stop)
+        self.library = str(_shared_library(self.root / "ovddk" / "libvixDiskLib.so", {"VixDiskLib_InitEx": True}))
+
+    def test_without_the_flag_inventories_keep_their_own_values(self) -> None:
+        own = self._vsphere(transport="soap")
+        plain = self._vsphere("vc2")
+        settings, changed, updated = vsphere_access.update_settings({"vddk_library": self.library}, updated_by="admin")
+        self.assertEqual((changed, updated), (["vddk_library"], []))
+        self.assertEqual((settings["vddk_library"], settings["vddk_library_source"]), (self.library, "global"))
+        self.assertEqual(abr_v41.resolve_inventory(record_id=own["id"])["transport"], "soap")
+        self.assertEqual(abr_v41.resolve_inventory(record_id=plain["id"])["effective_vddk_library"], self.library)
+
+    def test_the_flag_hands_every_inventory_back_and_names_them(self) -> None:
+        own = self._vsphere(transport="soap")
+        self._vsphere("vc2")
+        _settings, _changed, updated = vsphere_access.update_settings(
+            {"transport": "vddk", "apply_to_existing_inventories": True}, updated_by="admin"
+        )
+        self.assertEqual(updated, [{"id": own["id"], "name": "vc"}])
+        self.assertEqual(abr_v41.resolve_inventory(record_id=own["id"])["transport_source"], "global")
+
+    def test_the_directory_default_or_null_resets_the_library(self) -> None:
+        vsphere_access.update_settings({"vddk_library": self.library}, updated_by="admin")
+        settings, _changed, _updated = vsphere_access.update_settings({"vddk_library": None}, updated_by="admin")
+        self.assertIsNone(settings["vddk_library"])
+        settings, changed, _updated = vsphere_access.update_settings({"vddk_library": settings["default_vddk_library"]}, updated_by="admin")
+        self.assertEqual((settings["vddk_library"], changed), (None, []))
+
+    def test_a_file_that_is_not_a_vddk_is_refused_next_to_the_field(self) -> None:
+        other = str(_shared_library(self.root / "libcrypto.so.3", {"EVP_sha256": True}))
+        for call in (
+            lambda: vsphere_access.update_settings({"vddk_library": other}, updated_by="admin"),
+            lambda: self._vsphere(vddk_library=other),
+        ):
+            error = self._refused(call)
+            self.assertEqual((error.status_code, error.code), (422, "invalid_vddk_library"))
+            self.assertIn("does not export 'VixDiskLib_InitEx'", error.details["fields"]["vddk_library"])
+
+    def test_an_inventory_library_needs_the_vddk(self) -> None:
+        error = self._refused(self._vsphere, transport="soap", vddk_library=self.library)
+        self.assertEqual(error.code, "invalid_vddk_library")
+        inventory = self._vsphere(vddk_library=self.library)
+        self.assertEqual((inventory["vddk_library"], inventory["vddk_library_source"]), (self.library, "inventory"))
+        cleared = abr_v41.edit_inventory_record(inventory["id"], {"vddk_library": "inherit"})
+        self.assertEqual((cleared["vddk_library"], cleared["vddk_library_source"]), (None, "vddk_directory"))
+
+    def test_a_session_records_and_shows_what_it_uses(self) -> None:
+        inventory = self._vsphere(vddk_library=self.library)
+        parameters = abr_v41.session_transport_parameters(HYPERVISORS[inventory["id"]])
+        dto = abr_v41.session_to_dto({"id": "t1", "task_type": "backup", "status": "running", "parameters": parameters, "result": {}})
+        self.assertEqual(
+            {key: dto[key] for key in ("transport", "transport_source", "vddk_library", "vddk_library_file", "vddk_library_source")},
+            {
+                "transport": "vddk",
+                "transport_source": "global",
+                "vddk_library": self.library,
+                "vddk_library_file": "libvixDiskLib.so",
+                "vddk_library_source": "inventory",
+            },
+        )
+        self.assertEqual(
+            disk_transport.describe_access(parameters, verb="read"),
+            f"Disks are read over VDDK (the server-wide default), with the VDDK library {self.library} (set for this inventory)",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
