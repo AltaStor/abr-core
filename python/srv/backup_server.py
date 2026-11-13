@@ -83,7 +83,8 @@ from .services import (
     notification_detectors,
     tls_certificate_service,
 )
-from .services.abr_v41 import PRODUCT_NAME, backfill_inventory_transports, product_version
+from .services.abr_v41 import PRODUCT_NAME, product_version
+from .services import vsphere_access
 from .core.server_defaults import env_int
 from .core.task_pool import TaskProcessPool
 from .services.api_errors import (
@@ -246,11 +247,15 @@ async def lifespan(_: FastAPI):
         except Exception:
             logger.exception("SMB repository type backfill failed; continuing startup without it.")
         try:
-            transports = backfill_inventory_transports()
-            if transports:
-                logger.info("Set the VDDK transport on %d vSphere inventory(ies) from before transports existed.", transports)
+            handed_back = vsphere_access.initialise()
+            if handed_back:
+                logger.info(
+                    "%d vSphere inventory(ies) with the VDDK transport now follow the server-wide vSphere settings, "
+                    "which start as the VDDK with the library of the VDDK directory.",
+                    handed_back,
+                )
         except Exception:
-            logger.exception("vSphere transport backfill failed; continuing startup without it.")
+            logger.exception("Setting up the server-wide vSphere settings failed; continuing startup without them.")
         BACKUPS.clear()
         BACKUPS.update(load_backups())
         try:
