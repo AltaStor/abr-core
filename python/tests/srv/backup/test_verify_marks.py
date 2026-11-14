@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from python.srv.core.job_scheduler import JobScheduler
@@ -548,12 +550,49 @@ class JobVerifyRunTests(_Catalog):
 
         runs = [self.run_verify() for _ in range(3)]
 
-        self.assertEqual(runs, [[("newest_points", {"inc-b3"})], [("whole_chains", None)], [("newest_points", {"inc-b3"})]])
+        newest = {"full-b", "inc-b1", "inc-b2", "inc-b3"}
+        self.assertEqual(runs, [[("newest_points", newest)], [("whole_chains", None)], [("newest_points", newest)]])
         last = JOBS["job-1"]["last_verify"]
         self.assertEqual((last["run"], last["scope"], last["result"]), (3, "newest_points", "success"))
         sessions = [task for task in TASKS.values() if task["task_type"] == "verify"]
         self.assertEqual({(task["job_id"], task["trigger"]) for task in sessions}, {("job-1", "schedule")})
         self.assertFalse(abr_v41.job_verify_running("job-1"))
+
+    def test_a_newest_point_run_finds_damage_in_the_full_it_builds_on_and_leaves_older_chains_unread(self) -> None:
+        self.chain()
+        read: list[str] = []
+
+        def verify(point, disk, **_kwargs):
+            read.append(point["id"])
+            if point["id"] == "full-b":
+                return {"disk_key": "disk-1", "status": "corrupt", "message": "is CORRUPT", "corrupt_ranges": 1, "data_ranges": 4}
+            return {"disk_key": "disk-1", "status": "ok", "message": "Verified"}
+
+        with patch.object(abr_v41, "threading", SimpleNamespace(**{**vars(threading), "Thread": _ImmediateThread})), patch.object(abr_v41, "_verify_disk_artifact", side_effect=verify):
+            abr_v41.run_job_verify("job-1")
+
+        self.assertEqual(sorted(read), ["full-b", "inc-b1", "inc-b2", "inc-b3"])
+        self.assertEqual(JOBS["job-1"]["last_verify"]["result"], "failed")
+        self.assertEqual(
+            self.statuses(),
+            {"full-a": "available", "inc-a1": "available", "full-b": "corrupt", "inc-b1": "corrupt", "inc-b2": "corrupt", "inc-b3": "corrupt"},
+        )
+        log = [entry["message"] for task in TASKS.values() if task["task_type"] == "verify" for entry in task["logs"]]
+        self.assertTrue(any("the newest restore point (inc-b3) and the points it builds on" in message for message in log))
+
+    def test_the_newest_restore_path_is_the_newest_point_back_to_its_full(self) -> None:
+        self.chain()
+        points = abr_v41.grouped_backup_points()[BACKUPS["full-a"]["chain_id"]]
+
+        self.assertEqual(abr_v41.newest_restore_path(points), {"full-b", "inc-b1", "inc-b2", "inc-b3"})
+        self.assertEqual(abr_v41.newest_restore_path(points[:3]), {"full-b"})
+        self.assertEqual(abr_v41.newest_restore_path([]), set())
+
+    def test_points_without_recorded_parents_fall_back_to_everything_since_the_last_full(self) -> None:
+        self.chain()
+        points = [dict(point, parent_point_id=None) for point in abr_v41.grouped_backup_points()[BACKUPS["full-a"]["chain_id"]]]
+
+        self.assertEqual(abr_v41.newest_restore_path(points), {"full-b", "inc-b1", "inc-b2", "inc-b3"})
 
     def test_a_job_already_verifying_is_not_started_again(self) -> None:
         self.chain()

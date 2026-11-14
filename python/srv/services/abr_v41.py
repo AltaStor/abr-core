@@ -7965,7 +7965,10 @@ def _create_verify_session(
         "updated_at": utc_now(),
         "logs": [],
     }
-    what = {"newest_points": f"the newest restore point ({latest.get('id')})", "whole_chains": "every restore point"}.get(str(scope or ""), "")
+    what = {
+        "newest_points": f"the newest restore point ({latest.get('id')}) and the points it builds on",
+        "whole_chains": "every restore point",
+    }.get(str(scope or ""), "")
     _append_task_log(
         task,
         level="info",
@@ -8132,9 +8135,24 @@ def run_job_verify(job_id: str, *, trigger: str = "schedule") -> dict[str, Any] 
         run["run"],
         run["scope"].replace("_", " "),
         trigger,
-        "every restore point of each chain" if run["scope"] == "whole_chains" else "the newest restore point of each chain",
+        "every restore point of each chain" if run["scope"] == "whole_chains" else "the newest restore point of each chain and the points it builds on",
     )
     return run
+
+
+def newest_restore_path(points: list[dict[str, Any]]) -> set[str]:
+    if not points:
+        return set()
+    by_id = {str(point.get("id") or ""): point for point in points}
+    path: list[str] = []
+    current: dict[str, Any] | None = points[-1]
+    while current is not None and str(current.get("id") or "") not in path:
+        path.append(str(current.get("id") or ""))
+        if current.get("full_backup") or str(current.get("execution_type") or "") != "Incremental":
+            return set(path)
+        current = by_id.get(str(current.get("parent_point_id") or ""))
+    fulls = [index for index, point in enumerate(points) if point.get("full_backup") or str(point.get("execution_type") or "") != "Incremental"]
+    return {str(point.get("id") or "") for point in points[fulls[-1] if fulls else 0 :]}
 
 
 def _run_job_verify(job_id: str, run: dict[str, Any]) -> None:
@@ -8142,7 +8160,7 @@ def _run_job_verify(job_id: str, run: dict[str, Any]) -> None:
     try:
         name = str((JOBS.get(job_id) or {}).get("name") or job_id)
         for chain_id, points in _job_verify_targets(job_id):
-            point_ids = None if run["scope"] == "whole_chains" else {str(points[-1].get("id") or "")}
+            point_ids = None if run["scope"] == "whole_chains" else newest_restore_path(points)
             task = _create_verify_session(
                 chain_id, points, job_id=job_id, trigger=str(run["trigger"]), scope=str(run["scope"]), run_id=str(run["id"])
             )

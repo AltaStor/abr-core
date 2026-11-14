@@ -549,7 +549,7 @@ class JobCommands:
                 type=int,
                 help=(
                     "Every how many scheduled verify runs check every restore point of each chain instead of the "
-                    "newest one, 1-100 (default 4; 1 checks whole chains every time)"
+                    "newest one and the points it builds on, 1-100 (default 4; 1 checks whole chains every time)"
                 ),
             )
             for prefix, label in (("active-full", "Active full"), ("synthetic-full", "Synthetic full"), ("verify", "Verify")):

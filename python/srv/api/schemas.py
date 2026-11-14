@@ -930,12 +930,13 @@ class UpdateRepositoryRequest(_LenientModel):
 
 VERIFY_SCHEDULE = (
     "When the job's backups are verified, in the form of a full schedule; each run checks the newest restore point of "
-    "every chain the job wrote, and every verify_whole_chain_every-th run checks whole chains. A run waits while the "
+    "every chain the job wrote and the points it builds on (the data a restore of it reads), and every "
+    "verify_whole_chain_every-th run checks whole chains. A run waits while the "
     "job backs up. null, none or omitted on create: no scheduled verify"
 )
 VERIFY_SCHEDULE_EDIT = "As on create; null or none removes it, omitted keeps it"
 VERIFY_STATE = "true or false switches the verify schedule on or off, keeping its settings; it needs a verify schedule"
-VERIFY_WHOLE_CHAIN_EVERY = "Every how many scheduled verify runs check whole chains instead of the newest restore point, 1 to 100; null or omitted on create: 4"
+VERIFY_WHOLE_CHAIN_EVERY = "Every how many scheduled verify runs check whole chains instead of the newest restore point and the points it builds on, 1 to 100; null or omitted on create: 4"
 
 
 class CreateJobRequest(_LenientModel):
