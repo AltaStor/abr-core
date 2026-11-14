@@ -264,6 +264,26 @@ class SessionTypeFilterTests(_Api):
         second = self.client.get(first["next"]).json()
         self.assertEqual({item["id"] for item in first["items"] + second["items"]}, {"s0", "s4"})
 
+    def test_backup_copy_and_replication_sessions_carry_their_own_type_and_filter_apart(self) -> None:
+        sessions = {
+            "c1": ("backup", {"copy_job": True, "copy_mode": "periodic"}),
+            "c2": ("backup", {"copy_job": False, "copy_mode": "periodic", "synthetic_full": True}),
+            "r1": ("replication", {"replica_name": "sql-01-replica"}),
+        }
+        for session_id, (task_type, parameters) in sessions.items():
+            TASKS[session_id] = {
+                "id": session_id, "task_type": task_type, "status": "completed", "created_at": "2026-10-11T09:00:00+00:00", "result": {}, "parameters": parameters,
+            }
+
+        types = {item["id"]: item["type"] for item in self.client.get("/api/v1/sessions").json()["items"]}
+        self.assertEqual((types["c1"], types["c2"], types["r1"], types["s0"]), ("backup-copy", "backup-copy", "replication", "backup"))
+        self.assertEqual(self.client.get("/api/v1/sessions/c1").json()["type"], "backup-copy")
+        for session_type, expected in (("backup", {"s0", "s4"}), ("backup-copy", {"c1", "c2"}), ("replication", {"r1"})):
+            with self.subTest(session_type=session_type):
+                response = self.client.get("/api/v1/sessions", params={"type": session_type})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual({item["id"] for item in response.json()["items"]}, expected)
+
     def test_an_unknown_type_is_refused_instead_of_ignored(self) -> None:
         response = self.client.get("/api/v1/sessions", params={"type": "garbage"})
         self.assertEqual(response.status_code, 422, response.text)

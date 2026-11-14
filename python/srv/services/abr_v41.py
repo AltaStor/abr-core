@@ -6924,7 +6924,7 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     dto: dict[str, Any] = {
         "id": task.get("id"),
         "state": _session_state(task),
-        "type": task.get("task_type"),
+        "type": session_type_of(task),
         "job": {"id": job["id"], "name": job["name"]} if job else None,
         "vm_id": task.get("resource_external_id") if str(task.get("resource_type") or "") == "virtual_machine" else None,
         # The VM this session acts on, by name. For a restore this is the VM
@@ -6977,7 +6977,15 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     return dto
 
 
-SESSION_TYPES = ("backup", "restore", "verify", "delete")
+SESSION_TYPES = ("backup", "backup-copy", "replication", "restore", "verify", "delete")
+
+
+def session_type_of(task: dict[str, Any]) -> str | None:
+    task_type = task.get("task_type")
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    if task_type == "backup" and (parameters.get("copy_job") or parameters.get("copy_mode")):
+        return "backup-copy"
+    return task_type
 
 
 def list_sessions(
@@ -6996,7 +7004,7 @@ def list_sessions(
             f"type must be one of: {', '.join(SESSION_TYPES)}",
             type=session_type,
         )
-        tasks = [task for task in tasks if str(task.get("task_type") or "") == session_type]
+        tasks = [task for task in tasks if session_type_of(task) == session_type]
     if run_id:
         tasks = [task for task in tasks if str(task.get("run_id") or "") == run_id]
     sessions = [session_to_dto(task, include_logs=include_logs) for task in tasks]

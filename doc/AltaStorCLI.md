@@ -761,6 +761,9 @@ Description: Show active and historical sessions.
 
 abr session list [--job <name>] [--run <run-id>] [--since <ISO timestamp>] [--output json] 
 
+Notes: 
+• TYPE (type in --output json) says what a session does: backup, backup-copy (a session of a backup copy job, its synthetic fulls included), replication, restore, verify or delete. It stays after the job is deleted. GET /api/v1/sessions?type= filters by the same values. 
+
 abr session info 
 
 Description: Display detailed session telemetry. 

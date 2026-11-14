@@ -633,7 +633,7 @@ class CatalogManifestDTO(_LenientModel):
 class SessionDTO(_LenientModel):
     id: str
     state: str
-    type: str | None = None
+    type: str | None = Field(default=None, description="backup, backup-copy (a session of a backup copy job), restore, verify, delete or replication")
     transport: DocStr = Field(default=None, description="vSphere sessions: vddk or soap, the transport the session reads or writes disks over; it keeps the one it started with")
     job: _Ref | DocObject = None
     vm_id: str | None = None
