@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -20,7 +21,7 @@ from uuid import uuid4
 
 from .credential_encryption import is_encrypted, unreadable_encryption_key_message
 from .server_defaults import env_int
-from .subprocess_util import CompletedProcess, DataPathStalled, ProcessCancelled, run_capped
+from .subprocess_util import CompletedProcess, DataPathStalled, ProcessCancelled, describe_process_end, run_capped
 
 logger = logging.getLogger(__name__)
 
@@ -829,6 +830,28 @@ def probe_repository_access(
     remove_disk_tool_backup(repository, abr_path, backup_name, timeout=timeout)
 
 
+DISK_TOOL_NAME = "abr-vmdk-tool"
+OUT_OF_MEMORY_HINT = (
+    "SIGKILL usually comes from the kernel's out-of-memory killer; journalctl -k on the backup server shows it"
+)
+_PROGRESS_ONLY_LINE = re.compile(r"^\s*\d{1,3}%(?:\s*\(\d+\))?\s*$")
+
+
+def without_progress_lines(text: Any) -> str:
+    return "\n".join(line for line in str(text or "").splitlines() if line.strip() and not _PROGRESS_ONLY_LINE.match(line)).strip()
+
+
+def disk_tool_failure_text(returncode: int, stderr: Any, stdout: Any) -> str:
+    output = without_progress_lines(stderr) or without_progress_lines(stdout)
+    if returncode > 0 and output:
+        return output
+    message = f"the backup tool ended unexpectedly: {describe_process_end(DISK_TOOL_NAME, returncode)}"
+    if returncode == -signal.SIGKILL:
+        message += f" ({OUT_OF_MEMORY_HINT})"
+    last_line = output.splitlines()[-1].strip() if output else ""
+    return message + (f". Its last output: {last_line}" if last_line else ". It printed no error")
+
+
 def condense_disk_tool_message(text: Any) -> str:
     lines: list[str] = []
     for raw_line in str(text or "").splitlines():
@@ -1413,7 +1436,7 @@ def run_disk_tool(
 
     elapsed = time.monotonic() - started
     if completed.returncode != 0:
-        stderr = _name_unreadable_directories((completed.stderr or completed.stdout or "").strip())
+        stderr = _name_unreadable_directories(disk_tool_failure_text(completed.returncode, completed.stderr, completed.stdout))
         # Removing what was never written (cleanup after a failed run) is
         # not a storage problem worth a warning.
         absent = args[:1] == ["remove"] and _reports_absent_backup(stderr)
@@ -1424,7 +1447,7 @@ def run_disk_tool(
             elapsed,
             condense_disk_tool_message(stderr) or f"exit code {completed.returncode}",
         )
-        error = StorageToolError(stderr or f"backup tool failed with exit code {completed.returncode}")
+        error = StorageToolError(stderr)
         error.result_stdout = str(completed.stdout or "")
         raise error
 

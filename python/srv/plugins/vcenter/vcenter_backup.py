@@ -23,6 +23,7 @@ from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...services.share_mount import ensure_share_mounted
 from .disk_transport import SOAP, TRANSPORT_NAMES, VDDK, tool_api_args, transport_problem
 from ...core.storage_tool import (
+    OUT_OF_MEMORY_HINT,
     StorageToolError,
     apply_repository_immutability,
     chain_retention_till,
@@ -1270,9 +1271,6 @@ _TOOL_REPORTED_FAILURE = re.compile(
     re.IGNORECASE,
 )
 DATA_MOVER = "abr-vmdk-tool"
-OUT_OF_MEMORY_HINT = (
-    "SIGKILL usually comes from the kernel's out-of-memory killer; journalctl -k on the backup server shows it"
-)
 
 
 def _repository_free_bytes(repository: dict[str, Any] | None) -> int | None:
