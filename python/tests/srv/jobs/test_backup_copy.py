@@ -200,6 +200,50 @@ class CopyPlanTests(_Catalog):
         self.assertEqual(sources, ["f1", "i1", "i2"])
         self.assertIsNone(self._plan())
 
+    def _synthetic(self, point_id: str, merged: list[str], *, recorded: bool = True) -> dict:
+        merged_points = [BACKUPS[point] for point in merged]
+        extra = {"copy_source": backup_copy.synthetic_copy_source(merged_points)} if recorded else {}
+        return self._point(point_id, "SyntheticFull", job_id=self.copy["id"], repo="dst", **extra)
+
+    def test_a_copy_after_a_synthetic_full_is_an_incremental_on_it_with_only_what_is_new(self) -> None:
+        self._copied("c1", "f1")
+        self._copied("c2", "i1", kind="Incremental")
+        self._synthetic("s1", ["c1", "c2"])
+
+        plan = self._plan()
+
+        self.assertEqual((plan["kind"], self._ids(plan), plan["parent"]["id"]), ("incremental", ["i2"], "s1"))
+
+    def test_a_synthetic_full_made_before_this_fix_without_a_copy_source_is_still_built_on(self) -> None:
+        self._copied("c1", "f1")
+        self._copied("c2", "i1", kind="Incremental")
+        self._synthetic("s1", ["c1", "c2"], recorded=False)
+
+        plan = self._plan()
+
+        self.assertEqual((plan["kind"], self._ids(plan), plan["parent"]["id"]), ("incremental", ["i2"], "s1"))
+
+    def test_the_synthetic_full_records_the_source_point_whose_state_it_holds(self) -> None:
+        self._copied("c1", "f1")
+        self._copied("c2", "i1", kind="Incremental")
+
+        source = backup_copy.synthetic_copy_source([BACKUPS["c1"], BACKUPS["c2"]])
+
+        self.assertEqual((source["job_id"], source["repository_id"], source["point_id"]), ("nightly", "src", "i1"))
+        self.assertEqual(source["point_ids"], ["f1", "i1"])
+        self.assertIsNone(backup_copy.synthetic_copy_source([BACKUPS["f1"]]))
+
+    def test_after_a_synthetic_full_nothing_new_or_a_new_source_chain_behave_as_before(self) -> None:
+        self._copied("c1", "f1")
+        self._copied("c2", "i2", kind="Incremental")
+        self._synthetic("s1", ["c1", "c2"])
+        self.assertIsNone(self._plan())
+
+        self._point("f2", "ActiveFull")
+        plan = self._plan()
+
+        self.assertEqual((plan["kind"], self._ids(plan), plan["parent"]), ("full", ["f2"], None))
+
     def test_every_vm_of_the_sources_is_copied_unless_the_job_picks_some(self) -> None:
         BACKUPS["x1"] = dict(BACKUPS["i2"], id="x1", vm_id="vm-9", vm_name="web-09")
         job = JOBS[self.copy["id"]]
@@ -247,6 +291,15 @@ class SeveralJobsOfOneVmTests(_Catalog):
 
         self.assertIsNone(backup_copy.plan_copy(job, VM))
         self.assertEqual(backup_copy.followed_source_job(job, VM), ("Weekly", ["Nightly"]))
+
+    def test_the_copy_stays_on_its_job_after_a_synthetic_full_made_before_this_fix(self) -> None:
+        self.copy = self._copy_job(source_jobs=None, source_repositories=["Source"])
+        self._point("c1", "ActiveFull", job_id=self.copy["id"], repo="dst", copy_source={"job_id": "weekly", "repository_id": "src", "point_id": "w1"})
+        self._point("s1", "SyntheticFull", job_id=self.copy["id"], repo="dst")
+        job = abr_v41.normalize_job_record(JOBS[self.copy["id"]])
+
+        self.assertEqual(backup_copy.followed_source_job(job, VM), ("Weekly", ["Nightly"]))
+        self.assertIsNone(backup_copy.plan_copy(job, VM))
 
     def test_nothing_new_names_the_job_it_follows_and_the_jobs_it_does_not_copy(self) -> None:
         self.copy = self._copy_job(source_jobs=None, source_repositories=["Source"])

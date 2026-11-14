@@ -346,6 +346,7 @@ def run_synthetic_full(
         _resolve_tool_timeout_seconds,
     )
     from python.srv.services.abr_v41 import repository_actual_retention_days
+    from python.srv.services.backup_copy import synthetic_copy_source
     from python.srv.core.mongo_db_wrapper import JOBS
     from python.srv.core.task_executor import cancel_requested, task_status
     from python.srv.core.storage_tool import extract_s3_config, is_s3_repository
@@ -648,6 +649,7 @@ def run_synthetic_full(
         "synthetic_full": True,
         "merged_restore_point_ids": [str(point.get("id") or "") for point in points],
         "merged_from": len(points),
+        **({"copy_source": copied} if (copied := synthetic_copy_source(points)) else {}),
         "source_repository_id": source_repository_id,
         "immutability_generation": generation,
         "backup_root": str(task_root),

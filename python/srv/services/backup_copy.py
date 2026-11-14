@@ -198,8 +198,7 @@ def _source_chain(job: dict[str, Any], vm_id: str, previous: dict[str, Any] | No
 
 
 def followed_source_job(job: dict[str, Any], vm_id: str) -> tuple[str, list[str]]:
-    previous_points = destination_points(job, vm_id)
-    chain = _source_chain(job, vm_id, previous_points[-1] if previous_points else None)
+    chain = _source_chain(job, vm_id, copied_marker(destination_points(job, vm_id)))
     if not chain:
         return "", []
     followed = str(chain[-1].get("job_id") or "")
@@ -224,18 +223,19 @@ def plan_copy(job: dict[str, Any], vm_id: str, *, requested_type: str = "Increme
 
     previous_points = destination_points(job, vm_id)
     previous = previous_points[-1] if previous_points else None
-    chain = _source_chain(job, vm_id, previous)
+    marker = copied_marker(previous_points)
+    chain = _source_chain(job, vm_id, marker)
     if not chain:
         return None
 
     damaged = bool(damaged_chain_points(str(job.get("id") or ""), vm_id, str(job.get("repo_id") or "") or None))
     full_requested = requested_type in FULL_EXECUTION_TYPES or damaged
-    copied_id = str(_copy_source(previous or {}).get("point_id") or "")
+    copied_id = str(_copy_source(marker or {}).get("point_id") or "")
     position = {str(point.get("id") or ""): index for index, point in enumerate(chain)}
     if copied_id in position:
         pending = chain[position[copied_id] + 1 :]
     elif copied_id:
-        copied_at = _point_order(_copy_source_point_stub(previous))
+        copied_at = _point_order(_copy_source_point_stub(marker))
         pending = [point for point in chain if _point_order(point) > copied_at]
     else:
         pending = list(chain)
@@ -272,6 +272,24 @@ def plan_copy(job: dict[str, Any], vm_id: str, *, requested_type: str = "Increme
         "remaining": len(pending) - pending.index(target) - 1 if target in pending else 0,
         "damaged": damaged,
     }
+
+
+def copied_marker(destination: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next((point for point in reversed(destination) if _copy_source(point)), None)
+
+
+def synthetic_copy_source(points: list[dict[str, Any]]) -> dict[str, Any] | None:
+    sources = [_copy_source(point) for point in points if _copy_source(point)]
+    if not sources:
+        return None
+    newest = sources[-1]
+    point_ids: list[str] = []
+    for source in sources:
+        for point_id in source.get("point_ids") or [source.get("point_id")]:
+            if point_id and str(point_id) not in point_ids:
+                point_ids.append(str(point_id))
+    kept = ("job_id", "job_name", "repository_id", "repository_name", "point_id", "created_at")
+    return {**{key: newest.get(key) for key in kept}, "point_ids": point_ids}
 
 
 def _copy_source_point_stub(point: dict[str, Any] | None) -> dict[str, Any]:
