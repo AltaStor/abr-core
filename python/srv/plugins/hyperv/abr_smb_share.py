@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROGRAM = "abr_smb_share.py"
@@ -32,15 +33,18 @@ UNIT = os.environ.get("ABR_UNIT", "altastor-backup-server")
 SMB_CONF = Path("/etc/samba/smb.conf")
 SHARES_CONF = Path("/etc/samba/altastor-backup-shares.conf")
 INCLUDE_LINE = f"include = {SHARES_CONF}"
-ACCOUNT_COMMENT = "AltaStor Backup Hyper-V share"
+ACCOUNT_COMMENT = "AltaStor Backup SMB share"
+OUR_ACCOUNT_COMMENTS = {ACCOUNT_COMMENT, "AltaStor Backup Hyper-V share"}
 SAMBA_TOOLS = ("smbd", "testparm", "smbpasswd", "pdbedit", "smbcontrol")
 ACTIVE_STATES = {"queued", "pending", "running", "stopping"}
+SERVER_STATUS_FRESH_SECONDS = 60
+CONFIRM_SECONDS = 20
+LIVE = "live"
 USAGE = f"""usage: sudo python3 {PROGRAM} show | add <path> | del <path> | check <path>
-  show          list the local repositories of AltaStor Backup as <path> : <share name>|none
-  add <path>    share the repository at <path> over SMB for Hyper-V hosts: a hidden share and its own Samba account,
-                stored encrypted in AltaStor Backup
-  del <path>    remove that share and account; the repository is a local one again
-  check <path>  write, read back and delete a test file through the share with the stored account"""
+  show          list local repositories as <path> : \\\\<host>\\<share> or none
+  add <path>    share the repository over SMB with its own hidden share and Samba account
+  del <path>    remove that share and account; the repository is local again
+  check <path>  write, read back and delete a test file through the share"""
 
 
 class Refused(Exception):
@@ -101,13 +105,88 @@ def repository_at(catalog, raw_path):
     for record in local_repositories(catalog):
         if os.path.realpath(str(record.get("path") or "")) == wanted:
             return record
-    raise Refused(f"{wanted} is not a local repository of AltaStor Backup; sudo python3 {PROGRAM} show lists them")
+    raise Refused(f"{wanted} is not a local repository; see: sudo python3 {PROGRAM} show")
 
 
 def refuse_while_sessions_run(catalog):
     active = [task for task in catalog.catalog_records(catalog.TASKS) if str(task.get("status") or "") in ACTIVE_STATES]
     if active:
-        raise Refused(f"{len(active)} session(s) are queued or running and the server restarts at the end; run this again once they have finished")
+        raise Refused(f"{len(active)} session(s) are queued or running and the server restarts afterwards; run this again when they finish")
+
+
+def job_repositories(catalog, job_id, depth=0):
+    job = catalog.JOBS.get(job_id) or {}
+    found = {str(job.get("repo_id") or ""), *(str(value) for value in job.get("source_repository_ids") or [])}
+    sources = [*(job.get("source_job_ids") or []), (job.get("replication") or {}).get("source_job_id")]
+    for source in sources:
+        if source and depth < 2:
+            found |= job_repositories(catalog, str(source), depth + 1)
+    return found - {""}
+
+
+def values_of(value):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from values_of(item)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from values_of(item)
+    else:
+        yield str(value)
+
+
+def sessions_using(catalog, record):
+    repository_id = str(record.get("id") or "")
+    return [
+        task
+        for task in catalog.catalog_records(catalog.TASKS)
+        if str(task.get("status") or "") in ACTIVE_STATES
+        and (
+            repository_id in set(values_of(task.get("parameters") or {}))
+            or repository_id in job_repositories(catalog, str(task.get("job_id") or ""))
+        )
+    ]
+
+
+def refuse_while_in_use(catalog, record, mode):
+    if mode != LIVE:
+        refuse_while_sessions_run(catalog)
+        return
+    busy = sessions_using(catalog, record)
+    if busy:
+        raise Refused(f"{len(busy)} session(s) use this repository; run this again when they finish")
+
+
+def seconds_since(value):
+    try:
+        moment = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - moment).total_seconds()
+
+
+def server_mode(catalog):
+    status = catalog.server_status() or {}
+    age = seconds_since(status.get("updated_at"))
+    if status.get("repository_reload") and status.get("running") and age is not None and age <= SERVER_STATUS_FRESH_SECONDS:
+        return LIVE
+    return "restart"
+
+
+def apply_change(catalog, record, mode):
+    if mode != LIVE:
+        return restart_server()
+    repository_id = str(record.get("id") or "")
+    request_id = secrets.token_hex(8)
+    catalog.request_repository_reload(repository_id, request_id)
+    deadline = time.monotonic() + CONFIRM_SECONDS
+    while time.monotonic() < deadline:
+        if catalog.repository_reload_done(repository_id) == request_id:
+            return "The server picked up the change."
+        time.sleep(0.5)
+    return f"The server did not confirm within {CONFIRM_SECONDS} s; restart it to apply the change."
 
 
 def samba_sections(text):
@@ -134,20 +213,20 @@ def our_shares():
 def preflight():
     missing = [tool for tool in SAMBA_TOOLS if shutil.which(tool) is None]
     if missing or not SMB_CONF.is_file():
-        raise Refused(f"Samba is not installed (missing: {' '.join(missing) or SMB_CONF}); run sudo bash install-samba.sh first")
+        raise Refused(f"Samba is not installed (missing: {' '.join(missing) or SMB_CONF}); run: sudo bash install-samba.sh")
     if run(["systemctl", "is-active", "--quiet", "smbd"], check=False).returncode != 0:
-        raise Refused("smbd is installed but not running; start it with: sudo systemctl enable --now smbd")
+        raise Refused("smbd is not running; start it: sudo systemctl enable --now smbd")
     if run(["testparm", "-s", str(SMB_CONF)], check=False).returncode != 0:
-        raise Refused(f"the existing Samba configuration does not validate (testparm -s {SMB_CONF}); it is left as it is")
+        raise Refused(f"{SMB_CONF} does not validate (testparm -s); left as is")
     role = run(["testparm", "-s", "--parameter-name=server role"], check=False).stdout.lower()
     backend = run(["testparm", "-s", "--parameter-name=config backend"], check=False).stdout.lower()
     passdb = run(["testparm", "-s", "--parameter-name=passdb backend"], check=False).stdout.strip().lower()
     if "active directory domain controller" in role:
-        raise Refused("this Samba is an Active Directory domain controller; its configuration is left as it is")
+        raise Refused("this Samba is an Active Directory domain controller; left as is")
     if "registry" in backend:
-        raise Refused("this Samba keeps its configuration in the registry; it is left as it is")
+        raise Refused("this Samba keeps its configuration in the registry; left as is")
     if not passdb.startswith("tdbsam"):
-        raise Refused(f"this Samba keeps its accounts in '{passdb}', not tdbsam; no account is added to it")
+        raise Refused(f"this Samba keeps its accounts in '{passdb}', not tdbsam; left as is")
 
 
 def write_file(path, text, *, like=None):
@@ -185,7 +264,7 @@ def remove_account(user):
     if run(["pdbedit", "-L", "-u", user], check=False).returncode == 0:
         run(["smbpasswd", "-x", user])
     entry = run(["getent", "passwd", user], check=False).stdout.split(":")
-    if len(entry) > 4 and entry[4] == ACCOUNT_COMMENT:
+    if len(entry) > 4 and entry[4] in OUR_ACCOUNT_COMMENTS:
         run(["userdel", user])
 
 
@@ -205,7 +284,7 @@ def new_names():
 def open_share(folder, share, user, password):
     owner, group = folder.owner(), folder.group()
     if folder.stat().st_uid == 0:
-        raise Refused(f"{folder} belongs to root; only a folder of the AltaStor Backup service user is shared")
+        raise Refused(f"{folder} belongs to root; only a folder of the AltaStor Backup service user can be shared")
     smb_before = SMB_CONF.read_text()
     shares_before = SHARES_CONF.read_text() if SHARES_CONF.is_file() else None
     created = False
@@ -227,7 +306,7 @@ def open_share(folder, share, user, password):
         if INCLUDE_LINE not in smb_before.splitlines():
             write_file(SMB_CONF, smb_before + ("" if smb_before.endswith("\n") else "\n") + INCLUDE_LINE + "\n", like=SMB_CONF)
         if run(["testparm", "-s", str(SMB_CONF)], check=False).returncode != 0 or share not in all_shares():
-            raise Refused("the Samba configuration does not validate with the share added; the previous configuration is restored")
+            raise Refused("Samba rejects the configuration with the share added; the previous one is restored")
         run(["useradd", "--system", "--no-create-home", "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
              "--no-user-group", "--gid", "nogroup", "--comment", ACCOUNT_COMMENT, user])
         created = True
@@ -264,34 +343,39 @@ def close_share(share, user):
 def restart_server():
     if run(["systemctl", "is-active", "--quiet", UNIT], check=False).returncode == 0:
         run(["systemctl", "restart", UNIT])
-        return f"Restarted {UNIT} so it uses the change."
+        return f"Restarted {UNIT}."
     if run(["systemctl", "cat", UNIT], check=False).returncode == 0:
-        return f"{UNIT} is not running; it uses the change when it starts."
-    return f"There is no {UNIT} service here: restart the AltaStor Backup server yourself so it uses the change."
+        return f"{UNIT} is not running; it reads the change when it starts."
+    return f"No {UNIT} service here; restart the AltaStor Backup server to apply the change."
+
+
+def unc(stored):
+    return f"\\\\{stored.get('server') or socket.getfqdn()}\\{stored.get('share')}"
 
 
 def show(catalog):
     for record in local_repositories(catalog):
-        share = metadata(record).get("share") if metadata(record).get("support_hyperv") else None
-        print(f"{record.get('path')} : {share or 'none'}")
+        stored = metadata(record)
+        print(f"{record.get('path')} : {unc(stored) if stored.get('support_hyperv') and stored.get('share') else 'none'}")
 
 
 def add(catalog, crypto, raw_path):
     record = repository_at(catalog, raw_path)
     folder = Path(os.path.realpath(str(record.get("path"))))
     if metadata(record).get("support_hyperv"):
-        print(f"{folder} is already shared as {metadata(record).get('share')}; nothing to do")
+        print(f"{folder} is already shared as {unc(metadata(record))}")
         return
-    refuse_while_sessions_run(catalog)
+    mode = server_mode(catalog)
+    refuse_while_in_use(catalog, record, mode)
     preflight()
     if not folder.is_dir():
         raise Refused(f"{folder} is not a folder")
     for name, values in our_shares().items():
         if os.path.realpath(values.get("path", "")) == str(folder):
-            raise Refused(f"Samba already shares {folder} as {name} for AltaStor Backup; it is left as it is")
+            raise Refused(f"Samba already shares {folder} as {name} for AltaStor Backup; left as is")
     others = [name for name, values in all_shares().items() if os.path.realpath(values.get("path", "") or "/nonexistent") == str(folder)]
     if others:
-        print(f"Note: Samba already shares this folder as {', '.join(others)}; that share is left as it is")
+        print(f"Note: Samba also shares this folder as {', '.join(others)}; left as is")
     share, user, password = new_names()
     open_share(folder, share, user, password)
     updated = dict(record)
@@ -304,8 +388,8 @@ def add(catalog, crypto, raw_path):
     except BaseException:
         close_share(share, user)
         raise
-    print(f"Shared {folder} as \\\\{socket.getfqdn()}\\{share} for Samba account {user}; Hyper-V jobs can back up into it.")
-    print(restart_server())
+    print(f"Shared {folder} as {unc(stored)}, account {user}")
+    print(apply_change(catalog, record, mode))
 
 
 def delete(catalog, abr_v41, raw_path):
@@ -313,19 +397,20 @@ def delete(catalog, abr_v41, raw_path):
     folder = os.path.realpath(str(record.get("path")))
     stored = metadata(record)
     if not stored.get("support_hyperv"):
-        print(f"{folder} is not shared; nothing to do")
+        print(f"{folder} is not shared")
         return
     share, user = str(stored.get("share") or ""), str(stored.get("username") or "")
     if share not in our_shares():
-        raise Refused(f"the share {share} of {folder} was not made by this script (it comes from the Hyper-V switch of the Default Repo); turn it off with: abr repo default --no-support-hyperv")
+        raise Refused(f"{share} was made by abr repo default --support-hyperv; remove it with: abr repo default --no-support-hyperv")
     jobs = sorted(
         str(job.get("name") or job.get("id"))
         for job in catalog.catalog_records(catalog.JOBS)
         if str(job.get("repo_id") or "") == str(record.get("id") or "") and abr_v41._inventory_is_hyperv(job.get("inventory_id"))
     )
     if jobs:
-        raise Refused(f"Hyper-V job(s) {', '.join(jobs)} back up into {folder} through its share; move them to another repository or delete them first")
-    refuse_while_sessions_run(catalog)
+        raise Refused(f"job(s) {', '.join(jobs)} use this share; move them to another repository or delete them first")
+    mode = server_mode(catalog)
+    refuse_while_in_use(catalog, record, mode)
     updated = dict(record)
     cleared = dict(stored)
     cleared.update({"server": None, "share": None, "username": None, "password": None, "support_hyperv": False})
@@ -336,8 +421,8 @@ def delete(catalog, abr_v41, raw_path):
         close_share(share, user)
     except Refused as exc:
         raise Refused(f"AltaStor Backup no longer uses {share}, but Samba kept it: {exc}") from exc
-    print(f"{folder} is no longer shared; the share {share} and the Samba account {user} are removed.")
-    print(restart_server())
+    print(f"Unshared {folder}: removed {unc(stored)} and account {user}")
+    print(apply_change(catalog, record, mode))
 
 
 def check(catalog, crypto, raw_path):
@@ -347,7 +432,7 @@ def check(catalog, crypto, raw_path):
     if not stored.get("support_hyperv"):
         raise Refused(f"{folder} is not shared; run add first")
     if shutil.which("smbclient") is None:
-        raise Refused("smbclient is missing: run sudo bash install-samba.sh first")
+        raise Refused("smbclient is missing; run: sudo bash install-samba.sh")
     share, user = stored.get("share"), stored.get("username")
     name = f"abr-share-check-{int(time.time())}.txt"
     with tempfile.TemporaryDirectory() as work:
@@ -364,7 +449,7 @@ def check(catalog, crypto, raw_path):
             raise Refused(f"the test file read back through {share} differs from the one written")
         if written.exists():
             raise Refused(f"the test file is still in {folder} after it was deleted through the share")
-    print(f"OK: wrote, read back and deleted a test file through {target} as {user}; in {folder} it belonged to {owner}.")
+    print(f"OK: {unc(stored)} as {user}: write, read back and delete passed; files belong to {owner}")
 
 
 def main(argv):

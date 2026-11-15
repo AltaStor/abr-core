@@ -300,7 +300,7 @@ repositories by hand with two root scripts instead of the switch:
 
 ```bash
 sudo bash scripts/install-samba.sh                       # Samba and smbclient, when they are missing
-sudo python3 python/srv/plugins/hyperv/abr_smb_share.py show          # <path> : <share>|none for each local repository
+sudo python3 python/srv/plugins/hyperv/abr_smb_share.py show          # <path> : \\<host>\<share>|none for each local repository
 sudo python3 python/srv/plugins/hyperv/abr_smb_share.py add <path>    # hidden share + own Samba account, stored encrypted
 sudo python3 python/srv/plugins/hyperv/abr_smb_share.py check <path>  # write, read back and delete a test file through the share
 sudo python3 python/srv/plugins/hyperv/abr_smb_share.py del <path>    # remove the share and account
@@ -309,11 +309,19 @@ sudo python3 python/srv/plugins/hyperv/abr_smb_share.py del <path>    # remove t
 `abr_smb_share.py` works for any local repository, the Default Repo included,
 and several at once. It keeps its shares in `/etc/samba/altastor-backup-shares.conf`
 (one `include` line in `smb.conf`), writes the share, account and encrypted
-password into that repository so Hyper-V jobs use it, reloads smbd without
-dropping connections and restarts the server only when it runs. It refuses
-while sessions run, `del` refuses while Hyper-V jobs use the repository, and it
-leaves alone a share it did not make, such as the switch's. Run `del` before
-removing a repository it shared.
+password into that repository so jobs reach it over SMB, and reloads smbd
+without dropping connections. A running server is not restarted: `add` and
+`del` leave a request in the catalog, the server re-reads that repository
+within a few seconds, and the script waits for its answer and says the server
+picked up the change. A stopped server reads it when it starts; a server older
+than this script, which cannot re-read a repository, is restarted as before.
+`add` and `del` refuse while a session uses that repository (a backup or copy
+into it, a copy, restore or replication from it, a verify or delete of its
+chains), and other repositories can be shared or unshared meanwhile; with an
+older server they refuse while any session runs, since it is restarted. `del`
+also refuses while Hyper-V jobs use the repository, and the script leaves alone
+a share it did not make, such as the switch's. Run `del` before removing a
+repository it shared.
 
 On a development machine the server runs as your own user from the checkout,
 so the switch needs the two things a package would bring, Samba and a way to run
