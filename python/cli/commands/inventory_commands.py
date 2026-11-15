@@ -65,10 +65,19 @@ class InventoryCommands:
         add_secret_argument(add, "--password", env_var=INVENTORY_PASSWORD_ENV_VAR, help_text="Inventory password")
         add_secret_argument(add, "--token", env_var=INVENTORY_TOKEN_ENV_VAR, help_text="Inventory token")
         add.add_argument("--insecure", action="store_true", help="Disable SSL verification")
-        add.add_argument(
-            "--transport",
+        add_api = add.add_mutually_exclusive_group()
+        add_api.add_argument(
+            "--api",
             choices=("vddk", "soap"),
-            help="vSphere only: how disks are read and written, vddk (the VMware VDDK, the default) or soap (the vSphere SOAP API)",
+            help="vSphere only: how disks are read and written, vddk (the VMware VDDK) or soap (the vSphere SOAP API); "
+            "without it the inventory uses the server-wide API (abr settings vsphere)",
+        )
+        add_api.add_argument("--transport", choices=("vddk", "soap"), help="The same as --api, its earlier name")
+        add.add_argument(
+            "--vddk-lib",
+            metavar="PATH",
+            help="vSphere only: the full path of the VDDK library file on the backup server; without it the "
+            "inventory uses the server-wide one",
         )
         add.set_defaults(handler=self.add)
 
@@ -142,10 +151,23 @@ class InventoryCommands:
         add_secret_argument(edit, "--password", env_var=INVENTORY_PASSWORD_ENV_VAR, help_text="Updated password")
         add_secret_argument(edit, "--token", env_var=INVENTORY_TOKEN_ENV_VAR, help_text="Updated token")
         edit.add_argument("--insecure", action="store_true", help="Disable SSL verification")
-        edit.add_argument(
-            "--transport",
+        edit_api = edit.add_mutually_exclusive_group()
+        edit_api.add_argument(
+            "--api",
             choices=("vddk", "soap"),
-            help="vSphere only: how disks are read and written from now on; running sessions keep the one they started with",
+            help="vSphere only: how disks are read and written from now on; running sessions keep the one they "
+            "started with",
+        )
+        edit_api.add_argument("--transport", choices=("vddk", "soap"), help="The same as --api, its earlier name")
+        edit_api.add_argument(
+            "--reset-api", action="store_true", help="vSphere only: use the server-wide API (abr settings vsphere)"
+        )
+        edit_library = edit.add_mutually_exclusive_group()
+        edit_library.add_argument(
+            "--vddk-lib", metavar="PATH", help="vSphere only: the full path of the VDDK library file on the backup server"
+        )
+        edit_library.add_argument(
+            "--reset-vddk-lib", action="store_true", help="vSphere only: use the server-wide VDDK library"
         )
         edit.add_argument("--secure", action="store_true", help="Enable SSL verification")
         edit.set_defaults(handler=self.edit)
@@ -188,7 +210,10 @@ class InventoryCommands:
             "password": password,
             "token": token,
             "insecure": args.insecure,
+            # --transport goes as transport, its name before api, so a server from before api still takes it.
+            **({"api": args.api} if args.api else {}),
             **({"transport": args.transport} if args.transport else {}),
+            **({"vddk_library": args.vddk_lib} if args.vddk_lib else {}),
         })
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("endpoint", "ENDPOINT"), ("status", "STATUS")])
         return 0
@@ -213,7 +238,9 @@ class InventoryCommands:
             "username": args.username,
             "password": resolve_secret(args.password, env_var=INVENTORY_PASSWORD_ENV_VAR, prompt="Inventory password"),
             "token": resolve_secret(args.token, env_var=INVENTORY_TOKEN_ENV_VAR, prompt="Inventory token"),
+            "api": "inherit" if args.reset_api else args.api,
             "transport": args.transport,
+            "vddk_library": "inherit" if args.reset_vddk_lib else args.vddk_lib,
         }.items() if value is not None}
         if args.insecure and args.secure:
             raise ValueError("Use only one of --insecure or --secure")

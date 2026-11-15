@@ -13,7 +13,15 @@ from typing import Any, Callable
 from ...core.subprocess_util import ProcessCancelled, run_capped
 from ...core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES, catalog_records
 from ...core.task_executor import TaskStopRequested, cancel_requested
-from .disk_transport import SOAP, TRANSPORT_NAMES, VDDK, transport_problem
+from .disk_transport import (
+    SOAP,
+    VDDK,
+    describe_access,
+    describe_tool_environment,
+    parameters_library,
+    tool_environment,
+    transport_problem,
+)
 from ...core.storage_tool import (
     build_s3_location,
     chain_source_names,
@@ -907,14 +915,23 @@ def run_vcenter_restore(
         transport_mode = None if requested_transport_mode.lower() in {"auto", "none", "omit"} else requested_transport_mode
     vsphere_transport = str(parameters.get("vsphere_transport") or VDDK)
     over_soap = vsphere_transport == SOAP
-    transport_issue = transport_problem(vsphere_transport, tool_path)
+    transport_issue = transport_problem(vsphere_transport, tool_path, library=parameters_library(parameters))
     if transport_issue:
         raise VCenterBackupError(transport_issue)
+    # Every abr-vmdk-tool that writes a disk gets exactly one of ABR_VMDK_TOOL_VDDK_LIB and ABR_VMDK_TOOL_VDDK_DIR
+    # (or neither over SOAP), as the session recorded them when it was created.
+    tool_env = tool_environment(parameters)
+    logger.info(
+        "Restore (task %s) writes its disks over %s; abr-vmdk-tool gets %s",
+        task.get("id"),
+        vsphere_transport,
+        describe_tool_environment(parameters),
+    )
     _emit_progress(
         progress_callback,
         "prepare",
         5,
-        f"Disks are written over {TRANSPORT_NAMES.get(vsphere_transport, vsphere_transport)}",
+        describe_access(parameters, verb="written"),
         worker_mode="vcenter-abr-vmdk-tool",
         vsphere_transport=vsphere_transport,
     )
@@ -1298,6 +1315,7 @@ def run_vcenter_restore(
                             )
                             completed = _run_restore_layer(
                                 command,
+                                env=tool_env,
                                 check=False,
                                 capture_output=True,
                                 text=True,
@@ -1755,6 +1773,7 @@ def run_vcenter_restore(
                     )
                     completed = _run_restore_layer(
                         command,
+                        env=tool_env,
                         check=False,
                         capture_output=True,
                         text=True,

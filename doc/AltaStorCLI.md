@@ -469,7 +469,7 @@ abr inventory add
 
 Description: Register a new virtualization inventory source. 
 
-abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --address <host/ip> [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--transport <vddk|soap>] 
+abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --address <host/ip> [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--api <vddk|soap>] [--vddk-lib <path>] 
 
 The password comes from ABR_INVENTORY_PASSWORD and the token from ABR_INVENTORY_TOKEN, or the password is asked for interactively. A value typed after --password or --token is still accepted, but every local user can read it (ps, /proc) while the command runs, and it stays in the shell history. 
 
@@ -490,18 +490,46 @@ HTTP: a host without an HTTPS listener, or with a certificate the server does
 not trust, is refused with the reason. --insecure accepts a self-signed
 certificate. --protocol applies to hyper-v only.
 
-vSphere transport. --transport chooses how a vsphere inventory's disks are read
-and written: vddk (the VMware VDDK, the default) or soap (the vSphere SOAP API,
-which needs no VMware library on the server). Inventories from before this
-setting use vddk and behave as before. The server refuses a transport it
-cannot use, with the reason, when it is chosen and when a backup, restore or
-replication session starts: vddk when the VDDK is not installed next to
-abr-vmdk-tool (or in ABR_VMDK_TOOL_VDDK_DIR), soap when abr-vmdk-tool has no
---api soap. A backup job can override it (job create/edit --transport); a
-restore and a replication always use the transport of their target inventory.
-Each session keeps the transport it started with, so changing it never touches
-a running session; inventory info, job info and session info show it, and the
-session log says which one read or wrote the disks.
+vSphere API. --api chooses how a vsphere inventory's (hypervisor's) disks are
+read and written: vddk (the VMware VDDK) or soap (the vSphere SOAP API, which
+needs no VMware library on the server). Without it the inventory uses the
+server-wide API (abr settings vsphere show|set), which starts as vddk, so
+inventories from before this setting behave as before; inventory edit
+--reset-api goes back to it. --transport is the earlier name of --api and still
+works. The server refuses an API it cannot use, with the reason, when it is
+chosen and when a backup, restore or replication session starts: vddk when
+there is no VDDK library to load, soap when abr-vmdk-tool has no --api soap. A
+backup job can override it (job create/edit --transport); a restore and a
+replication always use the API of their target inventory.
+
+VDDK library. --vddk-lib names the VDDK library file the inventory's VDDK
+sessions load, under whatever name it has: VMware's VDDK
+(lib64/libvixDiskLib.so.9.1.0.0), openVDDK or our oVDDK build. It must be a full
+path to a file the backup service can read on the backup server, and export
+VixDiskLib_InitEx; anything else is refused with the reason
+(invalid_vddk_library). A VMware VDDK's file has to stay in its bundle's lib64,
+where its transport plugins are. Without it, or after inventory edit
+--reset-vddk-lib, the inventory uses the server-wide library, and when none is
+set the library of the VDDK directory:
+<directory>/lib64/libvixDiskLib.so, where the directory is
+ABR_VMDK_TOOL_VDDK_DIR in the server's environment or the vddk folder next to
+abr-vmdk-tool. It needs abr-disk-tools a14e078 or later, and is refused on an
+older abr-vmdk-tool. A library set on a soap inventory is refused.
+
+inventory info shows the inventory's own values (api: vddk, soap or inherit;
+vddk_library: a path or null), the values in effect (effective_api,
+effective_vddk_library, and vddk_library_file, the file the library resolves to,
+e.g. libvixDiskLib.so.9.1.0.0) and where each comes from (api_source and
+vddk_library_source: hypervisor, global, or vddk_directory for the fallback).
+
+Each session records, when it is created, the API, the library, the file the
+library resolves to and where each came from (job, hypervisor, global or
+vddk_directory), so changing them never touches a session already created; job
+info and session info show them, and the session log says which ones read or
+wrote the disks. abr-vmdk-tool then gets exactly one of
+ABR_VMDK_TOOL_VDDK_LIB (a library set for the inventory or server-wide) and
+ABR_VMDK_TOOL_VDDK_DIR (the VDDK directory), whatever the server's own
+environment has, and neither over soap; the server log names the one passed.
 
 Over soap:
 - a running VM is backed up through vSphere's export of the backup snapshot,
@@ -551,7 +579,7 @@ abr inventory edit
 
 Description: Update server connection attributes or credentials. 
 
-abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--transport <vddk|soap>] 
+abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--api <vddk|soap> | --reset-api] [--vddk-lib <path> | --reset-vddk-lib] 
 
 Changing --protocol of a hyper-v inventory moves a standard port along with it
 (5986 for https, 5985 for http); a port of your own stays as it is.
@@ -942,6 +970,27 @@ Example: abr restore start --restore-point 6b0f2c1e-8d4a-4c55-9a1e-3f7d2b9c8e10 
 SYSTEM COMMANDS 
 
 Inspect health and version state. 
+
+abr settings vsphere show 
+
+Description: Show the server-wide vSphere API and VDDK library, which every vSphere hypervisor (inventory) without its own uses. 
+
+abr settings vsphere show [--output json] 
+
+It shows the API, the library (vddk_library, null when it follows the VDDK directory), the library in effect and the file it resolves to (e.g. libvixDiskLib.so.9.1.0.0), the VDDK directory and where it comes from (environment or default), whether this server can use each API now and why not (apis), and every vSphere hypervisor with its own values (hypervisors). abr inventory info shows one hypervisor's own values, the values in effect and where each comes from. Needs inventory.view. 
+
+abr settings vsphere set 
+
+Description: Change the server-wide vSphere API and VDDK library. 
+
+abr settings vsphere set [--api <vddk|soap>] [--vddk-lib <path|default>] [--update-existing-hypervisors [--yes]] 
+
+Examples: 
+abr settings vsphere set --vddk-lib /opt/vmware-vix-disklib/lib64/libvixDiskLib.so.9.1.0.0 
+abr settings vsphere set --vddk-lib default 
+abr settings vsphere set --api soap --update-existing-hypervisors --yes 
+
+The library is checked as for inventory add --vddk-lib. default, or the VDDK directory's own lib64/libvixDiskLib.so, makes it follow the VDDK directory again, so it changes with ABR_VMDK_TOOL_VDDK_DIR. Hypervisors with their own values keep them, unless --update-existing-hypervisors removes the API and VDDK library of each, so they all use the server-wide values from now on. It names those hypervisors and asks first; --yes skips the question, and without a terminal to ask on it is required (exit code 2 otherwise). The command then prints the hypervisors it changed. An API the server cannot use is refused (transport_unavailable), and the server's reason for refusing a value is printed as it is. Needs inventory.edit; recorded in the audit log. 
 
 abr system version 
 

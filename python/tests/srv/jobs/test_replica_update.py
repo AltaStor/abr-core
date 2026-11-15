@@ -198,7 +198,7 @@ class _UpdateCase(unittest.TestCase):
             ("python.srv.services.internal.replication.replica_config.point_config", lambda _point: copy.deepcopy(self.point_config)),
             ("python.srv.services.internal.replication.replica_update._platform", lambda _inventory: self.platform),
             ("python.srv.services.internal.replication.replica_update._connect", lambda _inventory: FakeNode()),
-            ("python.srv.services.internal.replication.replica_update.transport_problem", lambda _transport: None),
+            ("python.srv.services.internal.replication.replica_update.transport_problem", lambda _transport, **_options: None),
             ("python.srv.services.internal.replication.replication_session.persist_job", lambda job: JOBS.__setitem__(job["id"], job)),
             ("python.srv.services.internal.replication.replica_update.manifest_disks", lambda _point: self.manifest),
             ("python.srv.services.internal.replication.replica_update._repository_and_key", lambda _point: ({"id": "repo", "type": "local"}, "")),
@@ -506,7 +506,7 @@ class UpdateTests(_UpdateCase):
         asked: list[str] = []
         connected: list[str] = []
 
-        def problem(transport: str) -> str:
+        def problem(transport: str, **_options) -> str:
             asked.append(transport)
             return "The VDDK transport is not available: the VMware VDDK is not installed"
 
@@ -531,7 +531,7 @@ class UpdateTests(_UpdateCase):
     def test_the_transport_of_the_session_is_the_one_checked_and_hyper_v_targets_are_not_checked(self) -> None:
         TASKS[SESSION_ID] = {"id": SESSION_ID, "job_id": JOB_ID, "task_type": "replication", "status": "running", "created_at": "2026-11-09T00:00:00"}
         asked: list[str] = []
-        checked = patch("python.srv.services.internal.replication.replica_update.transport_problem", lambda transport: asked.append(transport))
+        checked = patch("python.srv.services.internal.replication.replica_update.transport_problem", lambda transport, **_options: asked.append(transport))
         rebuild = patch("python.srv.services.internal.replication.replica_update._update_mode_two", side_effect=ReplicationError("rebuild chosen"))
         with checked, rebuild, self.assertRaisesRegex(ReplicationError, "rebuild chosen"):
             run_replication({"id": SESSION_ID, "job_id": JOB_ID, "parameters": {"vsphere_transport": "soap"}}, progress_callback=self.updates.append)

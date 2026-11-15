@@ -142,6 +142,7 @@ from python.srv.services.share_mount import share_mount_check, unmounted_share_m
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.hyperv.vhdx_tool import VhdxToolError, ensure_hyperv_repository
 from python.srv.plugins.vcenter import disk_transport
+from python.srv.services import vsphere_access
 from python.srv.plugins.vcenter.vcenter_backup import DEFAULT_COMPRESSION_LEVEL, QUIESCE_FAILURE_ACTIONS
 
 from .api_errors import ApiError, api_error
@@ -1175,7 +1176,7 @@ def normalize_inventory_record(record: dict[str, Any]) -> dict[str, Any]:
         "protocol": metadata.get("protocol"),
     }
     if item["type"] == "vsphere":
-        item["transport"] = disk_transport.inventory_transport(item)
+        item.update(disk_transport.inventory_view(item))
     refs = inventory_references(str(item.get("id") or ""))
     referenced_jobs = refs["jobs"] if isinstance(refs.get("jobs"), list) else []
     active_sessions = refs["tasks"] if isinstance(refs.get("tasks"), list) else []
@@ -1649,35 +1650,90 @@ def _inventory_endpoint_key(record: dict[str, Any]) -> tuple[str, int]:
     return host.strip().lower(), port
 
 
-def _inventory_transport_or_422(inventory_type: str, value: Any) -> str | None:
-    try:
-        transport = disk_transport.parse_transport(value)
-    except ValueError as exc:
-        raise api_error(422, "invalid_inventory", f"Inventory {exc}") from exc
-    if transport is None:
+def _inventory_api_or_422(inventory_type: str, payload: dict[str, Any]) -> str | None:
+    """A hypervisor's own API from ``api`` (or ABR-495's ``transport``), or None for inherit and an empty value."""
+    given = {field: payload[field] for field in ("api", "transport") if payload.get(field) is not None}
+    parsed: dict[str, str | None] = {}
+    for field, value in given.items():
+        try:
+            parsed[field] = disk_transport.parse_api(value, field=field, inherit_allowed=True)
+        except ValueError as exc:
+            raise api_error(422, "invalid_inventory", f"Inventory {exc}", fields={field: str(exc)}) from exc
+    _ensure(
+        len(set(parsed.values())) <= 1,
+        422,
+        "invalid_inventory",
+        "api and transport name the same setting; give one of them, or the same value in both",
+    )
+    api = next(iter(parsed.values()), None)
+    if api is not None:
+        _ensure(
+            inventory_type == "vsphere",
+            422,
+            "invalid_inventory",
+            f"{next(iter(parsed))} applies to vSphere inventories (vCenter or ESXi) only",
+        )
+    return api
+
+
+def _inventory_library_or_422(inventory_type: str, value: Any) -> str | None:
+    """An inventory's own VDDK library, checked on this server, or None for inherit and an empty value."""
+    text = str(value or "").strip()
+    if text in ("", disk_transport.INHERIT):
         return None
     _ensure(
         inventory_type == "vsphere",
         422,
         "invalid_inventory",
-        "transport applies to vSphere inventories (vCenter or ESXi) only",
+        "vddk_library applies to vSphere inventories (vCenter or ESXi) only",
     )
-    problem = disk_transport.transport_problem(transport)
-    _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=transport)
-    return transport
+    return vsphere_access.vddk_library_or_error(text)
 
 
-def backfill_inventory_transports() -> int:
-    changed = 0
-    for record in catalog_records(HYPERVISORS):
-        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-        if inventory_type_from_record(record) != "vsphere" or metadata.get("vsphere_transport"):
-            continue
-        updated = dict(record)
-        updated["metadata"] = {**metadata, "vsphere_transport": disk_transport.VDDK}
-        persist_hypervisor(updated)
-        changed += 1
-    return changed
+def _apply_inventory_access(record: dict[str, Any], payload: dict[str, Any], *, creating: bool) -> bool:
+    """Set a hypervisor's own API and VDDK library from the request; True when anything was asked for.
+
+    ``api`` and ABR-495's ``transport`` are the same setting. The API the hypervisor ends up with must be one this
+    server can use, and a VDDK library needs the VDDK.
+    """
+    asked = [
+        key
+        for key in ("api", "transport", "vddk_library")
+        if key in payload and (payload[key] is not None or creating)
+    ]
+    if not asked:
+        return False
+    inventory_type = inventory_type_from_record(record)
+    metadata = dict(record.get("metadata") if isinstance(record.get("metadata"), dict) else {})
+    api_asked = "api" in asked or "transport" in asked
+    if api_asked:
+        api = _inventory_api_or_422(inventory_type, payload)
+        if api:
+            metadata["vsphere_transport"] = api
+        else:
+            metadata.pop("vsphere_transport", None)
+    if "vddk_library" in asked:
+        library = _inventory_library_or_422(inventory_type, payload["vddk_library"])
+        if library:
+            metadata["vddk_library"] = library
+        else:
+            metadata.pop("vddk_library", None)
+    record["metadata"] = metadata
+    if inventory_type != "vsphere":
+        return True
+    access = disk_transport.resolve_access(record)
+    if "vddk_library" in asked and metadata.get("vddk_library") and access["api"] != disk_transport.VDDK:
+        message = (
+            "A VDDK library applies when the hypervisor uses the VDDK, and this one uses the vSphere SOAP API "
+            f"({disk_transport.SOURCE_NAMES[access['api_source']]})"
+        )
+        raise api_error(422, "invalid_vddk_library", message, fields={"vddk_library": message})
+    if api_asked and metadata.get("vsphere_transport"):
+        api = access["api"]
+        library = disk_transport.explicit_library(access["vddk_library"], access["vddk_library_source"])
+        problem = disk_transport.transport_problem(api, library=library)
+        _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=api, fields={"api": str(problem)})
+    return True
 
 
 def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1709,7 +1765,6 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
         protocol = inventory_protocol(inventory_type, payload.get("protocol"))
     except ValueError as exc:
         raise api_error(422, "invalid_inventory", str(exc)) from exc
-    transport = _inventory_transport_or_422(inventory_type, payload.get("transport"))
     _ensure(bool(name.strip()), 422, "invalid_inventory", "Inventory name is required")
     _ensure_ascii_name(name, field="Inventory name", code="invalid_inventory")
     _validate_text_fields(payload, INVENTORY_TEXT_FIELDS, code="invalid_inventory")
@@ -1767,7 +1822,6 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             "port": effective_port,
             "port_explicit": port is not None,
             **({"protocol": protocol} if protocol else {}),
-            **({"vsphere_transport": transport or disk_transport.VDDK} if inventory_type == "vsphere" else {}),
             "verify_ssl": not insecure,
             "credentials": {
                 "username": username or None,
@@ -1776,6 +1830,7 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             "token": token or None,
         },
     }
+    _apply_inventory_access(record, payload, creating=True)
     try:
         proof = _proof_of_connection(assert_inventory_registrable(record))
     except EsxHostInClusterError as exc:
@@ -1895,11 +1950,7 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
         metadata["verify_ssl"] = not bool(payload["insecure"])
         normalized["metadata"] = metadata
         normalized["updated_at"] = utc_now()
-    if "transport" in payload and payload["transport"] is not None:
-        transport = _inventory_transport_or_422(inventory_type_from_record(normalized), payload["transport"])
-        metadata = dict(normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {})
-        metadata["vsphere_transport"] = transport or disk_transport.VDDK
-        normalized["metadata"] = metadata
+    if _apply_inventory_access(normalized, payload, creating=False):
         normalized["updated_at"] = utc_now()
     if "token" in payload and payload["token"] is not None:
         metadata = dict(normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {})
@@ -1912,7 +1963,7 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
             _ensure(bool(new_name.strip()), 422, "invalid_inventory", "Inventory name must not be empty")
             _ensure_ascii_name(new_name, field="Inventory name", code="invalid_inventory")
         normalized = apply_inventory_updates(normalized, updates)
-    _ensure(any(key in payload for key in ("name", "address", "port", "protocol", "username", "password", "description", "token", "insecure", "transport")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
+    _ensure(any(key in payload for key in ("name", "address", "port", "protocol", "username", "password", "description", "token", "insecure", "api", "transport", "vddk_library")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
     if connection_fields_changed(payload):
         try:
             normalized = _recheck_inventory_connection(normalized)
@@ -4632,14 +4683,21 @@ def _job_transport_view(job: dict[str, Any]) -> dict[str, Any]:
         settings = job.get("replication") if isinstance(job.get("replication"), dict) else {}
         target = HYPERVISORS.get(str(settings.get("target_inventory_id") or ""))
         if isinstance(target, dict) and inventory_type_from_record(target) == "vsphere":
-            return {"transport": disk_transport.FROM_INVENTORY, "effective_transport": disk_transport.inventory_transport(target)}
+            access = disk_transport.resolve_access(target)
+            return {
+                "transport": disk_transport.FROM_INVENTORY,
+                "effective_transport": access["api"],
+                "api_source": access["api_source"],
+            }
         return {}
     inventory = HYPERVISORS.get(str(job.get("inventory_id") or ""))
     if not isinstance(inventory, dict) or inventory_type_from_record(inventory) != "vsphere":
         return {}
+    access = disk_transport.resolve_access(inventory, job)
     return {
         "transport": disk_transport.job_transport(job) or disk_transport.FROM_INVENTORY,
-        "effective_transport": disk_transport.session_transport(job, inventory),
+        "effective_transport": access["api"],
+        "api_source": access["api_source"],
     }
 
 
@@ -5542,9 +5600,10 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def session_transport_parameters(inventory: dict[str, Any] | None, job: dict[str, Any] | None = None) -> dict[str, str]:
+    """The transport, VDDK library and where each comes from, as the session records them when it is created."""
     if not isinstance(inventory, dict) or inventory_type_from_record(inventory) != "vsphere":
         return {}
-    return {"vsphere_transport": disk_transport.session_transport(job, inventory)}
+    return disk_transport.session_parameters(inventory, job)
 
 
 def _ensure_job_transport(job: dict[str, Any]) -> None:
@@ -5564,7 +5623,9 @@ def _ensure_job_transport(job: dict[str, Any]) -> None:
         "invalid_job",
         f"transport applies to jobs of a vSphere inventory, and {job.get('inventory_name')} is not one",
     )
-    problem = disk_transport.transport_problem(override)
+    access = disk_transport.resolve_access(inventory, job)
+    library = disk_transport.explicit_library(access["vddk_library"], access["vddk_library_source"])
+    problem = disk_transport.transport_problem(override, library=library)
     _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=override)
 
 
@@ -6955,6 +7016,14 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     if parameters.get("vsphere_transport"):
         dto["transport"] = parameters["vsphere_transport"]
+        for key, field in (
+            ("vsphere_api_source", "api_source"),
+            ("vddk_library", "vddk_library"),
+            ("vddk_library_file", "vddk_library_file"),
+            ("vddk_library_source", "vddk_library_source"),
+        ):
+            if parameters.get(key):
+                dto[field] = parameters[key]
     if result.get("failure_kind"):
         dto["failure_kind"] = result.get("failure_kind")
     if result.get("restore_point_id"):
@@ -10441,7 +10510,8 @@ def _create_backup_session(
             "active_full": execution_type == "ActiveFull",
         }
     )
-    parameters.pop("vsphere_transport", None)
+    for key in disk_transport.SESSION_KEYS:
+        parameters.pop(key, None)
     parameters.update(session_transport_parameters(HYPERVISORS.get(str(job.get("inventory_id") or "")), job))
     if requires_task_id:
         parameters["requires_task_id"] = requires_task_id
@@ -11089,7 +11159,9 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
     )
     transport_parameters = session_transport_parameters(target_inventory)
     if transport_parameters:
-        problem = disk_transport.transport_problem(transport_parameters["vsphere_transport"])
+        problem = disk_transport.transport_problem(
+            transport_parameters["vsphere_transport"], library=disk_transport.parameters_library(transport_parameters)
+        )
         _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=transport_parameters["vsphere_transport"])
     task = {
         "id": str(uuid4()),

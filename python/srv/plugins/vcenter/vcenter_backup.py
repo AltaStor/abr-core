@@ -21,7 +21,16 @@ from ...core.credential_encryption import is_encrypted, unreadable_encryption_ke
 from ...core.server_defaults import env_int
 from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...services.share_mount import ensure_share_mounted
-from .disk_transport import SOAP, TRANSPORT_NAMES, VDDK, tool_api_args, transport_problem
+from .disk_transport import (
+    SOAP,
+    VDDK,
+    describe_access,
+    describe_tool_environment,
+    parameters_library,
+    tool_api_args,
+    tool_environment,
+    transport_problem,
+)
 from ...core.storage_tool import (
     OUT_OF_MEMORY_HINT,
     StorageToolError,
@@ -1761,6 +1770,9 @@ def run_vcenter_backup(
         requested_transport_mode = str(transport_mode_value).strip()
         transport_mode = None if requested_transport_mode.lower() in {"auto", "none", "omit"} else requested_transport_mode
     vsphere_transport = str(parameters.get("vsphere_transport") or VDDK)
+    # Every abr-vmdk-tool that reads a disk gets exactly one of ABR_VMDK_TOOL_VDDK_LIB and ABR_VMDK_TOOL_VDDK_DIR
+    # (or neither over SOAP), as the session recorded them when it was created.
+    tool_env = tool_environment(parameters)
     tool_timeout_seconds = _resolve_tool_timeout_seconds(parameters)
     # Live "transferred" probe for the per-disk progress reporter. Only a local
     # repository has a directory whose size IS what has landed so far; an S3
@@ -1830,9 +1842,16 @@ def run_vcenter_backup(
     if not query_changed_areas_only and not tool_path.exists():
         raise VCenterBackupError(f"Backup tool not found: {tool_path}")
     if not query_changed_areas_only:
-        transport_issue = transport_problem(vsphere_transport, tool_path)
+        transport_issue = transport_problem(vsphere_transport, tool_path, library=parameters_library(parameters))
         if transport_issue:
             raise VCenterBackupError(transport_issue)
+        logger.info(
+            "Backup of %s (task %s) reads its disks over %s; abr-vmdk-tool gets %s",
+            vm_name,
+            task.get("id"),
+            vsphere_transport,
+            describe_tool_environment(parameters),
+        )
 
     logger.info(
         "Preparing VMware backup for VM %s (task=%s) using destination %s",
@@ -1853,7 +1872,7 @@ def run_vcenter_backup(
         progress_callback,
         "prepare",
         5,
-        f"Disks are read over {TRANSPORT_NAMES.get(vsphere_transport, vsphere_transport)}",
+        describe_access(parameters, verb="read"),
         worker_mode="vcenter-abr-vmdk-tool",
         vsphere_transport=vsphere_transport,
     )
@@ -2538,6 +2557,7 @@ def run_vcenter_backup(
                             )
                             completed = _run_watched_disk_tool(
                                 no_cbt_command,
+                                env=tool_env,
                                 data_host=data_host,
                                 disk_label=f"disk {index}/{len(disks)}",
                                 datastore_path=datastore_path,
@@ -2619,6 +2639,7 @@ def run_vcenter_backup(
                             )
                             completed = _run_watched_disk_tool(
                                 command,
+                                env=tool_env,
                                 data_host=data_host,
                                 disk_label=f"disk {index}/{len(disks)}",
                                 datastore_path=datastore_path,
@@ -2964,6 +2985,7 @@ def run_vcenter_backup(
                     try:
                         completed = _run_watched_disk_tool(
                             command,
+                            env=tool_env,
                             data_host=data_host,
                             disk_label=f"disk {index}/{len(disks)}",
                             datastore_path=datastore_path,
@@ -3033,6 +3055,7 @@ def run_vcenter_backup(
                         time.sleep(_TRANSIENT_DISK_ACCESS_RETRY_DELAY_SECONDS)
                         completed = _run_watched_disk_tool(
                             command,
+                            env=tool_env,
                             data_host=data_host,
                             disk_label=f"disk {index}/{len(disks)}",
                             datastore_path=datastore_path,
@@ -3133,6 +3156,7 @@ def run_vcenter_backup(
                             )
                             retry_completed = _run_watched_disk_tool(
                                 retry_command,
+                                env=tool_env,
                                 data_host=data_host,
                                 disk_label=f"disk {index}/{len(disks)}",
                                 datastore_path=datastore_path,

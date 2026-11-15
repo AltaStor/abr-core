@@ -14,7 +14,7 @@ from python.srv.core.utils import utc_now
 from python.srv.plugins import build_hypervisor_plugin
 from python.srv.plugins.hyperv import hyperv_replica
 from python.srv.plugins.vcenter import vcenter_replica
-from python.srv.plugins.vcenter.disk_transport import SOAP, VDDK, transport_problem
+from python.srv.plugins.vcenter.disk_transport import SOAP, VDDK, parameters_library, tool_environment, transport_problem
 from python.srv.services.api_errors import ApiError
 from python.srv.services.internal.replication.replica_config import settle_replica
 from python.srv.services.internal.replication.replica_leftovers import (
@@ -506,6 +506,7 @@ def _update_mode_one(
                 report=report,
                 should_cancel=lambda: cancel_requested(session_id),
                 timeout_seconds=None,
+                **({"tool_env": tool_environment(task.get("parameters"))} if platform is vcenter_replica else {}),
             )
             written += int(outcome.get("written_bytes") or 0) or layer_bytes(item["layers"], int(item.get("index") or index))
             if cancel_requested(session_id):
@@ -897,7 +898,8 @@ def _attempt(
     inventory = _target(settings)
     platform = _platform(inventory)
     if str(inventory.get("kind") or "") == "vcenter":
-        problem = transport_problem(str((task.get("parameters") or {}).get("vsphere_transport") or VDDK))
+        parameters = task.get("parameters") or {}
+        problem = transport_problem(str(parameters.get("vsphere_transport") or VDDK), library=parameters_library(parameters))
         if problem:
             raise ReplicationError(problem)
     report_progress(progress_callback, 1, f"Connecting to the target environment {settings['target_inventory_name']}", stage="prepare")
