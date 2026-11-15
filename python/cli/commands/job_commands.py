@@ -12,6 +12,8 @@ from ..exit_codes import GENERAL_ERROR, INVALID_STATE, VALIDATION_FAILED
 from ..parsing.common_arguments import add_name_or_id_selector
 from ..parsing.secret_arguments import ENCRYPTION_KEY_ENV_VAR, add_secret_argument
 from ..parsing.validators import (
+    day_of_month_type,
+    duration_type,
     parse_compression_level,
     parse_day_of_month,
     parse_duration,
@@ -52,6 +54,8 @@ def _last_run_text(run: object) -> str:
         return ""
     result = str(run["result"])
     total = int(run.get("vm_count") or 0)
+    if result == "failed" and not total:
+        return "Failed (no source left)" if "no source left" in str(run.get("message") or "") else "Failed"
     if result == "running":
         return f"Running ({total - int(run.get('running') or 0)}/{total} VMs done)"
     if result == "success":
@@ -62,7 +66,14 @@ def _last_run_text(run: object) -> str:
 
 
 def _names(items: Any) -> str:
-    return ", ".join(str(item.get("name") or item.get("id")) for item in items or [] if isinstance(item, dict)) or "-"
+    return (
+        ", ".join(
+            f"{item.get('name') or item.get('id')}{' (missing)' if item.get('missing') else ''}"
+            for item in items or []
+            if isinstance(item, dict)
+        )
+        or "-"
+    )
 
 
 def _backup_copy_rows(view: dict[str, Any]) -> dict[str, Any]:
@@ -72,7 +83,7 @@ def _backup_copy_rows(view: dict[str, Any]) -> dict[str, Any]:
         "copy_mode": view.get("copy_mode"),
         "source_jobs": _names(view.get("source_jobs")),
         "source_repositories": _names(view.get("source_repositories")),
-        "run_after_job": (run_after or {}).get("name") or "-",
+        "run_after_job": (f"{run_after.get('name') or run_after.get('id')}{' (missing)' if run_after.get('missing') else ''}" if run_after else "-"),
         "copy_window": view.get("copy_window_summary") or "any time",
         "retry": f"{retry.get('count')} time(s), {retry.get('interval_minutes')} minute(s) apart",
     }
@@ -538,7 +549,7 @@ class JobCommands:
                 type=int,
                 help=(
                     "Every how many scheduled verify runs check every restore point of each chain instead of the "
-                    "newest one, 1-100 (default 4; 1 checks whole chains every time)"
+                    "newest one and the points it builds on, 1-100 (default 4; 1 checks whole chains every time)"
                 ),
             )
             for prefix, label in (("active-full", "Active full"), ("synthetic-full", "Synthetic full"), ("verify", "Verify")):
@@ -557,13 +568,13 @@ class JobCommands:
                 parser.add_argument(
                     f"--{prefix}-day-of-month",
                     dest=f"{dest}_day_of_month",
-                    type=parse_day_of_month,
+                    type=day_of_month_type(f"--{prefix}-day-of-month"),
                     help=f"{label} monthly schedule day from 1 to 31",
                 )
                 parser.add_argument(
                     f"--{prefix}-every",
                     dest=f"{dest}_every",
-                    type=parse_duration,
+                    type=duration_type(f"--{prefix}-every"),
                     help=f"{label} periodic interval like 15m, 1h, 6h, or 1d",
                 )
                 full_state = parser.add_mutually_exclusive_group()
@@ -598,9 +609,9 @@ class JobCommands:
                 "new into one restore point; immediate copies every new restore point as soon as its backup ends"
             ),
         )
-        parser.add_argument("--source-job", dest="source_jobs", action="append", default=[], help=f"{only}a backup job whose restore points are copied, by name. Repeat as needed{replaces}")
+        parser.add_argument("--source-job", dest="source_jobs", action="append", default=[], help=f"{only}a backup job whose restore points are copied, by name. Repeat as needed; for a VM that several source jobs back up, the job given first is copied{replaces}")
         parser.add_argument("--source-job-id", dest="source_job_ids", action="append", default=[], help=f"{only}a source backup job by ID. Repeat as needed")
-        parser.add_argument("--source-repo", dest="source_repositories", action="append", default=[], help=f"{only}a repository whose restore points are copied, every job's, by name. Repeat as needed{replaces}")
+        parser.add_argument("--source-repo", dest="source_repositories", action="append", default=[], help=f"{only}a repository whose restore points are copied, by name; a VM that several of its jobs back up is copied from one of them: a --source-job job if given, else the job created first. Repeat as needed{replaces}")
         parser.add_argument("--source-repo-id", dest="source_repository_ids", action="append", default=[], help=f"{only}a source repository by ID. Repeat as needed")
         parser.add_argument("--run-after-job", dest="run_after_job", help=f"{only}start the copy each time a run of this job ends (periodic only), by name; none clears it")
         parser.add_argument("--run-after-job-id", dest="run_after_job_id", help=f"{only}the same job by ID")

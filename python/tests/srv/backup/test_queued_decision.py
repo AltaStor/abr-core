@@ -124,7 +124,6 @@ class RefreshQueuedBackupDecisionTests(unittest.TestCase):
             _task("ActiveFull", "ForceFull"),
             _task("SyntheticFull", "ForceSynthetic"),
             _task("SyntheticFull", "SyntheticFullSchedule", requires_task_id="task-1"),
-            _task("ActiveFull", "FirstRun", copy_job=True),
             _task("Incremental", "StandardIncremental"),
         ]
         for task in cases:
@@ -136,11 +135,32 @@ class RefreshQueuedBackupDecisionTests(unittest.TestCase):
             )
             self.assertEqual(refreshed["logs"], [])
 
-    def test_a_first_run_with_the_chain_still_empty_stays_a_first_run(self) -> None:
-        task = abr_v41.refresh_queued_backup_decision(_task("ActiveFull", "FirstRun"))
+    def test_a_copy_session_queued_as_a_first_run_starts_as_an_incremental_once_a_copy_is_there(self) -> None:
+        self._seed_full()
 
-        self.assertEqual(task["parameters"]["resolved_backup_reason"], "FirstRun")
-        self.assertEqual(task["logs"], [])
+        task = abr_v41.refresh_queued_backup_decision(_task("ActiveFull", "FirstRun", copy_job=True))
+
+        self.assertEqual(
+            (task["parameters"]["resolved_backup_type"], task["parameters"]["resolved_backup_reason"], task["parameters"]["backup_mode_request"]),
+            ("Incremental", "StandardIncremental", "auto"),
+        )
+        self.assertIn("it was queued as ActiveFull (FirstRun)", task["logs"][0]["message"])
+
+    def test_a_copy_session_keeps_every_other_decision(self) -> None:
+        self._seed_full()
+        for queued in (("ActiveFull", "ForceFull"), ("Incremental", "StandardIncremental"), ("ActiveFull", "ActiveFullSchedule")):
+            with self.subTest(queued=queued):
+                task = abr_v41.refresh_queued_backup_decision(_task(*queued, copy_job=True))
+                self.assertEqual((task["parameters"]["resolved_backup_type"], task["parameters"]["resolved_backup_reason"]), queued)
+                self.assertEqual(task["logs"], [])
+
+    def test_a_first_run_with_the_chain_still_empty_stays_a_first_run(self) -> None:
+        for extra in ({}, {"copy_job": True}):
+            with self.subTest(extra=extra):
+                task = abr_v41.refresh_queued_backup_decision(_task("ActiveFull", "FirstRun", **extra))
+
+                self.assertEqual(task["parameters"]["resolved_backup_reason"], "FirstRun")
+                self.assertEqual(task["logs"], [])
 
     def test_restores_and_tasks_without_a_job_are_left_alone(self) -> None:
         restore = {"id": "r1", "task_type": "restore", "parameters": {"point_id": "p"}}

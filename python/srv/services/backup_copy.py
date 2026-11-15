@@ -162,11 +162,27 @@ def _segments(points: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return _segment_points(points)
 
 
-def _source_chain(job: dict[str, Any], vm_id: str, previous: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _vm_source_chains(job: dict[str, Any], vm_id: str) -> dict[str, list[dict[str, Any]]]:
     by_source: dict[str, list[dict[str, Any]]] = {}
     for point in source_points(job):
         if str(point.get("vm_id") or "") == vm_id:
             by_source.setdefault(f"{point.get('job_id')}::{point.get('repository_id')}", []).append(point)
+    return by_source
+
+
+def _source_rank(job: dict[str, Any]) -> Callable[[list[dict[str, Any]]], tuple[int, str, str]]:
+    order = {job_id: position for position, job_id in enumerate(source_job_ids(job))}
+
+    def rank(points: list[dict[str, Any]]) -> tuple[int, str, str]:
+        job_id = str(points[-1].get("job_id") or "")
+        source_job = JOBS.get(job_id) if isinstance(JOBS.get(job_id), dict) else {}
+        return order.get(job_id, len(order)), str(source_job.get("created_at") or "") or "~", job_id
+
+    return rank
+
+
+def _source_chain(job: dict[str, Any], vm_id: str, previous: dict[str, Any] | None) -> list[dict[str, Any]]:
+    by_source = _vm_source_chains(job, vm_id)
     if not by_source:
         return []
 
@@ -175,12 +191,31 @@ def _source_chain(job: dict[str, Any], vm_id: str, previous: dict[str, Any] | No
     if kept:
         return kept
 
-    order = {job_id: position for position, job_id in enumerate(source_job_ids(job))}
-    first_rank = min(order.get(str(points[-1].get("job_id") or ""), len(order)) for points in by_source.values())
-    candidates = [
-        points for points in by_source.values() if order.get(str(points[-1].get("job_id") or ""), len(order)) == first_rank
-    ]
+    rank = _source_rank(job)
+    first = min(rank(points) for points in by_source.values())
+    candidates = [points for points in by_source.values() if rank(points) == first]
     return max(candidates, key=lambda points: _point_order(points[-1]))
+
+
+def followed_source_job(job: dict[str, Any], vm_id: str) -> tuple[str, list[str]]:
+    chain = _source_chain(job, vm_id, copied_marker(destination_points(job, vm_id)))
+    if not chain:
+        return "", []
+    followed = str(chain[-1].get("job_id") or "")
+    others = {
+        str(points[-1].get("job_name") or points[-1].get("job_id") or "")
+        for points in _vm_source_chains(job, vm_id).values()
+        if str(points[-1].get("job_id") or "") != followed
+    }
+    return str(chain[-1].get("job_name") or followed), sorted(others)
+
+
+def other_jobs_note(vm_name: str, others: list[str]) -> str:
+    return (
+        f"Job(s) {', '.join(others)} also back up {vm_name} in the sources, and their restore points of it are not copied: "
+        "a backup copy job keeps one chain per VM, from the first of its --source-job jobs that backs the VM up, else "
+        "from the job created first, and stays on the job it has copied from"
+    )
 
 
 def plan_copy(job: dict[str, Any], vm_id: str, *, requested_type: str = "Incremental") -> dict[str, Any] | None:
@@ -188,18 +223,19 @@ def plan_copy(job: dict[str, Any], vm_id: str, *, requested_type: str = "Increme
 
     previous_points = destination_points(job, vm_id)
     previous = previous_points[-1] if previous_points else None
-    chain = _source_chain(job, vm_id, previous)
+    marker = copied_marker(previous_points)
+    chain = _source_chain(job, vm_id, marker)
     if not chain:
         return None
 
     damaged = bool(damaged_chain_points(str(job.get("id") or ""), vm_id, str(job.get("repo_id") or "") or None))
     full_requested = requested_type in FULL_EXECUTION_TYPES or damaged
-    copied_id = str(_copy_source(previous or {}).get("point_id") or "")
+    copied_id = str(_copy_source(marker or {}).get("point_id") or "")
     position = {str(point.get("id") or ""): index for index, point in enumerate(chain)}
     if copied_id in position:
         pending = chain[position[copied_id] + 1 :]
     elif copied_id:
-        copied_at = _point_order(_copy_source_point_stub(previous))
+        copied_at = _point_order(_copy_source_point_stub(marker))
         pending = [point for point in chain if _point_order(point) > copied_at]
     else:
         pending = list(chain)
@@ -236,6 +272,24 @@ def plan_copy(job: dict[str, Any], vm_id: str, *, requested_type: str = "Increme
         "remaining": len(pending) - pending.index(target) - 1 if target in pending else 0,
         "damaged": damaged,
     }
+
+
+def copied_marker(destination: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return next((point for point in reversed(destination) if _copy_source(point)), None)
+
+
+def synthetic_copy_source(points: list[dict[str, Any]]) -> dict[str, Any] | None:
+    sources = [_copy_source(point) for point in points if _copy_source(point)]
+    if not sources:
+        return None
+    newest = sources[-1]
+    point_ids: list[str] = []
+    for source in sources:
+        for point_id in source.get("point_ids") or [source.get("point_id")]:
+            if point_id and str(point_id) not in point_ids:
+                point_ids.append(str(point_id))
+    kept = ("job_id", "job_name", "repository_id", "repository_name", "point_id", "created_at")
+    return {**{key: newest.get(key) for key in kept}, "point_ids": point_ids}
 
 
 def _copy_source_point_stub(point: dict[str, Any] | None) -> dict[str, Any]:
@@ -284,6 +338,16 @@ def create_copy_sessions(
     run_id = run_id or str(uuid4())
     destination = REPOSITORIES.get(str(normalized.get("repo_id") or "")) or {}
     sessions: list[dict[str, Any]] = []
+    missing = missing_copy_sources(normalized)
+    missing_warning = (
+        {
+            "code": "copy_source_missing",
+            "message": f"{missing_sources_text(normalized, missing)}. Edit the job (abr job edit --name {normalized.get('name')}) or delete it",
+            **missing,
+        }
+        if any(missing.values())
+        else None
+    )
 
     for target in copy_targets(normalized):
         vm_id = target["vm_id"]
@@ -342,6 +406,10 @@ def create_copy_sessions(
                 "updated_at": now,
                 "logs": [],
             }
+
+            if missing_warning is not None:
+                task["warnings"] = [dict(missing_warning)]
+                _append_task_log(task, level="warn", message=missing_warning["message"], component="session")
 
             what = "synthetic full of the copied chain" if synthetic else "backup copy"
             window = copy_window_state(normalized)
@@ -850,12 +918,19 @@ def run_backup_copy(
             progress_callback({"progress": max(0, min(100, progress)), "message": message, **extra})
 
     plan = plan_copy(job, vm_id, requested_type=str(parameters.get("resolved_backup_type") or "Incremental"))
+    followed, others = followed_source_job(job, vm_id)
+    note = other_jobs_note(vm_name, others) if others else ""
     if plan is None:
+        message = (
+            f"Nothing new to copy for {vm_name}: the newest restore point of job {followed} is already in {destination.get('name')}"
+            if followed
+            else f"Nothing new to copy for {vm_name}: the sources hold no restore point of it that can be copied"
+        )
         return {
             "operation": "backup",
             "worker_mode": "backup-copy",
             "nothing_copied": True,
-            "message": f"Nothing new to copy for {vm_name}: its newest restore point is already in {destination.get('name')}",
+            "message": f"{message}. {note}" if note else message,
             "vm_name": vm_name,
             "vm_external_id": vm_id,
         }
@@ -870,6 +945,8 @@ def run_backup_copy(
         f"from repository {target.get('repository_name')} into repository {destination.get('name')} "
         f"as {'a full backup' if plan['kind'] == 'full' else 'an incremental backup'}",
     )
+    if note:
+        emit(0, note)
 
     attempt = 0
     while True:
@@ -1217,9 +1294,94 @@ def _named(ids: list[str], names: list[Any], store: dict[str, dict[str, Any]]) -
         {
             "id": record_id,
             "name": (store.get(record_id) or {}).get("name") or (stored_names[index] if index < len(stored_names) else None),
+            **({} if isinstance(store.get(record_id), dict) else {"missing": True}),
         }
         for index, record_id in enumerate(ids)
     ]
+
+
+def _all_copy_jobs() -> list[dict[str, Any]]:
+    return sorted(
+        (record for record in catalog_records(JOBS) if record.get("job_type") == "backup-copy"),
+        key=lambda record: (str(record.get("name") or "").lower(), str(record.get("id") or "")),
+    )
+
+
+def copy_jobs_using_job(job_id: str) -> list[dict[str, Any]]:
+    found = []
+    for record in _all_copy_jobs():
+        if str(record.get("id") or "") == job_id:
+            continue
+        roles = [role for role, used in (("source", job_id in source_job_ids(record)), ("run after", str(record.get("run_after_job_id") or "") == job_id)) if used]
+        if roles:
+            found.append({"id": record.get("id"), "name": record.get("name"), "roles": roles})
+    return found
+
+
+def copy_jobs_using_repository(repository_id: str) -> list[dict[str, Any]]:
+    return [
+        {"id": record.get("id"), "name": record.get("name"), "roles": ["source"]}
+        for record in _all_copy_jobs()
+        if repository_id in source_repository_ids(record)
+    ]
+
+
+def ensure_job_not_used_by_copies(job: dict[str, Any]) -> None:
+    users = copy_jobs_using_job(str(job.get("id") or ""))
+    if not users:
+        return
+    listed = ", ".join(f"{user['name']} ({' and '.join(user['roles'])})" for user in users)
+    raise api_error(
+        409,
+        "backup_copy_source_in_use",
+        f"Job {job.get('name')} is used by backup copy job(s) {listed}. Take it out of them with abr job edit "
+        "(--source-job, --run-after-job none) or delete them first",
+        backup_copy_jobs=[user["name"] for user in users],
+    )
+
+
+def ensure_repository_not_used_by_copies(repository: dict[str, Any]) -> None:
+    users = copy_jobs_using_repository(str(repository.get("id") or ""))
+    if not users:
+        return
+    raise api_error(
+        409,
+        "backup_copy_source_in_use",
+        f"Repository {repository.get('name')} is a source of backup copy job(s) {', '.join(user['name'] for user in users)}. "
+        "Take it out of their sources with abr job edit (--source-repo) or delete them first",
+        backup_copy_jobs=[user["name"] for user in users],
+    )
+
+
+def missing_copy_sources(job: dict[str, Any]) -> dict[str, list[str]]:
+    view = copy_job_view(job)
+    run_after = view.get("run_after_job")
+    return {
+        "source_jobs": [str(item.get("name") or item.get("id")) for item in view["source_jobs"] if item.get("missing")],
+        "source_repositories": [str(item.get("name") or item.get("id")) for item in view["source_repositories"] if item.get("missing")],
+        "run_after_job": [str(run_after.get("name") or run_after.get("id"))] if isinstance(run_after, dict) and run_after.get("missing") else [],
+    }
+
+
+def missing_sources_text(job: dict[str, Any], missing: dict[str, list[str]]) -> str:
+    parts = [
+        *(f"source job {name} was deleted" for name in missing["source_jobs"]),
+        *(f"source repository {name} was removed" for name in missing["source_repositories"]),
+        *(f"run-after job {name} was deleted, so nothing starts this job after it" for name in missing["run_after_job"]),
+    ]
+    return f"Backup copy job {job.get('name')}: {'; '.join(parts)}"
+
+
+def has_no_source_left(job: dict[str, Any], missing: dict[str, list[str]]) -> bool:
+    listed = len(source_job_ids(job)) + len(source_repository_ids(job))
+    return listed > 0 and len(missing["source_jobs"]) + len(missing["source_repositories"]) == listed
+
+
+def no_source_left_message(job: dict[str, Any], missing: dict[str, list[str]]) -> str:
+    return (
+        f"{missing_sources_text(job, missing)}. It has no source left to copy from: give it one with abr job edit "
+        f"--name {job.get('name')} --source-job/--source-repo, or delete it"
+    )
 
 
 def copy_job_view(job: dict[str, Any]) -> dict[str, Any]:

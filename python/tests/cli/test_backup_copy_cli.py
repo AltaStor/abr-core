@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from python.cli.commands.job_commands import JobCommands, _backup_copy_rows
+from python.cli.commands.job_commands import JobCommands, _backup_copy_rows, _last_run_text
 from python.cli.parsing.parser_builder import build_parser
 from python.cli.services.job_service import JobService
 from python.cli.services.restore_service import RestoreService
@@ -154,6 +154,30 @@ class ViewTests(unittest.TestCase):
         args = build_parser().parse_args(["restore", "list", "--job", "Offsite"])
 
         self.assertEqual(RestoreService(None).build_restore_list_params(args), {"job": "Offsite"})
+
+
+class MissingSourceViewTests(unittest.TestCase):
+    def test_a_source_or_run_after_job_that_no_longer_exists_is_marked_missing(self) -> None:
+        rows = _backup_copy_rows(
+            {
+                "copy_mode": "periodic",
+                "source_jobs": [{"id": "j1", "name": "Nightly", "missing": True}, {"id": "j2", "name": "Weekly"}],
+                "source_repositories": [{"id": "r1", "name": "Spare", "missing": True}],
+                "run_after_job": {"id": "j1", "name": "Nightly", "missing": True},
+                "retry": {"count": 5, "interval_minutes": 0},
+            }
+        )
+
+        self.assertEqual(
+            (rows["source_jobs"], rows["source_repositories"], rows["run_after_job"]),
+            ("Nightly (missing), Weekly", "Spare (missing)", "Nightly (missing)"),
+        )
+
+    def test_a_run_that_failed_for_want_of_a_source_says_so(self) -> None:
+        run = {"result": "failed", "vm_count": 0, "message": "Backup copy job C: source job J was deleted. It has no source left to copy from: ..."}
+
+        self.assertEqual(_last_run_text(run), "Failed (no source left)")
+        self.assertEqual(_last_run_text({"result": "failed", "vm_count": 2, "failed": 1}), "Failed (1 of 2 VMs failed)")
 
 
 class ApiRoundTripTests(_Cli):

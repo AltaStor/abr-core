@@ -126,7 +126,16 @@ from python.srv.services.inventory_management import (
     normalize_inventory_type,
 )
 from python.srv.services import replication_service
-from python.srv.services.backup_copy import apply_copy_settings, copy_job_view, create_copy_sessions
+from python.srv.services.backup_copy import (
+    apply_copy_settings,
+    copy_job_view,
+    create_copy_sessions,
+    ensure_job_not_used_by_copies,
+    ensure_repository_not_used_by_copies,
+    has_no_source_left,
+    missing_copy_sources,
+    no_source_left_message,
+)
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
 from python.srv.services.share_mount import share_mount_check, unmounted_share_message
@@ -4089,6 +4098,7 @@ def remove_repository_record(record_id: str) -> dict[str, Any]:
     linked_jobs = _jobs_referencing_repository_id(record_id)
     if linked_jobs:
         raise api_error(409, "repository_in_use", "Repository cannot be removed while jobs still reference it", jobs=linked_jobs)
+    ensure_repository_not_used_by_copies(repository)
     repo_points = [point for point in normalized_backup_points() if str(point.get("repository_id") or "") == record_id]
     if repo_points:
         raise api_error(409, "repository_has_backups", "Repository cannot be removed while backup chains still reference it", restore_point_count=len(repo_points))
@@ -4765,6 +4775,19 @@ def job_run_summary(job: dict[str, Any]) -> dict[str, Any] | None:
             entry["message"] = session.get("message") or (errors[0].get("message") if errors and isinstance(errors[0], dict) else None)
         if session.get("finished_at"):
             finished.append(str(session["finished_at"]))
+    if not vms and run.get("error"):
+        return {
+            "id": run["id"],
+            "trigger": run.get("trigger"),
+            "started_at": run.get("started_at"),
+            "finished_at": run.get("started_at"),
+            "result": "failed",
+            "message": run["error"],
+            "vm_count": 0,
+            "succeeded": 0,
+            **{name: 0 for name in ("warning", "failed", "stopped", "running")},
+            "vms": [],
+        }
     if not vms:
         return None
     counts = {name: sum(1 for vm in vms.values() if vm["result"] == name) for name in RUN_RESULTS_WORST_FIRST}
@@ -5598,6 +5621,7 @@ def delete_job_record(job_id: str, *, delete_replica: bool = False) -> dict[str,
         )
     if str(job.get("job_type") or "backup") == "backup":
         replication_service.ensure_source_job_free(job)
+    ensure_job_not_used_by_copies(job)
     removed = replication_service.delete_replica(normalize_job_record(job)) if delete_replica else None
     delete_job(job_id)
     result: dict[str, Any] = {"id": str(job.get("id") or job_id), "deleted": True}
@@ -5806,11 +5830,11 @@ def resolve_job_execution(
         return "SyntheticFull", "ForceSynthetic"
     if force_full:
         return "ActiveFull", "ForceFull"
+    if damaged_chain_points(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None):
+        return "ActiveFull", "DamagedChain"
     previous = _latest_successful_point(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None)
     if previous is None:
         return "ActiveFull", "FirstRun"
-    if damaged_chain_points(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None):
-        return "ActiveFull", "DamagedChain"
     if _encryption_differs_from_point(job, previous):
         return "ActiveFull", "EncryptionKeyChanged"
     if _chain_base_mismatches(str(job["id"]), vm_id, str(job.get("repo_id") or "") or None):
@@ -5862,7 +5886,7 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
         return task
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     job_id = str(task.get("job_id") or "")
-    if not job_id or job_id not in JOBS or parameters.get("copy_job") or parameters.get("requires_task_id"):
+    if not job_id or job_id not in JOBS or parameters.get("requires_task_id"):
         return task
     queued_type = str(parameters.get("resolved_backup_type") or "")
     queued_reason = str(parameters.get("resolved_backup_reason") or "")
@@ -5871,6 +5895,13 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
     job = resolve_job(record_id=job_id)
     vm_id = str(task.get("resource_external_id") or "")
     has_point = _latest_successful_point(job_id, vm_id, str(job.get("repo_id") or "") or None) is not None
+    if parameters.get("copy_job"):
+        if queued_reason != "FirstRun" or not has_point:
+            return task
+        execution_type, execution_reason = resolve_job_execution(job, vm_id=vm_id, force_full=False)
+        if execution_type == "SyntheticFull":
+            execution_type, execution_reason = "Incremental", "StandardIncremental"
+        return _record_refreshed_decision(task, parameters, (queued_type, queued_reason), (execution_type, execution_reason))
     if queued_reason == "FirstRun" and has_point:
         execution_type, execution_reason = resolve_job_execution(job, vm_id=vm_id, force_full=False)
         if execution_type == "SyntheticFull":
@@ -5880,7 +5911,7 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
     else:
         execution_type, execution_reason = queued_type, queued_reason
     damaged = damaged_chain_points(job_id, vm_id, str(job.get("repo_id") or "") or None)
-    if damaged and execution_type != "ActiveFull":
+    if damaged and (execution_type != "ActiveFull" or execution_reason == "FirstRun"):
         execution_type, execution_reason = "ActiveFull", "DamagedChain"
     if damaged and execution_reason == "DamagedChain":
         warnings = task.get("warnings") if isinstance(task.get("warnings"), list) else []
@@ -5907,7 +5938,15 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
         LOGGER.warning("Backup session %s of job '%s', VM %s: %s", task.get("id"), job.get("name"), vm_id, message)
         if (execution_type, execution_reason) == (queued_type, queued_reason):
             persist_task(task)
-    if (execution_type, execution_reason) == (queued_type, queued_reason):
+    return _record_refreshed_decision(task, parameters, (queued_type, queued_reason), (execution_type, execution_reason))
+
+
+def _record_refreshed_decision(
+    task: dict[str, Any], parameters: dict[str, Any], queued: tuple[str, str], decided: tuple[str, str]
+) -> dict[str, Any]:
+    queued_type, queued_reason = queued
+    execution_type, execution_reason = decided
+    if decided == queued:
         return task
     parameters.update(
         {
@@ -5934,6 +5973,7 @@ def refresh_queued_backup_decision(task: dict[str, Any]) -> dict[str, Any]:
     )
     persist_task(task)
     return task
+
 
 def bind_backup_parent(task: dict[str, Any]) -> dict[str, Any]:
     if str(task.get("task_type") or "") != "backup":
@@ -6884,7 +6924,7 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     dto: dict[str, Any] = {
         "id": task.get("id"),
         "state": _session_state(task),
-        "type": task.get("task_type"),
+        "type": session_type_of(task),
         "job": {"id": job["id"], "name": job["name"]} if job else None,
         "vm_id": task.get("resource_external_id") if str(task.get("resource_type") or "") == "virtual_machine" else None,
         # The VM this session acts on, by name. For a restore this is the VM
@@ -6937,7 +6977,15 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     return dto
 
 
-SESSION_TYPES = ("backup", "restore", "verify", "delete")
+SESSION_TYPES = ("backup", "backup-copy", "replication", "restore", "verify", "delete")
+
+
+def session_type_of(task: dict[str, Any]) -> str | None:
+    task_type = task.get("task_type")
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    if task_type == "backup" and (parameters.get("copy_job") or parameters.get("copy_mode")):
+        return "backup-copy"
+    return task_type
 
 
 def list_sessions(
@@ -6956,7 +7004,7 @@ def list_sessions(
             f"type must be one of: {', '.join(SESSION_TYPES)}",
             type=session_type,
         )
-        tasks = [task for task in tasks if str(task.get("task_type") or "") == session_type]
+        tasks = [task for task in tasks if session_type_of(task) == session_type]
     if run_id:
         tasks = [task for task in tasks if str(task.get("run_id") or "") == run_id]
     sessions = [session_to_dto(task, include_logs=include_logs) for task in tasks]
@@ -7925,7 +7973,10 @@ def _create_verify_session(
         "updated_at": utc_now(),
         "logs": [],
     }
-    what = {"newest_points": f"the newest restore point ({latest.get('id')})", "whole_chains": "every restore point"}.get(str(scope or ""), "")
+    what = {
+        "newest_points": f"the newest restore point ({latest.get('id')}) and the points it builds on",
+        "whole_chains": "every restore point",
+    }.get(str(scope or ""), "")
     _append_task_log(
         task,
         level="info",
@@ -8092,9 +8143,24 @@ def run_job_verify(job_id: str, *, trigger: str = "schedule") -> dict[str, Any] 
         run["run"],
         run["scope"].replace("_", " "),
         trigger,
-        "every restore point of each chain" if run["scope"] == "whole_chains" else "the newest restore point of each chain",
+        "every restore point of each chain" if run["scope"] == "whole_chains" else "the newest restore point of each chain and the points it builds on",
     )
     return run
+
+
+def newest_restore_path(points: list[dict[str, Any]]) -> set[str]:
+    if not points:
+        return set()
+    by_id = {str(point.get("id") or ""): point for point in points}
+    path: list[str] = []
+    current: dict[str, Any] | None = points[-1]
+    while current is not None and str(current.get("id") or "") not in path:
+        path.append(str(current.get("id") or ""))
+        if current.get("full_backup") or str(current.get("execution_type") or "") != "Incremental":
+            return set(path)
+        current = by_id.get(str(current.get("parent_point_id") or ""))
+    fulls = [index for index, point in enumerate(points) if point.get("full_backup") or str(point.get("execution_type") or "") != "Incremental"]
+    return {str(point.get("id") or "") for point in points[fulls[-1] if fulls else 0 :]}
 
 
 def _run_job_verify(job_id: str, run: dict[str, Any]) -> None:
@@ -8102,7 +8168,7 @@ def _run_job_verify(job_id: str, run: dict[str, Any]) -> None:
     try:
         name = str((JOBS.get(job_id) or {}).get("name") or job_id)
         for chain_id, points in _job_verify_targets(job_id):
-            point_ids = None if run["scope"] == "whole_chains" else {str(points[-1].get("id") or "")}
+            point_ids = None if run["scope"] == "whole_chains" else newest_restore_path(points)
             task = _create_verify_session(
                 chain_id, points, job_id=job_id, trigger=str(run["trigger"]), scope=str(run["scope"]), run_id=str(run["id"])
             )
@@ -10517,6 +10583,25 @@ def start_job_record(
         )
     if force_synthetic and job["job_type"] not in ("backup-copy", replication_service.REPLICATION_JOB_TYPE):
         _ensure_chain_can_be_merged(job)
+    if job["job_type"] == "backup-copy":
+        active = _active_sessions_for_job(str(job["id"]))
+        _ensure(
+            not active,
+            409,
+            "job_already_running",
+            f"Backup copy job {job.get('name')} already has a session queued or running (session "
+            f"{active[0]['id'] if active else ''}); start it again once that ends",
+            session_id=active[0]["id"] if active else None,
+        )
+        missing = missing_copy_sources(job)
+        _ensure(
+            not has_no_source_left(job, missing),
+            409,
+            "backup_copy_no_source",
+            no_source_left_message(job, missing),
+            missing_source_jobs=missing["source_jobs"],
+            missing_source_repositories=missing["source_repositories"],
+        )
     sessions = []
     run_id = str(uuid4())
     run_started_at = utc_now()
@@ -10594,11 +10679,8 @@ def _resolve_restore_source_point(payload: dict[str, Any]) -> dict[str, Any]:
         return point
 
     _ensure(bool(backup_id), 422, "invalid_restore", "restore start requires --point-id/--restore-point or --backup")
-    candidates = [point for point in normalized_backup_points() if _restore_point_matches_backup(point, backup_id)]
-    if vm_selector:
-        candidates = [point for point in candidates if _restore_point_matches_vm(point, vm_selector)]
-    candidates = [point for point in candidates if _restore_point_is_available(point)]
-    if not candidates:
+    matching = _backup_points_newest_first(backup_id, vm_selector)
+    if not matching:
         raise api_error(
             404,
             "restore_point_not_found",
@@ -10606,8 +10688,52 @@ def _resolve_restore_source_point(payload: dict[str, Any]) -> dict[str, Any]:
             backup_id=backup_id,
             vm=vm_selector or None,
         )
-    candidates.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")), reverse=True)
-    return candidates[0]
+    available = [point for point in matching if _restore_point_is_available(point)]
+    return available[0] if available else matching[0]
+
+
+def _backup_points_newest_first(backup_id: str, vm_selector: str) -> list[dict[str, Any]]:
+    matching = [point for point in normalized_backup_points() if _restore_point_matches_backup(point, backup_id)]
+    if vm_selector:
+        matching = [point for point in matching if _restore_point_matches_vm(point, vm_selector)]
+    return sorted(matching, key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")), reverse=True)
+
+
+def _skipped_newer_points(payload: dict[str, Any], point: dict[str, Any]) -> list[dict[str, Any]]:
+    if str(payload.get("point_id") or payload.get("restore_point_id") or "").strip():
+        return []
+    backup_id = str(payload.get("backup") or payload.get("backup_id") or "").strip()
+    newest_first = _backup_points_newest_first(backup_id, str(payload.get("vm") or "").strip())
+    ids = [str(item.get("id") or "") for item in newest_first]
+    point_id = str(point.get("id") or "")
+    return newest_first[: ids.index(point_id)] if point_id in ids else []
+
+
+def _unavailable_reason(point: dict[str, Any]) -> str:
+    status = str(point.get("status") or "")
+    corruption = point.get("corruption") if isinstance(point.get("corruption"), dict) else {}
+    if status == POINT_CORRUPT and corruption.get("kind") == "dependent":
+        return f"it builds on restore point {corruption.get('damaged_point_id')}, whose data is damaged"
+    if status == POINT_CORRUPT:
+        found = f"{corruption.get('found_by') or 'verification'} on {corruption.get('found_at')}" if corruption.get("found_at") else "verification"
+        return f"{found} found its data damaged"
+    if status == POINT_CHAIN_BROKEN:
+        return f"it builds on restore point {point.get('missing_ancestor_id')}, whose data is missing from the repository"
+    if status == POINT_DELETING:
+        return "it is being deleted"
+    return f"its status is {status or 'unknown'}"
+
+
+def newer_points_warning(skipped: list[dict[str, Any]], point: dict[str, Any]) -> dict[str, Any]:
+    details = "; ".join(f"{item.get('id')} ({item.get('created_at')}): {_unavailable_reason(item)}" for item in skipped)
+    return {
+        "code": "newer_points_unavailable",
+        "message": (
+            f"Restoring restore point {point.get('id')} ({point.get('created_at')}), the newest of this backup that can "
+            f"be restored; {len(skipped)} newer restore point(s) cannot be restored: {details}"
+        ),
+        "restore_point_ids": [str(item.get("id") or "") for item in skipped],
+    }
 
 
 def _inventory_vm_name_exists(inventory_id: str, vm_name: str) -> bool:
@@ -11015,6 +11141,9 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
         "updated_at": utc_now(),
         "logs": [],
     }
+    skipped = _skipped_newer_points(payload, point)
+    if skipped:
+        task["warnings"] = [newer_points_warning(skipped, point)]
     mode_label = "In-place" if restore_mode == "in_place" else "Out-of-place"
     placement_text = ", ".join(f"{source} -> {target}" for source, target in sorted((datastore_placement or {}).items()))
     network_text = ", ".join(f"{source} -> {target}" for source, target in sorted((network_map or {}).items()))
@@ -11037,6 +11166,9 @@ def restore_start(payload: dict[str, Any]) -> dict[str, Any]:
     )
     _append_task_log(task, level="info", message=restore_summary, component="session")
     LOGGER.info("Restore session %s queued: %s", task["id"], restore_summary)
+    for warning in task.get("warnings") or []:
+        _append_task_log(task, level="warn", message=warning["message"], component="session")
+        LOGGER.warning("Restore session %s: %s", task["id"], warning["message"])
     persist_task(task)
     session = session_to_dto(task)
     return {

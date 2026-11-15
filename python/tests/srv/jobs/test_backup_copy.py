@@ -200,6 +200,50 @@ class CopyPlanTests(_Catalog):
         self.assertEqual(sources, ["f1", "i1", "i2"])
         self.assertIsNone(self._plan())
 
+    def _synthetic(self, point_id: str, merged: list[str], *, recorded: bool = True) -> dict:
+        merged_points = [BACKUPS[point] for point in merged]
+        extra = {"copy_source": backup_copy.synthetic_copy_source(merged_points)} if recorded else {}
+        return self._point(point_id, "SyntheticFull", job_id=self.copy["id"], repo="dst", **extra)
+
+    def test_a_copy_after_a_synthetic_full_is_an_incremental_on_it_with_only_what_is_new(self) -> None:
+        self._copied("c1", "f1")
+        self._copied("c2", "i1", kind="Incremental")
+        self._synthetic("s1", ["c1", "c2"])
+
+        plan = self._plan()
+
+        self.assertEqual((plan["kind"], self._ids(plan), plan["parent"]["id"]), ("incremental", ["i2"], "s1"))
+
+    def test_a_synthetic_full_made_before_this_fix_without_a_copy_source_is_still_built_on(self) -> None:
+        self._copied("c1", "f1")
+        self._copied("c2", "i1", kind="Incremental")
+        self._synthetic("s1", ["c1", "c2"], recorded=False)
+
+        plan = self._plan()
+
+        self.assertEqual((plan["kind"], self._ids(plan), plan["parent"]["id"]), ("incremental", ["i2"], "s1"))
+
+    def test_the_synthetic_full_records_the_source_point_whose_state_it_holds(self) -> None:
+        self._copied("c1", "f1")
+        self._copied("c2", "i1", kind="Incremental")
+
+        source = backup_copy.synthetic_copy_source([BACKUPS["c1"], BACKUPS["c2"]])
+
+        self.assertEqual((source["job_id"], source["repository_id"], source["point_id"]), ("nightly", "src", "i1"))
+        self.assertEqual(source["point_ids"], ["f1", "i1"])
+        self.assertIsNone(backup_copy.synthetic_copy_source([BACKUPS["f1"]]))
+
+    def test_after_a_synthetic_full_nothing_new_or_a_new_source_chain_behave_as_before(self) -> None:
+        self._copied("c1", "f1")
+        self._copied("c2", "i2", kind="Incremental")
+        self._synthetic("s1", ["c1", "c2"])
+        self.assertIsNone(self._plan())
+
+        self._point("f2", "ActiveFull")
+        plan = self._plan()
+
+        self.assertEqual((plan["kind"], self._ids(plan), plan["parent"]), ("full", ["f2"], None))
+
     def test_every_vm_of_the_sources_is_copied_unless_the_job_picks_some(self) -> None:
         BACKUPS["x1"] = dict(BACKUPS["i2"], id="x1", vm_id="vm-9", vm_name="web-09")
         job = JOBS[self.copy["id"]]
@@ -207,6 +251,79 @@ class CopyPlanTests(_Catalog):
         self.assertEqual([target["vm_id"] for target in backup_copy.copy_targets(job)], [VM, "vm-9"])
         job["vm_ids"] = [VM]
         self.assertEqual([target["vm_id"] for target in backup_copy.copy_targets(job)], [VM])
+
+
+class SeveralJobsOfOneVmTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        JOBS["nightly"]["created_at"] = "2026-01-01T00:00:00+00:00"
+        JOBS["weekly"] = abr_v41.normalize_job_record(
+            {**JOBS["nightly"], "id": "weekly", "name": "Weekly", "created_at": "2026-02-01T00:00:00+00:00"}
+        )
+        self._point("n1", "ActiveFull")
+        self._point("w1", "ActiveFull", job_id="weekly")
+
+    def _followed(self, **payload) -> tuple[str, str, list[str]]:
+        self.copy = self._copy_job(**payload)
+        job = abr_v41.normalize_job_record(JOBS[self.copy["id"]])
+        plan = backup_copy.plan_copy(job, VM, requested_type="ActiveFull")
+        followed, others = backup_copy.followed_source_job(job, VM)
+        return plan["target"]["job_id"], followed, others
+
+    def test_from_a_repository_the_job_created_first_is_copied_even_when_another_has_the_newest_point(self) -> None:
+        self.assertEqual(self._followed(source_jobs=None, source_repositories=["Source"]), ("nightly", "Nightly", ["Weekly"]))
+
+    def test_the_order_of_the_source_jobs_comes_first(self) -> None:
+        self.assertEqual(self._followed(source_jobs=["Weekly", "Nightly"])[0], "weekly")
+        self.assertEqual(self._followed(name="Mixed copy", source_jobs=["Weekly"], source_repositories=["Source"])[0], "weekly")
+
+    def test_a_job_that_no_longer_exists_comes_after_every_job_that_does(self) -> None:
+        self._point("g1", "ActiveFull", job_id="gone", job_name="Gone")
+        JOBS["nightly"]["created_at"] = "2026-03-01T00:00:00+00:00"
+
+        self.assertEqual(self._followed(source_jobs=None, source_repositories=["Source"])[:2], ("weekly", "Weekly"))
+
+    def test_the_copy_stays_on_the_job_it_has_copied_from(self) -> None:
+        self.copy = self._copy_job(source_jobs=None, source_repositories=["Source"])
+        self._point("c1", "ActiveFull", job_id=self.copy["id"], repo="dst", copy_source={"job_id": "weekly", "repository_id": "src", "point_id": "w1"})
+        self._point("n2", "Incremental")
+        job = abr_v41.normalize_job_record(JOBS[self.copy["id"]])
+
+        self.assertIsNone(backup_copy.plan_copy(job, VM))
+        self.assertEqual(backup_copy.followed_source_job(job, VM), ("Weekly", ["Nightly"]))
+
+    def test_the_copy_stays_on_its_job_after_a_synthetic_full_made_before_this_fix(self) -> None:
+        self.copy = self._copy_job(source_jobs=None, source_repositories=["Source"])
+        self._point("c1", "ActiveFull", job_id=self.copy["id"], repo="dst", copy_source={"job_id": "weekly", "repository_id": "src", "point_id": "w1"})
+        self._point("s1", "SyntheticFull", job_id=self.copy["id"], repo="dst")
+        job = abr_v41.normalize_job_record(JOBS[self.copy["id"]])
+
+        self.assertEqual(backup_copy.followed_source_job(job, VM), ("Weekly", ["Nightly"]))
+        self.assertIsNone(backup_copy.plan_copy(job, VM))
+
+    def test_nothing_new_names_the_job_it_follows_and_the_jobs_it_does_not_copy(self) -> None:
+        self.copy = self._copy_job(source_jobs=None, source_repositories=["Source"])
+        self._point("c1", "ActiveFull", job_id=self.copy["id"], repo="dst", copy_source={"job_id": "nightly", "repository_id": "src", "point_id": "n1"})
+        self._point("w2", "Incremental", job_id="weekly")
+        task = backup_copy.create_copy_sessions(JOBS[self.copy["id"]], trigger="manual", include_idle=True)[0]
+
+        result = backup_copy.run_backup_copy(task)
+
+        self.assertTrue(result["nothing_copied"])
+        self.assertTrue(result["message"].startswith("Nothing new to copy for sql-01: the newest restore point of job Nightly is already in Offsite. "))
+        self.assertIn("Job(s) Weekly also back up sql-01 in the sources, and their restore points of it are not copied", result["message"])
+        self.assertNotIn("its newest restore point", result["message"])
+
+    def test_nothing_new_with_one_source_job_has_no_note(self) -> None:
+        del BACKUPS["w1"]
+        self.copy = self._copy_job(source_jobs=None, source_repositories=["Source"])
+        self._point("c1", "ActiveFull", job_id=self.copy["id"], repo="dst", copy_source={"job_id": "nightly", "repository_id": "src", "point_id": "n1"})
+        task = backup_copy.create_copy_sessions(JOBS[self.copy["id"]], trigger="manual", include_idle=True)[0]
+
+        self.assertEqual(
+            backup_copy.run_backup_copy(task)["message"],
+            "Nothing new to copy for sql-01: the newest restore point of job Nightly is already in Offsite",
+        )
 
 
 class CopiedDiskTests(unittest.TestCase):
@@ -490,6 +607,163 @@ class CopyScheduleTests(_Catalog):
         self.scheduler._dispatch_due_jobs()
 
         self.assertEqual([task for task in TASKS.values() if task.get("job_id") == job["id"]], [])
+
+
+class CopySourceInUseTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        self._point("f1", "ActiveFull")
+        JOBS["weekly"] = abr_v41.normalize_job_record({**JOBS["nightly"], "id": "weekly", "name": "Weekly"})
+        REPOSITORIES["spare"] = {"id": "spare", "name": "Spare", "type": "local", "path": tempfile.mkdtemp()}
+
+    def test_a_source_or_run_after_job_of_a_copy_cannot_be_deleted_and_the_refusal_names_the_copies(self) -> None:
+        self._copy_job(name="Offsite copy", run_after_job="Weekly")
+        self._copy_job(name="Second copy", source_jobs=["Weekly", "Nightly"], repo="Spare")
+
+        nightly = self._refused(lambda: abr_v41.delete_job_record("nightly"))
+        weekly = self._refused(lambda: abr_v41.delete_job_record("weekly"))
+
+        self.assertEqual((nightly.status_code, nightly.code), (409, "backup_copy_source_in_use"))
+        self.assertIn("Job Nightly is used by backup copy job(s) Offsite copy (source), Second copy (source)", nightly.message)
+        self.assertIn("Offsite copy (run after), Second copy (source)", weekly.message)
+        self.assertEqual(weekly.details["backup_copy_jobs"], ["Offsite copy", "Second copy"])
+        self.assertIn("nightly", JOBS)
+
+    def test_a_copy_job_itself_and_a_job_no_copy_uses_can_still_be_deleted(self) -> None:
+        copy = self._copy_job()
+
+        self.assertTrue(abr_v41.delete_job_record("weekly")["deleted"])
+        self.assertTrue(abr_v41.delete_job_record(copy["id"])["deleted"])
+        self.assertTrue(abr_v41.delete_job_record("nightly")["deleted"])
+
+    def test_a_source_repository_of_a_copy_cannot_be_removed(self) -> None:
+        copy = self._copy_job(source_jobs=None, source_repositories=["Spare", "Source"])
+
+        refused = self._refused(lambda: abr_v41.remove_repository_record("spare"))
+
+        self.assertEqual((refused.status_code, refused.code), (409, "backup_copy_source_in_use"))
+        self.assertIn("Repository Spare is a source of backup copy job(s) Offsite copy", refused.message)
+        abr_v41.edit_job_record(copy["id"], {"source_repositories": ["Source"]})
+        self.assertTrue(abr_v41.remove_repository_record("spare")["removed"])
+
+    def test_a_repository_a_job_writes_into_is_still_refused_as_before(self) -> None:
+        self._copy_job()
+
+        refused = self._refused(lambda: abr_v41.remove_repository_record("dst"))
+
+        self.assertEqual(refused.code, "repository_in_use")
+
+
+class MissingCopySourceTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        self._point("f1", "ActiveFull")
+        JOBS["weekly"] = abr_v41.normalize_job_record({**JOBS["nightly"], "id": "weekly", "name": "Weekly"})
+
+    def test_a_copy_whose_only_source_is_gone_is_marked_and_refuses_to_start(self) -> None:
+        copy = self._copy_job()
+        JOBS.pop("nightly")
+
+        view = backup_copy.copy_job_view(JOBS[copy["id"]])
+        refused = self._refused(lambda: abr_v41.start_job_record(copy["id"]))
+
+        self.assertEqual(view["source_jobs"], [{"id": "nightly", "name": "Nightly", "missing": True}])
+        self.assertEqual((refused.status_code, refused.code), (409, "backup_copy_no_source"))
+        self.assertIn("Backup copy job Offsite copy: source job Nightly was deleted. It has no source left", refused.message)
+        self.assertEqual([task for task in TASKS.values() if task.get("job_id") == copy["id"]], [])
+
+    def test_a_removed_source_repository_is_marked_and_refuses_to_start(self) -> None:
+        REPOSITORIES["spare"] = {"id": "spare", "name": "Spare", "type": "local", "path": tempfile.mkdtemp()}
+        copy = self._copy_job(source_jobs=None, source_repositories=["Spare"])
+        REPOSITORIES.pop("spare")
+
+        refused = self._refused(lambda: abr_v41.start_job_record(copy["id"]))
+
+        self.assertEqual(backup_copy.copy_job_view(JOBS[copy["id"]])["source_repositories"][0]["missing"], True)
+        self.assertIn("source repository Spare was removed", refused.message)
+
+    def test_a_scheduled_run_with_no_source_left_is_recorded_as_failed_with_the_reason(self) -> None:
+        copy = self._copy_job(schedule={"type": "daily", "time": "03:00"})
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        JOBS[copy["id"]].update({"created_at": past, "next_incremental_run_at": past})
+        JOBS.pop("nightly")
+
+        JobScheduler(poll_interval_seconds=0.1)._dispatch_due_jobs()
+
+        summary = abr_v41.job_run_summary(JOBS[copy["id"]])
+        self.assertEqual([task for task in TASKS.values() if task.get("job_id") == copy["id"]], [])
+        self.assertEqual((summary["result"], summary["vm_count"]), ("failed", 0))
+        self.assertIn("source job Nightly was deleted", summary["message"])
+        self.assertGreater(datetime.fromisoformat(JOBS[copy["id"]]["next_incremental_run_at"]), datetime.now(timezone.utc))
+
+    def test_a_copy_that_lost_one_of_its_sources_runs_and_every_session_warns(self) -> None:
+        copy = self._copy_job(source_jobs=["Weekly", "Nightly"])
+        JOBS.pop("weekly")
+
+        started = abr_v41.start_job_record(copy["id"])
+
+        warnings = [task.get("warnings") for task in started["items"]]
+        self.assertEqual([[item["code"] for item in found] for found in warnings], [["copy_source_missing"]])
+        self.assertIn("source job Weekly was deleted", warnings[0][0]["message"])
+        self.assertEqual(warnings[0][0]["source_jobs"], ["Weekly"])
+
+    def test_a_deleted_run_after_job_is_named_but_the_copy_still_runs(self) -> None:
+        copy = self._copy_job(run_after_job="Weekly")
+        JOBS.pop("weekly")
+
+        started = abr_v41.start_job_record(copy["id"])
+
+        self.assertEqual(backup_copy.copy_job_view(JOBS[copy["id"]])["run_after_job"]["missing"], True)
+        self.assertIn("run-after job Weekly was deleted, so nothing starts this job after it", started["items"][0]["warnings"][0]["message"])
+
+    def test_a_copy_with_every_source_in_place_carries_no_warning(self) -> None:
+        copy = self._copy_job()
+
+        started = abr_v41.start_job_record(copy["id"])
+
+        self.assertNotIn("warnings", started["items"][0])
+        self.assertNotIn("missing", backup_copy.copy_job_view(JOBS[copy["id"]])["source_jobs"][0])
+
+
+class DoubleStartTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        self._point("f1", "ActiveFull")
+        self.copy = self._copy_job()
+
+    def test_a_second_start_while_a_copy_session_is_queued_or_running_is_refused(self) -> None:
+        first = abr_v41.start_job_record(self.copy["id"])["items"][0]
+        for status in ("queued", "running"):
+            with self.subTest(status=status):
+                TASKS[first["id"]]["status"] = status
+                refused = self._refused(lambda: abr_v41.start_job_record(self.copy["id"]))
+                self.assertEqual((refused.status_code, refused.code), (409, "job_already_running"))
+                self.assertEqual(refused.details["session_id"], first["id"])
+                self.assertIn("Backup copy job Offsite copy already has a session queued or running", refused.message)
+
+        TASKS[first["id"]]["status"] = "completed"
+        self.assertEqual(len(abr_v41.start_job_record(self.copy["id"])["items"]), 1)
+
+    def test_a_session_queued_as_a_first_run_that_starts_after_the_first_copy_copies_nothing(self) -> None:
+        late = backup_copy.create_copy_sessions(JOBS[self.copy["id"]], trigger="schedule", include_idle=True)[0]
+        self.assertEqual(late["parameters"]["resolved_backup_reason"], "FirstRun")
+        self._copied("c1", "f1")
+
+        started = abr_v41.refresh_queued_backup_decision(late)
+        result = backup_copy.run_backup_copy(started)
+
+        self.assertEqual((started["parameters"]["resolved_backup_type"], started["parameters"]["resolved_backup_reason"]), ("Incremental", "StandardIncremental"))
+        self.assertTrue(result["nothing_copied"])
+        self.assertEqual([point["id"] for point in BACKUPS.values() if point["job_id"] == self.copy["id"]], ["c1"])
+
+    def test_a_forced_full_queued_behind_a_copy_still_copies_a_full(self) -> None:
+        self._copied("c1", "f1")
+        forced = backup_copy.create_copy_sessions(JOBS[self.copy["id"]], trigger="manual", force_full=True, include_idle=True)[0]
+
+        started = abr_v41.refresh_queued_backup_decision(forced)
+
+        self.assertEqual((started["parameters"]["resolved_backup_type"], started["parameters"]["resolved_backup_reason"]), ("ActiveFull", "ForceFull"))
+        self.assertEqual(backup_copy.plan_copy(abr_v41.normalize_job_record(JOBS[self.copy["id"]]), VM, requested_type="ActiveFull")["kind"], "full")
 
 
 class CopyToggleTests(_Catalog):

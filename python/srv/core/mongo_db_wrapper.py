@@ -478,6 +478,60 @@ def delete_backup(backup_id: str) -> bool:
         return deleted
 
 
+REPOSITORY_RELOAD_REQUEST = "repository_reload_request:"
+REPOSITORY_RELOAD_DONE = "repository_reload_done:"
+SERVER_STATUS = "server_status"
+
+
+def reload_repository(repository_id: str) -> None:
+    db = get_database()
+    if db is None:
+        return
+    record = db.get("repositories", "id", repository_id)
+    with CATALOG_LOCK:
+        if isinstance(record, dict):
+            REPOSITORIES[repository_id] = _normalize_record(record)
+        else:
+            REPOSITORIES.pop(repository_id, None)
+
+
+def request_repository_reload(repository_id: str, request_id: str) -> None:
+    persist_system_state(
+        {"id": f"{REPOSITORY_RELOAD_REQUEST}{repository_id}", "repository_id": repository_id, "request_id": request_id, "requested_at": utc_now()}
+    )
+
+
+def repository_reload_done(repository_id: str) -> str | None:
+    record = load_system_state(f"{REPOSITORY_RELOAD_DONE}{repository_id}") or {}
+    return str(record.get("request_id") or "") or None
+
+
+def pending_repository_reloads() -> list[dict[str, Any]]:
+    db = get_database()
+    if db is None:
+        return []
+    requests = db.find("system_state", {"id": {"$regex": f"^{re.escape(REPOSITORY_RELOAD_REQUEST)}"}})
+    return [
+        request
+        for request in requests
+        if request.get("repository_id") and request.get("request_id") and repository_reload_done(str(request["repository_id"])) != request["request_id"]
+    ]
+
+
+def mark_repository_reloaded(repository_id: str, request_id: str) -> None:
+    persist_system_state(
+        {"id": f"{REPOSITORY_RELOAD_DONE}{repository_id}", "repository_id": repository_id, "request_id": request_id, "done_at": utc_now()}
+    )
+
+
+def record_server_status(*, running: bool) -> None:
+    persist_system_state({"id": SERVER_STATUS, "running": running, "pid": os.getpid(), "repository_reload": True, "updated_at": utc_now()})
+
+
+def server_status() -> dict[str, Any] | None:
+    return load_system_state(SERVER_STATUS)
+
+
 def load_system_state(state_id: str) -> dict[str, Any] | None:
     db = get_database()
     if db is not None:

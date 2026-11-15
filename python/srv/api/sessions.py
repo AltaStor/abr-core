@@ -28,7 +28,7 @@ def list_sessions(
             "(nightly finds Nightly, night finds nothing). Sessions of a deleted job no longer carry a job and are not matched."
         ),
     ),
-    type: str | None = Query(default=None, description="Only sessions of this type: backup, restore, verify or delete"),
+    type: str | None = Query(default=None, description="Only sessions of this type: backup, backup-copy (the sessions of backup copy jobs), replication, restore, verify or delete"),
     run_id: str | None = Query(
         default=None,
         description="Only the sessions of one run of a job: the run_id of a session, or last_run.id of the job",

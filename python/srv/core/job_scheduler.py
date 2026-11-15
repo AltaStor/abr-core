@@ -12,12 +12,25 @@ from uuid import uuid4
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .mongo_db_wrapper import CATALOG_LOCK, HYPERVISORS, JOBS, RESOURCES_BY_HV, TASKS, catalog_records, persist_job, persist_task
+from .mongo_db_wrapper import (
+    CATALOG_LOCK,
+    HYPERVISORS,
+    JOBS,
+    RESOURCES_BY_HV,
+    TASKS,
+    catalog_records,
+    mark_repository_reloaded,
+    pending_repository_reloads,
+    persist_job,
+    persist_task,
+    record_server_status,
+    reload_repository,
+)
 from .server_defaults import env_int
 from .time_zones import load_zone
 from .utils import utc_now
 from python.srv.services import clock_guard, notification_detectors, replication_service
-from python.srv.services.backup_copy import create_copy_sessions
+from python.srv.services.backup_copy import create_copy_sessions, has_no_source_left, missing_copy_sources, no_source_left_message
 from python.srv.services.abr_v41 import (
     execution_phases,
     job_clock_anomalies,
@@ -32,6 +45,7 @@ from python.srv.services.abr_v41 import (
 )
 
 logger = logging.getLogger(__name__)
+SERVER_STATUS_SECONDS = 15
 WEEKDAY_INDEX = {
     "monday": 0,
     "tuesday": 1,
@@ -71,6 +85,7 @@ class JobScheduler:
         self._deletion_sweep: threading.Thread | None = None
         self._deletion_sweep_at = float("-inf")
         self._reported_clock_anomalies: dict[str, str] = {}
+        self._server_status_at = float("-inf")
 
     def start(self) -> None:
         if self._thread is not None:
@@ -91,6 +106,10 @@ class JobScheduler:
         if self._thread is not None:
             self._thread.join(timeout=max(self._poll_interval_seconds * 2, 1.0))
             self._thread = None
+        try:
+            record_server_status(running=False)
+        except Exception:
+            logger.exception("Could not record that the server stopped")
         logger.info("JobScheduler stopped successfully.")
 
     def _poll_loop(self) -> None:
@@ -100,6 +119,10 @@ class JobScheduler:
                 clock_guard.tick()
             except Exception as exc:
                 logger.exception("Could not check the server clock: %s", exc)
+            try:
+                self._apply_repository_reloads()
+            except Exception:
+                logger.exception("Could not re-read the repositories changed outside the server")
             try:
                 self._dispatch_due_jobs()
             except Exception as exc:
@@ -148,6 +171,16 @@ class JobScheduler:
         )
         self._deletion_sweep.start()
 
+    def _apply_repository_reloads(self) -> None:
+        for request in pending_repository_reloads():
+            repository_id, request_id = str(request["repository_id"]), str(request["request_id"])
+            reload_repository(repository_id)
+            mark_repository_reloaded(repository_id, request_id)
+            logger.info("Re-read repository %s, changed outside the server (request %s).", repository_id, request_id)
+        if time.monotonic() - self._server_status_at >= SERVER_STATUS_SECONDS:
+            record_server_status(running=True)
+            self._server_status_at = time.monotonic()
+
     def _dispatch_due_jobs(self) -> None:
         now = datetime.fromisoformat(utc_now())
         jobs = sorted(catalog_records(JOBS), key=lambda item: str(item.get("created_at", "")))
@@ -170,6 +203,17 @@ class JobScheduler:
 
             run_id = str(uuid4())
             if normalized_job.get("job_type") == "backup-copy":
+                missing = missing_copy_sources(normalized_job)
+                if has_no_source_left(normalized_job, missing):
+                    self._advance_due_slots(job, due_slots)
+                    message = no_source_left_message(normalized_job, missing)
+                    now_text = utc_now()
+                    job["last_run_at"] = now_text
+                    job["last_run"] = {"id": run_id, "trigger": "schedule", "started_at": now_text, "session_ids": [], "error": message}
+                    job["updated_at"] = now_text
+                    persist_job(dict(job))
+                    logger.warning("Scheduled run of backup copy job '%s' failed: %s", job["id"], message)
+                    continue
                 tasks = create_copy_sessions(
                     normalized_job, trigger="schedule", run_id=run_id, scheduled_type=due_slots[0][1]
                 )

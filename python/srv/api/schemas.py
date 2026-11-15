@@ -335,7 +335,7 @@ class JobDTO(_LenientModel):
     vms: list[_Ref] | DocArray = []
     repository: _Ref
     source_job: _Ref | DocObject = None
-    backup_copy: DocObject = Field(default=None, description="Backup copy jobs only: copy_mode, source_jobs, source_repositories, run_after_job and retry")
+    backup_copy: DocObject = Field(default=None, description="Backup copy jobs only: copy_mode, source_jobs, source_repositories, run_after_job and retry; a source or run-after job that no longer exists carries missing: true")
     replication: DocObject = Field(default=None, description="Replication jobs only: source job and VM, target environment, host, datastore, network map, replica name, run_after_source, the replica: its VM, the restore point it is at and the time of the last successful update, and run_pending with pending_trigger (what asked for the next run and since when) when a trigger arrived while a run was going")
     schedule: ScheduleDTO | DocObject = None
     schedule_summary: str | None = None
@@ -633,7 +633,7 @@ class CatalogManifestDTO(_LenientModel):
 class SessionDTO(_LenientModel):
     id: str
     state: str
-    type: str | None = None
+    type: str | None = Field(default=None, description="backup, backup-copy (a session of a backup copy job), restore, verify, delete or replication")
     transport: DocStr = Field(default=None, description="vSphere sessions: vddk or soap, the transport the session reads or writes disks over; it keeps the one it started with")
     job: _Ref | DocObject = None
     vm_id: str | None = None
@@ -930,12 +930,13 @@ class UpdateRepositoryRequest(_LenientModel):
 
 VERIFY_SCHEDULE = (
     "When the job's backups are verified, in the form of a full schedule; each run checks the newest restore point of "
-    "every chain the job wrote, and every verify_whole_chain_every-th run checks whole chains. A run waits while the "
+    "every chain the job wrote and the points it builds on (the data a restore of it reads), and every "
+    "verify_whole_chain_every-th run checks whole chains. A run waits while the "
     "job backs up. null, none or omitted on create: no scheduled verify"
 )
 VERIFY_SCHEDULE_EDIT = "As on create; null or none removes it, omitted keeps it"
 VERIFY_STATE = "true or false switches the verify schedule on or off, keeping its settings; it needs a verify schedule"
-VERIFY_WHOLE_CHAIN_EVERY = "Every how many scheduled verify runs check whole chains instead of the newest restore point, 1 to 100; null or omitted on create: 4"
+VERIFY_WHOLE_CHAIN_EVERY = "Every how many scheduled verify runs check whole chains instead of the newest restore point and the points it builds on, 1 to 100; null or omitted on create: 4"
 
 
 class CreateJobRequest(_LenientModel):
@@ -987,9 +988,9 @@ class CreateCopyJobRequest(_LenientModel):
 
 
 COPY_MODE = "periodic copies the newest restore point of each VM on the job's schedule, merging what is new into one; immediate copies every new restore point as soon as a backup of a source creates it. null or omitted on create: periodic"
-COPY_SOURCE_JOBS = "Backup jobs whose restore points are copied, by name (case-insensitive); with source_job_ids, source_repositories and source_repository_ids, at least one source"
+COPY_SOURCE_JOBS = "Backup jobs whose restore points are copied, by name (case-insensitive), in order: a VM that several of them back up is copied from the first; with source_job_ids, source_repositories and source_repository_ids, at least one source"
 COPY_SOURCE_JOB_IDS = "Backup jobs whose restore points are copied, by ID"
-COPY_SOURCE_REPOSITORIES = "Repositories whose restore points are copied, every job's, by name (case-insensitive)"
+COPY_SOURCE_REPOSITORIES = "Repositories whose restore points are copied, by name (case-insensitive); a VM that several jobs back up is copied from one job: the first source job that backs it up, else the job created first"
 COPY_SOURCE_REPOSITORY_IDS = "Repositories whose restore points are copied, by ID"
 COPY_RUN_AFTER = "Periodic copies only: start the copy each time a run of this job finishes, by name or with run_after_job_id by ID; empty clears it"
 COPY_RETRY_COUNT = "Retries of a VM whose copy failed, 0 to 20, within the same session; null or omitted: 5 for periodic, 3 for immediate"
