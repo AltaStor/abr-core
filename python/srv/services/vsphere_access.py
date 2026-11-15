@@ -13,7 +13,14 @@ import logging
 import os
 from typing import Any
 
-from python.srv.core.mongo_db_wrapper import HYPERVISORS, catalog_records, persist_hypervisor
+from python.srv.core.mongo_db_wrapper import (
+    BACKUPS,
+    HYPERVISORS,
+    JOBS,
+    catalog_records,
+    persist_hypervisor,
+)
+from python.srv.core.server_defaults import shipped_default
 from python.srv.core.utils import utc_now
 from python.srv.plugins.vcenter import disk_transport
 from python.srv.services.api_errors import api_error
@@ -75,6 +82,8 @@ def settings_dto() -> dict[str, Any]:
             }
             for record in _vsphere_inventories()
         ],
+        "detected_vddk_libraries": disk_transport.detected_libraries(),
+        "confirmed": bool(settings["updated_by"]),
         "updated_at": settings["updated_at"],
         "updated_by": settings["updated_by"],
     }
@@ -127,7 +136,7 @@ def update_settings(payload: dict[str, Any], *, updated_by: str | None) -> tuple
                 f"The hypervisors cannot be moved to the server-wide API: {problem}",
                 transport=api,
             )
-    if changed or not disk_transport.global_settings_stored():
+    if changed or not disk_transport.global_settings_stored() or not current["updated_by"]:
         disk_transport.store_global_settings(api, library, updated_by=updated_by)
     updated: list[dict[str, str]] = []
     for record in handed_back:
@@ -147,16 +156,65 @@ def update_settings(payload: dict[str, Any], *, updated_by: str | None) -> tuple
     return settings_dto(), changed, updated
 
 
+def _fresh_install() -> bool:
+    return not (catalog_records(HYPERVISORS) or catalog_records(JOBS) or catalog_records(BACKUPS))
+
+
+def _starting_value(name: str, fresh: bool) -> str:
+    value = os.environ.get(name, "").strip()
+    if fresh or value != (shipped_default(name) or "").strip():
+        return value
+    return ""
+
+
+def _starting_library(text: str) -> tuple[str | None, str | None]:
+    if not text or text.lower() == "default":
+        return None, None
+    if text.lower() == disk_transport.OVDDK:
+        candidate = str(disk_transport.ovddk_library())
+        if disk_transport.library_problem(candidate):
+            return None, f"oVDDK is not installed ({candidate}), so the VDDK library follows the VDDK directory"
+    else:
+        candidate = text
+        problem = disk_transport.library_problem(candidate)
+        if problem:
+            return None, f"{disk_transport.LIBRARY_DEFAULT_VARIABLE}={text} is not used: {problem}; the VDDK library follows the VDDK directory"
+    if not disk_transport.disk_tool_takes_library_file():
+        return None, f"{disk_transport.library_unsupported_message()}; the VDDK library follows the VDDK directory"
+    if disk_transport.is_default_library(candidate):
+        return None, None
+    return os.path.normpath(candidate), None
+
+
+def starting_settings() -> tuple[str, str | None, list[str]]:
+    fresh = _fresh_install()
+    notes: list[str] = []
+    api_text = _starting_value(disk_transport.API_DEFAULT_VARIABLE, fresh)
+    try:
+        api = disk_transport.parse_api(api_text, field=disk_transport.API_DEFAULT_VARIABLE) or disk_transport.VDDK
+    except ValueError as exc:
+        notes.append(f"{exc}; the API starts as vddk")
+        api = disk_transport.VDDK
+    library, note = _starting_library(_starting_value(disk_transport.LIBRARY_DEFAULT_VARIABLE, fresh))
+    if note:
+        notes.append(note)
+    return api, library, notes
+
+
 def initialise() -> int:
     """Store the server-wide settings on the first start that has them, keeping what every inventory did.
 
-    The server-wide transport starts as the VDDK and the library follows the VDDK directory, which is how the
-    server worked before. Inventories carrying vddk, which every inventory got as its default before there was a
-    server-wide value, are handed back to it; one with soap keeps it. Returns how many were handed back.
+    They start from starting_settings(). Inventories carrying vddk, which every inventory got as its default
+    before there was a server-wide value, are handed back to it; one with soap keeps it. Returns how many were
+    handed back.
     """
     if disk_transport.global_settings_stored():
         return 0
-    disk_transport.store_global_settings(disk_transport.VDDK, None, updated_by=None)
+    api, library, notes = starting_settings()
+    for note in notes:
+        logger.warning("vSphere settings: %s", note)
+    disk_transport.store_global_settings(api, library, updated_by=None)
+    logger.info("The server-wide vSphere settings start as API %s, VDDK library %s.", api, library or "from the VDDK directory")
     handed_back = 0
     for record in _vsphere_inventories():
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}

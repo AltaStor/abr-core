@@ -250,8 +250,7 @@ async def lifespan(_: FastAPI):
             handed_back = vsphere_access.initialise()
             if handed_back:
                 logger.info(
-                    "%d vSphere inventory(ies) with the VDDK transport now follow the server-wide vSphere settings, "
-                    "which start as the VDDK with the library of the VDDK directory.",
+                    "%d vSphere inventory(ies) with the VDDK transport now follow the server-wide vSphere settings.",
                     handed_back,
                 )
         except Exception:
