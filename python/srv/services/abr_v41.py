@@ -1650,22 +1650,30 @@ def _inventory_endpoint_key(record: dict[str, Any]) -> tuple[str, int]:
     return host.strip().lower(), port
 
 
-def _inventory_transport_or_422(inventory_type: str, value: Any) -> str | None:
-    """An inventory's own transport, or None for inherit (the server-wide default) and an empty value."""
-    text = str(value or "").strip().lower()
-    if text in ("", disk_transport.INHERIT):
-        return None
-    try:
-        transport = disk_transport.parse_transport(text)
-    except ValueError as exc:
-        raise api_error(422, "invalid_inventory", f"Inventory {exc}, {disk_transport.INHERIT}") from exc
+def _inventory_api_or_422(inventory_type: str, payload: dict[str, Any]) -> str | None:
+    """A hypervisor's own API from ``api`` (or ABR-495's ``transport``), or None for inherit and an empty value."""
+    given = {field: payload[field] for field in ("api", "transport") if payload.get(field) is not None}
+    parsed: dict[str, str | None] = {}
+    for field, value in given.items():
+        try:
+            parsed[field] = disk_transport.parse_api(value, field=field, inherit_allowed=True)
+        except ValueError as exc:
+            raise api_error(422, "invalid_inventory", f"Inventory {exc}", fields={field: str(exc)}) from exc
     _ensure(
-        inventory_type == "vsphere",
+        len(set(parsed.values())) <= 1,
         422,
         "invalid_inventory",
-        "transport applies to vSphere inventories (vCenter or ESXi) only",
+        "api and transport name the same setting; give one of them, or the same value in both",
     )
-    return transport
+    api = next(iter(parsed.values()), None)
+    if api is not None:
+        _ensure(
+            inventory_type == "vsphere",
+            422,
+            "invalid_inventory",
+            f"{next(iter(parsed))} applies to vSphere inventories (vCenter or ESXi) only",
+        )
+    return api
 
 
 def _inventory_library_or_422(inventory_type: str, value: Any) -> str | None:
@@ -1683,19 +1691,25 @@ def _inventory_library_or_422(inventory_type: str, value: Any) -> str | None:
 
 
 def _apply_inventory_access(record: dict[str, Any], payload: dict[str, Any], *, creating: bool) -> bool:
-    """Set an inventory's own transport and VDDK library from the request; True when anything was asked for.
+    """Set a hypervisor's own API and VDDK library from the request; True when anything was asked for.
 
-    The transport the inventory ends up with must be one this server can use, and a VDDK library needs the VDDK.
+    ``api`` and ABR-495's ``transport`` are the same setting. The API the hypervisor ends up with must be one this
+    server can use, and a VDDK library needs the VDDK.
     """
-    asked = [key for key in ("transport", "vddk_library") if key in payload and (payload[key] is not None or creating)]
+    asked = [
+        key
+        for key in ("api", "transport", "vddk_library")
+        if key in payload and (payload[key] is not None or creating)
+    ]
     if not asked:
         return False
     inventory_type = inventory_type_from_record(record)
     metadata = dict(record.get("metadata") if isinstance(record.get("metadata"), dict) else {})
-    if "transport" in asked:
-        transport = _inventory_transport_or_422(inventory_type, payload["transport"])
-        if transport:
-            metadata["vsphere_transport"] = transport
+    api_asked = "api" in asked or "transport" in asked
+    if api_asked:
+        api = _inventory_api_or_422(inventory_type, payload)
+        if api:
+            metadata["vsphere_transport"] = api
         else:
             metadata.pop("vsphere_transport", None)
     if "vddk_library" in asked:
@@ -1708,17 +1722,17 @@ def _apply_inventory_access(record: dict[str, Any], payload: dict[str, Any], *, 
     if inventory_type != "vsphere":
         return True
     access = disk_transport.resolve_access(record)
-    if "vddk_library" in asked and metadata.get("vddk_library") and access["transport"] != disk_transport.VDDK:
+    if "vddk_library" in asked and metadata.get("vddk_library") and access["api"] != disk_transport.VDDK:
         message = (
-            "A VDDK library applies when the inventory uses the VDDK, and this one uses the vSphere SOAP API "
-            f"({disk_transport.SOURCE_NAMES[access['transport_source']]})"
+            "A VDDK library applies when the hypervisor uses the VDDK, and this one uses the vSphere SOAP API "
+            f"({disk_transport.SOURCE_NAMES[access['api_source']]})"
         )
         raise api_error(422, "invalid_vddk_library", message, fields={"vddk_library": message})
-    if "transport" in asked and metadata.get("vsphere_transport"):
-        transport = access["transport"]
+    if api_asked and metadata.get("vsphere_transport"):
+        api = access["api"]
         library = disk_transport.explicit_library(access["vddk_library"], access["vddk_library_source"])
-        problem = disk_transport.transport_problem(transport, library=library)
-        _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=transport)
+        problem = disk_transport.transport_problem(api, library=library)
+        _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=api, fields={"api": str(problem)})
     return True
 
 
@@ -1949,7 +1963,7 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
             _ensure(bool(new_name.strip()), 422, "invalid_inventory", "Inventory name must not be empty")
             _ensure_ascii_name(new_name, field="Inventory name", code="invalid_inventory")
         normalized = apply_inventory_updates(normalized, updates)
-    _ensure(any(key in payload for key in ("name", "address", "port", "protocol", "username", "password", "description", "token", "insecure", "transport", "vddk_library")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
+    _ensure(any(key in payload for key in ("name", "address", "port", "protocol", "username", "password", "description", "token", "insecure", "api", "transport", "vddk_library")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
     if connection_fields_changed(payload):
         try:
             normalized = _recheck_inventory_connection(normalized)
@@ -4672,8 +4686,8 @@ def _job_transport_view(job: dict[str, Any]) -> dict[str, Any]:
             access = disk_transport.resolve_access(target)
             return {
                 "transport": disk_transport.FROM_INVENTORY,
-                "effective_transport": access["transport"],
-                "transport_source": access["transport_source"],
+                "effective_transport": access["api"],
+                "api_source": access["api_source"],
             }
         return {}
     inventory = HYPERVISORS.get(str(job.get("inventory_id") or ""))
@@ -4682,8 +4696,8 @@ def _job_transport_view(job: dict[str, Any]) -> dict[str, Any]:
     access = disk_transport.resolve_access(inventory, job)
     return {
         "transport": disk_transport.job_transport(job) or disk_transport.FROM_INVENTORY,
-        "effective_transport": access["transport"],
-        "transport_source": access["transport_source"],
+        "effective_transport": access["api"],
+        "api_source": access["api_source"],
     }
 
 
@@ -7003,7 +7017,7 @@ def session_to_dto(task: dict[str, Any], *, include_logs: bool = True) -> dict[s
     if parameters.get("vsphere_transport"):
         dto["transport"] = parameters["vsphere_transport"]
         for key, field in (
-            ("vsphere_transport_source", "transport_source"),
+            ("vsphere_api_source", "api_source"),
             ("vddk_library", "vddk_library"),
             ("vddk_library_file", "vddk_library_file"),
             ("vddk_library_source", "vddk_library_source"),

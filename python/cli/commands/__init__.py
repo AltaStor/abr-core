@@ -11,6 +11,7 @@ from .repository_commands import RepositoryCommands
 from .restore_commands import RestoreCommands
 from .role_commands import RoleCommands
 from .session_commands import SessionCommands
+from .settings_commands import SettingsCommands
 from .system_commands import SystemCommands
 from .user_commands import UserCommands
 
@@ -25,6 +26,7 @@ __all__ = [
     "RestoreCommands",
     "RoleCommands",
     "SessionCommands",
+    "SettingsCommands",
     "SystemCommands",
     "UserCommands",
 ]

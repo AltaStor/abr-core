@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright © 2026 Norvitex OÜ
 
-"""The server-wide vSphere transport and VDDK library (GET and PUT /api/v1/system/vsphere).
+"""The server-wide vSphere API (VDDK or SOAP) and VDDK library (GET and PUT /api/v1/system/vsphere).
 
-Every vSphere inventory without its own value follows them; see plugins/vcenter/disk_transport.py for how a
-session resolves what it uses.
+Every vSphere hypervisor (inventory) without its own value follows them; see plugins/vcenter/disk_transport.py
+for how a session resolves what it uses.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def settings_dto() -> dict[str, Any]:
         disk_transport.SOAP: disk_transport.transport_problem(disk_transport.SOAP),
     }
     return {
-        "transport": settings["transport"],
+        "api": settings["api"],
         "vddk_library": settings["vddk_library"],
         "effective_vddk_library": library,
         "vddk_library_source": disk_transport.FROM_GLOBAL if settings["vddk_library"] else disk_transport.FROM_DIRECTORY,
@@ -64,14 +64,12 @@ def settings_dto() -> dict[str, Any]:
         "default_vddk_library": default_library,
         "default_vddk_library_file": disk_transport.resolved_file_name(default_library),
         "library_file_supported": disk_transport.disk_tool_takes_library_file(),
-        "transports": {
-            transport: {"available": problem is None, "problem": problem} for transport, problem in problems.items()
-        },
-        "inventories": [
+        "apis": {api: {"available": problem is None, "problem": problem} for api, problem in problems.items()},
+        "hypervisors": [
             {
                 "id": str(record.get("id") or ""),
                 "name": str(record.get("name") or ""),
-                "transport_setting": disk_transport.inventory_transport_setting(record) or disk_transport.INHERIT,
+                "api": disk_transport.inventory_transport_setting(record) or disk_transport.INHERIT,
                 "vddk_library": disk_transport.inventory_library_setting(record),
                 "has_own_settings": _has_own_settings(record),
             }
@@ -83,51 +81,54 @@ def settings_dto() -> dict[str, Any]:
 
 
 def update_settings(payload: dict[str, Any], *, updated_by: str | None) -> tuple[dict[str, Any], list[str], list[dict[str, str]]]:
-    """Change the server-wide transport and VDDK library.
+    """Change the server-wide API and VDDK library.
 
     A library left out keeps its value; null, an empty one or the path the VDDK directory gives anyway resets it,
-    so it follows the directory again. ``apply_to_existing_inventories`` removes the transport and VDDK library of
-    every vSphere inventory that has its own, so all of them use the server-wide values from now on. Returns the
-    settings, the fields that changed, and the inventories that were handed back to the server-wide values.
+    so it follows the directory again. ``apply_to_existing_hypervisors`` removes the API and VDDK library of every
+    vSphere hypervisor that has its own, so all of them use the server-wide values from now on. Returns the
+    settings, the fields that changed, and the hypervisors that were handed back to the server-wide values.
     """
     current = disk_transport.global_settings()
-    transport, library = current["transport"], current["vddk_library"]
+    api, library = current["api"], current["vddk_library"]
     changed: list[str] = []
-    if payload.get("transport") is not None:
-        text = str(payload["transport"]).strip().lower()
-        if text not in disk_transport.TRANSPORTS:
-            message = f"transport must be one of: {', '.join(disk_transport.TRANSPORTS)}"
-            raise api_error(422, "invalid_vsphere_settings", message, fields={"transport": message})
-        if text != transport:
-            transport = text
-            changed.append("transport")
+    if payload.get("api") is not None:
+        try:
+            requested_api = disk_transport.parse_api(payload["api"])
+        except ValueError as exc:
+            raise api_error(422, "invalid_vsphere_settings", str(exc), fields={"api": str(exc)}) from exc
+        if requested_api is None:
+            message = f"api must be one of: {', '.join(disk_transport.TRANSPORTS)}"
+            raise api_error(422, "invalid_vsphere_settings", message, fields={"api": message})
+        if requested_api != api:
+            api = requested_api
+            changed.append("api")
     if "vddk_library" in payload:
         text = str(payload["vddk_library"] or "").strip()
         requested = None if disk_transport.is_default_library(text) else vddk_library_or_error(text)
         if requested != library:
             library = requested
             changed.append("vddk_library")
-    if "transport" in changed:
+    if "api" in changed:
         explicit = disk_transport.explicit_library(library, disk_transport.FROM_GLOBAL)
-        problem = disk_transport.transport_problem(transport, library=explicit)
+        problem = disk_transport.transport_problem(api, library=explicit)
         if problem:
-            raise api_error(503, "transport_unavailable", problem, transport=transport, fields={"transport": problem})
+            raise api_error(503, "transport_unavailable", problem, transport=api, fields={"api": problem})
     handed_back = [record for record in _vsphere_inventories() if _has_own_settings(record)] if payload.get(
-        "apply_to_existing_inventories"
+        "apply_to_existing_hypervisors"
     ) else []
     if handed_back:
         problem = disk_transport.transport_problem(
-            transport, library=disk_transport.explicit_library(library, disk_transport.FROM_GLOBAL)
+            api, library=disk_transport.explicit_library(library, disk_transport.FROM_GLOBAL)
         )
         if problem:
             raise api_error(
                 503,
                 "transport_unavailable",
-                f"The inventories cannot be moved to the server-wide transport: {problem}",
-                transport=transport,
+                f"The hypervisors cannot be moved to the server-wide API: {problem}",
+                transport=api,
             )
     if changed or not disk_transport.global_settings_stored():
-        disk_transport.store_global_settings(transport, library, updated_by=updated_by)
+        disk_transport.store_global_settings(api, library, updated_by=updated_by)
     updated: list[dict[str, str]] = []
     for record in handed_back:
         metadata = dict(record.get("metadata") if isinstance(record.get("metadata"), dict) else {})
@@ -137,11 +138,11 @@ def update_settings(payload: dict[str, Any], *, updated_by: str | None) -> tuple
         updated.append({"id": str(record.get("id") or ""), "name": str(record.get("name") or "")})
     if changed or updated:
         logger.info(
-            "vSphere settings changed by %s: transport %s, VDDK library %s%s",
+            "vSphere settings changed by %s: API %s, VDDK library %s%s",
             updated_by or "an unknown user",
-            transport,
+            api,
             library or "from the VDDK directory",
-            f"; {len(updated)} inventory(ies) use them from now on: {', '.join(item['name'] for item in updated)}" if updated else "",
+            f"; {len(updated)} hypervisor(s) use them from now on: {', '.join(item['name'] for item in updated)}" if updated else "",
         )
     return settings_dto(), changed, updated
 

@@ -8,6 +8,8 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
+from python.cli.errors import CliStructuredError
+from python.cli.exit_codes import INVALID_USAGE
 from python.cli.parsing.parser_builder import build_parser
 from python.cli.services.job_service import JobService
 
@@ -40,6 +42,52 @@ class InventoryTransportCliTests(unittest.TestCase):
     def test_an_unknown_transport_is_refused_before_anything_is_sent(self) -> None:
         with self.assertRaises(SystemExit), patch("sys.stderr"):
             build_parser().parse_args(["inventory", "edit", "--id", "inv-1", "--transport", "nbd"])
+
+    def test_inventory_edit_sets_or_resets_the_api_and_the_vddk_library(self) -> None:
+        edit = ["inventory", "edit", "--id", "inv-1"]
+        self.assertEqual(
+            self._sent([*edit, "--api", "vddk", "--vddk-lib", "/opt/vddk/lib64/libvixDiskLib.so.9.1.0.0"], "patch"),
+            {"api": "vddk", "vddk_library": "/opt/vddk/lib64/libvixDiskLib.so.9.1.0.0"},
+        )
+        self.assertEqual(self._sent([*edit, "--reset-api", "--reset-vddk-lib"], "patch"), {"api": "inherit", "vddk_library": "inherit"})
+        for conflicting in (["--api", "soap", "--reset-api"], ["--api", "soap", "--transport", "soap"], ["--vddk-lib", "/x.so", "--reset-vddk-lib"]):
+            with self.subTest(conflicting=conflicting), self.assertRaises(SystemExit), patch("sys.stderr"):
+                build_parser().parse_args([*edit, *conflicting])
+
+
+class SettingsVsphereCliTests(unittest.TestCase):
+    SETTINGS = {"api": "vddk", "hypervisors": [{"id": "h1", "name": "esxi-edge", "has_own_settings": True}, {"id": "h2", "name": "vc", "has_own_settings": False}]}
+
+    def _run(self, *argv: str, tty: bool = False, answer: str = "") -> tuple[int, object]:
+        args = build_parser().parse_args(["--base-url", "http://127.0.0.1:8000", "--output", "json", "settings", "vsphere", "set", *argv])
+        with (
+            patch("python.cli.api.client.AltaStorApiClient.get", return_value=self.SETTINGS),
+            patch("python.cli.api.client.AltaStorApiClient.put", return_value={"api": "soap", "updated_hypervisors": [{"id": "h1", "name": "esxi-edge"}]}) as put,
+            patch("sys.stdin.isatty", return_value=tty),
+            patch("builtins.input", return_value=answer),
+            redirect_stdout(io.StringIO()),
+        ):
+            try:
+                code = args.handler(args)
+            except CliStructuredError as exc:
+                return exc.exit_code, exc
+        return code, put.call_args.kwargs["json"]
+
+    def test_set_sends_the_api_and_a_library_or_default(self) -> None:
+        self.assertEqual(self._run("--api", "soap"), (0, {"api": "soap"}))
+        self.assertEqual(self._run("--vddk-lib", "default"), (0, {"vddk_library": None}))
+
+    def test_updating_existing_hypervisors_asks_first_unless_yes(self) -> None:
+        self.assertEqual(self._run("--api", "soap", "--update-existing-hypervisors", "--yes")[1], {"api": "soap", "apply_to_existing_hypervisors": True})
+        code, refused = self._run("--api", "soap", "--update-existing-hypervisors")
+        self.assertEqual(code, INVALID_USAGE)
+        self.assertIn("esxi-edge", str(refused))
+        self.assertIn("--yes", str(refused))
+        self.assertEqual(self._run("--update-existing-hypervisors", tty=True, answer="y"), (0, {"apply_to_existing_hypervisors": True}))
+        self.assertEqual(self._run("--update-existing-hypervisors", tty=True, answer="n")[0], INVALID_USAGE)
+
+    def test_set_without_a_change_is_refused(self) -> None:
+        self.assertEqual(self._run()[0], INVALID_USAGE)
 
 
 class JobTransportCliTests(unittest.TestCase):
@@ -105,9 +153,10 @@ class TransportHelpTests(unittest.TestCase):
 
     def test_help_names_the_choices_and_what_they_mean(self) -> None:
         inventory = self._help("inventory", "add")
-        self.assertIn("--transport {vddk,soap,inherit}", inventory)
-        self.assertIn("inherit (the default) uses the server-wide transport", inventory)
-        self.assertIn("--vddk-library PATH|inherit", inventory)
+        self.assertIn("--api {vddk,soap}", inventory)
+        self.assertIn("without it the inventory uses the server-wide API", inventory)
+        self.assertIn("--transport {vddk,soap}", inventory)
+        self.assertIn("--vddk-lib PATH", inventory)
         job = self._help("job", "create")
         self.assertIn("--transport {vddk,soap,inventory}", job)
         self.assertIn("inventory (the default) uses it", job)

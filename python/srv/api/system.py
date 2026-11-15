@@ -157,26 +157,26 @@ def revert_tls_certificate(request: Request) -> TlsCertificateChangeDTO:
 
 
 def get_vsphere_settings() -> VsphereSettingsDTO:
-    """The server-wide vSphere transport and VDDK library, which every vSphere inventory without its own uses,
-    with the VDDK directory the library falls back to, whether this server can use each transport, and the
-    inventories that have their own values."""
+    """The server-wide vSphere API (vddk or soap) and VDDK library, which every vSphere hypervisor (inventory)
+    without its own uses, with the VDDK directory the library falls back to, whether this server can use each
+    API, and the hypervisors that have their own values."""
     return vsphere_access.settings_dto()
 
 
 def update_vsphere_settings(
     request: Request, payload: VsphereSettingsRequest = Body(default_factory=VsphereSettingsRequest)
 ) -> VsphereSettingsDTO:
-    """Change the server-wide vSphere transport and VDDK library. A library is checked on this server: a full
-    path to a readable file that exports VixDiskLib_InitEx (422 invalid_vddk_library, the problem in
-    `error.details.fields.vddk_library`). A transport this server cannot use is refused (503
-    transport_unavailable). Running sessions keep what they started with."""
+    """Change the server-wide vSphere API and VDDK library. A library is checked on this server: a full path to
+    a readable file that exports VixDiskLib_InitEx (422 invalid_vddk_library, the problem in
+    `error.details.fields.vddk_library`). An API this server cannot use is refused (503 transport_unavailable,
+    the problem in `error.details.fields.api`). Running sessions keep what they started with."""
     settings, changed, updated = vsphere_access.update_settings(
         unset_excluded(payload), updated_by=getattr(request.state, "user_name", None)
     )
     request.state.audit.details["changed"] = changed
     if updated:
-        request.state.audit.details["updated_inventories"] = [item["name"] for item in updated]
-    return {**settings, "updated_inventories": updated}
+        request.state.audit.details["updated_hypervisors"] = [item["name"] for item in updated]
+    return {**settings, "updated_hypervisors": updated}
 
 
 register(router, [

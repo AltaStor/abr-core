@@ -217,18 +217,25 @@ class InventoryTransportTests(_Catalog):
         with patch.object(vsphere_access, "persist_hypervisor", side_effect=lambda record: HYPERVISORS.__setitem__(record["id"], record)):
             self.assertEqual(vsphere_access.initialise(), 1)
             self.assertEqual(vsphere_access.initialise(), 0)
-        self.assertEqual(disk_transport.global_settings()["transport"], "vddk")
+        self.assertEqual(disk_transport.global_settings()["api"], "vddk")
         self.assertIsNone(disk_transport.global_settings()["vddk_library"])
         self.assertNotIn("vsphere_transport", HYPERVISORS[vddk["id"]]["metadata"])
         self.assertEqual(HYPERVISORS[soap["id"]]["metadata"]["vsphere_transport"], "soap")
         self.assertEqual(abr_v41.resolve_inventory(record_id=vddk["id"])["transport"], "vddk")
 
     def test_inherit_hands_the_transport_back_to_the_server_wide_one(self) -> None:
-        inventory = self._vsphere(transport="soap")
-        self.assertEqual((inventory["transport_setting"], inventory["transport_source"]), ("soap", "inventory"))
-        edited = abr_v41.edit_inventory_record(inventory["id"], {"transport": "inherit"})
-        self.assertEqual((edited["transport"], edited["transport_setting"], edited["transport_source"]), ("vddk", "inherit", "global"))
+        inventory = self._vsphere(api="soap")
+        self.assertEqual((inventory["api"], inventory["effective_api"], inventory["api_source"]), ("soap", "soap", "hypervisor"))
+        edited = abr_v41.edit_inventory_record(inventory["id"], {"api": "inherit"})
+        self.assertEqual(
+            (edited["transport"], edited["api"], edited["effective_api"], edited["api_source"]), ("vddk", "inherit", "vddk", "global")
+        )
         self.assertNotIn("vsphere_transport", HYPERVISORS[inventory["id"]]["metadata"])
+
+    def test_api_and_its_earlier_name_transport_must_agree(self) -> None:
+        self.assertEqual(self._vsphere(api="soap", transport="soap")["api"], "soap")
+        error = self._refused(self._vsphere, "vc2", api="soap", transport="vddk")
+        self.assertIn("api and transport name the same setting", error.message)
 
 
 class JobTransportTests(_Catalog):
@@ -368,7 +375,7 @@ class AccessResolutionTests(unittest.TestCase):
 
     def test_nothing_set_falls_back_to_the_vddk_directory(self) -> None:
         self.assertEqual(self._library(self._inventory()), (self.default, "vddk_directory"))
-        self.assertEqual(disk_transport.resolve_access(self._inventory())["transport_source"], "global")
+        self.assertEqual(disk_transport.resolve_access(self._inventory())["api_source"], "global")
 
     def test_the_server_wide_library_applies_to_inventories_without_their_own(self) -> None:
         disk_transport.store_global_settings("vddk", self.server, updated_by="admin")
@@ -376,20 +383,20 @@ class AccessResolutionTests(unittest.TestCase):
 
     def test_the_inventory_library_wins_over_the_server_wide_one(self) -> None:
         own = self._inventory(vddk_library=self.own)
-        self.assertEqual(self._library(own), (self.own, "inventory"))
+        self.assertEqual(self._library(own), (self.own, "hypervisor"))
         disk_transport.store_global_settings("vddk", self.server, updated_by="admin")
-        self.assertEqual(self._library(own), (self.own, "inventory"))
+        self.assertEqual(self._library(own), (self.own, "hypervisor"))
 
     def test_the_transport_comes_from_the_job_then_the_inventory_then_the_server(self) -> None:
         disk_transport.store_global_settings("soap", None, updated_by="admin")
         inventory = self._inventory()
-        self.assertEqual(disk_transport.resolve_access(inventory)["transport"], "soap")
+        self.assertEqual(disk_transport.resolve_access(inventory)["api"], "soap")
         inventory["metadata"]["vsphere_transport"] = "vddk"
-        self.assertEqual(disk_transport.resolve_access(inventory)["transport_source"], "inventory")
+        self.assertEqual(disk_transport.resolve_access(inventory)["api_source"], "hypervisor")
         job = {"task_parameters": {"vsphere_transport": "soap"}}
         self.assertEqual(
-            {key: disk_transport.resolve_access(inventory, job)[key] for key in ("transport", "transport_source")},
-            {"transport": "soap", "transport_source": "job"},
+            {key: disk_transport.resolve_access(inventory, job)[key] for key in ("api", "api_source")},
+            {"api": "soap", "api_source": "job"},
         )
 
     def test_a_library_passes_only_the_library_variable_whatever_the_service_has(self) -> None:
@@ -410,7 +417,7 @@ class AccessResolutionTests(unittest.TestCase):
 
     def test_soap_passes_neither_and_a_session_from_before_keeps_the_service_environment(self) -> None:
         parameters = disk_transport.session_parameters(self._inventory(vsphere_transport="soap", vddk_library=self.own))
-        self.assertEqual(parameters, {"vsphere_transport": "soap", "vsphere_transport_source": "inventory"})
+        self.assertEqual(parameters, {"vsphere_transport": "soap", "vsphere_api_source": "hypervisor"})
         service = {"ABR_VMDK_TOOL_VDDK_DIR": "/opt/vddk", "ABR_VMDK_TOOL_VDDK_LIB": "/old.so"}
         self.assertEqual(disk_transport.tool_environment(parameters, base=service), {})
         self.assertIsNone(disk_transport.tool_environment({"vsphere_transport": "vddk"}, base=service))
@@ -455,10 +462,10 @@ class ServerWideSettingsTests(_Catalog):
         own = self._vsphere(transport="soap")
         self._vsphere("vc2")
         _settings, _changed, updated = vsphere_access.update_settings(
-            {"transport": "vddk", "apply_to_existing_inventories": True}, updated_by="admin"
+            {"api": "vddk", "apply_to_existing_hypervisors": True}, updated_by="admin"
         )
         self.assertEqual(updated, [{"id": own["id"], "name": "vc"}])
-        self.assertEqual(abr_v41.resolve_inventory(record_id=own["id"])["transport_source"], "global")
+        self.assertEqual(abr_v41.resolve_inventory(record_id=own["id"])["api_source"], "global")
 
     def test_the_directory_default_or_null_resets_the_library(self) -> None:
         vsphere_access.update_settings({"vddk_library": self.library}, updated_by="admin")
@@ -481,7 +488,7 @@ class ServerWideSettingsTests(_Catalog):
         error = self._refused(self._vsphere, transport="soap", vddk_library=self.library)
         self.assertEqual(error.code, "invalid_vddk_library")
         inventory = self._vsphere(vddk_library=self.library)
-        self.assertEqual((inventory["vddk_library"], inventory["vddk_library_source"]), (self.library, "inventory"))
+        self.assertEqual((inventory["vddk_library"], inventory["vddk_library_source"]), (self.library, "hypervisor"))
         cleared = abr_v41.edit_inventory_record(inventory["id"], {"vddk_library": "inherit"})
         self.assertEqual((cleared["vddk_library"], cleared["vddk_library_source"]), (None, "vddk_directory"))
 
@@ -490,18 +497,18 @@ class ServerWideSettingsTests(_Catalog):
         parameters = abr_v41.session_transport_parameters(HYPERVISORS[inventory["id"]])
         dto = abr_v41.session_to_dto({"id": "t1", "task_type": "backup", "status": "running", "parameters": parameters, "result": {}})
         self.assertEqual(
-            {key: dto[key] for key in ("transport", "transport_source", "vddk_library", "vddk_library_file", "vddk_library_source")},
+            {key: dto[key] for key in ("transport", "api_source", "vddk_library", "vddk_library_file", "vddk_library_source")},
             {
                 "transport": "vddk",
-                "transport_source": "global",
+                "api_source": "global",
                 "vddk_library": self.library,
                 "vddk_library_file": "libvixDiskLib.so",
-                "vddk_library_source": "inventory",
+                "vddk_library_source": "hypervisor",
             },
         )
         self.assertEqual(
             disk_transport.describe_access(parameters, verb="read"),
-            f"Disks are read over VDDK (the server-wide default), with the VDDK library {self.library} (set for this inventory)",
+            f"Disks are read over VDDK (the server-wide default), with the VDDK library {self.library} (set for the hypervisor)",
         )
 
 

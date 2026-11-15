@@ -327,7 +327,7 @@ class JobDTO(_LenientModel):
     job_type: str
     transport: DocStr = Field(default=None, description="vSphere jobs: vddk, soap, or inventory when the job uses its inventory's transport")
     effective_transport: DocStr = Field(default=None, description="vSphere jobs: the transport its sessions use, vddk or soap")
-    transport_source: DocStr = Field(default=None, description="vSphere jobs: where effective_transport comes from, job (set for the job), inventory (set for the inventory) or global (the server-wide default)")
+    api_source: DocStr = Field(default=None, description="vSphere jobs: where effective_transport comes from, job (set for the job), hypervisor (set for the inventory) or global (the server-wide default)")
     description: str | None = None
     inventory: _Ref
     vm_ids: list[str] = []
@@ -403,12 +403,13 @@ class InventoryDTO(_LenientModel):
     name: str
     type: str
     status: str
-    transport: DocStr = Field(default=None, description="vSphere only: vddk or soap, how disks are read and written now")
-    transport_setting: DocStr = Field(default=None, description="vSphere only: the inventory's own transport, vddk or soap, or inherit when it uses the server-wide one")
-    transport_source: DocStr = Field(default=None, description="vSphere only: where transport comes from, inventory or global")
-    vddk_library: DocStrOrNull = Field(default=None, description="vSphere only: the inventory's own VDDK library file, or null when it uses the server-wide one")
+    transport: DocStr = Field(default=None, description="vSphere only: vddk or soap, how disks are read and written now (the same as effective_api)")
+    api: DocStr = Field(default=None, description="vSphere only: the hypervisor's own API, vddk or soap, or inherit when it uses the server-wide one")
+    effective_api: DocStr = Field(default=None, description="vSphere only: the API its sessions use, vddk or soap")
+    api_source: DocStr = Field(default=None, description="vSphere only: where effective_api comes from, hypervisor or global")
+    vddk_library: DocStrOrNull = Field(default=None, description="vSphere only: the hypervisor's own VDDK library file, or null when it uses the server-wide one")
     effective_vddk_library: DocStr = Field(default=None, description="vSphere only: the VDDK library file its VDDK sessions use")
-    vddk_library_source: DocStr = Field(default=None, description="vSphere only: where effective_vddk_library comes from, inventory, global, or vddk_directory (the VDDK directory's lib64/libvixDiskLib.so)")
+    vddk_library_source: DocStr = Field(default=None, description="vSphere only: where effective_vddk_library comes from, hypervisor, global, or vddk_directory (the VDDK directory's lib64/libvixDiskLib.so, the fallback)")
     vddk_library_file: DocStrOrNull = Field(default=None, description="vSphere only: the file effective_vddk_library resolves to, e.g. libvixDiskLib.so.9.1.0.0; null when there is none")
     created_at: str
     updated_at: str
@@ -642,10 +643,10 @@ class SessionDTO(_LenientModel):
     state: str
     type: str | None = Field(default=None, description="backup, backup-copy (a session of a backup copy job), restore, verify, delete or replication")
     transport: DocStr = Field(default=None, description="vSphere sessions: vddk or soap, the transport the session reads or writes disks over; it keeps the one it started with")
-    transport_source: DocStr = Field(default=None, description="vSphere sessions: where transport came from, job (set for the job), inventory (set for the inventory) or global (the server-wide default)")
+    api_source: DocStr = Field(default=None, description="vSphere sessions: where transport came from, job (set for the job), hypervisor (set for the inventory) or global (the server-wide default)")
     vddk_library: DocStr = Field(default=None, description="VDDK sessions: the VDDK library file the session uses")
     vddk_library_file: DocStr = Field(default=None, description="VDDK sessions: the file vddk_library resolved to when the session was created, e.g. libvixDiskLib.so.9.1.0.0")
-    vddk_library_source: DocStr = Field(default=None, description="VDDK sessions: where vddk_library came from, inventory, global, or vddk_directory (the VDDK directory's lib64/libvixDiskLib.so)")
+    vddk_library_source: DocStr = Field(default=None, description="VDDK sessions: where vddk_library came from, hypervisor, global, or vddk_directory (the VDDK directory's lib64/libvixDiskLib.so, the fallback)")
     job: _Ref | DocObject = None
     vm_id: str | None = None
     started_at: str | None = None
@@ -876,7 +877,8 @@ class CreateInventoryRequest(_LenientModel):
     token: LaxStr | None = None
     insecure: LaxBool | None = Field(default=None, description="true accepts the server's certificate without checking it; false, null or omitted checks it")
     description: LaxStr | None = None
-    transport: LaxStr | None = Field(default=None, description="vSphere only: how disks are read and written, vddk (the VMware VDDK) or soap (the vSphere SOAP API through abr-vmdk-tool); inherit or omitted uses the server-wide transport (GET /system/vsphere)")
+    api: LaxStr | None = Field(default=None, description="vSphere only: how disks are read and written, vddk (the VMware VDDK) or soap (the vSphere SOAP API through abr-vmdk-tool); inherit or omitted uses the server-wide API (GET /system/vsphere)")
+    transport: LaxStr | None = Field(default=None, description="The same as api (its earlier name); give one of them")
     vddk_library: LaxStr | None = Field(default=None, description="vSphere only: the full path of the VDDK library file on the backup server, which must export VixDiskLib_InitEx; inherit, empty or omitted uses the server-wide one")
 
 
@@ -890,7 +892,8 @@ class UpdateInventoryRequest(_LenientModel):
     token: LaxStr | None = None
     insecure: LaxBool | None = Field(default=None, description=f"{INSECURE}; {OMITTED_KEEPS}")
     description: LaxStr | None = None
-    transport: LaxStr | None = Field(default=None, description=f"vSphere only: vddk or soap, or inherit to use the server-wide transport; {OMITTED_KEEPS}")
+    api: LaxStr | None = Field(default=None, description=f"vSphere only: vddk or soap, or inherit to use the server-wide API; {OMITTED_KEEPS}")
+    transport: LaxStr | None = Field(default=None, description="The same as api (its earlier name); give one of them")
     vddk_library: LaxStr | None = Field(default=None, description=f"vSphere only: the full path of a VDDK library file on the backup server, or inherit (or empty) to use the server-wide one; {OMITTED_KEEPS}")
 
 
@@ -1994,16 +1997,16 @@ class VsphereTransportAvailabilityDTO(_LenientModel):
     problem: DocStrOrNull = Field(default=None, description="Why this server cannot use the transport now, or null")
 
 
-class VsphereInventorySettingsDTO(_LenientModel):
+class VsphereHypervisorSettingsDTO(_LenientModel):
     id: DocStr = None
     name: DocStr = None
-    transport_setting: DocStr = Field(default=None, description="vddk, soap, or inherit")
-    vddk_library: DocStrOrNull = Field(default=None, description="The inventory's own VDDK library file, or null")
-    has_own_settings: DocBool = Field(default=None, description="true when apply_to_existing_inventories would hand it back to the server-wide values")
+    api: DocStr = Field(default=None, description="vddk, soap, or inherit")
+    vddk_library: DocStrOrNull = Field(default=None, description="The hypervisor's own VDDK library file, or null")
+    has_own_settings: DocBool = Field(default=None, description="true when apply_to_existing_hypervisors would hand it back to the server-wide values")
 
 
 class VsphereSettingsDTO(_LenientModel):
-    transport: DocStr = Field(default=None, description="The server-wide transport, vddk or soap, for every vSphere inventory without its own")
+    api: DocStr = Field(default=None, description="The server-wide API, vddk or soap, for every vSphere hypervisor without its own")
     vddk_library: DocStrOrNull = Field(default=None, description="The server-wide VDDK library file, or null when it follows the VDDK directory")
     effective_vddk_library: DocStr = Field(default=None, description="The VDDK library file inventories without their own use")
     vddk_library_source: DocStr = Field(default=None, description="global, or vddk_directory when the library follows the VDDK directory")
@@ -2013,14 +2016,14 @@ class VsphereSettingsDTO(_LenientModel):
     default_vddk_library: DocStr = Field(default=None, description="<vddk_directory>/lib64/libvixDiskLib.so, which the library resets to")
     default_vddk_library_file: DocStrOrNull = Field(default=None, description="The file default_vddk_library resolves to, or null when it is missing")
     library_file_supported: DocBool = Field(default=None, description="false when this server's abr-vmdk-tool is too old to take a VDDK library file")
-    transports: SkipValidation[dict[str, VsphereTransportAvailabilityDTO]] | None = Field(default=None, description="vddk and soap: whether this server can use each now")
-    inventories: SkipValidation[list[VsphereInventorySettingsDTO]] | None = Field(default=None, description="Every vSphere inventory with its own values")
+    apis: SkipValidation[dict[str, VsphereTransportAvailabilityDTO]] | None = Field(default=None, description="vddk and soap: whether this server can use each now")
+    hypervisors: SkipValidation[list[VsphereHypervisorSettingsDTO]] | None = Field(default=None, description="Every vSphere hypervisor (inventory) with its own values")
     updated_at: DocStrOrNull = None
     updated_by: DocStrOrNull = None
-    updated_inventories: DocObjectArray = Field(default=None, description="PUT only: the inventories apply_to_existing_inventories handed back, {id, name} each")
+    updated_hypervisors: DocObjectArray = Field(default=None, description="PUT only: the hypervisors apply_to_existing_hypervisors handed back, {id, name} each")
 
 
 class VsphereSettingsRequest(_LenientModel):
-    transport: LaxStr | None = Field(default=None, description="vddk or soap; omitted keeps it")
+    api: LaxStr | None = Field(default=None, description="vddk or soap; omitted keeps it")
     vddk_library: LaxStr | None = Field(default=None, description="The full path of a VDDK library file on the backup server, which must export VixDiskLib_InitEx. null or empty resets it to follow the VDDK directory, and so does that directory's own lib64/libvixDiskLib.so; omitted keeps it")
-    apply_to_existing_inventories: LaxBool | None = Field(default=None, description="true removes the transport and VDDK library of every vSphere inventory that has its own, so they all use these values from now on")
+    apply_to_existing_hypervisors: LaxBool | None = Field(default=None, description="true removes the API and VDDK library of every vSphere hypervisor that has its own, so they all use these values from now on")

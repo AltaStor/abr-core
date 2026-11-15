@@ -43,7 +43,7 @@ SETTINGS_ID = "vsphere_access"
 # What a session records about how it reaches the disks.
 SESSION_KEYS = (
     "vsphere_transport",
-    "vsphere_transport_source",
+    "vsphere_api_source",
     "vddk_library",
     "vddk_library_source",
     "vddk_library_file",
@@ -51,8 +51,9 @@ SESSION_KEYS = (
     "vddk_variable",
 )
 
-# Where a resolved value comes from. FROM_INVENTORY above is one of them.
+# Where a resolved value comes from. (FROM_INVENTORY is ABR-495's job value "use the inventory's transport".)
 FROM_JOB = "job"
+FROM_HYPERVISOR = "hypervisor"
 FROM_GLOBAL = "global"
 FROM_DIRECTORY = "vddk_directory"
 # Where the VDDK directory comes from.
@@ -61,7 +62,7 @@ DIRECTORY_DEFAULT = "default"
 
 SOURCE_NAMES = {
     FROM_JOB: "set for this job",
-    FROM_INVENTORY: "set for this inventory",
+    FROM_HYPERVISOR: "set for the hypervisor",
     FROM_GLOBAL: "the server-wide default",
     FROM_DIRECTORY: "from the VDDK directory",
 }
@@ -75,6 +76,17 @@ def parse_transport(value: Any, *, inventory_allowed: bool = False) -> str | Non
     if text not in allowed:
         raise ValueError(f"transport must be one of: {', '.join(allowed)}")
     return None if text == FROM_INVENTORY else text
+
+
+def parse_api(value: Any, *, field: str = "api", inherit_allowed: bool = False) -> str | None:
+    """vddk or soap; None for inherit (where allowed) and an empty value."""
+    text = str(value or "").strip().lower()
+    if not text or (inherit_allowed and text == INHERIT):
+        return None
+    if text not in TRANSPORTS:
+        allowed = (*TRANSPORTS, INHERIT) if inherit_allowed else TRANSPORTS
+        raise ValueError(f"{field} must be one of: {', '.join(allowed)}")
+    return text
 
 
 def _metadata(record: dict[str, Any] | None) -> dict[str, Any]:
@@ -100,22 +112,22 @@ def job_transport(job: dict[str, Any] | None) -> str | None:
 
 
 def global_settings() -> dict[str, Any]:
-    """The server-wide transport and VDDK library. Nothing stored means the VDDK and the VDDK directory."""
+    """The server-wide API and VDDK library. Nothing stored means the VDDK and the VDDK directory."""
     stored = load_system_state(SETTINGS_ID) or {}
-    transport = str(stored.get("transport") or "")
+    api = str(stored.get("api") or stored.get("transport") or "")
     return {
-        "transport": transport if transport in TRANSPORTS else VDDK,
+        "api": api if api in TRANSPORTS else VDDK,
         "vddk_library": str(stored.get("vddk_library") or "").strip() or None,
         "updated_at": stored.get("updated_at"),
         "updated_by": stored.get("updated_by"),
     }
 
 
-def store_global_settings(transport: str, vddk_library: str | None, *, updated_by: str | None) -> None:
+def store_global_settings(api: str, vddk_library: str | None, *, updated_by: str | None) -> None:
     persist_system_state(
         {
             "id": SETTINGS_ID,
-            "transport": transport,
+            "api": api,
             "vddk_library": vddk_library,
             "updated_at": utc_now(),
             "updated_by": updated_by,
@@ -128,7 +140,7 @@ def global_settings_stored() -> bool:
 
 
 def inventory_transport(record: dict[str, Any] | None, settings: dict[str, Any] | None = None) -> str:
-    return inventory_transport_setting(record) or (settings or global_settings())["transport"]
+    return inventory_transport_setting(record) or (settings or global_settings())["api"]
 
 
 def session_transport(job: dict[str, Any] | None, inventory: dict[str, Any] | None) -> str:
@@ -286,7 +298,7 @@ def resolve_library(
     """The VDDK library for an inventory, and where it comes from."""
     own = inventory_library_setting(inventory)
     if own:
-        return own, FROM_INVENTORY
+        return own, FROM_HYPERVISOR
     configured = (settings or global_settings())["vddk_library"]
     if configured:
         return configured, FROM_GLOBAL
@@ -301,15 +313,15 @@ def resolve_access(
 ) -> dict[str, Any]:
     settings = settings or global_settings()
     if job_transport(job):
-        transport, transport_source = job_transport(job), FROM_JOB
+        api, api_source = job_transport(job), FROM_JOB
     elif inventory_transport_setting(inventory):
-        transport, transport_source = inventory_transport_setting(inventory), FROM_INVENTORY
+        api, api_source = inventory_transport_setting(inventory), FROM_HYPERVISOR
     else:
-        transport, transport_source = settings["transport"], FROM_GLOBAL
+        api, api_source = settings["api"], FROM_GLOBAL
     library, library_source = resolve_library(inventory, settings, tool_path)
     return {
-        "transport": transport,
-        "transport_source": transport_source,
+        "api": api,
+        "api_source": api_source,
         "vddk_library": library,
         "vddk_library_source": library_source,
         "vddk_library_file": resolved_file_name(library),
@@ -317,12 +329,16 @@ def resolve_access(
 
 
 def inventory_view(record: dict[str, Any] | None, settings: dict[str, Any] | None = None) -> dict[str, Any]:
-    """What a vSphere inventory shows: its own values (None means the server-wide one) and what is in effect."""
+    """What a vSphere inventory shows: its own values (inherit / None: the server-wide one) and what is in effect.
+
+    ``transport`` is ABR-495's name for the API in effect, kept for the clients that read it.
+    """
     access = resolve_access(record, settings=settings or global_settings())
     return {
-        "transport": access["transport"],
-        "transport_setting": inventory_transport_setting(record) or INHERIT,
-        "transport_source": access["transport_source"],
+        "transport": access["api"],
+        "api": inventory_transport_setting(record) or INHERIT,
+        "effective_api": access["api"],
+        "api_source": access["api_source"],
         "vddk_library": inventory_library_setting(record),
         "effective_vddk_library": access["vddk_library"],
         "vddk_library_source": access["vddk_library_source"],
@@ -332,7 +348,7 @@ def inventory_view(record: dict[str, Any] | None, settings: dict[str, Any] | Non
 
 def explicit_library(library: str | None, source: str | None, tool_path: Path | None = None) -> str | None:
     """The library to hand over as ABR_VMDK_TOOL_VDDK_LIB, or None when the VDDK directory gives it."""
-    if source not in (FROM_INVENTORY, FROM_GLOBAL) or is_default_library(library, tool_path):
+    if source not in (FROM_HYPERVISOR, FROM_GLOBAL) or is_default_library(library, tool_path):
         return None
     return library
 
@@ -342,8 +358,8 @@ def session_parameters(
 ) -> dict[str, str]:
     """What a session records when it is created, so a later change never touches it."""
     access = resolve_access(inventory, job, tool_path=tool_path)
-    parameters = {"vsphere_transport": access["transport"], "vsphere_transport_source": access["transport_source"]}
-    if access["transport"] != VDDK:
+    parameters = {"vsphere_transport": access["api"], "vsphere_api_source": access["api_source"]}
+    if access["api"] != VDDK:
         return parameters
     parameters["vddk_library"] = access["vddk_library"]
     parameters["vddk_library_source"] = access["vddk_library_source"]
@@ -377,7 +393,7 @@ def tool_environment(parameters: Mapping[str, Any] | None, base: Mapping[str, st
     no VDDK over SOAP.
     """
     parameters = parameters or {}
-    if not parameters.get("vsphere_transport_source"):
+    if not parameters.get("vsphere_api_source"):
         return None
     environment = dict(os.environ if base is None else base)
     environment.pop(LIBRARY_VARIABLE, None)
@@ -408,7 +424,7 @@ def describe_access(parameters: Mapping[str, Any] | None, *, verb: str) -> str:
     parameters = parameters or {}
     transport = str(parameters.get("vsphere_transport") or VDDK)
     text = f"Disks are {verb} over {TRANSPORT_NAMES.get(transport, transport)}"
-    source = SOURCE_NAMES.get(str(parameters.get("vsphere_transport_source") or ""))
+    source = SOURCE_NAMES.get(str(parameters.get("vsphere_api_source") or ""))
     if source:
         text += f" ({source})"
     library = parameters.get("vddk_library")

@@ -8,22 +8,24 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
 
 ### Added
 
-- Server-wide and per-inventory choice of the vSphere transport (VDDK or the
-  vSphere SOAP API) and of the VDDK library file, so VMware's VDDK, openVDDK or
-  our oVDDK build can be used. `GET`/`PUT /api/v1/system/vsphere` (transport,
-  vddk_library, apply_to_existing_inventories) and `abr system vsphere
-  show|set`; `transport` (now also `inherit`) and `vddk_library` on
-  `POST`/`PATCH /api/v1/inventories` and `abr inventory add|edit`. A library
-  is checked on the server: a full path to a readable file that exports
-  `VixDiskLib_InitEx`. Unset, the library is `lib64/libvixDiskLib.so` of the
-  VDDK directory (`ABR_VMDK_TOOL_VDDK_DIR`, or the vddk folder next to
-  abr-vmdk-tool). Each session records the transport, library, resolved file
-  name and where each came from; session, job and inventory info show them, and
-  abr-vmdk-tool gets exactly one of `ABR_VMDK_TOOL_VDDK_LIB` and
-  `ABR_VMDK_TOOL_VDDK_DIR`, or neither over SOAP, whatever the service's own
-  environment has. On the first start the server-wide transport is VDDK and the
-  inventories that carried the old `vddk` default follow it, so nothing changes.
-  Needs abr-disk-tools a14e078 or later for a library file.
+- Server-wide and per-hypervisor choice of the vSphere API (VDDK or the
+  vSphere SOAP API) and of the VDDK library file, so VMware's VDDK, openVDDK
+  or our oVDDK build can be used. `GET`/`PUT /api/v1/system/vsphere` (api,
+  vddk_library, apply_to_existing_hypervisors) and `abr settings vsphere
+  show|set`; `api` (vddk, soap or inherit; `transport` is its earlier name and
+  still works) and `vddk_library` on `POST`/`PATCH /api/v1/inventories`, and
+  `--api`, `--vddk-lib`, `--reset-api` and `--reset-vddk-lib` on `abr
+  inventory add|edit`. A library is checked on the server: a full path to a
+  readable file that exports `VixDiskLib_InitEx`. Unset, the library is
+  `lib64/libvixDiskLib.so` of the VDDK directory (`ABR_VMDK_TOOL_VDDK_DIR`, or
+  the vddk folder next to abr-vmdk-tool). Each session records the transport,
+  library, resolved file name and where each came from; session, job and
+  inventory info show them, and abr-vmdk-tool gets exactly one of
+  `ABR_VMDK_TOOL_VDDK_LIB` and `ABR_VMDK_TOOL_VDDK_DIR`, or neither over SOAP,
+  whatever the service's own environment has. On the first start the
+  server-wide API is VDDK and the inventories that carried the old `vddk`
+  default follow it, so nothing changes. Needs abr-disk-tools a14e078 or later
+  for a library file.
 
 - Two-factor sign-in with an authenticator app such as Google Authenticator or
   Microsoft Authenticator (TOTP, RFC 6238), optional and per user, set up and
