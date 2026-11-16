@@ -456,6 +456,68 @@ class CopyJobSettingsTests(_Catalog):
         self.assertEqual(clone["backup_copy"]["retry"]["count"], 4)
 
 
+class CopyCycleTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        for repo_id, name in (("dst2", "Second"), ("dst3", "Third"), ("dst4", "Fourth")):
+            REPOSITORIES[repo_id] = {"id": repo_id, "name": name, "type": "local", "path": tempfile.mkdtemp()}
+        self.a = self._copy_job(name="A")
+        self.c2 = self._copy_job(name="C2", source_jobs=["A"], repo="Second")
+
+    def _cycle(self, call) -> str:
+        error = self._refused(call)
+        self.assertEqual(error.code, "backup_copy_cycle")
+        return error.message
+
+    def test_a_copy_job_cannot_copy_from_a_copy_job_that_copies_it(self) -> None:
+        message = self._cycle(lambda: abr_v41.edit_job_record(self.a["id"], {"source_jobs": ["C2"]}))
+
+        self.assertIn("A backup copy job cannot copy its own restore points, also not through other jobs: A copies from C2; C2 copies from A", message)
+        self.assertEqual(JOBS[self.a["id"]]["source_job_ids"], ["nightly"])
+
+    def test_a_longer_cycle_is_refused_and_named(self) -> None:
+        self._copy_job(name="C3", source_jobs=["C2"], repo="Third")
+
+        message = self._cycle(lambda: abr_v41.edit_job_record(self.a["id"], {"source_jobs": ["C3"]}))
+
+        self.assertIn("A copies from C3; C3 copies from C2; C2 copies from A", message)
+
+    def test_a_cycle_through_a_source_repository_is_refused(self) -> None:
+        message = self._cycle(lambda: abr_v41.edit_job_record(self.a["id"], {"source_jobs": [], "source_repositories": ["Second"]}))
+
+        self.assertIn("A reads repository Second, which C2 writes to; C2 copies from A", message)
+
+    def test_a_new_copy_job_that_closes_a_cycle_is_refused(self) -> None:
+        abr_v41.edit_job_record(self.a["id"], {"source_repositories": ["Fourth"]})
+
+        self._cycle(lambda: self._copy_job(name="C5", source_jobs=["A"], repo="Fourth"))
+
+        self.assertNotIn("C5", [job.get("name") for job in JOBS.values()])
+
+    def test_moving_a_copy_into_a_repository_its_source_reads_is_refused(self) -> None:
+        abr_v41.edit_job_record(self.a["id"], {"source_repositories": ["Fourth"]})
+
+        message = self._cycle(lambda: abr_v41.edit_job_record(self.c2["id"], {"repo": "Fourth"}))
+
+        self.assertIn("C2 copies from A; A reads repository Fourth, which C2 writes to", message)
+        self.assertEqual(JOBS[self.c2["id"]]["repo_id"], "dst2")
+
+    def test_a_cycle_made_before_this_check_can_still_be_switched_off_and_broken(self) -> None:
+        JOBS[self.a["id"]] = {**JOBS[self.a["id"]], "source_job_ids": [self.c2["id"]], "source_job_names": ["C2"]}
+
+        switched_off = abr_v41.edit_job_record(self.a["id"], {"enabled": False, "description": "stop the cycle"})
+        self.assertFalse(switched_off["enabled"])
+        self._cycle(lambda: abr_v41.edit_job_record(self.a["id"], {"source_jobs": ["C2", "Nightly"]}))
+        broken = abr_v41.edit_job_record(self.a["id"], {"source_jobs": ["Nightly"]})
+        self.assertEqual(broken["backup_copy"]["source_jobs"], [{"id": "nightly", "name": "Nightly"}])
+
+    def test_copies_of_copies_without_a_cycle_are_accepted(self) -> None:
+        self._copy_job(name="C4", source_jobs=["A"], repo="Third")
+        edited = abr_v41.edit_job_record(self.c2["id"], {"source_repositories": ["Offsite"]})
+
+        self.assertEqual([item["name"] for item in edited["backup_copy"]["source_repositories"]], ["Offsite"])
+
+
 class CopyRetentionTests(_Catalog):
     def test_copy_retention_drops_old_copies_and_never_a_source_point(self) -> None:
         old = "2026-01-0{}T01:00:00+00:00"

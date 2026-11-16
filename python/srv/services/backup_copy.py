@@ -20,6 +20,7 @@ from python.srv.core.mongo_db_wrapper import (
     JOBS,
     REPOSITORIES,
     TASKS,
+    catalog_entries,
     catalog_records,
     persist_task,
 )
@@ -1213,11 +1214,54 @@ def apply_copy_settings(job: dict[str, Any], payload: dict[str, Any], *, creatin
         job["retry_count"], job["retry_interval_minutes"] = _validate_retries(payload, current)
         changed = True
 
-    validate_copy_job(job, jobs, repositories)
+    links_changed = creating or sources_given or "repo" in payload or "repo_id" in payload
+    validate_copy_job(job, jobs, repositories, check_cycle=links_changed)
     return changed
 
 
-def validate_copy_job(job: dict[str, Any], jobs: list[dict[str, Any]], repositories: list[dict[str, Any]]) -> None:
+WRITING_JOB_TYPES = ("backup", "backup-copy")
+
+
+def _upstream(record: dict[str, Any], records: dict[str, dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+    if record.get("job_type") != "backup-copy":
+        return []
+    name = str(record.get("name") or record.get("id") or "")
+    found = [
+        (records[source_id], f"{name} copies from {records[source_id].get('name')}")
+        for source_id in source_job_ids(record)
+        if source_id in records
+    ]
+    for repository_id in source_repository_ids(record):
+        repository = str((REPOSITORIES.get(repository_id) or {}).get("name") or repository_id)
+        found += [
+            (other, f"{name} reads repository {repository}, which {other.get('name')} writes to")
+            for other in records.values()
+            if other.get("job_type") in WRITING_JOB_TYPES and str(other.get("repo_id") or "") == repository_id
+        ]
+    return found
+
+
+def copy_cycle(job: dict[str, Any]) -> list[str] | None:
+    job_id = str(job.get("id") or "")
+    records = {str(key): value for key, value in catalog_entries(JOBS) if isinstance(value, dict)}
+    records[job_id] = job
+    stack: list[tuple[dict[str, Any], list[str]]] = [(job, [])]
+    seen: set[str] = set()
+    while stack:
+        record, steps = stack.pop()
+        for upstream, step in _upstream(record, records):
+            upstream_id = str(upstream.get("id") or "")
+            if upstream_id == job_id:
+                return [*steps, step]
+            if upstream_id not in seen:
+                seen.add(upstream_id)
+                stack.append((upstream, [*steps, step]))
+    return None
+
+
+def validate_copy_job(
+    job: dict[str, Any], jobs: list[dict[str, Any]], repositories: list[dict[str, Any]], *, check_cycle: bool = True
+) -> None:
     from python.srv.plugins.hyperv.vhdx_tool import (
         VhdxToolError,
         ensure_hyperv_repository,
@@ -1246,6 +1290,14 @@ def validate_copy_job(job: dict[str, Any], jobs: list[dict[str, Any]], repositor
         422,
         "invalid_job",
         f"Repository {destination_name} is of type '{destination.get('type')}', which cannot hold backup copies",
+    )
+    cycle = copy_cycle(job) if check_cycle else None
+    _ensure(
+        not cycle,
+        422,
+        "backup_copy_cycle",
+        "A backup copy job cannot copy its own restore points, also not through other jobs: " + "; ".join(cycle or []),
+        cycle=cycle,
     )
 
     mode = str(job.get("copy_mode") or "periodic")
