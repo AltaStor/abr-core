@@ -192,7 +192,7 @@ class OutOfSpaceTests(unittest.TestCase):
     def _free(self, free_bytes: int | None):
         return patch.object(hyperv_backup, "filesystem_free_bytes", return_value=free_bytes)
 
-    def _back_up(self, lines: list[str], free_bytes: int | None) -> str:
+    def _back_up(self, lines: list[str], free_bytes: int | None, *, allocated: int = 0, incremental: bool = False) -> str:
         with (
             self._free(free_bytes),
             patch.object(hyperv_backup, "cancel_requested", return_value=False),
@@ -201,11 +201,11 @@ class OutOfSpaceTests(unittest.TestCase):
             hyperv_backup._back_up_disks(
                 _FailingNode(lines),
                 "NODE-A",
-                [{**_disk(), "capacity_gb": 1}],
+                [{**_disk(), "capacity_gb": 1, "allocated_bytes": allocated}],
                 task_id="task-1",
                 vm_name="et-vm",
-                incremental=False,
-                change_ids={},
+                incremental=incremental,
+                change_ids={"SCSI 0:0": "rct-1"} if incremental else {},
                 storage_args=[],
                 storage_env={},
                 repository=self.repository,
@@ -225,22 +225,32 @@ class OutOfSpaceTests(unittest.TestCase):
         self.assertEqual(
             message,
             f"Backing up disk SCSI 0:0 of et-vm failed: The repository 'Shared' at {self.root} ran out of space "
-            "(40.0 MiB free when this disk started). Free space in that filesystem, or point the job at another repository",
+            "(40.0 MiB free; 40.0 MiB free when this disk started). Free space in that filesystem, or point the job "
+            "at another repository",
         )
 
-    def test_a_write_error_with_more_room_than_the_disk_had_reached_keeps_the_tools_own_words(self) -> None:
-        message = self._back_up([f"Error: {TOOL_WRITE_ERROR}"], 261 * 1024**2)
+    def test_a_full_share_names_the_room_the_disk_takes_before_compression(self) -> None:
+        message = self._back_up([f"Error: {TOOL_WRITE_ERROR}"], 0, allocated=3 * 1024**3)
 
-        self.assertIn("Write error, expected 4194410 bytes", message)
-        self.assertNotIn("ran out of space", message)
+        self.assertIn("ran out of space (0 B free; 0 B free when this disk started; the disk takes 3.0 GiB on the host "
+                      "before compression)", message)
+        self.assertNotIn("Write error", message)
 
-    def test_a_write_error_without_an_offset_or_a_free_space_figure_keeps_the_tools_own_words(self) -> None:
-        for lines, free in (([f"Error: {TOOL_WRITE_ERROR.split('; failed')[0]}"], 1024), ([f"Error: {TOOL_WRITE_ERROR}"], None)):
+    def test_the_room_the_disk_takes_is_left_out_of_an_incremental(self) -> None:
+        message = self._back_up([f"Error: {TOOL_WRITE_ERROR}"], 0, allocated=3 * 1024**3, incremental=True)
+
+        self.assertIn("ran out of space", message)
+        self.assertNotIn("the disk takes", message)
+
+    def test_a_write_error_with_room_left_never_shows_the_tools_write_count(self) -> None:
+        for free in (261 * 1024**2, None):
             with self.subTest(free=free):
-                message = self._back_up(lines, free)
+                message = self._back_up([f"Error: {TOOL_WRITE_ERROR}"], free)
 
-                self.assertIn("Write error, expected 4194410 bytes", message)
                 self.assertNotIn("ran out of space", message)
+                self.assertNotIn("Write error", message)
+                self.assertNotIn("4256589585", message)
+                self.assertIn("attached read-only as \\\\.\\PhysicalDrive3; failed to save data range at offset 62914560", message)
 
     def test_a_tool_that_says_the_disk_is_full_is_believed_whatever_the_free_space(self) -> None:
         message = self._back_up(["Error: There is not enough space on the disk."], None)
@@ -278,7 +288,401 @@ class OutOfSpaceTests(unittest.TestCase):
             hyperv_backup._make_task_root(self.repository, Path(self.root) / "vm" / "task-1")
 
 
-INFO_LINE = "Virtual disk 'C:\\VMs\\et-vm\\disk.vhdx' attached read-only as \\\\.\\PhysicalDrive3"
+SHARE = "\\\\files\\abr-x$"
+WRITTEN = {"exit_code": 0, "result": {"status": "ok", "raw_data_size": 100, "stored_data_size": 50, "rct_id": "rct-2"}, "lines": []}
+WRITE_FAILED = {"exit_code": 1, "result": None, "lines": [f"Error: {TOOL_WRITE_ERROR}"]}
+WRITE_FAILED_LATE = {
+    "exit_code": 1,
+    "result": None,
+    "lines": [f"Error: {TOOL_WRITE_ERROR.replace('at offset 62914560', 'at offset 2147483648')}"],
+}
+OPENS = {"exit_code": 0, "result": {"status": "ok"}, "lines": []}
+CLOSED = {"exit_code": 1, "result": None, "lines": ["Error: NODE-A cannot open the repository share \\\\files\\abr-x$ as abr: The network name cannot be found."]}
+
+
+def _full_disk() -> dict:
+    return {
+        **_disk(),
+        "capacity_gb": 1,
+        "allocated_bytes": 1 << 28,
+        "controller_type": "SCSI",
+        "controller_number": 0,
+        "controller_location": 0,
+        "chain_paths": [],
+        "logical_sector_size": 512,
+        "physical_sector_size": 4096,
+        "block_size": 1 << 25,
+        "vhd_format": "VHDX",
+        "vhd_type": "Dynamic",
+        "source_disk_type_code": 3,
+        "source_disk_type_name": "Dynamic",
+        "source_disk_eager_zeroed": False,
+    }
+
+
+class _ScriptedNode:
+    def __init__(self, backups: list[dict], probes: list[dict] | None = None) -> None:
+        self.backups = list(backups)
+        self.probes = list(probes or [])
+        self.calls: list[str] = []
+
+    def run_disk_tool(self, node, args, **kwargs):
+        self.calls.append(args[0])
+        if args[0] == "info":
+            return self.probes.pop(0) if self.probes else OPENS
+        return self.backups.pop(0)
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def time(self) -> float:
+        return self.now
+
+
+class _LossCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = self.enterContext(tempfile.TemporaryDirectory())
+        self.repository = {"id": "repo-1", "name": "Shared", "type": "smb", "path": self.root}
+        self.notices: list[str] = []
+        self.removed: list[str] = []
+        self.clock = _Clock()
+        self.cancel = False
+
+    def _run(
+        self,
+        node: _ScriptedNode,
+        *,
+        attempts: int = 3,
+        window: int = 300,
+        incremental: bool = False,
+        free: int = 50 * 1024**3,
+        abr_path: str | None = None,
+        free_by_path: dict[str, int] | None = None,
+    ):
+        def progress(payload: dict) -> None:
+            if payload.get("log_level") == "warn":
+                self.notices.append(str(payload.get("message")))
+
+        def free_bytes(path: str) -> int:
+            return (free_by_path or {}).get(str(path), free)
+
+        with (
+            patch.dict("os.environ", {"ALTASTOR_HYPERV_STORAGE_ATTEMPTS": str(attempts)}),
+            patch.object(hyperv_backup, "filesystem_free_bytes", side_effect=free_bytes),
+            patch.object(hyperv_backup, "cancel_requested", side_effect=lambda _task: self.cancel),
+            patch.object(hyperv_backup, "reconnect_seconds", return_value=window),
+            patch.object(hyperv_backup, "remove_disk_tool_backup", side_effect=lambda _repo, _path, name, **_kw: self.removed.append(name)),
+            patch.object(hyperv_backup, "time", self.clock),
+        ):
+            return hyperv_backup._back_up_disks(
+                node,
+                "NODE-A",
+                [_full_disk()],
+                task_id="task-1",
+                vm_name="et-vm",
+                incremental=incremental,
+                change_ids={"SCSI 0:0": "rct-1"} if incremental else {},
+                storage_args=["--mode", "file", "--folder", f"{SHARE}\\vm\\task-1"],
+                storage_env={"ABR_SMB_SHARE": SHARE},
+                repository=self.repository,
+                abr_path=abr_path or self.root,
+                repository_label="Shared",
+                compression_level=3,
+                encryption_key="",
+                tool_timeout_seconds=900,
+                written_backup_names=[],
+                progress_callback=progress,
+            )
+
+    def _fails(self, node: _ScriptedNode, **kwargs) -> str:
+        with self.assertRaises(hyperv_backup.HyperVBackupError) as raised:
+            self._run(node, **kwargs)
+        return str(raised.exception)
+
+
+class ShareLossTests(_LossCase):
+    def test_a_share_lost_and_back_by_the_time_the_tool_fails_writes_the_disk_again(self) -> None:
+        node = _ScriptedNode([WRITE_FAILED, WRITTEN])
+
+        outputs = self._run(node)
+
+        self.assertEqual(node.calls, ["backup", "info", "backup"])
+        self.assertEqual(outputs[0]["change_id"], "rct-2")
+        self.assertEqual(self.removed, ["01-disk.vhdx"])
+        self.assertEqual(
+            self.notices,
+            [
+                (
+                    f"NODE-A lost the repository share {SHARE} while writing disk SCSI 0:0 of et-vm; it opens again, "
+                    "so the disk is backed up again from the start (attempt 2 of 3)"
+                )
+            ],
+        )
+
+    def test_a_share_still_lost_is_waited_for_and_then_the_disk_is_written_again(self) -> None:
+        node = _ScriptedNode([WRITE_FAILED, WRITTEN], [CLOSED, CLOSED, OPENS])
+
+        self._run(node, incremental=True)
+
+        self.assertEqual(node.calls, ["backup", "info", "info", "info", "backup"])
+        self.assertEqual(
+            self.notices[0],
+            f"NODE-A lost the repository share {SHARE} while writing disk SCSI 0:0 of et-vm; waiting up to 300 s for it "
+            "to open again",
+        )
+        self.assertIn("it opened again after 10 s, so the disk is backed up again from the start (attempt 2 of 3)", self.notices[1])
+
+    def test_a_share_that_does_not_come_back_within_the_window_says_so(self) -> None:
+        message = self._fails(_ScriptedNode([WRITE_FAILED], [CLOSED] * 100), window=30)
+
+        self.assertEqual(
+            message,
+            f"Backing up disk SCSI 0:0 of et-vm failed: NODE-A lost the repository share {SHARE} while writing disk "
+            "SCSI 0:0 of et-vm, and could not open it again within 30 s. Check the network between NODE-A and the file server",
+        )
+        self.assertEqual(self.removed, [])
+
+    def test_a_disk_that_fails_on_every_attempt_stops_after_the_last_one(self) -> None:
+        node = _ScriptedNode([WRITE_FAILED, WRITE_FAILED])
+
+        message = self._fails(node, attempts=2)
+
+        self.assertEqual(node.calls, ["backup", "info", "backup", "info"])
+        self.assertEqual(
+            message,
+            f"Backing up disk SCSI 0:0 of et-vm failed: NODE-A lost the repository share {SHARE} while writing disk "
+            "SCSI 0:0 of et-vm; it opened again each time, but the disk could not be written on any of 2 attempts",
+        )
+        self.assertNotIn("Write error", message)
+
+    def test_a_network_error_from_the_tool_counts_as_a_lost_share(self) -> None:
+        dropped = {"exit_code": 1, "result": None, "lines": ["Error: The specified network name is no longer available."]}
+        node = _ScriptedNode([dropped, WRITTEN])
+
+        self._run(node)
+
+        self.assertEqual(node.calls, ["backup", "info", "backup"])
+
+    def test_a_failure_that_is_not_a_write_is_not_retried(self) -> None:
+        denied = {"exit_code": 1, "result": None, "lines": ["Error: Access is denied."]}
+        node = _ScriptedNode([denied])
+
+        message = self._fails(node)
+
+        self.assertEqual(node.calls, ["backup"])
+        self.assertEqual(message, "Backing up disk SCSI 0:0 of et-vm failed: Access is denied.")
+
+    def test_an_s3_repository_is_not_waited_for(self) -> None:
+        self.repository = {"id": "repo-1", "name": "Bucket", "type": "s3", "path": "s3://bucket/abr"}
+        node = _ScriptedNode([WRITE_FAILED])
+
+        message = self._fails(node)
+
+        self.assertEqual(node.calls, ["backup"])
+        self.assertNotIn("lost the repository share", message)
+        self.assertNotIn("Write error", message)
+
+    def test_a_full_share_is_not_retried(self) -> None:
+        node = _ScriptedNode([WRITE_FAILED])
+
+        message = self._fails(node, free=1024)
+
+        self.assertIn("ran out of space (1.0 KiB free; 1.0 KiB free when this disk started; the disk takes", message)
+        self.assertEqual(node.calls, ["backup"])
+
+    def test_a_disk_that_failed_past_the_room_the_share_had_while_the_share_opens_ran_out_of_space(self) -> None:
+        node = _ScriptedNode([WRITE_FAILED_LATE])
+
+        message = self._fails(node, free=500 * 1024**2)
+
+        self.assertEqual(node.calls, ["backup", "info"])
+        self.assertEqual(
+            message,
+            f"Backing up disk SCSI 0:0 of et-vm failed: The repository 'Shared' at {self.root} ran out of space "
+            "(500.0 MiB free when this disk started; the disk takes 256.0 MiB on the host before compression). "
+            "Free space in that filesystem, or point the job at another repository",
+        )
+
+    def test_the_same_failure_while_the_share_does_not_open_is_a_lost_share(self) -> None:
+        node = _ScriptedNode([WRITE_FAILED_LATE, WRITTEN], [CLOSED, OPENS])
+
+        self._run(node, free=500 * 1024**2)
+
+        self.assertEqual(node.calls, ["backup", "info", "info", "backup"])
+        self.assertIn("attempt 2 of 3", self.notices[-1])
+
+    def test_the_free_space_is_read_where_the_point_is_written_not_at_the_repository_root(self) -> None:
+        folder = str(Path(self.root) / "et-vm" / "task-1")
+        node = _ScriptedNode([WRITE_FAILED])
+
+        message = self._fails(node, abr_path=folder, free_by_path={folder: 2048})
+
+        self.assertIn(f"The repository 'Shared' at {folder} ran out of space (2.0 KiB free", message)
+        self.assertEqual(node.calls, ["backup"])
+
+    def test_a_stop_while_waiting_for_the_share_stops_the_session(self) -> None:
+        node = _ScriptedNode([WRITE_FAILED], [CLOSED, CLOSED])
+        original = node.run_disk_tool
+
+        def probe_then_stop(n, args, **kwargs):
+            result = original(n, args, **kwargs)
+            if args[0] == "info":
+                self.cancel = True
+            return result
+
+        node.run_disk_tool = probe_then_stop
+
+        with self.assertRaises(hyperv_backup.ProcessCancelled):
+            self._run(node)
+        self.assertEqual(self.removed, [])
+
+
+S3_DOWN_LINE = (
+    "Error: Virtual disk 'C:\\VMs\\et-vm\\disk.vhdx' attached read-only as \\\\.\\PhysicalDrive3; S3 bucket 'et-bucket' is "
+    "not accessible at endpoint http://s3.example:9000: Encountered network error when sending http request. Create the "
+    "bucket or enable bucket auto-creation.; Failed to initialize backup manager!; failed to initialize 's3' backup "
+    "storage at 'et-bucket'"
+)
+S3_DOWN = {"exit_code": 1, "result": None, "lines": [S3_DOWN_LINE]}
+S3_CLOSED = {"exit_code": 1, "result": None, "lines": [S3_DOWN_LINE.replace("Virtual disk 'C:\\VMs\\et-vm\\disk.vhdx' attached read-only as \\\\.\\PhysicalDrive3; ", "")]}
+S3_NO_BUCKET = {
+    "exit_code": 1,
+    "result": None,
+    "lines": ["Error: S3 bucket 'et-bucket' does not exist at endpoint http://s3.example:9000. Create the bucket or enable bucket auto-creation."],
+}
+
+
+def _s3_repository() -> dict:
+    return {
+        "id": "repo-1",
+        "name": "Bucket",
+        "type": "s3",
+        "path": "s3://et-bucket/et",
+        "s3": {"bucket": "et-bucket", "endpoint_url": "http://s3.example:9000"},
+    }
+
+
+class S3LossTests(_LossCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repository = _s3_repository()
+
+    def test_a_storage_that_stops_answering_is_waited_for_and_the_disk_is_written_again(self) -> None:
+        node = _ScriptedNode([S3_DOWN, WRITTEN], [S3_CLOSED, OPENS])
+
+        self._run(node)
+
+        self.assertEqual(node.calls, ["backup", "info", "info", "backup"])
+        lost = "NODE-A lost the S3 storage http://s3.example:9000 while writing disk SCSI 0:0 of et-vm"
+        self.assertEqual(
+            self.notices,
+            [
+                f"{lost}; waiting up to 300 s for it to answer again",
+                f"{lost}; it answered again after 5 s, so the disk is backed up again from the start (attempt 2 of 3)",
+            ],
+        )
+
+    def test_a_storage_back_by_the_time_the_tool_fails_writes_the_disk_again_at_once(self) -> None:
+        node = _ScriptedNode([S3_DOWN, WRITTEN])
+
+        self._run(node, incremental=True)
+
+        self.assertEqual(node.calls, ["backup", "info", "backup"])
+        self.assertIn("it answers again, so the disk is backed up again from the start (attempt 2 of 3)", self.notices[0])
+
+    def test_a_storage_that_does_not_answer_within_the_window_says_so_without_the_tools_advice(self) -> None:
+        message = self._fails(_ScriptedNode([S3_DOWN], [S3_CLOSED] * 100), window=30)
+
+        self.assertEqual(
+            message,
+            "Backing up disk SCSI 0:0 of et-vm failed: NODE-A lost the S3 storage http://s3.example:9000 while writing disk "
+            "SCSI 0:0 of et-vm, and could not reach it again within 30 s. Check the network between NODE-A and the S3 "
+            "storage",
+        )
+        self.assertNotIn("Create the bucket", message)
+        self.assertNotIn("Failed to initialize", message)
+
+    def test_a_storage_that_fails_on_every_attempt_stops_after_the_last_one(self) -> None:
+        message = self._fails(_ScriptedNode([S3_DOWN, S3_DOWN]), attempts=2)
+
+        self.assertIn("it answered again each time, but the disk could not be written on any of 2 attempts", message)
+
+    def test_a_missing_bucket_is_not_waited_for(self) -> None:
+        node = _ScriptedNode([S3_NO_BUCKET])
+
+        message = self._fails(node)
+
+        self.assertEqual(node.calls, ["backup"])
+        self.assertIn("does not exist", message)
+
+    def test_a_stop_while_waiting_for_the_storage_stops_the_session(self) -> None:
+        node = _ScriptedNode([S3_DOWN], [S3_CLOSED, S3_CLOSED])
+        original = node.run_disk_tool
+
+        def probe_then_stop(n, args, **kwargs):
+            result = original(n, args, **kwargs)
+            if args[0] == "info":
+                self.cancel = True
+            return result
+
+        node.run_disk_tool = probe_then_stop
+
+        with self.assertRaises(hyperv_backup.ProcessCancelled):
+            self._run(node)
+
+
+class _InfoNode:
+    def __init__(self, run: dict) -> None:
+        self.run = run
+
+    def run_disk_tool(self, node, args, **kwargs):
+        return self.run
+
+
+class RepositoryCheckS3Tests(unittest.TestCase):
+    def _check(self, run: dict) -> str:
+        with (
+            patch.object(hyperv_backup, "cancel_requested", return_value=False),
+            self.assertRaises(hyperv_backup.HyperVBackupError) as raised,
+        ):
+            hyperv_backup._check_repository_access(
+                _InfoNode(run), "NODE-A", [], {}, "Bucket", "task-1", None, repository=_s3_repository()
+            )
+        return str(raised.exception)
+
+    def test_a_storage_that_does_not_answer_before_the_run_is_not_called_a_missing_bucket(self) -> None:
+        message = self._check(S3_CLOSED)
+
+        self.assertEqual(
+            message,
+            "NODE-A cannot reach repository Bucket: the S3 storage http://s3.example:9000 did not answer (a network error). "
+            "Check the network between NODE-A and the S3 storage",
+        )
+
+    def test_the_endpoint_comes_from_the_tool_then_the_repository_then_the_bucket(self) -> None:
+        bare = {"id": "repo-1", "name": "Bucket", "type": "s3", "s3": {"bucket": "et-bucket"}}
+        cases = [
+            (_s3_repository(), "network error at endpoint https://s3.other:443. Retry", "https://s3.other:443"),
+            (_s3_repository(), "Encountered network error", "http://s3.example:9000"),
+            (bare, "Encountered network error", "of bucket et-bucket"),
+        ]
+        for repository, text, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(hyperv_backup.s3_endpoint(repository, text), expected)
+
+    def test_a_missing_bucket_before_the_run_keeps_the_tools_words(self) -> None:
+        self.assertIn("does not exist", self._check(S3_NO_BUCKET))
+
+
+INFO_LINE ="Virtual disk 'C:\\VMs\\et-vm\\disk.vhdx' attached read-only as \\\\.\\PhysicalDrive3"
 
 
 class _EndedNode:

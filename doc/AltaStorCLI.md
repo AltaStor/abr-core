@@ -134,6 +134,8 @@ ABR_USERNAME=abr ABR_PASSWORD='secret' abr auth login
 
 --print-token: print only the token to stdout, for `export ABR_TOKEN=$(abr auth login --print-token)`. The session the CLI has cached is left as it was, so fetching a token for another account does not sign the CLI in as that account. 
 
+After signing in, a user who may change inventories (inventory.edit) gets a NOTE on stderr while nobody has set the server-wide vSphere settings yet (confirmed: false in abr settings vsphere show): it names the API and VDDK library the server started with and points to abr settings vsphere set, which confirms them. It is not printed while the account is on its default password, nor with --print-token. 
+
 abr auth logout 
 
 Description: Invalidate the current session and clear the cached token. 
@@ -493,9 +495,8 @@ certificate. --protocol applies to hyper-v only.
 vSphere API. --api chooses how a vsphere inventory's (hypervisor's) disks are
 read and written: vddk (the VMware VDDK) or soap (the vSphere SOAP API, which
 needs no VMware library on the server). Without it the inventory uses the
-server-wide API (abr settings vsphere show|set), which starts as vddk, so
-inventories from before this setting behave as before; inventory edit
---reset-api goes back to it. --transport is the earlier name of --api and still
+server-wide API (abr settings vsphere show|set); inventory edit --reset-api
+goes back to it. --transport is the earlier name of --api and still
 works. The server refuses an API it cannot use, with the reason, when it is
 chosen and when a backup, restore or replication session starts: vddk when
 there is no VDDK library to load, soap when abr-vmdk-tool has no --api soap. A
@@ -977,20 +978,26 @@ Description: Show the server-wide vSphere API and VDDK library, which every vSph
 
 abr settings vsphere show [--output json] 
 
-It shows the API, the library (vddk_library, null when it follows the VDDK directory), the library in effect and the file it resolves to (e.g. libvixDiskLib.so.9.1.0.0), the VDDK directory and where it comes from (environment or default), whether this server can use each API now and why not (apis), and every vSphere hypervisor with its own values (hypervisors). abr inventory info shows one hypervisor's own values, the values in effect and where each comes from. Needs inventory.view. 
+It shows the API, the library (vddk_library, null when it follows the VDDK directory), the library in effect and the file it resolves to (e.g. libvixDiskLib.so.9.1.0.0), the VDDK directory and where it comes from (environment or default), whether this server can use each API now and why not (apis), every vSphere hypervisor with its own values (hypervisors), the VDDK libraries found on the backup server (detected_vddk_libraries: path, kind ovddk, vmware_vddk or system, and the file it resolves to), and whether an administrator has set the values (confirmed: false while they are the ones the server started with). abr inventory info shows one hypervisor's own values, the values in effect and where each comes from. Needs inventory.view. 
+
+The values the server starts with. On its first start the server stores the server-wide API and VDDK library from ABR_VSPHERE_API (vddk or soap; vddk by default) and ABR_VSPHERE_VDDK_LIB (ovddk by default: the oVDDK library of the altastor-backup-ovddk package, /opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so; default for the VDDK directory; or a full path), which /etc/altastor-backup/server.conf can set. A value that cannot be used is not stored: the server log says why, and the API starts as vddk, the library follows the VDDK directory; the same happens when oVDDK is not installed. A server that already has inventories, jobs or backups when it first gets these settings keeps working as before (vddk, the VDDK directory) unless server.conf sets them. Once stored, the values change only through abr settings vsphere set (or the Web UI); restarts and upgrades leave them as they are. 
 
 abr settings vsphere set 
 
 Description: Change the server-wide vSphere API and VDDK library. 
 
-abr settings vsphere set [--api <vddk|soap>] [--vddk-lib <path|default>] [--update-existing-hypervisors [--yes]] 
+abr settings vsphere set [--api <vddk|soap>] [--vddk-lib <path|ovddk|default>] [--update-existing-hypervisors [--yes]] 
 
 Examples: 
+abr settings vsphere set 
+abr settings vsphere set --vddk-lib ovddk 
 abr settings vsphere set --vddk-lib /opt/vmware-vix-disklib/lib64/libvixDiskLib.so.9.1.0.0 
 abr settings vsphere set --vddk-lib default 
 abr settings vsphere set --api soap --update-existing-hypervisors --yes 
 
-The library is checked as for inventory add --vddk-lib. default, or the VDDK directory's own lib64/libvixDiskLib.so, makes it follow the VDDK directory again, so it changes with ABR_VMDK_TOOL_VDDK_DIR. Hypervisors with their own values keep them, unless --update-existing-hypervisors removes the API and VDDK library of each, so they all use the server-wide values from now on. It names those hypervisors and asks first; --yes skips the question, and without a terminal to ask on it is required (exit code 2 otherwise). The command then prints the hypervisors it changed. An API the server cannot use is refused (transport_unavailable), and the server's reason for refusing a value is printed as it is. Needs inventory.edit; recorded in the audit log. 
+Without options, in a terminal, it shows the values in effect and asks for the API (Enter keeps it) and, for vddk, the library: it lists the libraries found on the backup server, following the VDDK directory, and another file (asked for as a full path); Enter takes oVDDK when it is installed, otherwise the current library. A VMware VDDK library must stay in the lib64 folder of its bundle: its transport plugins are found only through that folder. An answer that is not one of the choices changes nothing (exit code 2). Without a terminal, at least one option is required (exit code 2). Setting the values, even unchanged, marks them confirmed. 
+
+The library is checked as for inventory add --vddk-lib. ovddk takes the oVDDK library the backup server has, and is refused when it has none. default, or the VDDK directory's own lib64/libvixDiskLib.so, makes it follow the VDDK directory again, so it changes with ABR_VMDK_TOOL_VDDK_DIR. Hypervisors with their own values keep them, unless --update-existing-hypervisors removes the API and VDDK library of each, so they all use the server-wide values from now on. It names those hypervisors and asks first; --yes skips the question, and without a terminal to ask on it is required (exit code 2 otherwise). The command then prints the hypervisors it changed. An API the server cannot use is refused (transport_unavailable), and the server's reason for refusing a value is printed as it is. Needs inventory.edit; recorded in the audit log. 
 
 abr system version 
 

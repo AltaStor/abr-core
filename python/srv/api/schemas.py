@@ -2018,6 +2018,8 @@ class VsphereSettingsDTO(_LenientModel):
     library_file_supported: DocBool = Field(default=None, description="false when this server's abr-vmdk-tool is too old to take a VDDK library file")
     apis: SkipValidation[dict[str, VsphereTransportAvailabilityDTO]] | None = Field(default=None, description="vddk and soap: whether this server can use each now")
     hypervisors: SkipValidation[list[VsphereHypervisorSettingsDTO]] | None = Field(default=None, description="Every vSphere hypervisor (inventory) with its own values")
+    detected_vddk_libraries: DocObjectArray = Field(default=None, description="The VDDK library files found on this server that it can use, {path, kind, file} each; kind is ovddk (the oVDDK package next to abr-vmdk-tool), vmware_vddk (a VMware VDDK bundle in the VDDK directory) or system (a library folder of the system)")
+    confirmed: DocBool = Field(default=None, description="false while the settings are the ones the server started with (ABR_VSPHERE_API, ABR_VSPHERE_VDDK_LIB); true once an administrator has set them")
     updated_at: DocStrOrNull = None
     updated_by: DocStrOrNull = None
     updated_hypervisors: DocObjectArray = Field(default=None, description="PUT only: the hypervisors apply_to_existing_hypervisors handed back, {id, name} each")

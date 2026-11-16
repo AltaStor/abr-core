@@ -4280,6 +4280,7 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
     item["job_type"] = raw_job_type if raw_job_type in JOB_TYPES else "backup"
     item["inventory_id"] = str(item.get("inventory_id") or item.get("hypervisor_id") or metadata.get("inventory_id") or item.get("source_inventory_id") or "")
     item["inventory_name"] = str(item.get("inventory_name") or metadata.get("inventory_name") or "")
+    item["inventory_name"] = _current_name(HYPERVISORS, item["inventory_id"]) or item["inventory_name"]
     item["vm_ids"] = [
         str(value)
         for value in (
@@ -4302,6 +4303,7 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
     ]
     item["repo_id"] = str(item.get("repo_id") or metadata.get("repo_id") or metadata.get("repository_id") or (_split_csv(str(metadata.get("repository_ids") or ""))[0] if isinstance(metadata.get("repository_ids"), str) else (metadata.get("repository_ids") or [None])[0]) or "")
     item["repo_name"] = str(item.get("repo_name") or metadata.get("repo_name") or metadata.get("repository_name") or (_split_csv(str(metadata.get("repo") or ""))[0] if isinstance(metadata.get("repo"), str) else (metadata.get("repo") or [None])[0]) or "")
+    item["repo_name"] = _repository_name_for(item["repo_id"]) or item["repo_name"]
     item["source_job_id"] = str(item.get("source_job_id") or metadata.get("source_job_id") or "")
     item["source_job_name"] = str(item.get("source_job_name") or metadata.get("source_job_name") or "")
     if item["job_type"] == "backup-copy":
@@ -5733,13 +5735,20 @@ def normalize_backup_point(record: dict[str, Any]) -> dict[str, Any]:
     full_backup = execution_type in {"ActiveFull", "SyntheticFull"} or bool(point.get("full_backup"))
     point["id"] = str(point.get("id") or uuid4())
     point["job_id"] = job_id or None
-    point["job_name"] = str(point.get("job_name") or origin.get("job_name") or "")
+    point["job_name"] = _current_name(JOBS, job_id) or str(point.get("job_name") or origin.get("job_name") or "")
     point["vm_id"] = vm_id or None
     point["vm_name"] = str(point.get("vm_name") or source.get("vm_name") or source.get("resource_name") or vm_id or "")
     point["inventory_id"] = str(point.get("inventory_id") or source.get("hypervisor_id") or "")
-    point["inventory_name"] = str(point.get("inventory_name") or source.get("hypervisor_name") or "")
+    point["inventory_name"] = _current_name(HYPERVISORS, point["inventory_id"]) or str(
+        point.get("inventory_name") or source.get("hypervisor_name") or ""
+    )
     point["repository_id"] = repository_id or None
-    point["repository_name"] = str(point.get("repository_name") or placement.get("repository_name") or "")
+    point["repository_name"] = _repository_name_for(repository_id) or str(
+        point.get("repository_name") or placement.get("repository_name") or ""
+    )
+    for item in placements:
+        if isinstance(item, dict):
+            item["repository_name"] = _repository_name_for(str(item.get("repository_id") or "")) or item.get("repository_name")
     point["repository_type"] = str(point.get("repository_type") or placement.get("repository_type") or "")
     point["execution_type"] = execution_type or ("ActiveFull" if full_backup else "Incremental")
     point["execution_reason"] = execution_reason or ("StandardIncremental" if point["execution_type"] == "Incremental" else "")
@@ -6933,9 +6942,13 @@ def _session_vm_names(task: dict[str, Any]) -> tuple[str | None, str | None]:
     return str(parameters.get("vm_name") or "").strip() or None, None
 
 
-def _repository_name_for(repository_id: str) -> str | None:
-    record = REPOSITORIES.get(repository_id) if repository_id else None
+def _current_name(catalog: dict[str, dict[str, Any]], record_id: str | None) -> str | None:
+    record = catalog.get(record_id) if record_id else None
     return str(record.get("name") or "") or None if isinstance(record, dict) else None
+
+
+def _repository_name_for(repository_id: str) -> str | None:
+    return _current_name(REPOSITORIES, repository_id)
 
 
 def _replication_report(task: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:

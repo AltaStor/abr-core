@@ -34,7 +34,7 @@ import re
 import shutil
 import time
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from ...core.mongo_db_wrapper import HYPERVISORS, REPOSITORIES, RESOURCES_BY_HV
 from ...core.storage_tool import (
@@ -48,6 +48,7 @@ from ...core.storage_tool import (
     filesystem_free_bytes,
     is_s3_repository,
     make_durable,
+    remove_disk_tool_backup,
     remove_empty_parents,
     run_disk_tool,
     write_file_durably,
@@ -84,6 +85,7 @@ from .hyperv import (
     HyperVUnreachableError,
     node_options,
     protocol_recorder,
+    reconnect_seconds,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,35 +105,111 @@ class HyperVBackupError(RuntimeError):
 
 _WRITE_FAILED = re.compile(r"write error|no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
 _NO_SPACE = re.compile(r"no space left|not enough space|disk full|ENOSPC", re.IGNORECASE)
+_NETWORK_LOST = re.compile(
+    r"network name is no longer available|network path was not found|semaphore timeout|unexpected network error"
+    r"|network location cannot be reached|connection was forcibly closed|network connection was aborted",
+    re.IGNORECASE,
+)
+_S3_NETWORK = re.compile(
+    r"network error|couldn't connect|could not connect|failed to connect|connection refused|connection reset"
+    r"|timed out|timeout was reached|could not resolve host",
+    re.IGNORECASE,
+)
+_S3_ENDPOINT = re.compile(r"at endpoint (\S+?):?\s", re.IGNORECASE)
 _FAILED_AT_OFFSET = re.compile(r"at offset (\d+)", re.IGNORECASE)
+_TOOL_WRITE_COUNT = re.compile(r"\s*Write error, expected \d+ bytes, written \d+ bytes!;?", re.IGNORECASE)
 NEARLY_FULL_BYTES = 64 * 1024 * 1024
+STORAGE_PROBE_TIMEOUT_SECONDS = 60
+STORAGE_PROBE_PAUSE_SECONDS = 5
 
 
-def _repository_free_bytes(repository: dict[str, Any]) -> int | None:
+def _repository_free_bytes(repository: dict[str, Any], folder: str | None = None) -> int | None:
     if is_s3_repository(repository):
         return None
-    root = str(repository.get("path") or "").strip()
+    root = str(folder or repository.get("path") or "").strip()
     return filesystem_free_bytes(root) if root else None
 
 
-def out_of_space_message(repository: dict[str, Any], free_bytes: int | None, *, before: bool = False) -> str:
+def out_of_space_message(
+    repository: dict[str, Any],
+    free_bytes: int | None,
+    *,
+    free_at_start: int | None = None,
+    needed_bytes: int | None = None,
+    folder: str | None = None,
+) -> str:
     name = str(repository.get("name") or repository.get("id") or "the destination")
-    root = str(repository.get("path") or "").strip()
+    root = str(folder or repository.get("path") or "").strip()
     where = f"repository {name!r}" + (f" at {root}" if root else "")
-    when = " when this disk started" if before else ""
-    free = f" ({describe_bytes(free_bytes)} free{when})" if free_bytes is not None else ""
+    figures = [f"{describe_bytes(free_bytes)} free"] if free_bytes is not None else []
+    if free_at_start is not None:
+        figures.append(f"{describe_bytes(free_at_start)} free when this disk started")
+    if needed_bytes:
+        figures.append(f"the disk takes {describe_bytes(needed_bytes)} on the host before compression")
+    free = f" ({'; '.join(figures)})" if figures else ""
     return f"The {where} ran out of space{free}. Free space in that filesystem, or point the job at another repository"
 
 
-def out_of_space_detail(repository: dict[str, Any], tool_error: str, free_before: int | None) -> str | None:
+def out_of_space_detail(
+    repository: dict[str, Any],
+    tool_error: str,
+    free_before: int | None,
+    needed_bytes: int | None = None,
+    folder: str | None = None,
+) -> str | None:
     if not _WRITE_FAILED.search(tool_error or ""):
         return None
-    if _NO_SPACE.search(tool_error):
-        return out_of_space_message(repository, _repository_free_bytes(repository))
-    offset = _FAILED_AT_OFFSET.search(tool_error)
-    if free_before is None or offset is None or free_before > int(offset.group(1)):
+    free_now = _repository_free_bytes(repository, folder)
+    if not _NO_SPACE.search(tool_error) and (free_now is None or free_now >= NEARLY_FULL_BYTES):
         return None
-    return out_of_space_message(repository, free_before, before=True)
+    return out_of_space_message(
+        repository, free_now, free_at_start=free_before, needed_bytes=needed_bytes, folder=folder
+    )
+
+
+def filled_before_failing(tool_error: str, free_before: int | None) -> bool:
+    offset = _FAILED_AT_OFFSET.search(tool_error or "")
+    return free_before is not None and offset is not None and free_before <= int(offset.group(1))
+
+
+def without_write_count(tool_error: str) -> str:
+    return _TOOL_WRITE_COUNT.sub("", tool_error or "").strip(" ;")
+
+
+class LostStorage(NamedTuple):
+    what: str
+    regain: str
+    wait: str
+    back: str
+    comes_back: str
+    peer: str
+
+
+def s3_endpoint(repository: dict[str, Any], tool_error: str = "") -> str:
+    named = _S3_ENDPOINT.search(tool_error or "")
+    if named:
+        return named.group(1).rstrip(".,;:")
+    config = extract_s3_config(repository)
+    if config.get("endpoint_url"):
+        return str(config["endpoint_url"])
+    return f"of bucket {config['bucket']}" if config.get("bucket") else "of the repository"
+
+
+def s3_unreachable(repository: dict[str, Any], tool_error: str) -> bool:
+    return is_s3_repository(repository) and bool(_S3_NETWORK.search(tool_error or ""))
+
+
+def lost_storage(repository: dict[str, Any], storage_env: dict[str, str], tool_error: str) -> LostStorage | None:
+    if is_s3_repository(repository):
+        if not s3_unreachable(repository, tool_error):
+            return None
+        return LostStorage(
+            f"the S3 storage {s3_endpoint(repository, tool_error)}", "reach", "answer", "answered", "answers", "the S3 storage"
+        )
+    share = str(storage_env.get("ABR_SMB_SHARE") or vhdx_tool.windows_share(repository) or "")
+    if not share or not (_WRITE_FAILED.search(tool_error or "") or _NETWORK_LOST.search(tool_error or "")):
+        return None
+    return LostStorage(f"the repository share {share}", "open", "open", "opened", "opens", "the file server")
 
 
 def _out_of_space_error(repository: dict[str, Any], exc: OSError) -> HyperVBackupError | None:
@@ -986,6 +1064,12 @@ def _check_repository_access(
         return True, ""
 
     reached, detail = tool(["info", "--json", *storage_args])
+    if not reached and isinstance(repository, dict) and s3_unreachable(repository, detail):
+        logger.warning("%s cannot reach the S3 storage of repository %s: %s", source_node, repository_label, detail)
+        raise HyperVBackupError(
+            f"{source_node} cannot reach repository {repository_label}: the S3 storage {s3_endpoint(repository, detail)} "
+            f"did not answer (a network error). Check the network between {source_node} and the S3 storage"
+        )
     if not reached:
         raise HyperVBackupError(f"{source_node} cannot reach repository {repository_label}: {detail}")
     if isinstance(repository, dict) and not is_s3_repository(repository):
@@ -1016,6 +1100,60 @@ def _cannot_write_message(
         f"{source_node} can read repository {repository_label} but cannot write to it: {who} has no write access "
         f"to {share}. Give it write access to the share, or set an account that has it ({detail})"
     )
+
+
+def _storage_opens(
+    node: HyperVNode, source_node: str, storage_args: list[str], storage_env: dict[str, str], task_id: str
+) -> str:
+    try:
+        run = node.run_disk_tool(
+            source_node,
+            ["info", "--json", *storage_args],
+            env=storage_env,
+            should_cancel=lambda: cancel_requested(task_id),
+            timeout=STORAGE_PROBE_TIMEOUT_SECONDS,
+        )
+    except HyperVError as exc:
+        return str(exc)
+    result = run.get("result") or {}
+    if run.get("exit_code") == 0 and result.get("status") in (None, "ok"):
+        return ""
+    return vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
+
+
+def _wait_for_storage(
+    node: HyperVNode,
+    source_node: str,
+    storage_args: list[str],
+    storage_env: dict[str, str],
+    task_id: str,
+    lost: str,
+    storage: LostStorage,
+    notice: Callable[[str], None],
+    reason: str,
+) -> int | None:
+    window = reconnect_seconds()
+    started = time.monotonic()
+    if not reason:
+        return 0
+    logger.warning("%s cannot %s %s yet: %s", source_node, storage.regain, storage.what, reason)
+    notice(f"{lost}; waiting up to {window} s for it to {storage.wait} again")
+    while time.monotonic() - started < window:
+        if cancel_requested(task_id):
+            raise ProcessCancelled("cancellation requested")
+        time.sleep(STORAGE_PROBE_PAUSE_SECONDS)
+        reason = _storage_opens(node, source_node, storage_args, storage_env, task_id)
+        if not reason:
+            return int(time.monotonic() - started)
+    logger.warning("%s could not %s %s again within %d s: %s", source_node, storage.regain, storage.what, window, reason)
+    return None
+
+
+def _remove_partial_disk(repository: dict[str, Any], abr_path: str, backup_name: str) -> None:
+    try:
+        remove_disk_tool_backup(repository, abr_path, backup_name, timeout=REPOSITORY_CHECK_TIMEOUT_SECONDS)
+    except StorageToolError as exc:
+        logger.warning("Could not remove the partly written %s from %s before writing it again: %s", backup_name, abr_path, exc)
 
 
 def _back_up_disks(
@@ -1086,18 +1224,22 @@ def _back_up_disks(
             worker_mode=WORKER_MODE,
         )
         written_backup_names.append(backup_name)
-        free_before = _repository_free_bytes(repository)
-        run = node.run_disk_tool(
-            source_node,
-            args,
-            env=storage_env,
-            on_progress=lambda percent: report(percent, 0),
-            should_cancel=lambda: cancel_requested(task_id),
-            timeout=_disk_timeout_seconds(tool_timeout_seconds, disk["capacity_gb"]),
-            on_notice=lambda message, progress=progress: _warn(progress_callback, "transfer", progress, message),
-        )
-        result = run.get("result") or {}
-        if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
+        attempts = env_int("ALTASTOR_HYPERV_STORAGE_ATTEMPTS")
+        attempt = 1
+        while True:
+            free_before = _repository_free_bytes(repository, abr_path)
+            run = node.run_disk_tool(
+                source_node,
+                args,
+                env=storage_env,
+                on_progress=lambda percent: report(percent, 0),
+                should_cancel=lambda: cancel_requested(task_id),
+                timeout=_disk_timeout_seconds(tool_timeout_seconds, disk["capacity_gb"]),
+                on_notice=lambda message, progress=progress: _warn(progress_callback, "transfer", progress, message),
+            )
+            result = run.get("result") or {}
+            if run.get("exit_code") == 0 and result.get("status") in (None, "ok"):
+                break
             lines = run.get("lines") or []
             if vhdx_tool.ended_unexpectedly(run.get("result"), lines, run.get("exit_code")):
                 raise HyperVBackupError(
@@ -1108,10 +1250,57 @@ def _back_up_disks(
             detail = vhdx_tool.failure_message(result, lines, run.get("exit_code"))
             if change_id and vhdx_tool.change_tracking_lost(result, lines, run.get("exit_code")):
                 raise _ChangeTrackingLost(detail)
-            no_room = out_of_space_detail(repository, detail, free_before)
+            needed = None if change_id else int(disk.get("allocated_bytes") or 0) or None
+            no_room = out_of_space_detail(repository, detail, free_before, needed, abr_path)
             if no_room:
                 logger.warning("Backing up disk %s of %s failed on a full repository: %s", slot, vm_name, detail)
-            raise HyperVBackupError(f"Backing up disk {slot} of {vm_name} failed: {no_room or detail}")
+                raise HyperVBackupError(f"Backing up disk {slot} of {vm_name} failed: {no_room}")
+            storage = lost_storage(repository, storage_env, detail)
+            if not storage:
+                raise HyperVBackupError(f"Backing up disk {slot} of {vm_name} failed: {without_write_count(detail)}")
+            logger.warning(
+                "%s lost %s while writing disk %s of %s (attempt %d of %d): %s",
+                source_node, storage.what, slot, vm_name, attempt, attempts, detail,
+            )
+            reason = _storage_opens(node, source_node, storage_args, storage_env, task_id)
+            if not reason and filled_before_failing(detail, free_before):
+                raise HyperVBackupError(
+                    f"Backing up disk {slot} of {vm_name} failed: "
+                    + out_of_space_message(
+                        repository, None, free_at_start=free_before, needed_bytes=needed, folder=abr_path
+                    )
+                )
+            lost = f"{source_node} lost {storage.what} while writing disk {slot} of {vm_name}"
+            waited = _wait_for_storage(
+                node,
+                source_node,
+                storage_args,
+                storage_env,
+                task_id,
+                lost,
+                storage,
+                lambda message, progress=progress: _warn(progress_callback, "transfer", progress, message),
+                reason,
+            )
+            if waited is None:
+                raise HyperVBackupError(
+                    f"Backing up disk {slot} of {vm_name} failed: {lost}, and could not {storage.regain} it again "
+                    f"within {reconnect_seconds()} s. Check the network between {source_node} and {storage.peer}"
+                )
+            if attempt >= attempts:
+                raise HyperVBackupError(
+                    f"Backing up disk {slot} of {vm_name} failed: {lost}; it {storage.back} again each time, but "
+                    f"the disk could not be written on any of {attempts} attempts"
+                )
+            _remove_partial_disk(repository, abr_path, backup_name)
+            attempt += 1
+            again = f"it {storage.back} again after {waited} s" if waited else f"it {storage.comes_back} again"
+            _warn(
+                progress_callback,
+                "transfer",
+                progress,
+                f"{lost}; {again}, so the disk is backed up again from the start (attempt {attempt} of {attempts})",
+            )
         logical = int(result.get("raw_data_size") or 0)
         stored = int(result.get("stored_data_size") or 0)
         total_read += logical

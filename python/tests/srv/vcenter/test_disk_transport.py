@@ -514,3 +514,123 @@ class ServerWideSettingsTests(_Catalog):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartingSettingsTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        self.problem.stop()
+        environment = patch.dict(os.environ, {"ABR_VSPHERE_API": "vddk", "ABR_VSPHERE_VDDK_LIB": "ovddk"}, clear=False)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("ABR_VMDK_TOOL_VDDK_DIR", None)
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        self.launcher = _launcher(self.root, with_vddk=False, takes_library_file=True)
+        located = patch.object(disk_transport, "default_disk_tool_path", return_value=self.launcher)
+        located.start()
+        self.addCleanup(located.stop)
+        soap = patch.object(disk_transport, "disk_tool_has_soap_api", return_value=True)
+        soap.start()
+        self.addCleanup(soap.stop)
+        system = patch.object(disk_transport, "SYSTEM_LIBRARY_DIRS", ())
+        system.start()
+        self.addCleanup(system.stop)
+        self.ovddk = self.root / "tools" / "ovddk" / "lib64" / "libvixDiskLib.so"
+        self.vmware = self.root / "tools" / "vddk" / "lib64" / "libvixDiskLib.so"
+
+    def _library(self, path: Path, *, exports: bool = True) -> str:
+        return str(_shared_library(path, {"VixDiskLib_InitEx": exports}))
+
+    def _start(self) -> tuple[dict, list[str]]:
+        with self.assertLogs(vsphere_access.logger, level="INFO") as logs:
+            vsphere_access.initialise()
+        return disk_transport.global_settings(), logs.output
+
+    def test_a_fresh_install_starts_with_ovddk_when_it_is_installed(self) -> None:
+        self._library(self.ovddk)
+
+        settings, _logs = self._start()
+
+        self.assertEqual((settings["api"], settings["vddk_library"]), ("vddk", str(self.ovddk)))
+        dto = vsphere_access.settings_dto()
+        self.assertEqual((dto["vddk_library_source"], dto["confirmed"]), ("global", False))
+
+    def test_without_ovddk_a_fresh_install_follows_the_vddk_directory_and_says_why(self) -> None:
+        settings, logs = self._start()
+
+        self.assertEqual((settings["api"], settings["vddk_library"]), ("vddk", None))
+        self.assertTrue(any("oVDDK is not installed" in line for line in logs), logs)
+
+    def test_server_conf_values_are_taken_on_a_fresh_install(self) -> None:
+        library = self._library(self.root / "custom" / "lib64" / "libvixDiskLib.so.9")
+        os.environ.update({"ABR_VSPHERE_API": "soap", "ABR_VSPHERE_VDDK_LIB": library})
+
+        settings, _logs = self._start()
+
+        self.assertEqual((settings["api"], settings["vddk_library"]), ("soap", library))
+
+    def test_a_library_or_api_that_cannot_be_used_is_not_stored_and_the_reason_is_logged(self) -> None:
+        cases = {
+            "missing": (self.root / "missing.so", "There is no file"),
+            "not a VDDK": (Path(self._library(self.root / "other" / "libother.so", exports=False)), "does not export 'VixDiskLib_InitEx'"),
+        }
+        for label, (path, reason) in cases.items():
+            with self.subTest(label):
+                SYSTEM_STATE.clear()
+                os.environ.update({"ABR_VSPHERE_API": "nbd", "ABR_VSPHERE_VDDK_LIB": str(path)})
+                settings, logs = self._start()
+                self.assertEqual((settings["api"], settings["vddk_library"]), ("vddk", None))
+                self.assertTrue(any(reason in line for line in logs), logs)
+                self.assertTrue(any("ABR_VSPHERE_API must be one of: vddk, soap; the API starts as vddk" in line for line in logs), logs)
+
+    def test_an_abr_vmdk_tool_that_takes_no_library_file_leaves_the_vddk_directory(self) -> None:
+        self._library(self.ovddk)
+        self.launcher.write_text("#!/bin/sh\n")
+
+        settings, logs = self._start()
+
+        self.assertIsNone(settings["vddk_library"])
+        self.assertTrue(any("follows the VDDK directory" in line for line in logs), logs)
+
+    def test_a_server_that_already_has_data_keeps_working_as_before_unless_server_conf_says_otherwise(self) -> None:
+        self._library(self.ovddk)
+        JOBS["j"] = {"id": "j", "name": "nightly"}
+
+        settings, _logs = self._start()
+        self.assertEqual((settings["api"], settings["vddk_library"]), ("vddk", None))
+
+        SYSTEM_STATE.clear()
+        os.environ["ABR_VSPHERE_API"] = "soap"
+        settings, _logs = self._start()
+        self.assertEqual((settings["api"], settings["vddk_library"]), ("soap", None))
+
+    def test_stored_settings_are_never_replaced_by_the_starting_values(self) -> None:
+        self._library(self.ovddk)
+        disk_transport.store_global_settings("soap", None, updated_by="admin")
+        os.environ.update({"ABR_VSPHERE_API": "vddk", "ABR_VSPHERE_VDDK_LIB": "ovddk"})
+
+        self.assertEqual(vsphere_access.initialise(), 0)
+
+        settings = disk_transport.global_settings()
+        self.assertEqual((settings["api"], settings["vddk_library"], settings["updated_by"]), ("soap", None, "admin"))
+
+    def test_the_libraries_found_on_the_server_are_listed_once_each(self) -> None:
+        self._library(self.ovddk)
+        self._library(self.vmware)
+        (self.root / "tools" / "vddk-link").symlink_to(self.root / "tools" / "vddk")
+        os.environ["ABR_VMDK_TOOL_VDDK_DIR"] = str(self.root / "tools" / "vddk-link")
+
+        found = disk_transport.detected_libraries()
+
+        self.assertEqual([(item["kind"], item["path"]) for item in found], [("ovddk", str(self.ovddk)), ("vmware_vddk", str(self.root / "tools" / "vddk-link" / "lib64" / "libvixDiskLib.so"))])
+        self.assertEqual(vsphere_access.settings_dto()["detected_vddk_libraries"], found)
+
+    def test_an_administrator_setting_the_same_values_confirms_them(self) -> None:
+        self._library(self.ovddk)
+        self._start()
+
+        settings, changed, _updated = vsphere_access.update_settings({"api": "vddk", "vddk_library": str(self.ovddk)}, updated_by="admin")
+
+        self.assertEqual((changed, settings["confirmed"], settings["updated_by"]), ([], True, "admin"))

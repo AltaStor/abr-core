@@ -39,6 +39,16 @@ VDDK_INIT_SYMBOL = "VixDiskLib_InitEx"
 LIBRARY_VARIABLE = "ABR_VMDK_TOOL_VDDK_LIB"
 DIRECTORY_VARIABLE = "ABR_VMDK_TOOL_VDDK_DIR"
 SETTINGS_ID = "vsphere_access"
+API_DEFAULT_VARIABLE = "ABR_VSPHERE_API"
+LIBRARY_DEFAULT_VARIABLE = "ABR_VSPHERE_VDDK_LIB"
+OVDDK = "ovddk"
+VMWARE_VDDK = "vmware_vddk"
+SYSTEM_LIBRARY = "system"
+SYSTEM_LIBRARY_DIRS = (Path("/usr/local/lib"), Path("/usr/lib64"), Path("/usr/lib/x86_64-linux-gnu"), Path("/usr/lib"))
+LIB64_NOTE = (
+    "A VMware VDDK library must stay in the lib64 folder of its bundle: its transport plugins are found only "
+    "through that folder"
+)
 
 # What a session records about how it reaches the disks.
 SESSION_KEYS = (
@@ -155,6 +165,25 @@ def default_vddk_roots(tool_path: Path | None = None) -> list[Path]:
     """Where the launcher looks when ABR_VMDK_TOOL_VDDK_DIR is not set: ../vddk, then ../../vddk."""
     launcher = _launcher(tool_path)
     return [launcher.parent.parent / "vddk", launcher.parent.parent.parent / "vddk"]
+
+
+def ovddk_library(tool_path: Path | None = None) -> Path:
+    return _launcher(tool_path).parent.parent / OVDDK / VDDK_LIBRARY
+
+
+def detected_libraries(tool_path: Path | None = None) -> list[dict[str, Any]]:
+    candidates = [(ovddk_library(tool_path), OVDDK)]
+    candidates += [(root / VDDK_LIBRARY, VMWARE_VDDK) for root in (vddk_directory(tool_path)[0], *default_vddk_roots(tool_path))]
+    candidates += [(folder / VDDK_LIBRARY.name, SYSTEM_LIBRARY) for folder in SYSTEM_LIBRARY_DIRS]
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for path, kind in candidates:
+        real = os.path.realpath(path)
+        if real in seen or library_problem(str(path)):
+            continue
+        seen.add(real)
+        found.append({"path": str(path), "kind": kind, "file": resolved_file_name(path)})
+    return found
 
 
 def vddk_directory(tool_path: Path | None = None) -> tuple[Path, str]:
