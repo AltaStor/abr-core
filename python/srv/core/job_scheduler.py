@@ -16,7 +16,7 @@ from .mongo_db_wrapper import CATALOG_LOCK, HYPERVISORS, JOBS, RESOURCES_BY_HV, 
 from .server_defaults import env_int
 from .time_zones import load_zone
 from .utils import utc_now
-from python.srv.services import clock_guard, notification_detectors, replication_service
+from python.srv.services import audit_service, clock_guard, notification_detectors, replication_service
 from python.srv.services.backup_copy import create_copy_sessions, has_no_source_left, missing_copy_sources, no_source_left_message
 from python.srv.services.abr_v41 import (
     execution_phases,
@@ -180,6 +180,13 @@ class JobScheduler:
                     job["updated_at"] = now_text
                     persist_job(dict(job))
                     logger.warning("Scheduled run of backup copy job '%s' failed: %s", job["id"], message)
+                    audit_service.record_server_start(
+                        function_id="job.start",
+                        target=audit_service.job_target(normalized_job),
+                        trigger="schedule",
+                        error={"code": "backup_copy_no_source", "message": message},
+                        details={"schedule": due_slots[0][1]},
+                    )
                     continue
                 tasks = create_copy_sessions(
                     normalized_job, trigger="schedule", run_id=run_id, scheduled_type=due_slots[0][1]
@@ -203,6 +210,13 @@ class JobScheduler:
             job["updated_at"] = tasks[-1]["created_at"]
             job["last_scheduler_error"] = None
             persist_job(dict(job))
+            audit_service.record_server_start(
+                function_id="job.start",
+                target=audit_service.job_target(normalized_job),
+                trigger="schedule",
+                session_ids=[task["id"] for task in tasks],
+                details={"schedule": due_slots[0][1]},
+            )
             logger.info(
                 "Scheduled job '%s' enqueued %d task(s); last task is '%s'.",
                 job["id"],
@@ -270,6 +284,13 @@ class JobScheduler:
             if due_slots:
                 fresh["last_scheduled_at"] = task["created_at"]
             persist_job(fresh)
+        audit_service.record_server_start(
+            function_id="job.start",
+            target=audit_service.job_target(normalized_job),
+            trigger=trigger,
+            session_ids=[task["id"]],
+            details={"schedule": due_slots[0][1]} if due_slots else None,
+        )
         logger.info("Replication job '%s' started session '%s' (trigger %s).", job_id, task["id"], trigger)
 
     EXECUTION_SLOTS = (

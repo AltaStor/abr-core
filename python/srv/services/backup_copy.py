@@ -38,6 +38,7 @@ from python.srv.core.storage_tool import (
 )
 from python.srv.core.subprocess_util import ProcessCancelled
 from python.srv.core.utils import utc_now
+from python.srv.services import audit_service
 from python.srv.services.api_errors import api_error
 from python.srv.services.backup_mode import (
     object_lock_expiry,
@@ -484,6 +485,9 @@ def _start_and_record(job: dict[str, Any], *, trigger: str, vm_ids: list[str] | 
         )
         stored["updated_at"] = utc_now()
         persist_job(stored)
+    audit_service.record_server_start(
+        function_id="job.start", target=audit_service.job_target(job), trigger=trigger, session_ids=[task["id"] for task in sessions]
+    )
     return sessions
 
 

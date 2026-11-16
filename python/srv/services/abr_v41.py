@@ -125,7 +125,7 @@ from python.srv.services.inventory_management import (
     inventory_type_from_record,
     normalize_inventory_type,
 )
-from python.srv.services import replication_service
+from python.srv.services import audit_service, replication_service
 from python.srv.services.backup_copy import (
     apply_copy_settings,
     copy_job_view,
@@ -8256,6 +8256,13 @@ def _run_job_verify(job_id: str, run: dict[str, Any]) -> None:
             )
             run["session_ids"].append(task["id"])
             _record_job_verify(job_id, run)
+            audit_service.record_server_start(
+                function_id="backup.verify",
+                target=audit_service.target_from_path({"backup_id": chain_id}),
+                trigger=str(run["trigger"]),
+                session_ids=[task["id"]],
+                details={"job": audit_service.job_target(JOBS.get(job_id) or {"id": job_id})},
+            )
             try:
                 report = _run_verify_session(
                     chain_id, str(task["id"]), point_ids=point_ids, found_by=f"the verify schedule of job {name}"

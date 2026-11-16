@@ -246,13 +246,14 @@ AUDIT COMMANDS
 
 abr audit list 
 
-Description: Show the audit log, newest first: the time (UTC), the user and the role they held then, the function ID, the target, the result (allowed, denied or failed), the session the command started, and the interface it came from (cli, web or api). Every command from any interface is recorded, and every user or role change; reads the Web UI repeats in the background are not. Passwords, keys and tokens are masked before a record is written. 
+Description: Show the audit log, newest first: the time (UTC), the user and the role they held then, the function ID, the target, the result (allowed, denied or failed), the session the command started, and the interface it came from (cli, web or api). Every command from any interface is recorded, and every user or role change; reads the Web UI repeats in the background are not. A run the server starts on its own is recorded too, as user system with interface scheduler: a scheduled backup, copy or replication run (job.start), a backup copy or replication that follows another job, and each session of a scheduled verify (backup.verify, with the job in details). Its details say what started it (trigger: schedule, immediate, after-job, after-source, copy-backlog or copy-window) and, for a schedule, which one fired (schedule: Incremental, ActiveFull or SyntheticFull). A scheduled backup copy that has no source left is recorded as failed, with the reason. Passwords, keys and tokens are masked before a record is written. 
 
 abr audit list [--user <name>] [--function <function-id | area.>] [--result allowed|denied|failed] [--since <iso>] [--until <iso>] [--limit <n>] [--offset <n>] 
 
 Examples: 
 abr audit list --result denied 
 abr audit list --user alice --since 2026-10-01 
+abr audit list --user system --function job.start 
 abr --output json audit list --function job. --limit 500 
 
 NOTIFICATION COMMANDS 
