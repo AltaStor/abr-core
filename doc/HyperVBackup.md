@@ -141,6 +141,21 @@ It mirrors the VMware backup step for step:
    into the VM's disks and keeps the change tracking position it marked. The
    reference point of the job's previous backup is then removed.
 
+When the host loses an SMB repository's share while a disk is written (a
+network outage, a file server failover, a Samba restart), the run goes on: the
+server checks from the host whether the share opens again, waits up to
+`ALTASTOR_HYPERV_RECONNECT_SECONDS` (300 s by default) for it, removes what the
+failed attempt wrote and backs that disk up again from the start, from the same
+checkpoint, up to `ALTASTOR_HYPERV_SHARE_ATTEMPTS` (3) times. The session log
+says so with a warning. A share that does not open again within that time, or a
+disk that fails on every attempt, fails the run, naming the host and the share.
+A write that failed because the share is full is not retried: the session says
+that the repository ran out of space, with the free space when the disk
+started and the room the disk takes on the host before compression (an upper
+bound, since the data is compressed). The count of written bytes abr-vhdx-tool
+prints with a write error is left out of every message: it does not reflect
+what was written.
+
 A job's runs follow the usual schedule rules: the first backup is full, the
 following ones incremental, with active and synthetic full backups on their
 own schedules or on demand. A synthetic full merges the chain on the backup
@@ -274,6 +289,8 @@ Lock validation. Credentials and encryption keys are never written to either.
 | `can read repository ... but cannot write to it` | Give the account it names write access to the share, or set an account that has it (`abr repo edit --username ... --password`) |
 | `abr-vhdx-tool on ... ended unexpectedly (exit code ...)` | The tool stopped without reporting an error of its own: it was killed, ran out of memory or was stopped by antivirus software on that host (the host's Application event log, and the antivirus log). Its last output is quoted for context only |
 | `cannot open the repository share` | The share's account (the repository's `--username`, else the inventory's), and that every node reaches the share on TCP 445 |
+| `lost the repository share` | The network between that node and the file server, and the file server itself. The run waited for the share and wrote the disk again; it fails only when the share stays away longer than `ALTASTOR_HYPERV_RECONNECT_SECONDS` or the disk fails on every attempt |
+| `ran out of space` | Free space in the repository's filesystem (the share), or point the job at another repository |
 | `did not answer WinRM over HTTPS on port ...` | No HTTPS listener on that port of the host: set one up, or set the inventory to HTTP (`abr inventory edit --protocol http`) |
 | `the port answers without TLS` | The port is an HTTP listener: give the HTTPS listener's port, or set the inventory to HTTP |
 | `The TLS certificate of Hyper-V host ... was not trusted` | Give the host a certificate the server trusts, or accept it with `--insecure` (*Skip TLS verification*) |
