@@ -108,6 +108,7 @@ class FakeVCenterNode:
     quiesce_failure: Exception | None = None
     snapshot_quiesced: bool = True
     tools_status: str = "toolsOk"
+    power_state: str = "poweredOn"
     raise_on_query_changed_disk_areas: Exception | None = None
     raise_on_query_for_disk_keys: dict[int, Exception] | None = None
     extra_live_disks: list[dict[str, object]] | None = None
@@ -189,7 +190,11 @@ class FakeVCenterNode:
 
     def snapshot_consistency(self, vm_name: str, snapshot_name: str) -> dict[str, str | None]:
         quiesced = self.snapshot_quiesced and self.snapshot_quiesce_requests[-1:] == [True]
-        return {"consistency": "quiesced" if quiesced else "crash_consistent", "tools_status": self.tools_status}
+        return {
+            "consistency": "quiesced" if quiesced else "crash_consistent",
+            "tools_status": self.tools_status,
+            "power_state": self.power_state,
+        }
 
     def get_backup_parameters(self, vm_name: str, snapshot_name: str) -> dict[str, str]:
         return {"vm_moref": "vm-123", "snapshot_moref": "snapshot-456"}
@@ -542,6 +547,7 @@ class TaskExecutorTests(unittest.TestCase):
         FakeVCenterNode.quiesce_failure = None
         FakeVCenterNode.snapshot_quiesced = True
         FakeVCenterNode.tools_status = "toolsOk"
+        FakeVCenterNode.power_state = "poweredOn"
         FakeVCenterNode.raise_on_query_changed_disk_areas = None
         FakeVCenterNode.raise_on_query_for_disk_keys = None
         FakeVCenterNode.extra_live_disks = None
@@ -8214,6 +8220,33 @@ class TaskExecutorTests(unittest.TestCase):
                     warnings,
                     [{"code": "crash_consistent", "message": f"{cause} in VM demo-vm: the backup is crash-consistent", "vm_name": "demo-vm"}],
                 )
+
+    def test_a_powered_off_vm_is_backed_up_as_consistent_without_a_warning(self) -> None:
+        for tools in ("toolsNotRunning", "toolsNotInstalled"):
+            with self.subTest(tools=tools):
+                FakeVCenterNode.snapshot_quiesce_requests.clear()
+                FakeVCenterNode.snapshot_quiesced = False
+                FakeVCenterNode.tools_status = tools
+                FakeVCenterNode.power_state = "poweredOff"
+
+                result, warnings, manifest = self._run_demo_vcenter_backup()
+
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["result"]["consistency"], "crash_consistent")
+                self.assertEqual(result["result"]["consistency_reason"], "vm_not_running")
+                self.assertEqual(manifest["consistency_reason"], "vm_not_running")
+                self.assertEqual(warnings, [])
+
+    def test_a_suspended_vm_still_gets_the_crash_consistent_warning(self) -> None:
+        FakeVCenterNode.snapshot_quiesce_requests.clear()
+        FakeVCenterNode.snapshot_quiesced = False
+        FakeVCenterNode.tools_status = "toolsNotRunning"
+        FakeVCenterNode.power_state = "suspended"
+
+        result, warnings, _manifest = self._run_demo_vcenter_backup()
+
+        self.assertEqual(result["result"]["consistency_reason"], "tools_not_running")
+        self.assertEqual([warning["code"] for warning in warnings], ["crash_consistent"])
 
     def test_a_failed_quiesce_fails_the_session_by_default_and_says_what_to_fix(self) -> None:
         from python.srv.plugins.hypervisor import QuiesceFailedError

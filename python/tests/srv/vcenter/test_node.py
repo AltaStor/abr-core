@@ -780,21 +780,23 @@ class VCenterNodeQuiesceTests(unittest.TestCase):
         self.assertEqual(len(node.si.manager.queries), 3)
 
     def test_the_consistency_comes_from_the_snapshot_itself(self) -> None:
-        for quiesced, tools, expected in (
-            (True, "toolsOk", "quiesced"),
-            (False, "toolsNotRunning", "crash_consistent"),
-            (False, "toolsNotInstalled", "crash_consistent"),
+        for quiesced, tools, power, expected in (
+            (True, "toolsOk", "poweredOn", "quiesced"),
+            (False, "toolsNotRunning", "poweredOn", "crash_consistent"),
+            (False, "toolsNotInstalled", "poweredOn", "crash_consistent"),
+            (False, "toolsNotRunning", "poweredOff", "crash_consistent"),
         ):
-            with self.subTest(tools=tools):
+            with self.subTest(tools=tools, power=power):
                 vm = _QuiesceSnapshotVm(None)
                 vm.guest = types.SimpleNamespace(toolsStatus=tools)
+                vm.runtime = types.SimpleNamespace(powerState=power)
                 node_entry = types.SimpleNamespace(name="FullBackup_1", quiesced=quiesced, childSnapshotList=[])
                 vm.snapshot = types.SimpleNamespace(rootSnapshotList=[node_entry])
                 node = self._node(vm, fails=False)
 
                 state = node.snapshot_consistency("demo-vm", "FullBackup_1")
 
-                self.assertEqual(state, {"consistency": expected, "tools_status": tools})
+                self.assertEqual(state, {"consistency": expected, "tools_status": tools, "power_state": power})
 
 
 class VCenterNodeFirmwareTests(unittest.TestCase):

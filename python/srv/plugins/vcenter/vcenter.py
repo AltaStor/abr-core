@@ -997,12 +997,14 @@ class VCenterNode(Hypervisor):
         if not vm:
             raise ValueError(f"VM '{vm_name}' not found on {self.host}.")
         tools_status = str(getattr(getattr(vm, "guest", None), "toolsStatus", "") or "") or None
+        power_state = str(getattr(getattr(vm, "runtime", None), "powerState", "") or "") or None
         node = self._find_snapshot(vm.snapshot.rootSnapshotList if vm.snapshot else [], snapshot_name)
         if node is None:
-            return {"consistency": None, "tools_status": tools_status}
+            return {"consistency": None, "tools_status": tools_status, "power_state": power_state}
         return {
             "consistency": "quiesced" if bool(getattr(node, "quiesced", False)) else "crash_consistent",
             "tools_status": tools_status,
+            "power_state": power_state,
         }
 
     def _reset_change_tracking(self, vm: Any, vm_name: str) -> None:
