@@ -57,7 +57,7 @@ other role is allowed exactly what it lists.
 | `dashboard.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `system.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `system.logs` | read | ✓ | ✓ | – | – | ✓ |
-| `system.support_bundle` | administer | ✓ | – | – | – | – |
+| `system.support_bundle` | administer | ✓ | ✓ | – | – | – |
 | `system.export` | administer | ✓ | – | – | – | – |
 | `system.import` | administer | ✓ | – | – | – | – |
 | `system.clock_confirm` | administer | ✓ | – | – | – | – |
@@ -80,29 +80,29 @@ other role is allowed exactly what it lists.
 | `repository.create` | configure | ✓ | ✓ | – | – | – |
 | `repository.edit` | configure | ✓ | ✓ | – | – | – |
 | `repository.delete` | destructive | ✓ | ✓ | – | – | – |
-| `repository.rescan` | operate | ✓ | ✓ | – | – | – |
-| `repository.verify` | operate | ✓ | ✓ | – | – | – |
+| `repository.rescan` | operate | ✓ | ✓ | ✓ | – | – |
+| `repository.verify` | operate | ✓ | ✓ | ✓ | – | – |
 | `repository.apply_immutability` | configure | ✓ | ✓ | – | – | – |
 | `inventory.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `inventory.create` | configure | ✓ | ✓ | – | – | – |
 | `inventory.edit` | configure | ✓ | ✓ | – | – | – |
 | `inventory.delete` | destructive | ✓ | ✓ | – | – | – |
-| `inventory.rescan` | operate | ✓ | ✓ | – | ✓ | – |
-| `inventory.test` | operate | ✓ | ✓ | – | ✓ | – |
-| `job.view` | read | ✓ | ✓ | ✓ | – | ✓ |
+| `inventory.rescan` | operate | ✓ | ✓ | ✓ | ✓ | – |
+| `inventory.test` | operate | ✓ | ✓ | ✓ | ✓ | – |
+| `job.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `job.create` | configure | ✓ | ✓ | – | – | – |
 | `job.edit` | configure | ✓ | ✓ | – | – | – |
 | `job.delete` | destructive | ✓ | ✓ | – | – | – |
 | `job.start` | operate | ✓ | ✓ | ✓ | – | – |
 | `job.retention` | destructive | ✓ | ✓ | – | – | – |
 | `session.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `session.stop` | operate | ✓ | ✓ | ✓ | ✓ | – |
+| `session.stop` | operate | ✓ | ✓ | ✓ | – | – |
 | `backup.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `backup.verify` | operate | ✓ | ✓ | ✓ | ✓ | – |
-| `backup.delete` | destructive | ✓ | ✓ | – | – | – |
+| `backup.delete` | destructive | ✓ | – | – | – | – |
 | `backup.import` | configure | ✓ | ✓ | – | – | – |
-| `restore.view` | read | ✓ | – | – | ✓ | – |
-| `restore.start` | operate | ✓ | – | – | ✓ | – |
+| `restore.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `restore.start` | operate | ✓ | ✓ | – | ✓ | – |
 
 The automated test `python/tests/srv/rbac/test_permission_matrix.py` holds the
 same matrix written out, so any change to a role has to be made in both places.
