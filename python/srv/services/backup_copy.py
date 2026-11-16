@@ -1563,17 +1563,27 @@ def waits_for_window(task: dict[str, Any]) -> bool:
     return job.get("job_type") == "backup-copy" and not copy_window_state(job)["open"]
 
 
+def _current_window(job: dict[str, Any]) -> dict[str, Any]:
+    stored = JOBS.get(str(job.get("id") or ""))
+    if not isinstance(stored, dict):
+        return job
+    return {**job, "copy_window": [rule for rule in stored.get("copy_window") or [] if isinstance(rule, dict)]}
+
+
 def _window_closed(job: dict[str, Any]) -> bool:
-    return not copy_window_state(job)["open"]
+    return not copy_window_state(_current_window(job))["open"]
 
 
 def _stop_for_window(job: dict[str, Any], detail: str) -> Exception:
     from python.srv.core.task_executor import TaskStopRequested
 
-    state = copy_window_state(job)
+    current = _current_window(job)
+    rules = current.get("copy_window") or []
+    changed = ", changed while the copy ran" if rules != list(job.get("copy_window") or []) else ""
+    state = copy_window_state(current)
     stop = TaskStopRequested(
-        f"The copy window ({describe_copy_window(job.get('copy_window') or [])}) closed {detail}; "
-        f"the copy is taken up again when it opens, {_local_text(state.get('opens_at'), job)}"
+        f"The copy window ({describe_copy_window(rules)}{changed}) closed {detail}; "
+        f"the copy is taken up again when it opens, {_local_text(state.get('opens_at'), current)}"
     )
     stop.reason = WINDOW_STOP_REASON
     return stop
