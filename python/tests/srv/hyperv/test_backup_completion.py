@@ -347,7 +347,7 @@ class _Clock:
         return self.now
 
 
-class ShareLossTests(unittest.TestCase):
+class _LossCase(unittest.TestCase):
     def setUp(self) -> None:
         self.root = self.enterContext(tempfile.TemporaryDirectory())
         self.repository = {"id": "repo-1", "name": "Shared", "type": "smb", "path": self.root}
@@ -375,7 +375,7 @@ class ShareLossTests(unittest.TestCase):
             return (free_by_path or {}).get(str(path), free)
 
         with (
-            patch.dict("os.environ", {"ALTASTOR_HYPERV_SHARE_ATTEMPTS": str(attempts)}),
+            patch.dict("os.environ", {"ALTASTOR_HYPERV_STORAGE_ATTEMPTS": str(attempts)}),
             patch.object(hyperv_backup, "filesystem_free_bytes", side_effect=free_bytes),
             patch.object(hyperv_backup, "cancel_requested", side_effect=lambda _task: self.cancel),
             patch.object(hyperv_backup, "reconnect_seconds", return_value=window),
@@ -407,6 +407,8 @@ class ShareLossTests(unittest.TestCase):
             self._run(node, **kwargs)
         return str(raised.exception)
 
+
+class ShareLossTests(_LossCase):
     def test_a_share_lost_and_back_by_the_time_the_tool_fails_writes_the_disk_again(self) -> None:
         node = _ScriptedNode([WRITE_FAILED, WRITTEN])
 
@@ -543,7 +545,144 @@ class ShareLossTests(unittest.TestCase):
         self.assertEqual(self.removed, [])
 
 
-INFO_LINE = "Virtual disk 'C:\\VMs\\et-vm\\disk.vhdx' attached read-only as \\\\.\\PhysicalDrive3"
+S3_DOWN_LINE = (
+    "Error: Virtual disk 'C:\\VMs\\et-vm\\disk.vhdx' attached read-only as \\\\.\\PhysicalDrive3; S3 bucket 'et-bucket' is "
+    "not accessible at endpoint http://s3.example:9000: Encountered network error when sending http request. Create the "
+    "bucket or enable bucket auto-creation.; Failed to initialize backup manager!; failed to initialize 's3' backup "
+    "storage at 'et-bucket'"
+)
+S3_DOWN = {"exit_code": 1, "result": None, "lines": [S3_DOWN_LINE]}
+S3_CLOSED = {"exit_code": 1, "result": None, "lines": [S3_DOWN_LINE.replace("Virtual disk 'C:\\VMs\\et-vm\\disk.vhdx' attached read-only as \\\\.\\PhysicalDrive3; ", "")]}
+S3_NO_BUCKET = {
+    "exit_code": 1,
+    "result": None,
+    "lines": ["Error: S3 bucket 'et-bucket' does not exist at endpoint http://s3.example:9000. Create the bucket or enable bucket auto-creation."],
+}
+
+
+def _s3_repository() -> dict:
+    return {
+        "id": "repo-1",
+        "name": "Bucket",
+        "type": "s3",
+        "path": "s3://et-bucket/et",
+        "s3": {"bucket": "et-bucket", "endpoint_url": "http://s3.example:9000"},
+    }
+
+
+class S3LossTests(_LossCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repository = _s3_repository()
+
+    def test_a_storage_that_stops_answering_is_waited_for_and_the_disk_is_written_again(self) -> None:
+        node = _ScriptedNode([S3_DOWN, WRITTEN], [S3_CLOSED, OPENS])
+
+        self._run(node)
+
+        self.assertEqual(node.calls, ["backup", "info", "info", "backup"])
+        lost = "NODE-A lost the S3 storage http://s3.example:9000 while writing disk SCSI 0:0 of et-vm"
+        self.assertEqual(
+            self.notices,
+            [
+                f"{lost}; waiting up to 300 s for it to answer again",
+                f"{lost}; it answered again after 5 s, so the disk is backed up again from the start (attempt 2 of 3)",
+            ],
+        )
+
+    def test_a_storage_back_by_the_time_the_tool_fails_writes_the_disk_again_at_once(self) -> None:
+        node = _ScriptedNode([S3_DOWN, WRITTEN])
+
+        self._run(node, incremental=True)
+
+        self.assertEqual(node.calls, ["backup", "info", "backup"])
+        self.assertIn("it answers again, so the disk is backed up again from the start (attempt 2 of 3)", self.notices[0])
+
+    def test_a_storage_that_does_not_answer_within_the_window_says_so_without_the_tools_advice(self) -> None:
+        message = self._fails(_ScriptedNode([S3_DOWN], [S3_CLOSED] * 100), window=30)
+
+        self.assertEqual(
+            message,
+            "Backing up disk SCSI 0:0 of et-vm failed: NODE-A lost the S3 storage http://s3.example:9000 while writing disk "
+            "SCSI 0:0 of et-vm, and could not reach it again within 30 s. Check the network between NODE-A and the S3 "
+            "storage",
+        )
+        self.assertNotIn("Create the bucket", message)
+        self.assertNotIn("Failed to initialize", message)
+
+    def test_a_storage_that_fails_on_every_attempt_stops_after_the_last_one(self) -> None:
+        message = self._fails(_ScriptedNode([S3_DOWN, S3_DOWN]), attempts=2)
+
+        self.assertIn("it answered again each time, but the disk could not be written on any of 2 attempts", message)
+
+    def test_a_missing_bucket_is_not_waited_for(self) -> None:
+        node = _ScriptedNode([S3_NO_BUCKET])
+
+        message = self._fails(node)
+
+        self.assertEqual(node.calls, ["backup"])
+        self.assertIn("does not exist", message)
+
+    def test_a_stop_while_waiting_for_the_storage_stops_the_session(self) -> None:
+        node = _ScriptedNode([S3_DOWN], [S3_CLOSED, S3_CLOSED])
+        original = node.run_disk_tool
+
+        def probe_then_stop(n, args, **kwargs):
+            result = original(n, args, **kwargs)
+            if args[0] == "info":
+                self.cancel = True
+            return result
+
+        node.run_disk_tool = probe_then_stop
+
+        with self.assertRaises(hyperv_backup.ProcessCancelled):
+            self._run(node)
+
+
+class _InfoNode:
+    def __init__(self, run: dict) -> None:
+        self.run = run
+
+    def run_disk_tool(self, node, args, **kwargs):
+        return self.run
+
+
+class RepositoryCheckS3Tests(unittest.TestCase):
+    def _check(self, run: dict) -> str:
+        with (
+            patch.object(hyperv_backup, "cancel_requested", return_value=False),
+            self.assertRaises(hyperv_backup.HyperVBackupError) as raised,
+        ):
+            hyperv_backup._check_repository_access(
+                _InfoNode(run), "NODE-A", [], {}, "Bucket", "task-1", None, repository=_s3_repository()
+            )
+        return str(raised.exception)
+
+    def test_a_storage_that_does_not_answer_before_the_run_is_not_called_a_missing_bucket(self) -> None:
+        message = self._check(S3_CLOSED)
+
+        self.assertEqual(
+            message,
+            "NODE-A cannot reach repository Bucket: the S3 storage http://s3.example:9000 did not answer (a network error). "
+            "Check the network between NODE-A and the S3 storage",
+        )
+
+    def test_the_endpoint_comes_from_the_tool_then_the_repository_then_the_bucket(self) -> None:
+        bare = {"id": "repo-1", "name": "Bucket", "type": "s3", "s3": {"bucket": "et-bucket"}}
+        cases = [
+            (_s3_repository(), "network error at endpoint https://s3.other:443. Retry", "https://s3.other:443"),
+            (_s3_repository(), "Encountered network error", "http://s3.example:9000"),
+            (bare, "Encountered network error", "of bucket et-bucket"),
+        ]
+        for repository, text, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(hyperv_backup.s3_endpoint(repository, text), expected)
+
+    def test_a_missing_bucket_before_the_run_keeps_the_tools_words(self) -> None:
+        self.assertIn("does not exist", self._check(S3_NO_BUCKET))
+
+
+INFO_LINE ="Virtual disk 'C:\\VMs\\et-vm\\disk.vhdx' attached read-only as \\\\.\\PhysicalDrive3"
 
 
 class _EndedNode:

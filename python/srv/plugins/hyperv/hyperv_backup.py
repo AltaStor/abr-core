@@ -34,7 +34,7 @@ import re
 import shutil
 import time
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from ...core.mongo_db_wrapper import HYPERVISORS, REPOSITORIES, RESOURCES_BY_HV
 from ...core.storage_tool import (
@@ -110,11 +110,17 @@ _NETWORK_LOST = re.compile(
     r"|network location cannot be reached|connection was forcibly closed|network connection was aborted",
     re.IGNORECASE,
 )
+_S3_NETWORK = re.compile(
+    r"network error|couldn't connect|could not connect|failed to connect|connection refused|connection reset"
+    r"|timed out|timeout was reached|could not resolve host",
+    re.IGNORECASE,
+)
+_S3_ENDPOINT = re.compile(r"at endpoint (\S+?):?\s", re.IGNORECASE)
 _FAILED_AT_OFFSET = re.compile(r"at offset (\d+)", re.IGNORECASE)
 _TOOL_WRITE_COUNT = re.compile(r"\s*Write error, expected \d+ bytes, written \d+ bytes!;?", re.IGNORECASE)
 NEARLY_FULL_BYTES = 64 * 1024 * 1024
-SHARE_PROBE_TIMEOUT_SECONDS = 60
-SHARE_PROBE_PAUSE_SECONDS = 5
+STORAGE_PROBE_TIMEOUT_SECONDS = 60
+STORAGE_PROBE_PAUSE_SECONDS = 5
 
 
 def _repository_free_bytes(repository: dict[str, Any], folder: str | None = None) -> int | None:
@@ -170,13 +176,40 @@ def without_write_count(tool_error: str) -> str:
     return _TOOL_WRITE_COUNT.sub("", tool_error or "").strip(" ;")
 
 
-def lost_share(repository: dict[str, Any], storage_env: dict[str, str], tool_error: str) -> str | None:
+class LostStorage(NamedTuple):
+    what: str
+    regain: str
+    wait: str
+    back: str
+    comes_back: str
+    peer: str
+
+
+def s3_endpoint(repository: dict[str, Any], tool_error: str = "") -> str:
+    named = _S3_ENDPOINT.search(tool_error or "")
+    if named:
+        return named.group(1).rstrip(".,;:")
+    config = extract_s3_config(repository)
+    if config.get("endpoint_url"):
+        return str(config["endpoint_url"])
+    return f"of bucket {config['bucket']}" if config.get("bucket") else "of the repository"
+
+
+def s3_unreachable(repository: dict[str, Any], tool_error: str) -> bool:
+    return is_s3_repository(repository) and bool(_S3_NETWORK.search(tool_error or ""))
+
+
+def lost_storage(repository: dict[str, Any], storage_env: dict[str, str], tool_error: str) -> LostStorage | None:
     if is_s3_repository(repository):
-        return None
+        if not s3_unreachable(repository, tool_error):
+            return None
+        return LostStorage(
+            f"the S3 storage {s3_endpoint(repository, tool_error)}", "reach", "answer", "answered", "answers", "the S3 storage"
+        )
     share = str(storage_env.get("ABR_SMB_SHARE") or vhdx_tool.windows_share(repository) or "")
     if not share or not (_WRITE_FAILED.search(tool_error or "") or _NETWORK_LOST.search(tool_error or "")):
         return None
-    return share
+    return LostStorage(f"the repository share {share}", "open", "open", "opened", "opens", "the file server")
 
 
 def _out_of_space_error(repository: dict[str, Any], exc: OSError) -> HyperVBackupError | None:
@@ -1031,6 +1064,12 @@ def _check_repository_access(
         return True, ""
 
     reached, detail = tool(["info", "--json", *storage_args])
+    if not reached and isinstance(repository, dict) and s3_unreachable(repository, detail):
+        logger.warning("%s cannot reach the S3 storage of repository %s: %s", source_node, repository_label, detail)
+        raise HyperVBackupError(
+            f"{source_node} cannot reach repository {repository_label}: the S3 storage {s3_endpoint(repository, detail)} "
+            f"did not answer (a network error). Check the network between {source_node} and the S3 storage"
+        )
     if not reached:
         raise HyperVBackupError(f"{source_node} cannot reach repository {repository_label}: {detail}")
     if isinstance(repository, dict) and not is_s3_repository(repository):
@@ -1063,7 +1102,7 @@ def _cannot_write_message(
     )
 
 
-def _share_opens(
+def _storage_opens(
     node: HyperVNode, source_node: str, storage_args: list[str], storage_env: dict[str, str], task_id: str
 ) -> str:
     try:
@@ -1072,7 +1111,7 @@ def _share_opens(
             ["info", "--json", *storage_args],
             env=storage_env,
             should_cancel=lambda: cancel_requested(task_id),
-            timeout=SHARE_PROBE_TIMEOUT_SECONDS,
+            timeout=STORAGE_PROBE_TIMEOUT_SECONDS,
         )
     except HyperVError as exc:
         return str(exc)
@@ -1082,13 +1121,14 @@ def _share_opens(
     return vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
 
 
-def _wait_for_share(
+def _wait_for_storage(
     node: HyperVNode,
     source_node: str,
     storage_args: list[str],
     storage_env: dict[str, str],
     task_id: str,
     lost: str,
+    storage: LostStorage,
     notice: Callable[[str], None],
     reason: str,
 ) -> int | None:
@@ -1096,16 +1136,16 @@ def _wait_for_share(
     started = time.monotonic()
     if not reason:
         return 0
-    logger.warning("%s cannot open the repository share yet: %s", source_node, reason)
-    notice(f"{lost}; waiting up to {window} s for it to open again")
+    logger.warning("%s cannot %s %s yet: %s", source_node, storage.regain, storage.what, reason)
+    notice(f"{lost}; waiting up to {window} s for it to {storage.wait} again")
     while time.monotonic() - started < window:
         if cancel_requested(task_id):
             raise ProcessCancelled("cancellation requested")
-        time.sleep(SHARE_PROBE_PAUSE_SECONDS)
-        reason = _share_opens(node, source_node, storage_args, storage_env, task_id)
+        time.sleep(STORAGE_PROBE_PAUSE_SECONDS)
+        reason = _storage_opens(node, source_node, storage_args, storage_env, task_id)
         if not reason:
             return int(time.monotonic() - started)
-    logger.warning("%s could not open the repository share again within %d s: %s", source_node, window, reason)
+    logger.warning("%s could not %s %s again within %d s: %s", source_node, storage.regain, storage.what, window, reason)
     return None
 
 
@@ -1184,7 +1224,7 @@ def _back_up_disks(
             worker_mode=WORKER_MODE,
         )
         written_backup_names.append(backup_name)
-        attempts = env_int("ALTASTOR_HYPERV_SHARE_ATTEMPTS")
+        attempts = env_int("ALTASTOR_HYPERV_STORAGE_ATTEMPTS")
         attempt = 1
         while True:
             free_before = _repository_free_bytes(repository, abr_path)
@@ -1215,14 +1255,14 @@ def _back_up_disks(
             if no_room:
                 logger.warning("Backing up disk %s of %s failed on a full repository: %s", slot, vm_name, detail)
                 raise HyperVBackupError(f"Backing up disk {slot} of {vm_name} failed: {no_room}")
-            share = lost_share(repository, storage_env, detail)
-            if not share:
+            storage = lost_storage(repository, storage_env, detail)
+            if not storage:
                 raise HyperVBackupError(f"Backing up disk {slot} of {vm_name} failed: {without_write_count(detail)}")
             logger.warning(
-                "%s lost the repository share %s while writing disk %s of %s (attempt %d of %d): %s",
-                source_node, share, slot, vm_name, attempt, attempts, detail,
+                "%s lost %s while writing disk %s of %s (attempt %d of %d): %s",
+                source_node, storage.what, slot, vm_name, attempt, attempts, detail,
             )
-            reason = _share_opens(node, source_node, storage_args, storage_env, task_id)
+            reason = _storage_opens(node, source_node, storage_args, storage_env, task_id)
             if not reason and filled_before_failing(detail, free_before):
                 raise HyperVBackupError(
                     f"Backing up disk {slot} of {vm_name} failed: "
@@ -1230,30 +1270,31 @@ def _back_up_disks(
                         repository, None, free_at_start=free_before, needed_bytes=needed, folder=abr_path
                     )
                 )
-            lost = f"{source_node} lost the repository share {share} while writing disk {slot} of {vm_name}"
-            waited = _wait_for_share(
+            lost = f"{source_node} lost {storage.what} while writing disk {slot} of {vm_name}"
+            waited = _wait_for_storage(
                 node,
                 source_node,
                 storage_args,
                 storage_env,
                 task_id,
                 lost,
+                storage,
                 lambda message, progress=progress: _warn(progress_callback, "transfer", progress, message),
                 reason,
             )
             if waited is None:
                 raise HyperVBackupError(
-                    f"Backing up disk {slot} of {vm_name} failed: {lost}, and could not open it again within "
-                    f"{reconnect_seconds()} s. Check the network between {source_node} and the file server"
+                    f"Backing up disk {slot} of {vm_name} failed: {lost}, and could not {storage.regain} it again "
+                    f"within {reconnect_seconds()} s. Check the network between {source_node} and {storage.peer}"
                 )
             if attempt >= attempts:
                 raise HyperVBackupError(
-                    f"Backing up disk {slot} of {vm_name} failed: {lost}; it opened again each time, but the "
-                    f"disk could not be written on any of {attempts} attempts"
+                    f"Backing up disk {slot} of {vm_name} failed: {lost}; it {storage.back} again each time, but "
+                    f"the disk could not be written on any of {attempts} attempts"
                 )
             _remove_partial_disk(repository, abr_path, backup_name)
             attempt += 1
-            again = f"it opened again after {waited} s" if waited else "it opens again"
+            again = f"it {storage.back} again after {waited} s" if waited else f"it {storage.comes_back} again"
             _warn(
                 progress_callback,
                 "transfer",

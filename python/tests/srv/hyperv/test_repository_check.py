@@ -102,8 +102,11 @@ class RepositoryCheckBeforeCheckpointTests(unittest.TestCase):
         node, error, discard = self._run({"exit_code": 1, "result": UNREACHABLE_RESULT, "lines": UNREACHABLE_LINES})
 
         self.assertIsInstance(error, hyperv_backup.HyperVBackupError)
-        self.assertIn("NODE-A cannot reach repository repo (S3 bucket bucket)", str(error))
-        self.assertIn("is not accessible at endpoint http://s3.example.test:9000", str(error))
+        self.assertEqual(
+            str(error),
+            "NODE-A cannot reach repository repo (S3 bucket bucket): the S3 storage http://s3.example.test:9000 did not "
+            "answer (a network error). Check the network between NODE-A and the S3 storage",
+        )
         self.assertEqual(
             node.calls,
             [("run_disk_tool", "NODE-A", ["info", "--json", *STORAGE_ARGS], STORAGE_ENV)],
