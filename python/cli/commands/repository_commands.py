@@ -23,6 +23,13 @@ IMMUTABILITY_MODES = ("none", "governance", "compliance")
 DEFAULT_REPOSITORY_TIMEOUT_SECONDS = 300
 IMMUTABILITY_VALIDATION_TIMEOUT_SECONDS = 21600
 STORAGE_VALIDATION_TIMEOUT_SECONDS = 900
+SHARE_COLUMNS = [
+    ("name", "NAME"),
+    ("path", "PATH"),
+    ("shared", "SHARED"),
+    ("network_path", "NETWORK PATH"),
+    ("username", "ACCOUNT"),
+]
 
 
 def _parse_remote_address(repo_type: str, address: str | None) -> dict[str, str]:
@@ -349,6 +356,46 @@ class RepositoryCommands:
         )
         default.set_defaults(handler=self.default)
 
+        share = commands.add_parser(
+            "share",
+            help="Share local repositories over SMB from this server, list, check or remove the shares.",
+            description=(
+                "Share a local repository's folder over SMB from this server, for example for Hyper-V hosts.\n\n"
+                "add makes a hidden share (abr-xxxxxxxx$) open only to a Samba account the server generates; "
+                "its password is kept encrypted and never shown. The repository is an SMB repository from then on. "
+                "del removes the share and the account and keeps the backups; it is refused while Hyper-V jobs back up "
+                "into the repository. show lists the local repositories and their shares, check writes, reads back "
+                "and deletes a test file through a share.\n\n"
+                "Examples:\n"
+                "  abr repo share show\n"
+                '  abr repo share add --name "Local-Repo-1"\n'
+                '  abr repo share check --name "Local-Repo-1"\n'
+                '  abr repo share del --name "Local-Repo-1"'
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        share_commands = share.add_subparsers(dest="share_command", required=True)
+        share_show = share_commands.add_parser(
+            "show",
+            help="List the local repositories and their shares.",
+            description="List the local repositories and their shares.\n\nExamples:\n  abr repo share show",
+            formatter_class=CompactHelpFormatter,
+        )
+        share_show.set_defaults(handler=self.share_show)
+        for name, help_text, handler in (
+            ("add", "Share a local repository over SMB.", self.share_add),
+            ("del", "Remove a repository's share and its account; the backups stay.", self.share_del),
+            ("check", "Write, read back and delete a test file through a repository's share.", self.share_check),
+        ):
+            parser = share_commands.add_parser(
+                name,
+                help=help_text,
+                description=f'{help_text}\n\nExamples:\n  abr repo share {name} --name "Local-Repo-1"\n  abr repo share {name} --id <repo-id>',
+                formatter_class=CompactHelpFormatter,
+            )
+            add_name_or_id_selector(parser, name_help="Repository name", id_help="Repository ID")
+            parser.set_defaults(handler=handler)
+
         list_parser = commands.add_parser(
             "list",
             help="List backup repositories.",
@@ -594,6 +641,37 @@ class RepositoryCommands:
         if summary["changed"]:
             state = "on" if hyperv else "off"
             print(f"Hyper-V support of {summary['name']} turned {state}.", file=sys.stderr)
+        return 0
+
+    def share_show(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        deps.context.print_output(deps.context.api_client.get("api/v1/repositories/shares"), SHARE_COLUMNS)
+        return 0
+
+    def share_add(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        result = deps.context.api_client.post(
+            f"api/v1/repositories/{self._resolve_id(deps, args)}/share", timeout=DEFAULT_REPOSITORY_TIMEOUT_SECONDS
+        )
+        deps.context.print_output(result, SHARE_COLUMNS)
+        print(f"{result.get('name')} is shared as {result.get('network_path')}, account {result.get('username')}.", file=sys.stderr)
+        return 0
+
+    def share_del(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        result = deps.context.api_client.delete(
+            f"api/v1/repositories/{self._resolve_id(deps, args)}/share", timeout=DEFAULT_REPOSITORY_TIMEOUT_SECONDS
+        )
+        deps.context.print_output(result, SHARE_COLUMNS)
+        print(f"{result.get('name')} is not shared any more; its backups stay.", file=sys.stderr)
+        return 0
+
+    def share_check(self, args: argparse.Namespace) -> int:
+        deps = CommandDependencies(args)
+        result = deps.context.api_client.post(
+            f"api/v1/repositories/{self._resolve_id(deps, args)}/share/check", timeout=DEFAULT_REPOSITORY_TIMEOUT_SECONDS
+        )
+        deps.context.print_output(result, [*SHARE_COLUMNS, ("message", "RESULT")])
         return 0
 
     def list(self, args: argparse.Namespace) -> int:

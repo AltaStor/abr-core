@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from fastapi import Body
 
-from python.srv.services import abr_v41, default_repository
+from python.srv.services import abr_v41, default_repository, repository_shares
 
 from ._routing import build_router, register
 from .schemas import (
@@ -17,6 +17,9 @@ from .schemas import (
     RepositoryImmutabilityApplyResult,
     RepositoryList,
     RepositoryScanResult,
+    RepositoryShareCheckResult,
+    RepositoryShareDTO,
+    RepositoryShareList,
     RepositoryVerifyResult,
     S3TestResult,
     UpdateRepositoryRequest,
@@ -64,6 +67,22 @@ def create_default_repository(
     return {"created": created, "changed": changed, "repository": repository}
 
 
+def list_repository_shares() -> RepositoryShareList:
+    return repository_shares.list_shares()
+
+
+def share_repository(repository_id: str) -> RepositoryShareDTO:
+    return repository_shares.share_view(repository_shares.share_repository(repository_shares.stored_repository(repository_id)))
+
+
+def unshare_repository(repository_id: str) -> RepositoryShareDTO:
+    return repository_shares.share_view(repository_shares.unshare_repository(repository_shares.stored_repository(repository_id)))
+
+
+def check_repository_share(repository_id: str) -> RepositoryShareCheckResult:
+    return repository_shares.check_share(repository_shares.stored_repository(repository_id))
+
+
 def list_repositories() -> RepositoryList:
     return {"items": abr_v41.list_repository_records()}
 
@@ -106,6 +125,7 @@ register(router, [
     ("", list_repositories, ["GET"], "repository.view"),
     ("/default", get_default_repository, ["GET"], "repository.view"),
     ("/default", create_default_repository, ["POST"], "repository.create"),
+    ("/shares", list_repository_shares, ["GET"], "repository.view"),
     ("/{repository_id}", get_repository, ["GET"], "repository.view"),
     ("/{repository_id}", patch_repository, ["PATCH"], "repository.edit"),
     ("/{repository_id}", delete_repository, ["DELETE"], "repository.delete"),
@@ -113,4 +133,7 @@ register(router, [
     ("/{repository_id}/verify", verify_repository, ["POST"], "repository.verify"),
     ("/{repository_id}/verify-immutability", verify_repository_immutability, ["POST"], "repository.verify"),
     ("/{repository_id}/apply-immutability", apply_repository_immutability, ["POST"], "repository.apply_immutability"),
+    ("/{repository_id}/share", share_repository, ["POST"], "repository.edit"),
+    ("/{repository_id}/share", unshare_repository, ["DELETE"], "repository.edit"),
+    ("/{repository_id}/share/check", check_repository_share, ["POST"], "repository.verify"),
 ])

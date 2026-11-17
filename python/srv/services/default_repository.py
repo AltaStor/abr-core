@@ -5,20 +5,11 @@ from __future__ import annotations
 
 import logging
 import os
-import secrets
-import socket
-import string
-import subprocess
 import threading
 from pathlib import Path
 from typing import Any
 
-from python.srv.core.credential_encryption import (
-    CredentialKeyUnavailable,
-    encrypt_secret,
-)
 from python.srv.core.mongo_db_wrapper import (
-    JOBS,
     REPOSITORIES,
     catalog_records,
     get_database,
@@ -26,7 +17,7 @@ from python.srv.core.mongo_db_wrapper import (
 )
 from python.srv.core.storage_tool import APP_ROOT, REPO_ROOT
 from python.srv.core.utils import utc_now
-from python.srv.services import abr_v41
+from python.srv.services import abr_v41, repository_shares
 from python.srv.services.api_errors import ApiError, api_error
 
 logger = logging.getLogger(__name__)
@@ -35,14 +26,8 @@ DEFAULT_REPOSITORY_NAME = "Default Repo"
 DEFAULT_REPOSITORY_PATH = "/var/lib/altastor-backup/repository"
 PATH_ENV = "ABR_DEFAULT_REPOSITORY_PATH"
 DEFAULT_MARK = "default_repository"
-HYPERV_MARK = "support_hyperv"
+HYPERV_MARK = repository_shares.SHARE_MARK
 DESCRIPTION = "Created automatically by AltaStor Backup & Replication"
-HELPER_ENV = "ABR_SAMBA_HELPER"
-DEFAULT_HELPER = str(Path(__file__).resolve().parents[3] / "scripts" / "abr-samba-helper.sh")
-HELPER_TIMEOUT_SECONDS = 120
-SHARE_FIELDS = ("server", "share", "username", "password")
-_NAME_ALPHABET = string.ascii_lowercase + string.digits
-_PASSWORD_ALPHABET = string.ascii_letters + string.digits
 
 _LOCK = threading.Lock()
 
@@ -179,154 +164,12 @@ def create_default_repository_at_startup() -> None:
         logger.warning("The %s was not created: %s", DEFAULT_REPOSITORY_NAME, exc.message)
 
 
-def _token(alphabet: str, length: int) -> str:
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-def _helper_failure(action: str, completed: subprocess.CompletedProcess[str], helper: str) -> ApiError:
-    detail = next((line for line in reversed((completed.stderr or "").splitlines()) if line.strip()), "")
-    detail = detail.removeprefix("abr-samba-helper: ").strip() or f"exit status {completed.returncode}"
-    if "password is required" in detail or "not allowed" in detail or "sudo:" in detail:
-        return api_error(
-            503,
-            "hyperv_share_not_permitted",
-            f"The Hyper-V share of the {DEFAULT_REPOSITORY_NAME} could not be {action}: this server may not run "
-            f"{helper} as root ({detail}). The altastor-backup package installs the sudo rule for it",
-        )
-    return api_error(
-        500,
-        "hyperv_share_failed",
-        f"The Hyper-V share of the {DEFAULT_REPOSITORY_NAME} could not be {action}: {detail}",
-    )
-
-
-def _run_helper(command: str, action: str, fields: dict[str, str]) -> None:
-    helper = os.environ.get(HELPER_ENV, "").strip() or DEFAULT_HELPER
-    request = "".join(f"{key}={value}\n" for key, value in fields.items())
-    try:
-        completed = subprocess.run(
-            ["sudo", "-n", helper, command],
-            input=request,
-            capture_output=True,
-            text=True,
-            timeout=HELPER_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise api_error(
-            503,
-            "hyperv_share_not_permitted",
-            f"The Hyper-V share of the {DEFAULT_REPOSITORY_NAME} could not be {action}: {helper} could not be run "
-            f"through sudo ({exc})",
-        ) from exc
-    if completed.returncode != 0:
-        raise _helper_failure(action, completed, helper)
-
-
-def _share_metadata(record: dict[str, Any]) -> dict[str, Any]:
-    return dict(record.get("metadata") if isinstance(record.get("metadata"), dict) else {})
-
-
-def _without_share(record: dict[str, Any]) -> dict[str, Any]:
-    updated = dict(record)
-    metadata = _share_metadata(record)
-    for field in SHARE_FIELDS:
-        metadata[field] = None
-    metadata[HYPERV_MARK] = False
-    updated["type"] = "local"
-    updated["metadata"] = metadata
-    updated["updated_at"] = utc_now()
-    return updated
-
-
-def _enable_hyperv(record: dict[str, Any]) -> dict[str, Any]:
-    share = f"abr-{_token(_NAME_ALPHABET, 8)}$"
-    user = f"abr-smb-{_token(_NAME_ALPHABET, 8)}"
-    password = _token(_PASSWORD_ALPHABET, 40)
-    try:
-        stored_password = encrypt_secret(password)
-    except CredentialKeyUnavailable as exc:
-        raise api_error(503, "credential_key_unavailable", f"{exc}. The Hyper-V share is not created.") from exc
-    folder = str(Path(str(record.get("path") or "")).resolve())
-    _run_helper("enable-share", "created", {"share": share, "user": user, "password": password, "path": folder})
-    updated = dict(record)
-    metadata = _share_metadata(record)
-    metadata.update(
-        {"server": socket.getfqdn(), "share": share, "username": user, "password": stored_password, HYPERV_MARK: True}
-    )
-    updated["type"] = "smb"
-    updated["metadata"] = metadata
-    updated["updated_at"] = utc_now()
-    try:
-        persist_repository(updated)
-    except Exception:
-        _run_helper("disable-share", "removed again", {"share": share, "user": user})
-        raise
-    logger.info(
-        "Hyper-V support is on for the %s: share %s for account %s on %s.", DEFAULT_REPOSITORY_NAME, share, user, folder
-    )
-    return updated
-
-
-def _disable_hyperv(record: dict[str, Any]) -> dict[str, Any]:
-    metadata = _share_metadata(record)
-    share, user = str(metadata.get("share") or ""), str(metadata.get("username") or "")
-    if share and user:
-        _run_helper("disable-share", "removed", {"share": share, "user": user})
-    updated = _without_share(record)
-    persist_repository(updated)
-    logger.info("Hyper-V support is off for the %s: share %s and account %s removed.", DEFAULT_REPOSITORY_NAME, share, user)
-    return updated
-
-
 def set_hyperv_support(enabled: bool) -> tuple[dict[str, Any], bool]:
     with _LOCK:
         record = find_default_repository()
         if record is None:
             raise api_error(404, "default_repository_missing", f"There is no {DEFAULT_REPOSITORY_NAME} to change")
-        if bool(_share_metadata(record).get(HYPERV_MARK)) == enabled:
+        if repository_shares.is_shared(record) == enabled:
             return abr_v41.normalize_repository_record(record), False
-        if not enabled:
-            _refuse_while_hyperv_jobs_use(record)
-        updated = _enable_hyperv(record) if enabled else _disable_hyperv(record)
+        updated = repository_shares.share_repository(record) if enabled else repository_shares.unshare_repository(record)
         return abr_v41.normalize_repository_record(updated), True
-
-
-def _refuse_while_hyperv_jobs_use(record: dict[str, Any]) -> None:
-    repository_id = str(record.get("id") or "")
-    jobs = sorted(
-        str(job.get("name") or job.get("id"))
-        for job in catalog_records(JOBS)
-        if str(job.get("repo_id") or "") == repository_id and abr_v41._inventory_is_hyperv(job.get("inventory_id"))
-    )
-    if jobs:
-        raise api_error(
-            409,
-            "default_repository_used_by_hyperv_jobs",
-            f"Hyper-V job(s) {', '.join(jobs)} back up into the {DEFAULT_REPOSITORY_NAME}, and their hosts reach it only "
-            f"through its share. Move them to an S3 or SMB repository (abr job edit --repository), or delete them, then "
-            f"turn Hyper-V support off",
-            jobs=jobs,
-        )
-
-
-def refuse_managed_share_edit(record: dict[str, Any], payload: dict[str, Any]) -> None:
-    metadata = _share_metadata(record)
-    if not (metadata.get(DEFAULT_MARK) and metadata.get(HYPERV_MARK)):
-        return
-    touched = sorted(field for field in (*SHARE_FIELDS, "address", "path", "type") if payload.get(field) is not None)
-    if touched:
-        raise api_error(
-            409,
-            "default_repository_share_managed",
-            f"The share of the {DEFAULT_REPOSITORY_NAME} is managed by its Hyper-V switch, so "
-            f"{', '.join(touched)} cannot be edited. Turn Hyper-V support off and on to get a new share and account",
-            fields=touched,
-        )
-
-
-def remove_managed_share(record: dict[str, Any]) -> None:
-    metadata = _share_metadata(record)
-    if metadata.get(DEFAULT_MARK) and metadata.get(HYPERV_MARK):
-        with _LOCK:
-            _disable_hyperv(record)
