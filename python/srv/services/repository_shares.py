@@ -21,6 +21,7 @@ from python.srv.core.credential_encryption import (
     CredentialKeyUnavailable,
     decrypt_secret,
     encrypt_secret,
+    is_encrypted,
 )
 from python.srv.core.mongo_db_wrapper import (
     JOBS,
@@ -32,7 +33,7 @@ from python.srv.core.mongo_db_wrapper import (
 from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
 from python.srv.services import abr_v41
-from python.srv.services.api_errors import api_error
+from python.srv.services.api_errors import ApiError, api_error
 
 logger = logging.getLogger(__name__)
 
@@ -102,16 +103,26 @@ def _call_broker(operation: str, arguments: dict[str, str], *, what: str) -> dic
         raise api_error(500, "repository_share_failed", f"{what}: {exc.message}") from exc
 
 
-def _configured_shares() -> dict[str, dict[str, str]]:
-    path = Path(os.environ.get(SHARES_CONF_ENV, "").strip() or DEFAULT_SHARES_CONF)
+def _shares_conf() -> Path:
+    return Path(os.environ.get(SHARES_CONF_ENV, "").strip() or DEFAULT_SHARES_CONF)
+
+
+def _read_configured_shares() -> dict[str, dict[str, str]] | None:
     try:
-        text = path.read_text()
+        text = _shares_conf().read_text()
     except FileNotFoundError:
         return {}
     except OSError as exc:
-        logger.warning("The Samba shares in %s cannot be read, so shares left behind are not looked for: %s", path, exc)
-        return {}
+        logger.warning("The Samba shares in %s cannot be read: %s", _shares_conf(), exc)
+        return None
+    return _parse_sections(text)
 
+
+def _configured_shares() -> dict[str, dict[str, str]]:
+    return _read_configured_shares() or {}
+
+
+def _parse_sections(text: str) -> dict[str, dict[str, str]]:
     sections: dict[str, dict[str, str]] = {}
     name = None
     for raw in text.splitlines():
@@ -265,12 +276,7 @@ def _remove_share(record: dict[str, Any]) -> dict[str, Any]:
     if share and user:
         _call_broker("remove-share", {"share": share, "user": user}, what=f"The share of {_name(record)} could not be removed")
 
-    updated = dict(record)
-    for field in SHARE_FIELDS:
-        metadata[field] = None
-    metadata[SHARE_MARK] = False
-    updated.update({"type": "local", "metadata": metadata, "updated_at": utc_now()})
-    persist_repository(updated)
+    updated = _clear_share(record)
     logger.info("The share %s of %s and its account %s are removed.", share, _name(record), user)
     return updated
 
@@ -279,6 +285,89 @@ def remove_repository_share(record: dict[str, Any]) -> None:
     if is_shared(record):
         with LOCK:
             _remove_share(record)
+
+
+def _clear_share(record: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(record)
+    metadata = _metadata(record)
+    for field in SHARE_FIELDS:
+        metadata[field] = None
+    metadata[SHARE_MARK] = False
+    updated.update({"type": "local", "metadata": metadata, "updated_at": utc_now()})
+    persist_repository(updated)
+    return updated
+
+
+def _forget_unreadable_share(record: dict[str, Any], share: str, user: str) -> None:
+    try:
+        _call_broker("remove-share", {"share": share, "user": user}, what=f"The account of the share of {_name(record)} could not be removed")
+    except ApiError as exc:
+        logger.warning("%s; the account %s is left in Samba.", exc.message, user)
+    _clear_share(record)
+    logger.warning(
+        "The share %s of %s is not in Samba and its stored password cannot be decrypted with the credential key, so it is "
+        "not restored: %s is a local repository again. Share it again with abr repo share add.",
+        share,
+        _name(record),
+        _name(record),
+    )
+
+
+def _restore_share(record: dict[str, Any]) -> str:
+    metadata = _metadata(record)
+    share, user = str(metadata.get("share") or ""), str(metadata.get("username") or "")
+    password = decrypt_secret(metadata.get("password"))
+    if not isinstance(password, str) or not password or is_encrypted(password):
+        _forget_unreadable_share(record, share, user)
+        return "reset"
+
+    try:
+        _call_broker(
+            "add-share",
+            {"share": share, "user": user, "password": password, "path": _folder(record)},
+            what=f"The share {share} of {_name(record)} could not be restored",
+        )
+    except ApiError as exc:
+        logger.warning("%s; it is tried again when the server starts next time.", exc.message)
+        return "kept"
+    logger.info("Restored the share %s of %s for account %s: Samba no longer had it.", network_path(record), _name(record), user)
+    return "restored"
+
+
+def restore_shares() -> dict[str, list[str]]:
+    outcome: dict[str, list[str]] = {"restored": [], "reset": [], "kept": []}
+    recorded = [
+        record
+        for record in catalog_records(REPOSITORIES)
+        if is_shared(record) and _metadata(record).get("share") and _metadata(record).get("username")
+    ]
+    if not recorded:
+        return outcome
+
+    configured = _read_configured_shares()
+    if configured is None:
+        logger.warning("The shares of %d repositories are not checked against Samba, since its shares file cannot be read.", len(recorded))
+        return outcome
+
+    with LOCK:
+        for record in recorded:
+            if str(_metadata(record).get("share")) in configured:
+                continue
+            outcome[_restore_share(record)].append(_name(record))
+    return outcome
+
+
+def restore_shares_in_background() -> threading.Thread:
+    thread = threading.Thread(target=_restore_quietly, name="restore-shares", daemon=True)
+    thread.start()
+    return thread
+
+
+def _restore_quietly() -> None:
+    try:
+        restore_shares()
+    except Exception:
+        logger.exception("Could not check the shares of the repositories against Samba")
 
 
 def refuse_managed_share_edit(record: dict[str, Any], payload: dict[str, Any]) -> None:

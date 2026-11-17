@@ -52,6 +52,9 @@ SHARE_SETTINGS = {
 }
 ADD_FIELDS = ("share", "user", "password", "path")
 REMOVE_FIELDS = ("share", "user")
+CLOSED = 0
+CLOSE_FAILED = 1
+CLOSED_WITHOUT_RELOAD = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +425,48 @@ def remove_share(samba: Samba, arguments: Mapping[str, Any]) -> dict[str, Any]:
     return {"share": share, "user": user, "removed_share": section is not None, "removed_account": removed_account, "reloaded": reloaded}
 
 
+def close_shares(samba: Samba) -> dict[str, Any]:
+    with _locked(samba):
+        has_file = samba.shares_conf.is_file()
+        has_include = samba.smb_conf.is_file() and samba.include_line in samba.smb_conf.read_text().splitlines()
+        if not has_file and not has_include:
+            return {"closed": False, "shares": [], "reload_error": None}
+
+        shares = sorted(_our_sections(samba)) if has_file else []
+        if has_include:
+            snapshot = _snapshot(samba)
+            _write_smb_conf(samba, snapshot, _without_include(samba, snapshot.smb_conf))
+        samba.shares_conf.unlink(missing_ok=True)
+
+        reload_error = None
+        if samba.which("smbcontrol") is not None and smbd_running(samba):
+            try:
+                _reload(samba)
+            except BrokerError as exc:
+                reload_error = exc.message
+    return {"closed": True, "shares": shares, "reload_error": reload_error}
+
+
+def close_from_command_line(samba: Samba) -> int:
+    if os.geteuid() != 0:
+        print("shares_broker: --close-shares must run as root", file=sys.stderr)
+        return CLOSE_FAILED
+    try:
+        result = close_shares(samba)
+    except (BrokerError, OSError) as exc:
+        print(f"shares_broker: the shares could not be closed: {getattr(exc, 'message', exc)}", file=sys.stderr)
+        return CLOSE_FAILED
+
+    if not result["closed"]:
+        print("No AltaStor Backup shares to close.")
+        return CLOSED
+    print(f"Closed the AltaStor Backup shares ({', '.join(result['shares']) or 'none listed'}); their accounts are kept.")
+    if result["reload_error"]:
+        print(f"shares_broker: smbd did not reload its configuration ({result['reload_error']}); restart smbd to stop serving them", file=sys.stderr)
+        return CLOSED_WITHOUT_RELOAD
+    return CLOSED
+
+
 def operations(samba: Samba) -> dict[str, Operation]:
     return {
         "add-share": lambda arguments: add_share(samba, arguments),
@@ -430,9 +475,18 @@ def operations(samba: Samba) -> dict[str, Operation]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    options = broker_core.parse_arguments(sys.argv[1:] if argv is None else argv, description=DESCRIPTION)
+    parser = broker_core.argument_parser(DESCRIPTION)
+    parser.add_argument(
+        "--close-shares",
+        action="store_true",
+        help="as root from the command line, without the socket: close every share of AltaStor Backup and keep their accounts",
+    )
+    options = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     os.umask(0o077)
-    return broker_core.serve(operations(Samba(options.service_user)), service_user=options.service_user)
+    samba = Samba(options.service_user)
+    if options.close_shares:
+        return close_from_command_line(samba)
+    return broker_core.serve(operations(samba), service_user=options.service_user)
 
 
 if __name__ == "__main__":

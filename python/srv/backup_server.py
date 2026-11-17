@@ -81,6 +81,7 @@ from .services import (
     clock_guard,
     default_repository,
     notification_detectors,
+    repository_shares,
     tls_certificate_service,
 )
 from .services.abr_v41 import PRODUCT_NAME, product_version
@@ -327,6 +328,8 @@ async def lifespan(_: FastAPI):
             default_repository.create_default_repository_at_startup()
         except Exception:
             logger.exception("Could not check the default repository; continuing startup.")
+
+        repository_shares.restore_shares_in_background()
 
         try:
             clock_guard.load()

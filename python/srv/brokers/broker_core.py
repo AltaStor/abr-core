@@ -120,11 +120,15 @@ def serve(
     return 0 if reply["ok"] else 1
 
 
-def parse_arguments(argv: Sequence[str], *, description: str) -> argparse.Namespace:
+def argument_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--service-user",
         default=SERVICE_USER,
         help=f"the account the server runs as, which may connect besides root (default {SERVICE_USER})",
     )
-    return parser.parse_args(list(argv))
+    return parser
+
+
+def parse_arguments(argv: Sequence[str], *, description: str) -> argparse.Namespace:
+    return argument_parser(description).parse_args(list(argv))

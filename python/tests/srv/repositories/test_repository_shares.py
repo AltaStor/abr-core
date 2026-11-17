@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -199,6 +199,126 @@ class LeftBehindShareTests(_SharesCase):
         self.assertEqual(error.code, "repository_share_refused")
         self.assertEqual([operation for operation, _ in self.broker.calls], ["remove-share"])
         self.assertFalse(repository_shares.is_shared(self.stored()))
+
+
+class RestoreTests(_SharesCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.conf = self.root / "samba-shares.conf"
+        environment = patch.dict("os.environ", {repository_shares.SHARES_CONF_ENV: str(self.conf)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.share()
+        self.metadata = dict(self.stored()["metadata"])
+        self.password = self.broker.calls[0][1]["password"]
+        self.broker.calls.clear()
+
+    def configure(self, share: str) -> None:
+        self.conf.write_text(f"[{share}]\n    path = {os.path.realpath(self.folder)}\n    valid users = {self.metadata['username']}\n")
+
+    def test_a_share_samba_no_longer_has_is_restored_with_the_stored_names_and_password(self) -> None:
+        with self.assertLogs("python.srv", level=logging.INFO) as logs:
+            outcome = repository_shares.restore_shares()
+
+        self.assertEqual(outcome, {"restored": ["Local-Repo-1"], "reset": [], "kept": []})
+        self.assertEqual(
+            self.broker.calls,
+            [("add-share", {"share": self.metadata["share"], "user": self.metadata["username"], "password": self.password, "path": os.path.realpath(self.folder)})],
+        )
+        self.assertEqual(self.stored()["metadata"], self.metadata)
+        self.assertIn("Restored the share", "\n".join(logs.output))
+        self.assertFalse(any(self.password in line for line in logs.output))
+
+    def test_a_share_samba_has_is_left_alone(self) -> None:
+        self.configure(self.metadata["share"])
+
+        self.assertEqual(repository_shares.restore_shares(), {"restored": [], "reset": [], "kept": []})
+        self.assertEqual(self.broker.calls, [])
+
+    def test_a_shares_file_that_cannot_be_read_restores_nothing_and_resets_nothing(self) -> None:
+        self.conf.mkdir()
+
+        with self.assertLogs("python.srv", level=logging.WARNING) as logs:
+            repository_shares.restore_shares()
+
+        self.assertEqual(self.broker.calls, [])
+        self.assertTrue(repository_shares.is_shared(self.stored()))
+        self.assertIn("are not checked against Samba", "\n".join(logs.output))
+
+    def test_a_password_the_key_cannot_decrypt_resets_the_repository_and_removes_the_account(self) -> None:
+        REPOSITORIES[self.repository["id"]]["metadata"]["password"] = "abr-enc:v1:not-a-token"
+
+        with self.assertLogs("python.srv", level=logging.WARNING) as logs:
+            outcome = repository_shares.restore_shares()
+
+        self.assertEqual(outcome["reset"], ["Local-Repo-1"])
+        self.assertEqual(self.broker.calls, [("remove-share", {"share": self.metadata["share"], "user": self.metadata["username"]})])
+        self.assertEqual(self.stored()["type"], "local")
+        self.assertIn("cannot be decrypted", "\n".join(logs.output))
+
+    def test_the_reset_goes_ahead_even_when_the_account_cannot_be_removed(self) -> None:
+        REPOSITORIES[self.repository["id"]]["metadata"]["password"] = "abr-enc:v1:not-a-token"
+        self.broker.error = broker_client.BrokerUnavailable("nothing listens")
+
+        with self.assertLogs("python.srv", level=logging.WARNING) as logs:
+            repository_shares.restore_shares()
+
+        self.assertEqual(self.stored()["type"], "local")
+        self.assertIn(f"the account {self.metadata['username']} is left in Samba", "\n".join(logs.output))
+
+    def test_a_refusing_or_absent_broker_keeps_the_share_for_the_next_start(self) -> None:
+        for error in (broker_client.BrokerRefused("refused", "smbd is not running"), broker_client.BrokerUnavailable("nothing listens")):
+            with self.subTest(error=type(error).__name__):
+                self.broker.error = error
+                with self.assertLogs("python.srv", level=logging.WARNING) as logs:
+                    outcome = repository_shares.restore_shares()
+                self.assertEqual(outcome["kept"], ["Local-Repo-1"])
+                self.assertEqual(self.stored()["metadata"], self.metadata)
+                self.assertIn("tried again when the server starts next time", "\n".join(logs.output))
+
+    def test_only_the_missing_shares_are_restored_and_repositories_not_shared_are_skipped(self) -> None:
+        second = self.root / "second"
+        second.mkdir()
+        other = abr_v41.create_repository_record({"name": "Other", "type": "local", "path": str(second)})
+        third = self.root / "third"
+        third.mkdir()
+        abr_v41.create_repository_record({"name": "Plain", "type": "local", "path": str(third)})
+        repository_shares.share_repository(REPOSITORIES[other["id"]])
+        self.configure(REPOSITORIES[other["id"]]["metadata"]["share"])
+        self.broker.calls.clear()
+
+        outcome = repository_shares.restore_shares()
+
+        self.assertEqual(outcome["restored"], ["Local-Repo-1"])
+        self.assertEqual([arguments["share"] for _operation, arguments in self.broker.calls], [self.metadata["share"]])
+
+    def test_nothing_shared_reads_nothing(self) -> None:
+        repository_shares.unshare_repository(self.stored())
+        self.broker.calls.clear()
+
+        with patch.object(repository_shares, "_read_configured_shares") as read:
+            self.assertEqual(repository_shares.restore_shares(), {"restored": [], "reset": [], "kept": []})
+        read.assert_not_called()
+
+    def test_the_background_run_logs_a_crash_instead_of_raising(self) -> None:
+        with patch.object(repository_shares, "restore_shares", side_effect=RuntimeError("boom")), self.assertLogs("python.srv", level=logging.ERROR) as logs:
+            repository_shares.restore_shares_in_background().join(5)
+
+        self.assertIn("Could not check the shares of the repositories against Samba", "\n".join(logs.output))
+
+
+class StartupRestoreTests(unittest.TestCase):
+    def test_the_server_starts_the_restore_when_it_starts(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from python.srv.backup_server import app
+
+        with patch.object(repository_shares, "restore_shares_in_background") as restore, patch.dict(
+            "os.environ", {"ABR_BOOTSTRAP_ADMIN_USER": "admin", "ABR_BOOTSTRAP_ADMIN_PASSWORD": "Sup3rSecretPW"}
+        ), TestClient(app):
+            pass
+
+        restore.assert_called_once_with()
 
 
 class BrokerErrorTests(_SharesCase):
@@ -502,6 +622,35 @@ class EndToEndTests(_Catalog):
         sections = shares_broker.parse_sections(self.system.shares_conf.read_text())
         self.assertEqual(list(sections), [self.stored()["metadata"]["share"]])
         self.assertNotIn("abr-smb-orphan01", self.system.accounts)
+
+    def test_a_closed_share_comes_back_through_the_real_broker_with_the_same_account(self) -> None:
+        repository_shares.share_repository(self.stored())
+        metadata = self.stored()["metadata"]
+        with patch.object(shares_broker.os, "geteuid", return_value=0), redirect_stdout(io.StringIO()):
+            self.assertEqual(shares_broker.close_from_command_line(self.system.samba()), shares_broker.CLOSED)
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
+        useradds = [argv for argv, _ in self.system.calls if argv[0] == "useradd"]
+
+        outcome = repository_shares.restore_shares()
+
+        self.assertEqual(outcome["restored"], ["Local-Repo-1"])
+        self.assertIn(metadata["share"], shares_broker.parse_sections(self.system.shares_conf.read_text()))
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT + f"include = {self.system.shares_conf}\n")
+        self.assertEqual([argv for argv, _ in self.system.calls if argv[0] == "useradd"], useradds)
+        self.assertEqual(self.system.samba_accounts[metadata["username"]], credential_encryption.decrypt_secret(metadata["password"]))
+
+    def test_an_account_samba_lost_is_made_again_with_the_stored_password(self) -> None:
+        repository_shares.share_repository(self.stored())
+        metadata = self.stored()["metadata"]
+        with patch.object(shares_broker.os, "geteuid", return_value=0), redirect_stdout(io.StringIO()):
+            shares_broker.close_from_command_line(self.system.samba())
+        self.system.samba_accounts.clear()
+        self.system.accounts.clear()
+
+        repository_shares.restore_shares()
+
+        self.assertEqual(self.system.accounts[metadata["username"]], shares_broker.ACCOUNT_COMMENT)
+        self.assertEqual(self.system.samba_accounts[metadata["username"]], credential_encryption.decrypt_secret(metadata["password"]))
 
     def test_a_share_goes_from_the_server_through_the_socket_to_samba_and_back_out(self) -> None:
         repository_shares.share_repository(self.stored())

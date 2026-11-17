@@ -322,6 +322,27 @@ smbd is stopped edits the configuration without a reload. The server waits
 `ABR_SHARES_BROKER_TIMEOUT_SECONDS` (60) for an answer; without the units it
 answers 503 `repository_share_unavailable` and names the socket unit.
 
+When the package is removed, its `prerm` closes every share before the files
+go: `cd /opt/altastor-backup && python3 -B -m python.srv.brokers.shares_broker --close-shares`,
+as root and without the socket or a running server. It removes
+`samba-shares.conf` and the `include` line and reloads Samba (without starting
+a stopped smbd), and keeps the `abr-smb-*` accounts. It exits 0 when the shares
+are closed or there were none, 1 when it is not run as root or cannot change
+the files, and 2 when the shares are closed but smbd did not reload, so smbd
+still serves them until it restarts.
+
+The catalog keeps the shared repositories, with their share, account and
+encrypted password, and `/var/lib/altastor-backup/credentials.key` survives
+remove and purge. When the server starts and finds a share the catalog records
+but `samba-shares.conf` does not have (after the package was installed again,
+or the section was removed by hand), it asks the broker to put it back with the
+same name, account and password, making the account again when Samba lost it;
+the log says so. A share whose password the key cannot decrypt is not restored:
+that repository becomes local again and its account is removed. When the
+broker is away or refuses (smbd stopped, folder gone), the repository is left
+as it is and the next start tries again. A shares file the server cannot read
+is not acted on. A share is closed for good only with `abr repo share del`.
+
 Without Samba or the broker units the Default Repo still works as a local
 repository, and sharing answers why the share could not be made. Hyper-V hosts
 reach the share at this machine's address on port 445.

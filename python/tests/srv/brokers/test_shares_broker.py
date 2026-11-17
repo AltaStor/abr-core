@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import io
 import os
 import pwd
 import stat
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -396,6 +398,106 @@ class RemoveShareTests(_BrokerCase):
         self.assertTrue(self.remove()["removed_account"])
         self.assertNotIn("pdbedit", self.tools_run())
         self.assertEqual(self.system.accounts, {})
+
+
+class CloseSharesTests(_BrokerCase):
+    def close(self) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(shares_broker.os, "geteuid", return_value=0), redirect_stdout(out), redirect_stderr(err):
+            code = shares_broker.close_from_command_line(self.samba)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_closing_removes_the_shares_file_and_the_include_and_keeps_the_accounts(self) -> None:
+        self.add()
+        self.add(OTHER_SHARE, OTHER_USER, self.second)
+        reloads = self.tools_run().count("smbcontrol")
+
+        code, out, _err = self.close()
+
+        self.assertEqual(code, shares_broker.CLOSED)
+        self.assertIn(", ".join(sorted([SHARE, OTHER_SHARE])), out)
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
+        self.assertFalse(self.system.shares_conf.exists())
+        self.assertEqual(sorted(self.system.accounts), sorted([USER, OTHER_USER]))
+        self.assertEqual(sorted(self.system.samba_accounts), sorted([USER, OTHER_USER]))
+        self.assertEqual(self.tools_run().count("smbcontrol"), reloads + 1)
+
+    def test_nothing_to_close_succeeds_and_changes_nothing(self) -> None:
+        code, out, _err = self.close()
+
+        self.assertEqual((code, out.strip()), (shares_broker.CLOSED, "No AltaStor Backup shares to close."))
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
+        self.assertNotIn("smbcontrol", self.tools_run())
+
+    def test_an_include_left_without_its_file_or_a_file_without_its_include_is_closed_too(self) -> None:
+        self.system.smb_conf.write_text(SMB_CONF_TEXT + f"include = {self.system.shares_conf}\n")
+        self.assertEqual(self.close()[0], shares_broker.CLOSED)
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
+
+        self.system.shares_conf.parent.mkdir(parents=True, exist_ok=True)
+        self.system.shares_conf.write_text(f"[{SHARE}]\n    path = /srv\n")
+        self.assertEqual(self.close()[0], shares_broker.CLOSED)
+        self.assertFalse(self.system.shares_conf.exists())
+
+    def test_a_stopped_smbd_is_not_started_and_the_close_still_succeeds(self) -> None:
+        self.add()
+        self.system.running = False
+        before = len(self.system.calls)
+
+        code, _out, _err = self.close()
+
+        closing = [argv for argv, _ in self.system.calls[before:]]
+        self.assertEqual(code, shares_broker.CLOSED)
+        self.assertFalse(self.system.shares_conf.exists())
+        self.assertEqual([argv[0] for argv in closing], ["systemctl"])
+        self.assertEqual(closing[0][1:3], ["is-active", "--quiet"])
+        self.assertFalse(self.system.running)
+
+    def test_a_failing_reload_still_closes_and_says_so_with_its_own_exit_code(self) -> None:
+        self.add()
+        self.system.failing = {"smbcontrol"}
+
+        code, _out, err = self.close()
+
+        self.assertEqual(code, shares_broker.CLOSED_WITHOUT_RELOAD)
+        self.assertIn("restart smbd to stop serving them", err)
+        self.assertFalse(self.system.shares_conf.exists())
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
+
+    def test_samba_removed_already_leaves_only_our_file_to_delete(self) -> None:
+        self.add()
+        self.system.smb_conf.unlink()
+        self.system.missing = set(shares_broker.SAMBA_TOOLS)
+
+        self.assertEqual(self.close()[0], shares_broker.CLOSED)
+        self.assertFalse(self.system.shares_conf.exists())
+
+    def test_not_root_is_refused_at_once(self) -> None:
+        self.add()
+        err = io.StringIO()
+        with patch.object(shares_broker.os, "geteuid", return_value=1000), redirect_stderr(err):
+            code = shares_broker.close_from_command_line(self.samba)
+
+        self.assertEqual(code, shares_broker.CLOSE_FAILED)
+        self.assertIn("must run as root", err.getvalue())
+        self.assertTrue(self.system.shares_conf.exists())
+
+    def test_a_file_that_cannot_be_changed_fails_with_the_reason(self) -> None:
+        self.add()
+        with patch.object(shares_broker, "_write", side_effect=PermissionError(13, "Permission denied")):
+            code, _out, err = self.close()
+
+        self.assertEqual(code, shares_broker.CLOSE_FAILED)
+        self.assertIn("could not be closed: [Errno 13] Permission denied", err)
+
+    def test_the_command_line_option_runs_the_close_and_not_the_socket(self) -> None:
+        with patch.object(shares_broker, "close_from_command_line", return_value=7) as close, patch.object(shares_broker.broker_core, "serve") as serve, patch.object(
+            shares_broker.os, "umask"
+        ):
+            self.assertEqual(shares_broker.main(["--close-shares"]), 7)
+
+        close.assert_called_once()
+        serve.assert_not_called()
 
 
 class ConcurrencyTests(_BrokerCase):
