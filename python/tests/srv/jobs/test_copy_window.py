@@ -284,7 +284,9 @@ class WindowChangedWhileCopyingTests(_Catalog):
         self.assertTrue(backup_copy._window_closed(started_with))
         stop = backup_copy._stop_for_window(started_with, "while it copied; what it had written was discarded")
         self.assertEqual(stop.reason, backup_copy.WINDOW_STOP_REASON)
-        self.assertIn("The copy window (Mon 22:00-23:00, changed while the copy ran) closed while it copied", str(stop))
+        closed = backup_copy._stop_for_window(self._snapshot(), "while it copied; what it had written was discarded")
+        self.assertEqual(str(stop), str(closed))
+        self.assertIn("The copy window (Mon 22:00-23:00) closed while it copied; what it had written was discarded;", str(stop))
 
     def test_a_running_copy_goes_on_when_the_changed_window_still_holds_now(self) -> None:
         started_with = self._snapshot()

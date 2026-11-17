@@ -1634,11 +1634,9 @@ def _stop_for_window(job: dict[str, Any], detail: str) -> Exception:
     from python.srv.core.task_executor import TaskStopRequested
 
     current = _current_window(job)
-    rules = current.get("copy_window") or []
-    changed = ", changed while the copy ran" if rules != list(job.get("copy_window") or []) else ""
     state = copy_window_state(current)
     stop = TaskStopRequested(
-        f"The copy window ({describe_copy_window(rules)}{changed}) closed {detail}; "
+        f"The copy window ({describe_copy_window(current.get('copy_window') or [])}) closed {detail}; "
         f"the copy is taken up again when it opens, {_local_text(state.get('opens_at'), current)}"
     )
     stop.reason = WINDOW_STOP_REASON
