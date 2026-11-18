@@ -1098,7 +1098,7 @@ class CreateReplicationJobRequest(_LenientModel):
 
 class UpdateJobRequest(_LenientModel):
     name: LaxStr | None = None
-    schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
+    schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="The job's regular schedule; null removes it, so the job runs manually again and its full schedules stay; omitted leaves it as it is")
     enabled: LaxBool | None = Field(default=None, description=f"true or false switches the whole job and its base schedule on or off; {OMITTED_KEEPS}")
     retention_days: RawInt | None = None
     retention_min_fulls: RawInt | None = Field(default=None, description=f"0 to 100; 0 switches it off; {OMITTED_KEEPS}")

@@ -150,6 +150,7 @@ class JobService:
         return None
 
     EXECUTION_SCHEDULE_PREFIXES = ("active_full", "synthetic_full", "verify")
+    SCHEDULE_REMOVING_VALUES = frozenset({"none", "manual"})
 
     _SCHEDULE_DETAIL_FLAGS = (
         ("time", "--time"),
@@ -742,7 +743,11 @@ class JobService:
         if enabled_override is not None:
             payload["enabled"] = enabled_override
         stored_schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else None
-        if enabled_override is None or self._schedule_detail_fields_present(args) or getattr(args, "schedule", None):
+        if str(getattr(args, "schedule", None) or "").strip().lower() in self.SCHEDULE_REMOVING_VALUES:
+            if self._schedule_detail_fields_present(args):
+                raise ValueError("--schedule none removes the schedule, so it takes no --time, --days, --day-of-month or --every")
+            payload["schedule"] = None
+        elif enabled_override is None or self._schedule_detail_fields_present(args) or getattr(args, "schedule", None):
             schedule = self.build_schedule_payload(args, current_schedule=stored_schedule)
             if schedule is not None:
                 payload["schedule"] = schedule

@@ -866,6 +866,36 @@ class JobPayloadBuilderTests(unittest.TestCase):
         base.update(overrides)
         return SimpleNamespace(**base)
 
+    def test_edit_payload_schedule_none_or_manual_removes_the_schedule(self) -> None:
+        job = {"id": "job-1", "schedule": {"type": "daily", "time": "23:00", "enabled": True}}
+        for value in ("none", "manual", "NONE", " Manual "):
+            with self.subTest(value=value):
+                payload = self.service.build_edit_payload(job, self._base_edit_args(schedule=value))
+
+                self.assertEqual(payload, {"schedule": None})
+
+    def test_edit_payload_schedule_none_keeps_the_other_changes(self) -> None:
+        payload = self.service.build_edit_payload(
+            {"id": "job-1", "schedule": {"type": "daily", "time": "23:00"}},
+            self._base_edit_args(schedule="none", disabled=True, retention_days=20),
+        )
+
+        self.assertEqual(payload, {"schedule": None, "enabled": False, "retention_days": 20})
+
+    def test_edit_payload_schedule_none_takes_no_schedule_details(self) -> None:
+        for detail in ({"time": "03:00"}, {"days": ["monday"]}, {"day_of_month": 5}, {"every": "1h"}):
+            with self.subTest(detail=detail), self.assertRaisesRegex(ValueError, "--schedule none removes the schedule"):
+                self.service.build_edit_payload({"id": "job-1"}, self._base_edit_args(schedule="none", **detail))
+
+    def test_edit_payload_empty_schedule_still_asks_for_an_option(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires at least one editable option"):
+            self.service.build_edit_payload({"id": "job-1"}, self._base_edit_args(schedule=""))
+
+    def test_edit_payload_other_schedules_are_built_as_before(self) -> None:
+        payload = self.service.build_edit_payload({"id": "job-1"}, self._base_edit_args(schedule="daily", time="22:00"))
+
+        self.assertEqual(payload["schedule"], {"type": "daily", "time": "22:00", "enabled": True})
+
     def test_edit_payload_supports_compression_level_update(self) -> None:
         args = self._base_edit_args(compression_level=9)
 

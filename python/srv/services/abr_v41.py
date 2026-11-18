@@ -5455,6 +5455,11 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 raise api_error(409, "job_name_exists", "Job name already exists", name=new_name)
         updated["name"] = new_name
         changed = True
+    if "schedule" in payload and payload["schedule"] is None:
+        updated["schedule"] = None
+        updated["schedule_summary"] = None
+        updated["next_incremental_run_at"] = None
+        changed = True
     if "schedule" in payload and payload["schedule"] is not None:
         previously_ran = _schedule_runs(updated.get("schedule"))
         updated["schedule"] = _schedule_from_request(payload["schedule"])
