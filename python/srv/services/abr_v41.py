@@ -2886,7 +2886,7 @@ def _reject_storage_location_change_if_repository_has_backups(
 
 def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     record = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
-    from python.srv.services.default_repository import refuse_managed_share_edit
+    from python.srv.services.repository_shares import refuse_managed_share_edit
 
     refuse_managed_share_edit(record, payload)
     original_path = str(record.get("path") or "")
@@ -4153,9 +4153,9 @@ def remove_repository_record(record_id: str) -> dict[str, Any]:
     repo_points = [point for point in normalized_backup_points() if str(point.get("repository_id") or "") == record_id]
     if repo_points:
         raise api_error(409, "repository_has_backups", "Repository cannot be removed while backup chains still reference it", restore_point_count=len(repo_points))
-    from python.srv.services.default_repository import remove_managed_share
+    from python.srv.services.repository_shares import remove_repository_share
 
-    remove_managed_share(repository)
+    remove_repository_share(repository)
     delete_repository(record_id)
     return {"id": str(repository.get("id") or record_id), "removed": True}
 

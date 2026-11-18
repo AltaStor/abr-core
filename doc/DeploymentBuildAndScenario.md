@@ -277,67 +277,75 @@ it off, or removing the Default Repo, removes the share and the account and
 keeps the backups. While it is on, the share, account and password of the
 repository cannot be edited by hand.
 
-The share is made by `scripts/abr-samba-helper.sh`, which needs root. The
-server runs it as `sudo -n $ABR_SAMBA_HELPER` (empty by default:
-`scripts/abr-samba-helper.sh` under the server's root, so
-`/opt/altastor-backup/scripts/abr-samba-helper.sh` on an install). The server
-package does not install `scripts/`, so a package that offers the switch puts
-the helper there (or points `ABR_SAMBA_HELPER` at it), adds a sudo rule that
-lets the service user run that file, and depends on Samba. The script only shares a folder that belongs
-to the user who asked for it, adds a single `include` line to `smb.conf`, keeps
-that file's owner and mode, refuses an Active Directory domain controller, a
-registry configuration, a passdb other than tdbsam or a share name already
-taken, and puts the previous configuration back, and removes the account it
-made, when Samba rejects the result or smbd does not stay up after reloading it;
-removing the share leaves `smb.conf` as it was. It also refuses when a Samba
-program it needs (`smbd`, `testparm`, `smbpasswd`, `pdbedit`, `smbcontrol`) is
-missing, and when smbd is installed but not running: it never starts smbd
-itself, since another SMB server may hold port 445 on purpose.
-
-On an install where the server cannot reach root (the service unit's
-`CapabilityBoundingSet` and no sudo rule), an administrator shares local
-repositories by hand with two root scripts instead of the switch:
+Any other local repository is shared the same way from the CLI (or the API),
+the Default Repo included:
 
 ```bash
-sudo bash scripts/install-samba.sh                       # Samba and smbclient, when they are missing
-sudo python3 python/srv/plugins/hyperv/abr_smb_share.py show          # <path> : \\<host>\<share>|none for each local repository
-sudo python3 python/srv/plugins/hyperv/abr_smb_share.py add <path>    # hidden share + own Samba account, stored encrypted
-sudo python3 python/srv/plugins/hyperv/abr_smb_share.py check <path>  # write, read back and delete a test file through the share
-sudo python3 python/srv/plugins/hyperv/abr_smb_share.py del <path>    # remove the share and account
+abr repo share show                        # every local repository and its share: \\<host>\<share> or not shared
+abr repo share add --name <repository>     # hidden share + own Samba account, stored encrypted   (repository.edit)
+abr repo share check --name <repository>   # write, read back and delete a test file through the share (repository.verify)
+abr repo share del --name <repository>     # remove the share and the account; the backups stay  (repository.edit)
 ```
 
-`abr_smb_share.py` works for any local repository, the Default Repo included,
-and several at once. It keeps its shares in `/etc/samba/altastor-backup-shares.conf`
-(one `include` line in `smb.conf`), writes the share, account and encrypted
-password into that repository so jobs reach it over SMB, and reloads smbd
-without dropping connections. A running server is not restarted: `add` and
-`del` leave a request in the catalog, the server re-reads that repository
-within a few seconds, and the script waits for its answer and says the server
-picked up the change. A stopped server reads it when it starts; a server older
-than this script, which cannot re-read a repository, is restarted as before.
-`add` and `del` refuse while a session uses that repository (a backup or copy
-into it, a copy, restore or replication from it, a verify or delete of its
-chains), and other repositories can be shared or unshared meanwhile; with an
-older server they refuse while any session runs, since it is restarted. `del`
-also refuses while Hyper-V jobs use the repository, and the script leaves alone
-a share it did not make, such as the switch's. Run `del` before removing a
-repository it shared.
+`GET /api/v1/repositories/shares`, `POST` and `DELETE /api/v1/repositories/{id}/share`
+and `POST /api/v1/repositories/{id}/share/check` are the same operations. A
+shared repository is an SMB repository from then on; `add` and `del` refuse
+while a session uses that repository (a backup or copy into it, a copy, restore
+or replication from it, a verify or delete of its chains), `del` also while
+Hyper-V jobs back up into it, and removing a repository removes its share. The
+server keeps the share, account and encrypted password in the repository and
+none of them can be edited by hand.
 
-On a development machine the server runs as your own user from the checkout,
-so the switch needs the two things a package would bring, Samba and a way to run
-the helper as root. `scripts/setup_samba_dev.sh` sets both up once:
+The server never runs as root. The Samba side is done by the shares broker,
+`python/srv/brokers/shares_broker.py`, which systemd starts as root for each
+request on the socket `/run/altastor-backup-shares.sock`
+(`ABR_SHARES_BROKER_SOCKET`; the `altastor-backup-shares.socket` and
+`altastor-backup-shares@.service` units of the server package, with
+`Accept=yes`): one JSON request on stdin, one JSON answer on stdout, then it
+exits, and each call is a line in the journal. It answers only root and the
+service user (`SO_PEERCRED`), runs nothing but its two operations,
+`add-share` and `remove-share`, and checks every argument itself: the share and
+account names (`abr-xxxxxxxx$`, `abr-smb-xxxxxxxx`), the password, and a folder
+given without symbolic links that belongs to the service user. It keeps the
+shares in `/etc/altastor-backup/samba-shares.conf` (root:altastor-backup,
+0640) and adds one `include` line for it to `smb.conf`, which it removes with
+the last share and otherwise leaves as it was, owner and mode included. It
+refuses an Active Directory domain controller, a registry configuration, a
+passdb other than tdbsam, a share name already taken, an account it did not
+make, a missing Samba program (`smbd`, `testparm`, `smbpasswd`, `pdbedit`,
+`smbcontrol`) and an smbd that is not running: it never starts, stops, enables
+or restarts smbd, it only reloads its configuration (`smbcontrol smbd
+reload-config`). When Samba rejects the result or smbd does not stay up after
+the reload, it puts the previous configuration back and removes the account it
+made. Concurrent requests wait for each other on a lock. Removing a share while
+smbd is stopped edits the configuration without a reload. The server waits
+`ABR_SHARES_BROKER_TIMEOUT_SECONDS` (60) for an answer; without the units it
+answers 503 `repository_share_unavailable` and names the socket unit.
 
-```bash
-scripts/setup_samba_dev.sh            # installs Samba, adds /etc/sudoers.d/abr-samba-helper-dev
-scripts/setup_samba_dev.sh --remove   # takes the sudo rule away again; Samba stays
-```
+When the package is removed, its `prerm` closes every share before the files
+go: `cd /opt/altastor-backup && python3 -B -m python.srv.brokers.shares_broker --close-shares`,
+as root and without the socket or a running server. It removes
+`samba-shares.conf` and the `include` line and reloads Samba (without starting
+a stopped smbd), and keeps the `abr-smb-*` accounts. It exits 0 when the shares
+are closed or there were none, 1 when it is not run as root or cannot change
+the files, and 2 when the shares are closed but smbd did not reload, so smbd
+still serves them until it restarts.
 
-Run it as your own user; it asks for sudo where it needs root and can be run
-again. The rule lets your user run the checkout's helper as root; the script is
-yours to edit, so the rule amounts to root for your user and belongs on a
-development machine only. Without Samba or the rule the Default Repo still works
-as a local repository, and turning the switch on answers why the share could not
-be made. Hyper-V hosts reach the share at this machine's address on port 445.
+The catalog keeps the shared repositories, with their share, account and
+encrypted password, and `/var/lib/altastor-backup/credentials.key` survives
+remove and purge. When the server starts and finds a share the catalog records
+but `samba-shares.conf` does not have (after the package was installed again,
+or the section was removed by hand), it asks the broker to put it back with the
+same name, account and password, making the account again when Samba lost it;
+the log says so. A share whose password the key cannot decrypt is not restored:
+that repository becomes local again and its account is removed. When the
+broker is away or refuses (smbd stopped, folder gone), the repository is left
+as it is and the next start tries again. A shares file the server cannot read
+is not acted on. A share is closed for good only with `abr repo share del`.
+
+Without Samba or the broker units the Default Repo still works as a local
+repository, and sharing answers why the share could not be made. Hyper-V hosts
+reach the share at this machine's address on port 445.
 
 Log in. Every `/api/v1` call needs a session, so this comes before anything
 else. The shipped `admin`/`admin` is a bootstrap credential -- change it with

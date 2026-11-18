@@ -397,9 +397,24 @@ The period runs from each backup's own creation, and stored restore points keep 
 
 abr repo default 
 
-Description: Create the Default Repo when it is missing, and turn its Hyper-V share on or off. The Default Repo is the local repository the server keeps in /var/lib/altastor-backup/repository (ABR_DEFAULT_REPOSITORY_PATH) and also creates at startup. Without an option the command creates it when it is missing and otherwise reports it without changing anything. --support-hyperv (creating it first when needed) shares its folder with Hyper-V hosts through a hidden SMB share (abr-xxxxxxxx$) open only to an account the server generates; the account's password is kept encrypted and is never printed. --no-support-hyperv removes the share and the account and keeps the backups; it is refused, naming them, while Hyper-V jobs back up into the Default Repo, since their hosts reach it only through the share. The output shows the path, whether Hyper-V support is on, and the share and its account when it is. Turning the share on needs Samba and the root helper the altastor-backup-server package installs; when either is missing, or the folder cannot be created, the command prints the server's reason and exits non-zero. 
+Description: Create the Default Repo when it is missing, and turn its Hyper-V share on or off. The Default Repo is the local repository the server keeps in /var/lib/altastor-backup/repository (ABR_DEFAULT_REPOSITORY_PATH) and also creates at startup. Without an option the command creates it when it is missing and otherwise reports it without changing anything. --support-hyperv (creating it first when needed) shares its folder with Hyper-V hosts through a hidden SMB share (abr-xxxxxxxx$) open only to an account the server generates; the account's password is kept encrypted and is never printed. --no-support-hyperv removes the share and the account and keeps the backups; it is refused, naming them, while Hyper-V jobs back up into the Default Repo, since their hosts reach it only through the share. The output shows the path, whether Hyper-V support is on, and the share and its account when it is. It is the same share abr repo share add makes, and both are refused while a session uses the repository. Turning the share on needs Samba and the shares broker the altastor-backup-server package installs (see abr repo share); when either is missing, or the folder cannot be created, the command prints the server's reason and exits non-zero. 
 
 abr repo default [--support-hyperv | --no-support-hyperv] [--output json] 
+
+abr repo share 
+
+Description: Share a local repository's folder over SMB from this server, for example so Hyper-V hosts can back up into it, and list, check or remove those shares. add makes a hidden share (abr-xxxxxxxx$) open only to a Samba account the server generates (abr-smb-xxxxxxxx); its password is kept encrypted and is never printed, and the repository is an SMB repository from then on, whose share, account and password cannot be edited by hand. del removes the share and the account and keeps the backups; it is refused while Hyper-V jobs back up into the repository. add and del are refused while a session uses the repository. show lists every local repository with its share (\\<host>\<share>) or none. check writes, reads back and deletes a test file through the share with its account. abr repo remove of a shared repository removes its share too. The Default Repo can be shared either way (abr repo default --support-hyperv). The server never runs as root: the Samba side is done by the shares broker, which systemd starts as root for each request (altastor-backup-shares.socket); it refuses a folder that does not belong to the service user, an Active Directory domain controller, a registry configuration, a passdb other than tdbsam, and an smbd that is not running, which it never starts. When the server starts it puts back any share the catalog records but Samba no longer has (after the package was installed again, or the section was removed by hand) with the same name, account and password; a share is closed for good only with abr repo share del. Removing the package closes every share and keeps the accounts. Without the broker the command exits non-zero with 503 repository_share_unavailable; a refusal is 409 (exit 4). Permissions: show repository.view, add and del repository.edit, check repository.verify. 
+
+abr repo share show [--output json] 
+abr repo share add --name <name> | --id <id> 
+abr repo share del --name <name> | --id <id> 
+abr repo share check --name <name> | --id <id> 
+
+Examples: 
+abr repo share show 
+abr repo share add --name "Local-Repo-1" 
+abr repo share check --name "Local-Repo-1" 
+abr repo share del --name "Local-Repo-1" 
 
 abr repo list 
 

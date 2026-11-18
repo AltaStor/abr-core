@@ -552,6 +552,26 @@ class DefaultRepositoryResult(_LenientModel):
     repository: RepositoryDTO
 
 
+class RepositoryShareDTO(_LenientModel):
+    id: str
+    name: DocStrOrNull = None
+    path: DocStrOrNull = None
+    default: DocBool = Field(default=None, description="true for the Default Repo")
+    shared: DocBool = Field(default=None, description="true while this server shares the repository's folder over SMB")
+    network_path: DocStrOrNull = Field(default=None, description="The share as \\\\<host>\\<share>, or null when it is not shared")
+    share: DocStrOrNull = Field(default=None, description="The hidden share name, abr-xxxxxxxx$")
+    username: DocStrOrNull = Field(default=None, description="The Samba account that may open the share, abr-smb-xxxxxxxx; its password is never shown")
+
+
+class RepositoryShareList(_LenientModel):
+    items: list[RepositoryShareDTO]
+
+
+class RepositoryShareCheckResult(RepositoryShareDTO):
+    checked: DocBool = None
+    message: DocStrOrNull = None
+
+
 class RestorePointDTO(_LenientModel):
     id: str
     copy_source: DocObject = Field(default=None, description="Copies made by a backup copy job only: the source job, repository and restore points it was copied from")

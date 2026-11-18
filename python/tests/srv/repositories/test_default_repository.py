@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import logging
 import stat
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,10 +14,21 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from python.srv.backup_server import app
-from python.srv.core import credential_encryption
-from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, SESSIONS, USERS
+from python.srv.core import broker_client, credential_encryption
+from python.srv.core.mongo_db_wrapper import (
+    HYPERVISORS,
+    JOBS,
+    REPOSITORIES,
+    SESSIONS,
+    USERS,
+)
 from python.srv.plugins.hyperv import vhdx_tool
-from python.srv.services import abr_v41, auth_service, default_repository
+from python.srv.services import (
+    abr_v41,
+    auth_service,
+    default_repository,
+    repository_shares,
+)
 from python.srv.services.api_errors import ApiError
 
 BOOTSTRAP_ENV = {
@@ -228,31 +238,33 @@ class StartupTests(_DefaultRepositoryCase):
         self.assertIn("could not be created", logs.output[0])
 
 
-class _Helper:
+class _Broker:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, str], list[str]]] = []
-        self.answer = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        self.calls: list[tuple[str, dict[str, str], str]] = []
+        self.answer: BaseException | None = None
 
-    def __call__(self, command, *, input, **_kwargs):
-        fields = dict(line.split("=", 1) for line in input.splitlines() if line)
-        self.calls.append((command[-1], fields, command[:-1]))
-        if isinstance(self.answer, BaseException):
+    def __call__(self, socket_path, operation, arguments, *, timeout):
+        self.calls.append((operation, dict(arguments), socket_path))
+        if self.answer is not None:
             raise self.answer
-        return self.answer
+        return {}
 
 
 class _HyperVCase(_DefaultRepositoryCase):
     def setUp(self) -> None:
         super().setUp()
-        key = patch.dict("os.environ", {credential_encryption.KEY_FILE_ENV: str(self.root / "credentials.key")})
+        key = patch.dict(
+            "os.environ",
+            {credential_encryption.KEY_FILE_ENV: str(self.root / "credentials.key"), repository_shares.SHARES_CONF_ENV: str(self.root / "no-shares.conf")},
+        )
         key.start()
         self.addCleanup(key.stop)
         credential_encryption.reset_cipher()
         self.addCleanup(credential_encryption.reset_cipher)
-        self.helper = _Helper()
-        run = patch.object(default_repository.subprocess, "run", side_effect=self.helper)
-        run.start()
-        self.addCleanup(run.stop)
+        self.helper = _Broker()
+        call = patch.object(repository_shares.broker_client, "call", side_effect=self.helper)
+        call.start()
+        self.addCleanup(call.stop)
         self.repository, _created = default_repository.ensure_default_repository()
 
     def _stored(self) -> dict:
@@ -264,9 +276,9 @@ class HyperVSwitchTests(_HyperVCase):
         repository, changed = default_repository.set_hyperv_support(True)
 
         self.assertTrue(changed)
-        [(command, fields, prefix)] = self.helper.calls
-        self.assertEqual(command, "enable-share")
-        self.assertEqual(prefix, ["sudo", "-n", default_repository.DEFAULT_HELPER])
+        [(command, fields, socket_path)] = self.helper.calls
+        self.assertEqual(command, "add-share")
+        self.assertEqual(socket_path, repository_shares.DEFAULT_SOCKET)
         self.assertRegex(fields["share"], r"^abr-[a-z0-9]{8}\$$")
         self.assertRegex(fields["user"], r"^abr-smb-[a-z0-9]{8}$")
         self.assertRegex(fields["password"], r"^[A-Za-z0-9]{40}$")
@@ -297,9 +309,9 @@ class HyperVSwitchTests(_HyperVCase):
         repository, changed = default_repository.set_hyperv_support(False)
 
         self.assertTrue(changed)
-        self.assertEqual(self.helper.calls[-1][:2], ("disable-share", {"share": share, "user": user}))
+        self.assertEqual(self.helper.calls[-1][:2], ("remove-share", {"share": share, "user": user}))
         self.assertEqual(self._stored()["type"], "local")
-        self.assertTrue(all(self._stored()["metadata"][field] is None for field in default_repository.SHARE_FIELDS))
+        self.assertTrue(all(self._stored()["metadata"][field] is None for field in repository_shares.SHARE_FIELDS))
         self.assertFalse(repository["support_hyperv"])
 
     def _job_on_the_default_repo(self, name: str, kind: str) -> None:
@@ -318,7 +330,7 @@ class HyperVSwitchTests(_HyperVCase):
             default_repository.set_hyperv_support(False)
 
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertEqual(caught.exception.code, "default_repository_used_by_hyperv_jobs")
+        self.assertEqual(caught.exception.code, "repository_share_used_by_hyperv_jobs")
         self.assertIn("hv-nightly", caught.exception.message)
         self.assertEqual(len(self.helper.calls), calls)
         self.assertEqual(self._stored()["type"], "smb")
@@ -339,50 +351,49 @@ class HyperVSwitchTests(_HyperVCase):
         self.assertEqual(self.helper.calls, [])
 
     def test_a_refused_share_leaves_the_repository_as_it_was(self) -> None:
-        self.helper.answer = subprocess.CompletedProcess(
-            [], 1, stdout="", stderr="abr-samba-helper: a share named abr-x$ already exists in the Samba configuration\n"
-        )
+        self.helper.answer = broker_client.BrokerRefused("refused", "a share named abr-x$ already exists in the Samba configuration")
         before = json.dumps(self._stored(), sort_keys=True)
 
         with self.assertRaises(ApiError) as caught:
             default_repository.set_hyperv_support(True)
 
-        self.assertEqual((caught.exception.status_code, caught.exception.code), (500, "hyperv_share_failed"))
+        self.assertEqual((caught.exception.status_code, caught.exception.code), (409, "repository_share_refused"))
         self.assertIn("a share named abr-x$ already exists", caught.exception.message)
         self.assertEqual(json.dumps(self._stored(), sort_keys=True), before)
 
-    def test_a_server_without_the_sudo_rule_is_told_so(self) -> None:
-        self.helper.answer = subprocess.CompletedProcess([], 1, stdout="", stderr="sudo: a password is required\n")
+    def test_a_server_without_the_broker_is_told_which_unit_it_needs(self) -> None:
+        self.helper.answer = broker_client.BrokerUnavailable("nothing listens on /run/altastor-backup-shares.sock")
 
         with self.assertRaises(ApiError) as caught:
             default_repository.set_hyperv_support(True)
 
-        self.assertEqual((caught.exception.status_code, caught.exception.code), (503, "hyperv_share_not_permitted"))
-        self.assertIn("sudo rule", caught.exception.message)
+        self.assertEqual((caught.exception.status_code, caught.exception.code), (503, "repository_share_unavailable"))
+        self.assertIn("altastor-backup-shares.socket", caught.exception.message)
+        self.assertFalse(self._stored()["metadata"]["support_hyperv"])
 
-    def test_a_server_without_sudo_is_told_so(self) -> None:
-        self.helper.answer = FileNotFoundError(2, "No such file or directory", "sudo")
+    def test_a_server_the_broker_refuses_is_told_so(self) -> None:
+        self.helper.answer = broker_client.BrokerRefused("not_permitted", "uid 1000 may not use this broker")
 
         with self.assertRaises(ApiError) as caught:
             default_repository.set_hyperv_support(True)
 
-        self.assertEqual(caught.exception.code, "hyperv_share_not_permitted")
+        self.assertEqual(caught.exception.code, "repository_share_unavailable")
 
     def test_a_share_the_catalog_cannot_record_is_removed_again(self) -> None:
         with (
-            patch.object(default_repository, "persist_repository", side_effect=RuntimeError("catalog down")),
+            patch.object(repository_shares, "persist_repository", side_effect=RuntimeError("catalog down")),
             self.assertRaises(RuntimeError),
         ):
             default_repository.set_hyperv_support(True)
 
-        self.assertEqual([call[0] for call in self.helper.calls], ["enable-share", "disable-share"])
+        self.assertEqual([call[0] for call in self.helper.calls], ["add-share", "remove-share"])
         self.assertEqual(self.helper.calls[1][1]["share"], self.helper.calls[0][1]["share"])
         self.assertFalse(self._stored()["metadata"]["support_hyperv"])
 
     def test_without_a_credential_key_nothing_is_created(self) -> None:
         with (
             patch.object(
-                default_repository,
+                repository_shares,
                 "encrypt_secret",
                 side_effect=credential_encryption.CredentialKeyUnavailable("The credential key cannot be read"),
             ),
@@ -408,7 +419,7 @@ class HyperVSwitchTests(_HyperVCase):
         with self.assertRaises(ApiError) as caught:
             abr_v41.edit_repository_record(self.repository["id"], {"password": "mine", "username": "me"})
 
-        self.assertEqual((caught.exception.status_code, caught.exception.code), (409, "default_repository_share_managed"))
+        self.assertEqual((caught.exception.status_code, caught.exception.code), (409, "repository_share_managed"))
         self.assertEqual(caught.exception.details["fields"], ["password", "username"])
         edited = abr_v41.edit_repository_record(self.repository["id"], {"description": "Ours"})
         self.assertEqual(edited["description"], "Ours")
@@ -419,7 +430,7 @@ class HyperVSwitchTests(_HyperVCase):
 
         abr_v41.remove_repository_record(self.repository["id"])
 
-        self.assertEqual(self.helper.calls[-1][0], "disable-share")
+        self.assertEqual(self.helper.calls[-1][0], "remove-share")
         self.assertEqual(self.helper.calls[-1][1]["share"], share)
         self.assertEqual(list(REPOSITORIES), [])
 
@@ -519,9 +530,12 @@ class DefaultRepositoryApiTests(_DefaultRepositoryCase):
         self.assertEqual(by_id.json()["id"], created["id"])
 
     def test_the_hyperv_switch_through_the_api(self) -> None:
-        helper = _Helper()
-        key = patch.dict("os.environ", {credential_encryption.KEY_FILE_ENV: str(self.root / "credentials.key")})
-        with key, patch.object(default_repository.subprocess, "run", side_effect=helper):
+        helper = _Broker()
+        key = patch.dict(
+            "os.environ",
+            {credential_encryption.KEY_FILE_ENV: str(self.root / "credentials.key"), repository_shares.SHARES_CONF_ENV: str(self.root / "no-shares.conf")},
+        )
+        with key, patch.object(repository_shares.broker_client, "call", side_effect=helper):
             credential_encryption.reset_cipher()
             self.addCleanup(credential_encryption.reset_cipher)
             on = self.client.post("/api/v1/repositories/default", headers=self.headers, json={"support_hyperv": True})
