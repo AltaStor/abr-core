@@ -616,13 +616,14 @@ class BackupChainDTO(_LenientModel):
     vm: _Ref
     inventory: _Ref
     repository: _Ref
-    status: str | None = None
+    status: str | None = Field(default=None, description="The status of the chain's newest restore point, or of its first point that is missing, broken or failed; corrupt points older than a newest point that is not corrupt are counted in corrupt instead")
     restore_point_count: int = 0
     created_at: str | None = None
     last_restore_point_at: str | None = None
     latest_execution_type: str | None = None
     latest_execution_reason: str | None = None
     gfs_protected: bool = False
+    corrupt: DocObject = Field(default=None, description="Restore points of the chain marked corrupt by a verify: restore_point_count, damaged_point_ids and found_at, the latest find; null when there are none")
     pending_deletion: DocObject = Field(default=None, description="Restore points of the chain waiting for deletion: restore_point_count, requested_at, and delete_after, the latest Object Lock date among them; null when there are none")
     restore_points: list[RestorePointDTO] | DocArray = []
 

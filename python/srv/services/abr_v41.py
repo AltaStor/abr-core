@@ -7257,7 +7257,7 @@ def _chain_name(points: list[dict[str, Any]]) -> str:
 def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
     latest = points[-1]
     unhealthy = next(
-        (point for point in points if _normalize_backup_health(point.get("status")) == "invalid"),
+        (point for point in points if _normalize_backup_health(point.get("status")) == "invalid" and not _corrupt_behind(point, latest)),
         None,
     )
     restore_points = [
@@ -7315,6 +7315,10 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
         "corrupt": _corruption_summary(points),
         "restore_points": restore_points,
     }
+
+
+def _corrupt_behind(point: dict[str, Any], latest: dict[str, Any]) -> bool:
+    return point.get("status") == POINT_CORRUPT and latest.get("status") != POINT_CORRUPT
 
 
 def corrupt_point_message(point: dict[str, Any]) -> str:
