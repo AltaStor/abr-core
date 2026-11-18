@@ -482,7 +482,7 @@ def load_system_state(state_id: str) -> dict[str, Any] | None:
     db = get_database()
     if db is not None:
         record = db.get("system_state", "id", state_id)
-        return dict(record) if isinstance(record, dict) else None
+        return _normalize_record(record) if isinstance(record, dict) else None
     with CATALOG_LOCK:
         record = SYSTEM_STATE.get(state_id)
         return dict(record) if record else None
