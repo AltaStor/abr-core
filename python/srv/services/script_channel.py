@@ -54,6 +54,7 @@ ID = "script"
 LABEL = "Script"
 # Not repeated: a script need not be safe to run twice.
 RETRY_DELAYS_SECONDS: tuple[int, ...] = ()
+REPEAT_AFTER_RESTART = False
 STATE_ID = "notification_script"
 ENABLE_ENV = "ABR_NOTIFICATION_SCRIPTS"
 RUN_ROOT = Path("/var/lib/altastor-backup/notification-runs")

@@ -26,6 +26,7 @@ As a channel of the notification service this module offers ``wants``,
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 import smtplib
@@ -53,6 +54,7 @@ ID = "email"
 LABEL = "E-mail"
 # A message that failed for a reason that can pass is tried again after these.
 RETRY_DELAYS_SECONDS = (30, 120)
+REPEAT_AFTER_RESTART = True
 PRODUCT_NAME = "AltaStor Backup & Replication"
 STATE_ID = "email_notifications"
 
@@ -75,7 +77,9 @@ GOOGLE_SCOPE = "https://mail.google.com/"
 
 # An address as people write them: something@domain.tld, no spaces, no display name.
 ADDRESS_PATTERN = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$")
-HOST_PATTERN = re.compile(r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$|^\[?[0-9A-Fa-f:.]+\]?$")
+HOST_NAME_PATTERN = re.compile(r"(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*")
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+MAX_SENDER_NAME_LENGTH = 100
 
 _lock = threading.RLock()
 
@@ -265,7 +269,7 @@ def validate(settings: dict[str, Any], *, require_complete: bool) -> dict[str, s
     oauth = smtp["oauth2"]
 
     host = smtp.get("host") or ""
-    if host and not HOST_PATTERN.match(host):
+    if host and not is_host(host):
         problems["smtp.host"] = "Not a host name or IP address"
     elif require_complete and not host:
         problems["smtp.host"] = "Enter the SMTP server's host name or IP address"
@@ -321,8 +325,11 @@ def validate(settings: dict[str, Any], *, require_complete: bool) -> dict[str, s
         problems["sender.address"] = "Not an e-mail address"
     elif require_complete and not address:
         problems["sender.address"] = "Enter the address notifications are sent from"
-    if len(settings["sender"].get("name") or "") > 100:
-        problems["sender.name"] = "At most 100 characters"
+    name = settings["sender"].get("name") or ""
+    if len(name) > MAX_SENDER_NAME_LENGTH:
+        problems["sender.name"] = f"At most {MAX_SENDER_NAME_LENGTH} characters"
+    elif CONTROL_CHARACTERS.search(name):
+        problems["sender.name"] = "Must be one line, without line breaks or other control characters"
 
     recipients = settings.get("recipients") or []
     bad = [item for item in recipients if not ADDRESS_PATTERN.match(item)]
@@ -337,6 +344,21 @@ def validate(settings: dict[str, Any], *, require_complete: bool) -> dict[str, s
     if not isinstance(threshold, int) or not 50 <= threshold <= 99:
         problems["repository_space_threshold_percent"] = "Must be from 50 to 99 percent"
     return problems
+
+
+def is_host(value: str) -> bool:
+    if HOST_NAME_PATTERN.fullmatch(value):
+        return True
+    address = value[1:-1] if value.startswith("[") and value.endswith("]") else value
+    try:
+        ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return True
+
+
+def one_line(value: str) -> str:
+    return CONTROL_CHARACTERS.sub(" ", value)
 
 
 def _refuse(problems: dict[str, str]):
@@ -647,9 +669,9 @@ def test_message(settings: dict[str, Any], recipients: list[str]) -> tuple[str, 
 def build_message(settings: dict[str, Any], recipients: list[str], subject: str, body: str) -> EmailMessage:
     sender = settings["sender"]
     message = EmailMessage()
-    message["From"] = formataddr((sender.get("name") or "", sender["address"]))
+    message["From"] = formataddr((one_line(sender.get("name") or ""), sender["address"]))
     message["To"] = ", ".join(recipients)
-    message["Subject"] = subject
+    message["Subject"] = one_line(subject)
     message["Date"] = formatdate(localtime=False)
     message["Message-ID"] = make_msgid(domain=sender["address"].rsplit("@", 1)[-1])
     message["Auto-Submitted"] = "auto-generated"

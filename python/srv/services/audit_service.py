@@ -45,6 +45,8 @@ DENIED = "denied"
 FAILED = "failed"
 RESULTS = (ALLOWED, DENIED, FAILED)
 KEEP_ALIVE_FUNCTIONS = frozenset({"auth.touch_session"})
+SYSTEM_USER = "system"
+SERVER_INTERFACE = "scheduler"
 
 MASK = "********"
 MAX_TEXT_LENGTH = 256
@@ -249,6 +251,38 @@ def record(
         f" session={session_id}" if session_id else "",
     )
     return entry
+
+
+def job_target(job: dict[str, Any]) -> dict[str, Any]:
+    name = job.get("name")
+    return {"type": "job", "id": str(job.get("id") or ""), "name": str(name) if name else None}
+
+
+def record_server_start(
+    *,
+    function_id: str,
+    target: dict[str, Any] | None,
+    trigger: str,
+    session_ids: list[str] | None = None,
+    error: dict[str, Any] | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    ids = [str(session_id) for session_id in session_ids or [] if session_id]
+    if not ids and error is None:
+        return None
+    extra: dict[str, Any] = {"trigger": trigger, **(details or {})}
+    if len(ids) > 1:
+        extra["session_ids"] = ids
+    return record(
+        function_id=function_id,
+        result=FAILED if error is not None else ALLOWED,
+        user=SYSTEM_USER,
+        target=target,
+        session_id=ids[0] if ids else None,
+        interface=SERVER_INTERFACE,
+        error={"code": str(error.get("code") or "internal_error"), "message": mask(str(error.get("message") or ""))} if error else None,
+        details=extra,
+    )
 
 
 def _json_body(raw: bytes | None) -> dict[str, Any]:

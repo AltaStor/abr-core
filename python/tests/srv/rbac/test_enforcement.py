@@ -141,14 +141,14 @@ class DeniedOperationTests(RbacApiCase):
 
     def test_a_role_change_applies_to_the_next_request(self) -> None:
         olga = self.headers(rbac.BACKUP_OPERATOR)
-        self.assertEqual(self.client.get("/api/v1/jobs", headers=olga).status_code, 200)
+        self.assertEqual(self.client.post("/api/v1/sessions/missing/stop", headers=olga).status_code, 404)
         self.client.patch(
             f"/api/v1/users/{self.user_id('olga')}",
             json={"role": rbac.RESTORE_OPERATOR},
             headers=self.headers(rbac.ADMINISTRATOR),
         )
-        self.assertEqual(self.client.get("/api/v1/jobs", headers=olga).status_code, 403)
-        self.assertEqual(self.audit(function_id="job.view")[-1]["role"], rbac.RESTORE_OPERATOR)
+        self.assertEqual(self.client.post("/api/v1/sessions/missing/stop", headers=olga).status_code, 403)
+        self.assertEqual(self.audit(function_id="session.stop")[-1]["role"], rbac.RESTORE_OPERATOR)
 
     def test_a_user_without_a_valid_role_can_do_nothing(self) -> None:
         USERS[self.user_id("olga")] = {**USERS[self.user_id("olga")], "role": "superuser"}
@@ -215,9 +215,9 @@ class AuditLogTests(RbacApiCase):
 
     def test_a_background_refresh_is_not_logged_but_its_denial_is(self) -> None:
         refresh = {"X-ABR-Refresh": "1"}
-        self.client.get("/api/v1/jobs", headers=self.headers(rbac.AUDITOR, **refresh))
-        self.client.get("/api/v1/jobs", headers=self.headers(rbac.RESTORE_OPERATOR, **refresh))
-        self.assertEqual([entry["role"] for entry in self.audit(function_id="job.view")], [rbac.RESTORE_OPERATOR])
+        self.client.get("/api/v1/users", headers=self.headers(rbac.AUDITOR, **refresh))
+        self.client.get("/api/v1/users", headers=self.headers(rbac.RESTORE_OPERATOR, **refresh))
+        self.assertEqual([entry["role"] for entry in self.audit(function_id="user.view")], [rbac.RESTORE_OPERATOR])
         # The console asks what its role allows before every refresh.
         self.client.get("/api/v1/auth/me", headers=self.headers(rbac.AUDITOR, **refresh))
         self.assertEqual(self.audit(function_id="auth.whoami"), [])

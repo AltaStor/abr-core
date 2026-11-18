@@ -303,7 +303,7 @@ class JobCommands:
         )
         add_name_or_id_selector(edit, name_help="Job name", id_help="Job ID")
         edit.add_argument("--new-name", help="Updated job name")
-        self._add_common_job_create_arguments(edit, for_copy=False, include_name=False, retention_default=None, gfs_default=None)
+        self._add_common_job_create_arguments(edit, for_copy=False, include_name=False, editing=True, retention_default=None, gfs_default=None)
         self._add_backup_copy_arguments(edit, creating=False)
         self._add_replication_arguments(edit, creating=False)
         edit.set_defaults(handler=self.edit)
@@ -409,6 +409,7 @@ class JobCommands:
         *,
         for_copy: bool,
         include_name: bool = True,
+        editing: bool = False,
         retention_default: int | None = 14,
         gfs_default: int | None = 0,
         include_policy_flags: bool = True,
@@ -430,6 +431,7 @@ class JobCommands:
             help=(
                 "Schedule type: daily, weekly, monthly, or periodic. "
                 "Legacy schedule text and cron expressions are also accepted for compatibility."
+                + (" none (or manual) removes the schedule: the job runs manually again, and its full schedules stay." if editing else "")
             ),
         )
         parser.add_argument("--time", type=parse_strict_hhmm, help="Schedule time in HH:MM")

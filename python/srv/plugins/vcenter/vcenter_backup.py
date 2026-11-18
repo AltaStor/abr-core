@@ -389,6 +389,14 @@ def _take_backup_snapshot(
         return snapshot_name, {"consistency": None, "consistency_reason": None}
     if state.get("consistency") != "crash_consistent":
         return snapshot_name, {"consistency": state.get("consistency"), "consistency_reason": None}
+    if state.get("power_state") == "poweredOff":
+        message = f"VM {vm_name} is powered off: nothing runs in it to quiesce, so the backup is consistent"
+        logger.info("%s (task %s)", message, task.get("id"))
+        try:
+            _emit_progress(progress_callback, "snapshot", 15, message, worker_mode="vcenter-abr-vmdk-tool", vm_name=vm_name)
+        except TaskStopRequested:
+            pass
+        return snapshot_name, {"consistency": "crash_consistent", "consistency_reason": "vm_not_running"}
     reason, cause = _CRASH_CONSISTENT_CAUSES.get(
         str(state.get("tools_status") or ""), ("not_quiesced", "VMware Tools did not quiesce the guest")
     )

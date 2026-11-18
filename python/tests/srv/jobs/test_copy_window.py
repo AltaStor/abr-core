@@ -254,5 +254,66 @@ class CopyWindowJobTests(_Catalog):
         self.assertIn("The copy window (Mon 22:00-23:00) closed before the copy could start", str(caught.exception))
 
 
+class _FrozenClock(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        moment = _at(0, 12)
+        return moment.astimezone(tz) if tz else moment
+
+
+class WindowChangedWhileCopyingTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        clock = patch.object(backup_copy, "datetime", _FrozenClock)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def _edit(self, *rules: str) -> None:
+        abr_v41.edit_job_record(self.copy["id"], {"copy_window": list(rules)})
+
+    def _snapshot(self) -> dict:
+        return abr_v41.normalize_job_record(JOBS[self.copy["id"]])
+
+    def test_a_running_copy_stops_when_the_window_is_changed_so_that_now_is_outside_it(self) -> None:
+        self._edit("mon 10:00-16:00")
+        started_with = self._snapshot()
+        self.assertFalse(backup_copy._window_closed(started_with))
+
+        self._edit("mon 22:00-23:00")
+
+        self.assertTrue(backup_copy._window_closed(started_with))
+        stop = backup_copy._stop_for_window(started_with, "while it copied; what it had written was discarded")
+        self.assertEqual(stop.reason, backup_copy.WINDOW_STOP_REASON)
+        closed = backup_copy._stop_for_window(self._snapshot(), "while it copied; what it had written was discarded")
+        self.assertEqual(str(stop), str(closed))
+        self.assertIn("The copy window (Mon 22:00-23:00) closed while it copied; what it had written was discarded;", str(stop))
+
+    def test_a_running_copy_goes_on_when_the_changed_window_still_holds_now(self) -> None:
+        started_with = self._snapshot()
+        self.assertTrue(backup_copy._window_closed(started_with))
+
+        self._edit("mon 10:00-16:00")
+
+        self.assertFalse(backup_copy._window_closed(started_with))
+
+    def test_a_running_copy_goes_on_when_the_window_is_removed(self) -> None:
+        started_with = self._snapshot()
+
+        self._edit()
+
+        self.assertFalse(backup_copy._window_closed(started_with))
+
+    def test_a_window_that_closes_by_itself_still_says_so_without_a_change(self) -> None:
+        stop = backup_copy._stop_for_window(self._snapshot(), "while it copied; what it had written was discarded")
+
+        self.assertIn("The copy window (Mon 22:00-23:00) closed while it copied", str(stop))
+        self.assertNotIn("changed", str(stop))
+
+    def test_a_copy_whose_job_is_gone_keeps_the_window_it_started_with(self) -> None:
+        started_with = self._snapshot()
+        JOBS.pop(self.copy["id"])
+
+        self.assertTrue(backup_copy._window_closed(started_with))
+
 if __name__ == "__main__":
     unittest.main()

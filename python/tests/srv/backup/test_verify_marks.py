@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from python.cli.commands import backup_commands
 from python.srv.core.job_scheduler import JobScheduler
 from python.srv.core.mongo_db_wrapper import BACKUPS, JOBS, REPOSITORIES, TASKS
 from python.srv.core.storage_tool import (
@@ -310,6 +311,42 @@ class VerifyMarkTests(_Catalog):
 
         self.assertEqual(chain["status"], "corrupt")
         self.assertEqual((chain["corrupt"]["restore_point_count"], chain["corrupt"]["damaged_point_ids"]), (2, ["inc-b2"]))
+
+    def test_after_the_active_full_the_chain_is_available_and_still_counts_its_corrupt_points(self) -> None:
+        self.chain()
+        self.mark({"inc-b2": "corrupt"})
+        self.store(_point("full-c", parent=None, day=7))
+
+        chain = abr_v41.backup_chain_to_dto(abr_v41.grouped_backup_points()[BACKUPS["full-a"]["chain_id"]])
+
+        self.assertEqual(chain["status"], "available")
+        self.assertEqual((chain["corrupt"]["restore_point_count"], chain["corrupt"]["damaged_point_ids"]), (2, ["inc-b2"]))
+        self.assertEqual(backup_commands._chain_status(chain), "available, 2 point(s) corrupt")
+
+    def test_a_corrupt_older_segment_leaves_the_chain_available(self) -> None:
+        self.chain()
+        self.mark({"inc-a1": "corrupt"})
+
+        chain = abr_v41.backup_chain_to_dto(abr_v41.grouped_backup_points()[BACKUPS["full-a"]["chain_id"]])
+
+        self.assertEqual((chain["status"], chain["corrupt"]["restore_point_count"]), ("available", 1))
+
+    def test_a_corrupt_newest_point_still_makes_the_chain_corrupt(self) -> None:
+        self.chain()
+        self.mark({"inc-b3": "corrupt"})
+
+        chain = abr_v41.backup_chain_to_dto(abr_v41.grouped_backup_points()[BACKUPS["full-a"]["chain_id"]])
+
+        self.assertEqual(backup_commands._chain_status(chain), "corrupt, 1 point(s) corrupt")
+
+    def test_other_broken_points_still_set_the_chain_status(self) -> None:
+        self.chain()
+        self.mark({"inc-a1": "corrupt"})
+        BACKUPS["inc-b1"]["status"] = "missing"
+
+        chain = abr_v41.backup_chain_to_dto(abr_v41.grouped_backup_points()[BACKUPS["full-a"]["chain_id"]])
+
+        self.assertEqual(chain["status"], "missing")
 
 
 class VerifyChainTests(_Catalog):

@@ -616,13 +616,14 @@ class BackupChainDTO(_LenientModel):
     vm: _Ref
     inventory: _Ref
     repository: _Ref
-    status: str | None = None
+    status: str | None = Field(default=None, description="The status of the chain's newest restore point, or of its first point that is missing, broken or failed; corrupt points older than a newest point that is not corrupt are counted in corrupt instead")
     restore_point_count: int = 0
     created_at: str | None = None
     last_restore_point_at: str | None = None
     latest_execution_type: str | None = None
     latest_execution_reason: str | None = None
     gfs_protected: bool = False
+    corrupt: DocObject = Field(default=None, description="Restore points of the chain marked corrupt by a verify: restore_point_count, damaged_point_ids and found_at, the latest find; null when there are none")
     pending_deletion: DocObject = Field(default=None, description="Restore points of the chain waiting for deletion: restore_point_count, requested_at, and delete_after, the latest Object Lock date among them; null when there are none")
     restore_points: list[RestorePointDTO] | DocArray = []
 
@@ -1097,7 +1098,7 @@ class CreateReplicationJobRequest(_LenientModel):
 
 class UpdateJobRequest(_LenientModel):
     name: LaxStr | None = None
-    schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = None
+    schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description="The job's regular schedule; null removes it, so the job runs manually again and its full schedules stay; omitted leaves it as it is")
     enabled: LaxBool | None = Field(default=None, description=f"true or false switches the whole job and its base schedule on or off; {OMITTED_KEEPS}")
     retention_days: RawInt | None = None
     retention_min_fulls: RawInt | None = Field(default=None, description=f"0 to 100; 0 switches it off; {OMITTED_KEEPS}")
@@ -1881,7 +1882,7 @@ class EmailOAuth2Request(_LenientModel):
 
 
 class EmailSmtpRequest(_LenientModel):
-    host: SkipValidation[str] | None = Field(default=None, description="SMTP server host name or IP address")
+    host: SkipValidation[str] | None = Field(default=None, description="SMTP server host name (at most 253 characters) or IP address")
     port: SkipValidation[int] | None = Field(default=None, description="1-65535; usually 587 for starttls, 465 for ssl, 25 for none")
     security: SkipValidation[str] | None = Field(default=None, description="starttls (upgrade to TLS after connecting), ssl (TLS from the start) or none (no encryption)")
     verify_tls: SkipValidation[bool] | None = Field(default=None, description="Check the server certificate against the system trust store (default true)")
@@ -1894,7 +1895,7 @@ class EmailSmtpRequest(_LenientModel):
 
 class EmailSenderRequest(_LenientModel):
     address: SkipValidation[str] | None = Field(default=None, description="The From address")
-    name: SkipValidation[str] | None = Field(default=None, description="The From display name")
+    name: SkipValidation[str] | None = Field(default=None, description="The From display name: one line, at most 100 characters")
 
 
 class EmailNotificationSettingsRequest(_LenientModel):
@@ -1908,7 +1909,7 @@ class EmailNotificationSettingsRequest(_LenientModel):
 
 class EmailTestRequest(_LenientModel):
     settings: SkipValidation[EmailNotificationSettingsRequest] | None = Field(default=None, description="Unsaved changes to test with, over the stored settings; nothing is saved")
-    to: SkipValidation[list[str]] | None = Field(default=None, description="Send to these addresses instead of the configured recipients")
+    to: SkipValidation[list[str]] | None = Field(default=None, description="Send to these addresses instead of the configured recipients; a list, even of one address")
 
 
 class NotificationEventDTO(_LenientModel):

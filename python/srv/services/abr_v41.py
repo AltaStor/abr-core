@@ -125,7 +125,7 @@ from python.srv.services.inventory_management import (
     inventory_type_from_record,
     normalize_inventory_type,
 )
-from python.srv.services import replication_service
+from python.srv.services import audit_service, replication_service
 from python.srv.services.backup_copy import (
     apply_copy_settings,
     copy_job_view,
@@ -5455,6 +5455,11 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 raise api_error(409, "job_name_exists", "Job name already exists", name=new_name)
         updated["name"] = new_name
         changed = True
+    if "schedule" in payload and payload["schedule"] is None:
+        updated["schedule"] = None
+        updated["schedule_summary"] = None
+        updated["next_incremental_run_at"] = None
+        changed = True
     if "schedule" in payload and payload["schedule"] is not None:
         previously_ran = _schedule_runs(updated.get("schedule"))
         updated["schedule"] = _schedule_from_request(payload["schedule"])
@@ -7257,7 +7262,7 @@ def _chain_name(points: list[dict[str, Any]]) -> str:
 def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
     latest = points[-1]
     unhealthy = next(
-        (point for point in points if _normalize_backup_health(point.get("status")) == "invalid"),
+        (point for point in points if _normalize_backup_health(point.get("status")) == "invalid" and not _corrupt_behind(point, latest)),
         None,
     )
     restore_points = [
@@ -7315,6 +7320,10 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
         "corrupt": _corruption_summary(points),
         "restore_points": restore_points,
     }
+
+
+def _corrupt_behind(point: dict[str, Any], latest: dict[str, Any]) -> bool:
+    return point.get("status") == POINT_CORRUPT and latest.get("status") != POINT_CORRUPT
 
 
 def corrupt_point_message(point: dict[str, Any]) -> str:
@@ -8256,6 +8265,13 @@ def _run_job_verify(job_id: str, run: dict[str, Any]) -> None:
             )
             run["session_ids"].append(task["id"])
             _record_job_verify(job_id, run)
+            audit_service.record_server_start(
+                function_id="backup.verify",
+                target=audit_service.target_from_path({"backup_id": chain_id}),
+                trigger=str(run["trigger"]),
+                session_ids=[task["id"]],
+                details={"job": audit_service.job_target(JOBS.get(job_id) or {"id": job_id})},
+            )
             try:
                 report = _run_verify_session(
                     chain_id, str(task["id"]), point_ids=point_ids, found_by=f"the verify schedule of job {name}"

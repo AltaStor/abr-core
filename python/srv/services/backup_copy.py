@@ -20,6 +20,7 @@ from python.srv.core.mongo_db_wrapper import (
     JOBS,
     REPOSITORIES,
     TASKS,
+    catalog_entries,
     catalog_records,
     persist_task,
 )
@@ -37,6 +38,7 @@ from python.srv.core.storage_tool import (
 )
 from python.srv.core.subprocess_util import ProcessCancelled
 from python.srv.core.utils import utc_now
+from python.srv.services import audit_service
 from python.srv.services.api_errors import api_error
 from python.srv.services.backup_mode import (
     object_lock_expiry,
@@ -483,6 +485,9 @@ def _start_and_record(job: dict[str, Any], *, trigger: str, vm_ids: list[str] | 
         )
         stored["updated_at"] = utc_now()
         persist_job(stored)
+    audit_service.record_server_start(
+        function_id="job.start", target=audit_service.job_target(job), trigger=trigger, session_ids=[task["id"] for task in sessions]
+    )
     return sessions
 
 
@@ -1213,11 +1218,54 @@ def apply_copy_settings(job: dict[str, Any], payload: dict[str, Any], *, creatin
         job["retry_count"], job["retry_interval_minutes"] = _validate_retries(payload, current)
         changed = True
 
-    validate_copy_job(job, jobs, repositories)
+    links_changed = creating or sources_given or "repo" in payload or "repo_id" in payload
+    validate_copy_job(job, jobs, repositories, check_cycle=links_changed)
     return changed
 
 
-def validate_copy_job(job: dict[str, Any], jobs: list[dict[str, Any]], repositories: list[dict[str, Any]]) -> None:
+WRITING_JOB_TYPES = ("backup", "backup-copy")
+
+
+def _upstream(record: dict[str, Any], records: dict[str, dict[str, Any]]) -> list[tuple[dict[str, Any], str]]:
+    if record.get("job_type") != "backup-copy":
+        return []
+    name = str(record.get("name") or record.get("id") or "")
+    found = [
+        (records[source_id], f"{name} copies from {records[source_id].get('name')}")
+        for source_id in source_job_ids(record)
+        if source_id in records
+    ]
+    for repository_id in source_repository_ids(record):
+        repository = str((REPOSITORIES.get(repository_id) or {}).get("name") or repository_id)
+        found += [
+            (other, f"{name} reads repository {repository}, which {other.get('name')} writes to")
+            for other in records.values()
+            if other.get("job_type") in WRITING_JOB_TYPES and str(other.get("repo_id") or "") == repository_id
+        ]
+    return found
+
+
+def copy_cycle(job: dict[str, Any]) -> list[str] | None:
+    job_id = str(job.get("id") or "")
+    records = {str(key): value for key, value in catalog_entries(JOBS) if isinstance(value, dict)}
+    records[job_id] = job
+    stack: list[tuple[dict[str, Any], list[str]]] = [(job, [])]
+    seen: set[str] = set()
+    while stack:
+        record, steps = stack.pop()
+        for upstream, step in _upstream(record, records):
+            upstream_id = str(upstream.get("id") or "")
+            if upstream_id == job_id:
+                return [*steps, step]
+            if upstream_id not in seen:
+                seen.add(upstream_id)
+                stack.append((upstream, [*steps, step]))
+    return None
+
+
+def validate_copy_job(
+    job: dict[str, Any], jobs: list[dict[str, Any]], repositories: list[dict[str, Any]], *, check_cycle: bool = True
+) -> None:
     from python.srv.plugins.hyperv.vhdx_tool import (
         VhdxToolError,
         ensure_hyperv_repository,
@@ -1246,6 +1294,14 @@ def validate_copy_job(job: dict[str, Any], jobs: list[dict[str, Any]], repositor
         422,
         "invalid_job",
         f"Repository {destination_name} is of type '{destination.get('type')}', which cannot hold backup copies",
+    )
+    cycle = copy_cycle(job) if check_cycle else None
+    _ensure(
+        not cycle,
+        422,
+        "backup_copy_cycle",
+        "A backup copy job cannot copy its own restore points, also not through other jobs: " + "; ".join(cycle or []),
+        cycle=cycle,
     )
 
     mode = str(job.get("copy_mode") or "periodic")
@@ -1563,17 +1619,25 @@ def waits_for_window(task: dict[str, Any]) -> bool:
     return job.get("job_type") == "backup-copy" and not copy_window_state(job)["open"]
 
 
+def _current_window(job: dict[str, Any]) -> dict[str, Any]:
+    stored = JOBS.get(str(job.get("id") or ""))
+    if not isinstance(stored, dict):
+        return job
+    return {**job, "copy_window": [rule for rule in stored.get("copy_window") or [] if isinstance(rule, dict)]}
+
+
 def _window_closed(job: dict[str, Any]) -> bool:
-    return not copy_window_state(job)["open"]
+    return not copy_window_state(_current_window(job))["open"]
 
 
 def _stop_for_window(job: dict[str, Any], detail: str) -> Exception:
     from python.srv.core.task_executor import TaskStopRequested
 
-    state = copy_window_state(job)
+    current = _current_window(job)
+    state = copy_window_state(current)
     stop = TaskStopRequested(
-        f"The copy window ({describe_copy_window(job.get('copy_window') or [])}) closed {detail}; "
-        f"the copy is taken up again when it opens, {_local_text(state.get('opens_at'), job)}"
+        f"The copy window ({describe_copy_window(current.get('copy_window') or [])}) closed {detail}; "
+        f"the copy is taken up again when it opens, {_local_text(state.get('opens_at'), current)}"
     )
     stop.reason = WINDOW_STOP_REASON
     return stop

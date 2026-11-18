@@ -145,6 +145,8 @@ class Database:
             "connectTimeoutMS": connect_timeout_ms,
             "socketTimeoutMS": socket_timeout_ms,
             "maxPoolSize": max_pool_size,
+            "tz_aware": True,
+            "tzinfo": timezone.utc,
         }
         client = MongoClient(uri, **client_options)
         client.admin.command("ping")
