@@ -46,6 +46,23 @@ empty, or not a key) is never replaced. The server still starts, logs the path
 and the reason, leaves every stored credential as it is and refuses to store a
 new password until the file is put back and the server restarted.
 
+### Repository passwords and secret keys
+
+The password of an SMB repository, the secret key of an S3 repository and the
+password of a repository's own Samba share are stored encrypted with the same
+key file, with the prefix `abr-enc:v1:`. An export carries them like the
+inventory credentials. A catalog written by an earlier version keeps them in
+plain text: the first start of this version encrypts each one and logs
+`Encrypted the stored password or secret key of repository <name>.`; later
+starts change nothing.
+
+Without the key file the server logs, for each such repository, that its
+password or secret key cannot be decrypted; enter it again with
+`abr repo edit --name <name> --password` (SMB) or `--secret-key` (S3). While the
+key file cannot be used, a changed password or secret key is not stored
+(503 `credential_key_unavailable`), other edits of the repository are, and no
+new share is made.
+
 ### Two-factor sign-in
 
 The secrets of users with two-factor sign-in are stored encrypted with the same

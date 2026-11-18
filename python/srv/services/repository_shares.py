@@ -19,8 +19,8 @@ from typing import Any
 from python.srv.core import broker_client
 from python.srv.core.credential_encryption import (
     CredentialKeyUnavailable,
+    credential_key_problem,
     decrypt_secret,
-    encrypt_secret,
     is_encrypted,
 )
 from python.srv.core.mongo_db_wrapper import (
@@ -237,10 +237,9 @@ def share_repository(record: dict[str, Any]) -> dict[str, Any]:
         share = f"abr-{_token(NAME_ALPHABET, 8)}$"
         user = f"abr-smb-{_token(NAME_ALPHABET, 8)}"
         password = _token(PASSWORD_ALPHABET, PASSWORD_LENGTH)
-        try:
-            stored_password = encrypt_secret(password)
-        except CredentialKeyUnavailable as exc:
-            raise api_error(503, "credential_key_unavailable", f"{exc}. The share of {_name(record)} is not created.") from exc
+        key_problem = credential_key_problem()
+        if key_problem is not None:
+            raise api_error(503, "credential_key_unavailable", f"{key_problem}. The share of {_name(record)} is not created.")
 
         folder = _folder(record)
         what = f"The share of {_name(record)} could not be created"
@@ -249,7 +248,7 @@ def share_repository(record: dict[str, Any]) -> dict[str, Any]:
 
         updated = dict(record)
         metadata = _metadata(record)
-        metadata.update({"server": socket.getfqdn(), "share": share, "username": user, "password": stored_password, SHARE_MARK: True})
+        metadata.update({"server": socket.getfqdn(), "share": share, "username": user, "password": password, SHARE_MARK: True})
         updated.update({"type": "smb", "metadata": metadata, "updated_at": utc_now()})
         try:
             persist_repository(updated)

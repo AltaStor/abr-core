@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from python.srv.brokers import broker_core, shares_broker
-from python.srv.core import broker_client, credential_encryption
+from python.srv.core import broker_client, credential_encryption, mongo_db_wrapper
 from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, TASKS
 from python.srv.services import abr_v41, rbac, repository_shares
 from python.srv.services.api_errors import ApiError
@@ -113,8 +113,10 @@ class ShareTests(_SharesCase):
         metadata = self.stored()["metadata"]
         self.assertEqual((self.stored()["type"], metadata["support_hyperv"]), ("smb", True))
         self.assertEqual((metadata["share"], metadata["username"]), (arguments["share"], arguments["user"]))
-        self.assertNotEqual(metadata["password"], arguments["password"])
-        self.assertEqual(credential_encryption.decrypt_secret(metadata["password"]), arguments["password"])
+        self.assertEqual(metadata["password"], arguments["password"])
+        stored = mongo_db_wrapper._repository_for_storage(self.stored(), None)["metadata"]["password"]
+        self.assertTrue(credential_encryption.is_encrypted(stored))
+        self.assertEqual(credential_encryption.decrypt_secret(stored), arguments["password"])
         self.assertEqual(repository_shares.network_path(shared), f"\\\\{metadata['server']}\\{arguments['share']}")
 
     def test_a_shared_repository_is_not_shared_again(self) -> None:
@@ -133,9 +135,7 @@ class ShareTests(_SharesCase):
         self.assertEqual(self.broker.calls, [])
 
     def test_without_a_credential_key_nothing_is_created(self) -> None:
-        with patch.object(
-            repository_shares, "encrypt_secret", side_effect=credential_encryption.CredentialKeyUnavailable("The credential key cannot be read")
-        ):
+        with patch.object(repository_shares, "credential_key_problem", return_value="The credential key cannot be read"):
             error = self.refused(self.share)
 
         self.assertEqual(error.code, "credential_key_unavailable")

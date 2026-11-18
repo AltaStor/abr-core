@@ -417,16 +417,91 @@ def delete_job(job_id: str) -> bool:
         return deleted
 
 
+REPOSITORY_SECRET_PATHS = (("metadata", "password"), ("metadata", "s3", "secret_key"))
+
+
+def _repository_secret_holders(record: dict[str, Any]) -> list[tuple[dict[str, Any], str]]:
+    holders: list[tuple[dict[str, Any], str]] = []
+    for path in REPOSITORY_SECRET_PATHS:
+        holder: Any = record
+        for key in path[:-1]:
+            holder = holder.get(key) if isinstance(holder, dict) else None
+        if isinstance(holder, dict) and path[-1] in holder:
+            holders.append((holder, path[-1]))
+    return holders
+
+
+def _with_repository_secrets(record: dict[str, Any], convert: Callable[[Any], Any]) -> dict[str, Any]:
+    converted = _normalize_record(record)
+    for holder, key in _repository_secret_holders(converted):
+        holder[key] = convert(holder[key])
+    return converted
+
+
+def _repository_secret_values(record: dict[str, Any] | None) -> list[tuple[str, Any]]:
+    return [(key, holder[key]) for holder, key in _repository_secret_holders(record or {})]
+
+
+def _repository_holds_a_clear_secret(record: dict[str, Any]) -> bool:
+    return any(
+        isinstance(value, str) and value and not is_encrypted(value)
+        for _key, value in _repository_secret_values(record)
+    )
+
+
+def _repository_for_storage(normalized: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
+    try:
+        return _with_repository_secrets(normalized, encrypt_secret)
+    except CredentialKeyUnavailable as exc:
+        if _repository_secret_values(normalized) != _repository_secret_values(previous):
+            raise api_error(
+                503,
+                "credential_key_unavailable",
+                f"{exc}. The new password or secret key of repository {normalized.get('name') or normalized.get('id')} "
+                f"is not stored. {KEY_REPAIR_HINT}, then enter it again.",
+                repository_id=normalized.get("id"),
+            ) from exc
+        return normalized
+
+
 def load_repositories() -> dict[str, dict[str, Any]]:
     db = get_database()
     if db is None:
         return {}
 
-    return {
-        item["id"]: _normalize_record(item)
-        for item in db.find("repositories", {})
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
+    key_problem = credential_key_problem()
+    loaded: dict[str, dict[str, Any]] = {}
+    unreadable: list[str] = []
+    for item in db.find("repositories", {}):
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        record = _normalize_record(item)
+        name = str(record.get("name") or record["id"])
+        if key_problem is None and _repository_holds_a_clear_secret(record):
+            stored = _with_repository_secrets(record, encrypt_secret)
+            _run_db_write(lambda stored=stored: db.upsert("repositories", "id", stored))
+            LOGGER.info("Encrypted the stored password or secret key of repository %s.", name)
+        loaded[record["id"]] = _with_repository_secrets(record, decrypt_secret)
+        if any(is_encrypted(value) for _key, value in _repository_secret_values(loaded[record["id"]])):
+            unreadable.append(name)
+            if key_problem is None:
+                LOGGER.error(
+                    "The stored password or secret key of repository %s cannot be decrypted with the credential key "
+                    "at %s: it was encrypted with another key. Enter it again: abr repo edit --name %s --password, "
+                    "or --secret-key for an S3 repository.",
+                    name,
+                    credential_key_path(),
+                    name,
+                )
+    if key_problem is not None and any(_repository_secret_values(record) for record in loaded.values()):
+        LOGGER.error(
+            "%s. Stored repository passwords and secret keys are left as they are until it is fixed: none is "
+            "encrypted%s. %s.",
+            key_problem,
+            f", and repositories {', '.join(unreadable)} cannot use theirs" if unreadable else "",
+            KEY_REPAIR_HINT,
+        )
+    return loaded
 
 
 def persist_repository(record: dict[str, Any]) -> None:
@@ -434,7 +509,8 @@ def persist_repository(record: dict[str, Any]) -> None:
     with CATALOG_LOCK:
         db = get_database()
         if db is not None:
-            _run_db_write(lambda: db.upsert("repositories", "id", normalized))
+            stored = _repository_for_storage(normalized, REPOSITORIES.get(record["id"]))
+            _run_db_write(lambda: db.upsert("repositories", "id", stored))
         REPOSITORIES[record["id"]] = normalized
 
 
@@ -878,6 +954,8 @@ def restore_catalog(snapshot: dict[str, Any]) -> dict[str, int]:
         if get_database() is not None:
             for hypervisor in (snapshot.get("hypervisors") or {}).values():
                 _hypervisor_for_storage(_normalize_record(hypervisor), HYPERVISORS.get(hypervisor.get("id")))
+            for repository in (snapshot.get("repositories") or {}).values():
+                _repository_for_storage(_normalize_record(repository), REPOSITORIES.get(repository.get("id")))
             for user in (snapshot.get("users") or {}).values():
                 _user_for_storage(_normalize_record(user))
 
