@@ -142,7 +142,9 @@ STARTTLS.
 ## Sender and recipients
 
 The sender address (and display name) is the From of every message; the
-signed-in account must be allowed to send as it. Recipients: 1 to 50 addresses;
+signed-in account must be allowed to send as it. The display name is one line
+of at most 100 characters: a line break or another control character in it is
+refused, so it can never add a header to the message. Recipients: 1 to 50 addresses;
 every message goes to all of them in one delivery.
 
 ## Validation
@@ -153,10 +155,11 @@ field in `error.details.fields` (`smtp.host`, `smtp.port`, `smtp.username`,
 `smtp.password`, `smtp.oauth2.client_id`, `sender.address`, `recipients`,
 `events.<id>`, ...). The Web UI shows each one beside its field.
 
-- Values are always checked: host name syntax, port range, security, auth
-  method, provider and grant names, https token URL, address syntax, at most
-  50 recipients, known event IDs with true or false, threshold 50–99, timeout
-  5–300.
+- Values are always checked: host name syntax (at most 253 characters) or an
+  IPv4 or IPv6 address, port range, security, auth method, provider and grant
+  names, https token URL, address syntax, a sender name of one line and at
+  most 100 characters, at most 50 recipients, known event IDs with true or
+  false, threshold 50–99, timeout 5–300.
 - While notifications are on (or for a test) every setting delivery needs must
   be there as well: server, sender, at least one recipient, and the method's
   credentials (user name and password; or mailbox, client ID, tenant for
@@ -177,7 +180,8 @@ one and an empty text removes it. The audit log masks them.
 `POST /api/v1/notifications/email/test` (`abr notification test`, the Web UI's
 Send test e-mail) sends a message now, synchronously, with the stored settings
 and any unsaved changes laid over them; nothing is saved. It goes to the
-configured recipients, or to `to`. The answer is `200` with the recipients and
+configured recipients, or to `to`, a list of addresses (anything else is
+refused with `422 invalid_notification_settings` naming `to`). The answer is `200` with the recipients and
 how long it took, or `502` naming why it did not go:
 
 | Code | Stage | Meaning |

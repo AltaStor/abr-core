@@ -231,8 +231,11 @@ def send_test(patch: dict[str, Any] | None, to: list[str] | None) -> dict[str, A
     delivery that failed is a 502 naming why (smtp_connection_failed,
     smtp_tls_failed, smtp_auth_failed, oauth_token_failed, smtp_sender_refused,
     smtp_recipients_refused, smtp_error) and the stage it reached."""
+    if to is not None and not isinstance(to, list):
+        message = "Must be a list of e-mail addresses"
+        raise api_error(422, "invalid_notification_settings", f"to: {message}", fields={"to": message})
     settings = email_channel.settings_for_test(patch)
-    recipients = [address.strip() for address in to or [] if address and address.strip()] or list(settings["recipients"])
+    recipients = [str(address).strip() for address in to or [] if address is not None and str(address).strip()] or list(settings["recipients"])
     bad = [address for address in recipients if not email_channel.ADDRESS_PATTERN.match(address)]
     if bad:
         raise api_error(422, "invalid_notification_settings", f"Not an e-mail address: {', '.join(bad)}", fields={"to": ", ".join(bad)})

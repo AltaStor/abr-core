@@ -268,7 +268,7 @@ abr notification show [--output json]
 
 abr notification set 
 
-Description: Change the settings; options left out keep their value. The server refuses the whole change, naming every problem by field, when a value is invalid or when notifications are on and a setting delivery needs is missing (exit 2). A secret flag without a value reads ABR_SMTP_PASSWORD, ABR_SMTP_OAUTH_CLIENT_SECRET or ABR_SMTP_OAUTH_REFRESH_TOKEN, or prompts; an empty value removes the stored secret. 
+Description: Change the settings; options left out keep their value. The server refuses the whole change, naming every problem by field, when a value is invalid or when notifications are on and a setting delivery needs is missing (exit 2). A secret flag without a value reads ABR_SMTP_PASSWORD, ABR_SMTP_OAUTH_CLIENT_SECRET or ABR_SMTP_OAUTH_REFRESH_TOKEN, or prompts; an empty value removes the stored secret. The sender name (--from-name) is one line of at most 100 characters; --smtp-host is a host name of at most 253 characters or an IP address. 
 
 abr notification set [--enable | --disable] [--smtp-host <host>] [--smtp-port <port>] [--security starttls|ssl|none] [--verify-tls | --no-verify-tls] [--timeout <seconds>] [--auth password|oauth2|none] [--username <user-or-mailbox>] [--password [<pass>]] [--oauth-provider microsoft|google|custom] [--oauth-tenant <tenant>] [--oauth-client-id <id>] [--oauth-client-secret [<secret>]] [--oauth-grant client_credentials|refresh_token] [--oauth-refresh-token [<token>]] [--oauth-token-url <url>] [--oauth-scope <scope>] [--from <address>] [--from-name <name>] [--recipients <a,b> | --add-recipient <a> --remove-recipient <b>] [--space-threshold <percent>] 
 

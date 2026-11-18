@@ -104,7 +104,7 @@ def _add_settings_flags(parser: argparse.ArgumentParser) -> None:
     auth.add_argument("--oauth-scope", help="Overrides the provider's scope for SMTP")
     sender = parser.add_argument_group("Sender")
     sender.add_argument("--from", dest="sender", metavar="ADDRESS", help="The address notifications are sent from")
-    sender.add_argument("--from-name", dest="sender_name", metavar="NAME", help="The sender's display name")
+    sender.add_argument("--from-name", dest="sender_name", metavar="NAME", help="The sender's display name: one line, at most 100 characters")
 
 
 def _print_settings(deps: CommandDependencies, payload: dict[str, Any]) -> None:
