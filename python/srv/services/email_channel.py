@@ -54,6 +54,7 @@ ID = "email"
 LABEL = "E-mail"
 # A message that failed for a reason that can pass is tried again after these.
 RETRY_DELAYS_SECONDS = (30, 120)
+REPEAT_AFTER_RESTART = True
 PRODUCT_NAME = "AltaStor Backup & Replication"
 STATE_ID = "email_notifications"
 

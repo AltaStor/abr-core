@@ -42,6 +42,7 @@ LOGGER = logging.getLogger(__name__)
 
 HISTORY_SIZE = 50
 QUEUE_SIZE = 500
+WAITING_STATUSES = ("queued", "retrying")
 
 
 class _History:
@@ -82,6 +83,79 @@ class _History:
             return [dict(item) for item in self._loaded()]
 
 
+class _Waiting:
+    def __init__(self, state_id: str) -> None:
+        self._state_id = state_id
+        self._lock = threading.Lock()
+        self._items: dict[str, dict[str, Any]] | None = None
+
+    def _loaded(self) -> dict[str, dict[str, Any]]:
+        if self._items is None:
+            try:
+                stored = (load_system_state(self._state_id) or {}).get("items") or {}
+            except Exception as exc:
+                LOGGER.warning("Could not read %s from the catalog: %s", self._state_id, exc)
+                stored = {}
+            self._items = {str(key): dict(value) for key, value in stored.items() if isinstance(value, dict)} if isinstance(stored, dict) else {}
+        return self._items
+
+    def _persist(self, items: dict[str, dict[str, Any]]) -> None:
+        try:
+            persist_system_state({"id": self._state_id, "items": dict(items)})
+        except Exception as exc:
+            LOGGER.warning("Could not keep the waiting notifications in %s: %s", self._state_id, exc)
+
+    def keep(self, entry_id: str, notification: Notification) -> None:
+        with self._lock:
+            items = self._loaded()
+            items[entry_id] = {
+                "event": notification.event,
+                "subject": notification.subject,
+                "body": notification.body,
+                "severity": notification.severity,
+                "details": dict(notification.details or {}),
+            }
+            self._persist(items)
+
+    def mark(self, entry_id: str, *, started: bool, attempts: int) -> None:
+        with self._lock:
+            items = self._loaded()
+            if entry_id in items:
+                items[entry_id].update(started=started, attempts=attempts)
+                self._persist(items)
+
+    def drop(self, entry_id: str) -> None:
+        with self._lock:
+            items = self._loaded()
+            if items.pop(entry_id, None) is not None:
+                self._persist(items)
+
+    def items(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {key: dict(value) for key, value in self._loaded().items()}
+
+
+def _notification(stored: dict[str, Any]) -> Notification:
+    details = stored.get("details")
+    return Notification(
+        str(stored.get("event") or ""),
+        str(stored.get("subject") or ""),
+        str(stored.get("body") or ""),
+        str(stored.get("severity") or "info"),
+        dict(details) if isinstance(details, dict) else {},
+    )
+
+
+def _seconds_until(moment: Any) -> float:
+    try:
+        when = datetime.fromisoformat(str(moment))
+    except ValueError:
+        return 0.0
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, when.timestamp() - time.time())
+
+
 @dataclass
 class _Delivery:
     notification: Notification
@@ -101,6 +175,7 @@ class _Channel:
     def __init__(self, module: Any, history_state_id: str) -> None:
         self.module = module
         self.history = _History(history_state_id)
+        self.waiting = _Waiting(f"{history_state_id}_waiting")
         self._queue: queue.Queue[_Delivery] = queue.Queue(maxsize=QUEUE_SIZE)
         self._worker: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -115,14 +190,49 @@ class _Channel:
             self._give_up_on_full_queue(entry)
             LOGGER.error("%s notification '%s' dropped: %d are already waiting.", self.module.LABEL, entry["subject"], QUEUE_SIZE)
             return False
+        self.waiting.keep(entry["id"], notification)
         self.history.record(entry)
         self._ensure_worker()
         return True
 
+    def _finish(self, entry: dict[str, Any]) -> None:
+        self.history.record(entry)
+        self.waiting.drop(entry["id"])
+
     def _give_up_on_full_queue(self, entry: dict[str, Any]) -> None:
         message = "Too many notifications waiting to be delivered"
         entry.update(status="failed", error={"code": "queue_full", "message": message, "stage": "queue", "retryable": False})
-        self.history.record(entry)
+        self._finish(entry)
+
+    def _give_up_after_restart(self, entry: dict[str, Any], message: str) -> None:
+        entry.update(status="failed", error={"code": "interrupted", "message": message, "stage": "queue", "retryable": False})
+        entry.pop("next_attempt_at", None)
+        LOGGER.error("%s notification '%s'%s was not delivered: %s.", self.module.LABEL, entry.get("subject"), _addressees(entry), message)
+        self._finish(entry)
+
+    def resume(self) -> int:
+        kept = self.waiting.items()
+        resumed = 0
+        for entry in reversed(self.history.items()):
+            if entry.get("status") not in WAITING_STATUSES:
+                continue
+            stored = kept.pop(str(entry.get("id")), None)
+            if stored is None:
+                self._give_up_after_restart(entry, "The server restarted before it was delivered, and the message was not kept to send again")
+                continue
+            if stored.get("started") and not self.module.REPEAT_AFTER_RESTART:
+                self._give_up_after_restart(entry, "The server stopped while it ran, and it is not run again")
+                continue
+            entry["attempts"] = max(int(entry.get("attempts") or 0), int(stored.get("attempts") or 0))
+            delay = _seconds_until(entry.get("next_attempt_at")) if entry["status"] == "retrying" else 0.0
+            self._schedule(_Delivery(_notification(stored), entry), delay)
+            resumed += 1
+        for entry_id in kept:
+            self.waiting.drop(entry_id)
+        if resumed:
+            self._ensure_worker()
+            LOGGER.info("%s: %d notification(s) waiting before the restart are taken up again.", self.module.LABEL, resumed)
+        return resumed
 
     def _ensure_worker(self) -> None:
         with self._lock:
@@ -146,9 +256,11 @@ class _Channel:
         if not self.module.wants(delivery.notification):
             message = "Switched off before it was delivered"
             entry.update(status="cancelled", error={"code": "notifications_disabled", "message": message, "stage": "queue", "retryable": False})
-            self.history.record(entry)
+            entry.pop("next_attempt_at", None)
+            self._finish(entry)
             return
         entry["attempts"] = int(entry.get("attempts") or 0) + 1
+        self.waiting.mark(entry["id"], started=True, attempts=entry["attempts"])
         try:
             outcome = self.module.send(delivery.notification, entry)
         except DeliveryError as exc:
@@ -163,22 +275,29 @@ class _Channel:
                 "%s notification '%s'%s failed after %d attempt(s) (%s): %s",
                 label, entry["subject"], _addressees(entry), entry["attempts"], exc.code, exc,
             )
-            self.history.record(entry)
+            self._finish(entry)
             return
         entry.update(status="sent", sent_at=utc_now(), error=None, **outcome)
         entry.pop("next_attempt_at", None)
         LOGGER.info("%s notification '%s' delivered%s.", label, entry["subject"], _addressees(entry))
-        self.history.record(entry)
+        self._finish(entry)
 
     def _retry_later(self, delivery: _Delivery, delay: int, exc: DeliveryError) -> None:
         entry = delivery.entry
         entry["status"] = "retrying"
+        self.waiting.mark(entry["id"], started=False, attempts=entry["attempts"])
         entry["next_attempt_at"] = datetime.fromtimestamp(time.time() + delay, timezone.utc).isoformat(timespec="seconds")
         LOGGER.warning(
             "%s notification '%s' was not delivered (attempt %d, %s): %s. Trying again in %d s.",
             self.module.LABEL, entry["subject"], entry["attempts"], exc.code, exc, delay,
         )
         self.history.record(entry)
+        self._schedule(delivery, delay)
+
+    def _schedule(self, delivery: _Delivery, delay: float) -> None:
+        if delay <= 0:
+            self._requeue(delivery)
+            return
         timer = threading.Timer(delay, self._requeue, args=(delivery,))
         timer.daemon = True
         timer.start()
@@ -193,6 +312,14 @@ class _Channel:
 EMAIL = _Channel(email_channel, "email_notification_deliveries")
 SCRIPT = _Channel(script_channel, "notification_script_runs")
 CHANNELS = (EMAIL, SCRIPT)
+
+
+def resume_waiting() -> None:
+    for channel in CHANNELS:
+        try:
+            channel.resume()
+        except Exception:
+            LOGGER.exception("Could not take up the %s notifications waiting before the restart", channel.module.LABEL)
 
 
 def new_entry(notification: Notification, described: dict[str, Any], **fields: Any) -> dict[str, Any]:

@@ -41,7 +41,8 @@ as they are at that moment, so a change of recipients applies to messages still
 waiting, and a slow script does not hold up e-mail.
 
 A channel is a module with `ID`, `LABEL`, `RETRY_DELAYS_SECONDS`,
-`wants(notification)`, `describe(notification)` for the history entry, and
+`REPEAT_AFTER_RESTART` (whether a delivery the server stopped in the middle of
+is tried again when it starts), `wants(notification)`, `describe(notification)` for the history entry, and
 `send(notification, entry)`, which returns what to add to the entry or raises
 `DeliveryError`.
 
@@ -218,6 +219,15 @@ Every outcome is recorded:
 
 A message still waiting when notifications are switched off is `cancelled`.
 
+A message still waiting when the server stops, `queued` or `retrying`, is kept
+in the catalog (`system_state` `email_notification_deliveries_waiting`, until
+it is sent, fails or is cancelled) and taken up again when the server starts: a
+retry at its next attempt, or at once when that time passed while the server
+was down, with its attempts counting on; a `queued` message at once. A message
+the server was handing to the SMTP server at the moment it stopped may arrive
+twice. A message left `queued` or `retrying` by an earlier version, which did
+not keep it, ends `failed` with the code `interrupted` at the first start.
+
 ## Notification script
 
 An Administrator can upload one script. The appliance runs it when a chosen
@@ -311,7 +321,10 @@ curl -fsS -H 'Content-Type: application/json' \
 ### Runs
 
 Exit code 0 is success. Anything else is recorded with its code and output, and
-**not repeated**: a script need not be safe to run twice. Runs happen one at a
+**not repeated**: a script need not be safe to run twice. A run still waiting
+when the server stops is run when it starts again (kept in
+`notification_script_runs_waiting`); a run the server stopped in the middle of
+is not run again and ends `failed` with the code `interrupted`. Runs happen one at a
 time, in the order of the events, so a slow script delays the next run (never
 e-mail), and a queue of 500 absorbs a burst.
 

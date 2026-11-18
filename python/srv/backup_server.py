@@ -81,6 +81,7 @@ from .services import (
     clock_guard,
     default_repository,
     notification_detectors,
+    notification_service,
     repository_shares,
     tls_certificate_service,
 )
@@ -335,6 +336,8 @@ async def lifespan(_: FastAPI):
             clock_guard.load()
         except Exception:
             logger.exception("Could not check the server clock against its last known time; continuing startup.")
+
+        notification_service.resume_waiting()
 
         TASK_POOL = TaskProcessPool(
             WORKER_COUNT,

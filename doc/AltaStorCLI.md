@@ -285,7 +285,7 @@ abr notification test [--to <addresses>] [any abr notification set option except
 
 abr notification history 
 
-Description: The latest 50 deliveries, newest first: event, status (queued, retrying, sent, failed, cancelled), attempts, recipients and the error. Times are UTC. 
+Description: The latest 50 deliveries, newest first: event, status (queued, retrying, sent, failed, cancelled), attempts, recipients and the error. Times are UTC. A delivery still queued or retrying when the server restarts is taken up again when it starts; one left waiting by an earlier version ends failed (interrupted). 
 
 abr notification events list 
 
