@@ -415,6 +415,14 @@ class JobService:
             raise ValueError("Periodic schedules require --every")
         return {"type": "periodic", "every": parse_duration(str(every)), "enabled": enabled}
 
+    @classmethod
+    def schedule_fields_for_create(cls, args: Any) -> dict[str, Any]:
+        if not cls._is_empty_value(getattr(args, "schedule", None)) or cls._schedule_detail_fields_present(args):
+            schedule = cls.build_schedule_payload(args)
+            return {} if schedule is None else {"schedule": schedule}
+        enabled = cls._schedule_enabled_override(args)
+        return {} if enabled is None else {"enabled": enabled}
+
     def create_backup_job_payload(self, args: Any) -> dict[str, Any]:
         self.ensure_removed_options_unused(
             args,
@@ -434,7 +442,7 @@ class JobService:
         if not repository_name and not repository_id:
             raise ValueError("job create requires --repository/--repo or --repository-id/--repo-id")
 
-        schedule = self.build_schedule_payload(args)
+        schedule_fields = self.schedule_fields_for_create(args)
         payload: dict[str, Any] = {
             "name": name,
             "vms": vm_tokens,
@@ -456,8 +464,7 @@ class JobService:
         description = self._coalesce_string(getattr(args, "description", None))
         if description:
             payload["description"] = description
-        if schedule is not None:
-            payload["schedule"] = schedule
+        payload.update(schedule_fields)
         if getattr(args, "retention_min_fulls", None) is not None:
             payload["retention_min_fulls"] = int(args.retention_min_fulls)
         if getattr(args, "verify_whole_chain_every", None) is not None:
@@ -605,13 +612,7 @@ class JobService:
         vm_tokens = self._raw_vm_tokens(args)
         if vm_tokens:
             payload["vms"] = vm_tokens
-        schedule = self.build_schedule_payload(args)
-        if schedule is not None:
-            payload["schedule"] = schedule
-        else:
-            enabled_override = self._schedule_enabled_override(args)
-            if enabled_override is not None:
-                payload["enabled"] = enabled_override
+        payload.update(self.schedule_fields_for_create(args))
         description = self._coalesce_string(getattr(args, "description", None))
         if description:
             payload["description"] = description
@@ -650,13 +651,7 @@ class JobService:
         description = self._coalesce_string(getattr(args, "description", None))
         if description:
             payload["description"] = description
-        schedule = self.build_schedule_payload(args)
-        if schedule is not None:
-            payload["schedule"] = schedule
-        else:
-            enabled_override = self._schedule_enabled_override(args)
-            if enabled_override is not None:
-                payload["enabled"] = enabled_override
+        payload.update(self.schedule_fields_for_create(args))
         return payload
 
     def build_edit_payload(self, job: dict[str, Any], args: Any) -> dict[str, Any]:
