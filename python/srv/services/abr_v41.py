@@ -5092,11 +5092,12 @@ def _ensure_full_backup_schedule(job: dict[str, Any]) -> None:
         _has_full_backup_schedule(job.get(schedule_key), job.get(days_key))
         for schedule_key, days_key, _next_run_key in EXECUTION_SCHEDULE_FIELDS
     )
+    kind = "backup copy" if job.get("job_type") == "backup-copy" else "backup"
     _ensure(
         enabled,
         422,
         "invalid_job",
-        "A backup job requires at least one full backup schedule so that retention can free the chain: "
+        f"A {kind} job requires at least one full backup schedule so that retention can free the chain: "
         "set an active full or a synthetic full schedule",
     )
 
@@ -5282,6 +5283,7 @@ def create_backup_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     )
     _ensure_full_backup_schedule(
         {
+            "job_type": "backup-copy",
             "active_full_schedule": active_full_schedule,
             "active_full_days": active_full_days,
             "synthetic_full_schedule": synthetic_full_schedule,

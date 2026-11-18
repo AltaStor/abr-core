@@ -226,6 +226,8 @@ def _no_room_detail(
     repository: dict[str, Any],
     points: list[dict[str, Any]],
     free_at_start: int | None,
+    *,
+    copy: bool = False,
 ) -> str | None:
     lost = _lost_share(repository)
     if lost:
@@ -235,10 +237,11 @@ def _no_room_detail(
     needed = _largest_point_bytes(points)
     if needed is None or free_at_start >= needed:
         return None
-    return _ran_out_of_room_message(repository, needed=needed, free_at_start=free_at_start)
+    return _ran_out_of_room_message(repository, needed=needed, free_at_start=free_at_start, copy=copy)
 
 
 FREE_SPACE_HINT = "Free space in that filesystem, or merge into another repository"
+COPY_FREE_SPACE_HINT = "Free space in that filesystem, or copy into another repository"
 
 
 def _repository_label(repository: dict[str, Any]) -> str:
@@ -253,21 +256,22 @@ def _lost_share(repository: dict[str, Any]) -> str | None:
     return share_lost_message(repository)
 
 
-def _out_of_space_message(repository: dict[str, Any], free_bytes: int | None) -> str:
+def _out_of_space_message(repository: dict[str, Any], free_bytes: int | None, *, copy: bool = False) -> str:
     lost = _lost_share(repository)
     if lost:
         return lost
     free = f" ({describe_bytes(free_bytes)} free)" if free_bytes is not None else ""
-    return f"The {_repository_label(repository)} ran out of space{free}. {FREE_SPACE_HINT}"
+    return f"The {_repository_label(repository)} ran out of space{free}. {COPY_FREE_SPACE_HINT if copy else FREE_SPACE_HINT}"
 
 
 def _ran_out_of_room_message(
-    repository: dict[str, Any], *, needed: int, free_at_start: int
+    repository: dict[str, Any], *, needed: int, free_at_start: int, copy: bool = False
 ) -> str:
+    what, when, hint = ("copy", "copy", COPY_FREE_SPACE_HINT) if copy else ("synthetic full", "merge", FREE_SPACE_HINT)
     return (
-        f"The {_repository_label(repository)} ran out of space: this synthetic full needs about "
-        f"{describe_bytes(needed)} and {describe_bytes(free_at_start)} were free when the merge "
-        f"started. {FREE_SPACE_HINT}"
+        f"The {_repository_label(repository)} ran out of space: this {what} needs about "
+        f"{describe_bytes(needed)} and {describe_bytes(free_at_start)} were free when the {when} "
+        f"started. {hint}"
     )
 
 
