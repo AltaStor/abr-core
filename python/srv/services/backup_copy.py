@@ -476,12 +476,14 @@ def _copy_jobs() -> list[dict[str, Any]]:
     return [job for job in jobs if job.get("job_type") == "backup-copy" and job.get("enabled")]
 
 
-def _start_and_record(job: dict[str, Any], *, trigger: str, vm_ids: list[str] | None = None) -> list[dict[str, Any]]:
+def _start_and_record(
+    job: dict[str, Any], *, trigger: str, vm_ids: list[str] | None = None, include_idle: bool = False
+) -> list[dict[str, Any]]:
     from python.srv.core.mongo_db_wrapper import persist_job
     from python.srv.services.abr_v41 import job_run_record
 
     run_id = str(uuid4())
-    sessions = create_copy_sessions(job, trigger=trigger, run_id=run_id, vm_ids=vm_ids)
+    sessions = create_copy_sessions(job, trigger=trigger, run_id=run_id, vm_ids=vm_ids, include_idle=include_idle)
 
     stored = JOBS.get(str(job.get("id") or ""))
     if sessions and isinstance(stored, dict):
@@ -543,7 +545,7 @@ def on_session_finished(task: dict[str, Any]) -> None:
             and str(copy_job.get("run_after_job_id") or "") == job_id
             and _run_finished(task)
         ):
-            _start_and_record(copy_job, trigger="after-job")
+            _start_and_record(copy_job, trigger="after-job", include_idle=True)
 
 
 def _source_encryption_key(points: list[dict[str, Any]]) -> str:
