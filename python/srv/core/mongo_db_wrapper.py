@@ -464,6 +464,10 @@ def _repository_for_storage(normalized: dict[str, Any], previous: dict[str, Any]
         return normalized
 
 
+def refuse_unstorable_repository_secrets(record: dict[str, Any], previous: dict[str, Any] | None) -> None:
+    _repository_for_storage(_normalize_record(record), previous)
+
+
 def load_repositories() -> dict[str, dict[str, Any]]:
     db = get_database()
     if db is None:
