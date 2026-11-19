@@ -290,7 +290,9 @@ def _remove_share(record: dict[str, Any]) -> dict[str, Any]:
     metadata = _metadata(record)
     share, user = str(metadata.get("share") or ""), str(metadata.get("username") or "")
     if share and user:
-        _call_broker("remove-share", {"share": share, "user": user}, what=f"The share of {_name(record)} could not be removed")
+        result = _call_broker("remove-share", {"share": share, "user": user}, what=f"The share of {_name(record)} could not be removed")
+        if isinstance(result, dict) and result.get("account_error"):
+            logger.warning("The share %s of %s is removed, but %s", share, _name(record), result["account_error"])
 
     updated = _clear_share(record)
     logger.info("The share %s of %s and its account %s are removed.", share, _name(record), user)

@@ -311,13 +311,74 @@ class AddShareRollbackTests(_BrokerCase):
         self.assertNotIn(USER, self.system.accounts)
 
 
+class AccountRollbackTests(_BrokerCase):
+    def removals(self) -> list[list[str]]:
+        return [argv for argv, _stdin in self.system.calls if "-x" in argv]
+
+    def test_a_failing_pdbedit_still_removes_the_samba_account_with_smbpasswd(self) -> None:
+        self.system.failing = {"smbcontrol", "pdbedit"}
+
+        error = self.refused(self.add, FAILED)
+
+        self.assertTrue(error.message.endswith("the previous Samba configuration is restored"), error.message)
+        self.assertNotIn(USER, self.system.samba_accounts)
+        self.assertNotIn(USER, self.system.accounts)
+        self.assertEqual([argv[0] for argv in self.removals()], ["pdbedit", "smbpasswd"])
+
+    def test_when_no_tool_removes_the_samba_account_the_system_account_stays_and_the_rollback_says_so(self) -> None:
+        self.system.failing = {"smbcontrol", "pdbedit"}
+        self.system.failing_calls = {("smbpasswd", "-x")}
+
+        error = self.refused(self.add, FAILED)
+
+        self.assertIn("the previous Samba configuration is restored, but the account made for the share is left", error.message)
+        self.assertIn(f"the Samba account {USER} could not be removed (pdbedit: pdbedit: simulated failure; smbpasswd: smbpasswd: simulated failure)", error.message)
+        self.assertIn("its system account is kept until it is", error.message)
+        self.assertIn(USER, self.system.samba_accounts)
+        self.assertIn(USER, self.system.accounts)
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
+
+    def test_an_account_samba_does_not_have_is_not_removed_again(self) -> None:
+        self.system.failing = {"smbcontrol"}
+        self.system.failing_calls = {("smbpasswd", "-a")}
+
+        self.refused(self.add, FAILED)
+
+        self.assertEqual(self.removals(), [])
+        self.assertNotIn(USER, self.system.accounts)
+
+    def test_a_share_is_removed_even_when_its_samba_account_cannot_be_and_says_so(self) -> None:
+        self.add()
+        self.system.failing = {"pdbedit"}
+        self.system.failing_calls = {("smbpasswd", "-x")}
+
+        result = self.remove()
+
+        self.assertTrue(result["removed_share"])
+        self.assertFalse(result["removed_account"])
+        self.assertIn(f"the Samba account {USER} could not be removed", result["account_error"])
+        self.assertNotIn(SHARE, self.ours())
+        self.assertIn(USER, self.system.accounts)
+        self.assertIn(USER, self.system.samba_accounts)
+
+    def test_a_failing_pdbedit_still_lets_a_share_and_its_account_go(self) -> None:
+        self.add()
+        self.system.failing = {"pdbedit"}
+
+        result = self.remove()
+
+        self.assertEqual((result["removed_share"], result["removed_account"], result["account_error"]), (True, True, None))
+        self.assertNotIn(USER, self.system.samba_accounts)
+        self.assertNotIn(USER, self.system.accounts)
+
+
 class RemoveShareTests(_BrokerCase):
     def test_removing_the_last_share_leaves_smb_conf_byte_for_byte_as_it_was(self) -> None:
         self.add()
 
         result = self.remove()
 
-        self.assertEqual(result, {"share": SHARE, "user": USER, "removed_share": True, "removed_account": True, "reloaded": True})
+        self.assertEqual(result, {"share": SHARE, "user": USER, "removed_share": True, "removed_account": True, "account_error": None, "reloaded": True})
         self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
         self.assertFalse(self.system.shares_conf.exists())
         self.assertEqual((self.system.accounts, self.system.samba_accounts), ({}, {}))
@@ -353,7 +414,7 @@ class RemoveShareTests(_BrokerCase):
         self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
 
     def test_nothing_to_remove_answers_so(self) -> None:
-        self.assertEqual(self.remove(), {"share": SHARE, "user": USER, "removed_share": False, "removed_account": False, "reloaded": False})
+        self.assertEqual(self.remove(), {"share": SHARE, "user": USER, "removed_share": False, "removed_account": False, "account_error": None, "reloaded": False})
 
     def test_an_account_altastor_backup_did_not_make_is_left_alone(self) -> None:
         self.add()

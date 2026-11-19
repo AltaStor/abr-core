@@ -28,6 +28,7 @@ class FakeSystem:
     enabled: set[str] = field(default_factory=set)
     missing: set[str] = field(default_factory=set)
     failing: set[str] = field(default_factory=set)
+    failing_calls: set[tuple[str, str]] = field(default_factory=set)
     invalid_after_write: bool = False
     stop_on_reload: bool = False
     calls: list[tuple[list[str], str | None]] = field(default_factory=list)
@@ -67,7 +68,7 @@ class FakeSystem:
         with self.lock:
             self.calls.append((list(argv), input))
             tool = argv[0]
-            if tool in self.failing:
+            if tool in self.failing or any(tool == name and flag in argv for name, flag in self.failing_calls):
                 return self.answer(1, stderr=f"{tool}: simulated failure\n")
             return self._run(tool, list(argv[1:]), input)
 
@@ -90,10 +91,13 @@ class FakeSystem:
         if tool == "smbpasswd":
             return self._smbpasswd(arguments, stdin)
         if tool == "pdbedit":
+            user = arguments[-1]
+            if user not in self.samba_accounts:
+                return self.answer(255, stderr="Username not found!\n")
             if "-x" in arguments:
-                self.samba_accounts.pop(arguments[-1], None)
-                self.enabled.discard(arguments[-1])
-            return self.answer(0 if arguments[-1] in self.samba_accounts or "-x" in arguments else 255)
+                self.samba_accounts.pop(user, None)
+                self.enabled.discard(user)
+            return self.answer()
         if tool == "smbcontrol":
             if self.stop_on_reload:
                 self.running = False
@@ -117,6 +121,8 @@ class FakeSystem:
         elif "-e" in arguments:
             self.enabled.add(user)
         elif "-x" in arguments:
+            if user not in self.accounts:
+                return self.answer(1, stderr=f"Failed to find a Unix account for {user}\n")
             self.samba_accounts.pop(user, None)
             self.enabled.discard(user)
         return self.answer()
