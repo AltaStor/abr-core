@@ -523,8 +523,9 @@ class RepositoryDTO(_LenientModel):
     catalog: RepositoryCatalogDTO | DocObject = {}
     referenced_jobs: DocObjectArray = None
     jobs_count: int = 0
-    default: bool = False
-    support_hyperv: bool = False
+    default: bool = Field(default=False, description="true for the default repository, where a new backup job stores when none is named; set it with PATCH {\"default\": true}")
+    initial: bool = Field(default=False, description="true for the Initial Repo, the local repository the server made at its first start")
+    support_hyperv: bool = Field(default=False, description="true while this server shares the repository's folder over SMB (a shared local repository; its type is then smb)")
     share_error: DocStrOrNull = Field(default=None, description="On create only: why the new local repository could not be shared; it is added unshared")
     backup_chain_count: int = 0
     restore_point_count: int = 0
@@ -537,27 +538,11 @@ class RepositoryList(_LenientModel):
     items: list[RepositoryDTO]
 
 
-class DefaultRepositoryRequest(_LenientModel):
-    support_hyperv: bool | None = Field(
-        default=None,
-        description=(
-            "Turn the hidden SMB share Hyper-V hosts write through on (true) or off (false); "
-            "leave it out to keep the current setting."
-        ),
-    )
-
-
-class DefaultRepositoryResult(_LenientModel):
-    created: bool
-    changed: bool = False
-    repository: RepositoryDTO
-
-
 class RepositoryShareDTO(_LenientModel):
     id: str
     name: DocStrOrNull = None
     path: DocStrOrNull = None
-    default: DocBool = Field(default=None, description="true for the Default Repo")
+    default: DocBool = Field(default=None, description="true for the default repository")
     shared: DocBool = Field(default=None, description="true while this server shares the repository's folder over SMB")
     network_path: DocStrOrNull = Field(default=None, description="The share as \\\\<host>\\<share>, or null when it is not shared")
     share: DocStrOrNull = Field(default=None, description="The hidden share name, abr-xxxxxxxx$")
@@ -971,6 +956,10 @@ class UpdateRepositoryRequest(_LenientModel):
     verify_tls: LaxBool | None = Field(default=None, description=S3_VERIFY_TLS)
     immutability: Annotated[SkipValidation[ImmutabilityRequest] | None, _checked_booleans(ImmutabilityRequest)] = None
     create_bucket: LaxBool | None = Field(default=None, description=CREATE_BUCKET)
+    default: LaxBool | None = Field(
+        default=None,
+        description="true makes this the default repository (and no other); false stops it being the default",
+    )
 
 
 VERIFY_SCHEDULE = (

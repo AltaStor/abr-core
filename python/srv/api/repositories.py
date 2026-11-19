@@ -10,8 +10,6 @@ from python.srv.services import abr_v41, default_repository, repository_shares
 from ._routing import build_router, register
 from .schemas import (
     CreateRepositoryRequest,
-    DefaultRepositoryRequest,
-    DefaultRepositoryResult,
     RemovedResult,
     RepositoryDTO,
     RepositoryImmutabilityApplyResult,
@@ -58,20 +56,6 @@ def test_s3_immutability(
     return abr_v41.test_s3_immutability(unset_excluded(payload))
 
 
-def get_default_repository() -> RepositoryDTO:
-    return default_repository.get_default_repository()
-
-
-def create_default_repository(
-    payload: DefaultRepositoryRequest = Body(default_factory=DefaultRepositoryRequest),
-) -> DefaultRepositoryResult:
-    repository, created = default_repository.ensure_default_repository()
-    changed = False
-    if payload.support_hyperv is not None:
-        repository, changed = default_repository.set_hyperv_support(payload.support_hyperv)
-    return {"created": created, "changed": changed, "repository": repository}
-
-
 def list_repository_shares() -> RepositoryShareList:
     return repository_shares.list_shares()
 
@@ -99,7 +83,15 @@ def get_repository(repository_id: str) -> RepositoryDTO:
 def patch_repository(
     repository_id: str, payload: UpdateRepositoryRequest = Body(default_factory=UpdateRepositoryRequest)
 ) -> RepositoryDTO:
-    return abr_v41.edit_repository_record(repository_id, unset_excluded(payload))
+    body = unset_excluded(payload)
+    default = body.pop("default", None)
+    if default is None:
+        return abr_v41.edit_repository_record(repository_id, body)
+    edited = abr_v41.edit_repository_record(repository_id, body) if any(value is not None for value in body.values()) else None
+    repository = default_repository.set_default_repository(repository_id, bool(default))
+    if edited is None:
+        return repository
+    return {**edited, "default": repository["default"], "updated_at": repository["updated_at"]}
 
 
 def delete_repository(repository_id: str) -> RemovedResult:
@@ -128,8 +120,6 @@ register(router, [
     ("/test-smb", test_smb_connection, ["POST"], "repository.create"),
     ("/test-immutability", test_s3_immutability, ["POST"], "repository.create"),
     ("", list_repositories, ["GET"], "repository.view"),
-    ("/default", get_default_repository, ["GET"], "repository.view"),
-    ("/default", create_default_repository, ["POST"], "repository.create"),
     ("/shares", list_repository_shares, ["GET"], "repository.view"),
     ("/{repository_id}", get_repository, ["GET"], "repository.view"),
     ("/{repository_id}", patch_repository, ["PATCH"], "repository.edit"),

@@ -206,6 +206,17 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   back up into it (`POST /api/v1/repositories`, `abr repo add`); `"shared":
   false` (`--no-share`) adds it unshared, and when the share cannot be made it
   is added unshared with the reason in `share_error` and its warnings.
+- The repository the server creates at its first start is now the **Initial
+  Repo** (marked `initial`); a catalog that still has the Default Repo under
+  that name gets the new one at startup. Its Hyper-V switch is gone with
+  `GET`/`POST /api/v1/repositories/default` and `abr repo default`: it is shared
+  like any other local repository (`abr repo share`).
+- `default` on a repository now marks the default repository, where a new
+  backup job stores unless another is named: `PATCH /api/v1/repositories/{id}`
+  with `{"default": true}` or `false`, `abr repo edit --default|--no-default`,
+  and a DEFAULT column in `abr repo list`. A backup job created without
+  `repo_id` (`abr job create` without `--repository`) stores there, and is
+  refused when no repository is the default.
 - `abr user add` and `POST /api/v1/users` need a role (`--role`). Users from
   before roles existed become Administrators when the server starts, which is
   what they could do before.

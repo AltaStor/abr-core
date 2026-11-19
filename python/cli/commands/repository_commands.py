@@ -336,39 +336,6 @@ class RepositoryCommands:
         )
         add.set_defaults(handler=self.create)
 
-        default = commands.add_parser(
-            "default",
-            help="Create the Default Repo when it is missing, and turn its Hyper-V share on or off.",
-            description=(
-                "Create the Default Repo when it is missing, and turn its Hyper-V share on or off.\n\n"
-                "The Default Repo is a local repository the server keeps in /var/lib/altastor-backup/repository "
-                "(ABR_DEFAULT_REPOSITORY_PATH). Without an option the command creates it when it is missing and "
-                "otherwise only reports it. --support-hyperv shares its folder with Hyper-V hosts through a hidden "
-                "SMB share and an account the server generates, whose password is kept encrypted and never shown; "
-                "--no-support-hyperv removes the share and the account and keeps the backups.\n\n"
-                "Examples:\n"
-                "  abr repo default\n"
-                "  abr repo default --support-hyperv\n"
-                "  abr repo default --no-support-hyperv"
-            ),
-            formatter_class=CompactHelpFormatter,
-        )
-        hyperv = default.add_mutually_exclusive_group()
-        hyperv.add_argument(
-            "--support-hyperv",
-            dest="support_hyperv",
-            action="store_true",
-            default=None,
-            help="Share the Default Repo with Hyper-V hosts (creates it first when it is missing)",
-        )
-        hyperv.add_argument(
-            "--no-support-hyperv",
-            dest="support_hyperv",
-            action="store_false",
-            help="Remove the Hyper-V share and its account; the backups stay",
-        )
-        default.set_defaults(handler=self.default)
-
         share = commands.add_parser(
             "share",
             help="Share local repositories over SMB from this server, list, check or remove the shares.",
@@ -443,6 +410,7 @@ class RepositoryCommands:
                 '  abr repo edit --name "SMB-Repo" --server backup01 --share repo1 --username "CORP\\backupsvc" '
                 "--password\n"
                 '  abr repo edit --id <repo-id> --new-name "Local-Repo-1-Renamed"\n'
+                '  abr repo edit --name "S3-Repo" --default\n'
                 '  abr repo edit --name "S3-WORM" --immutable governance --immutability-days 30\n'
                 '  abr repo edit --name "S3-WORM" --immutable none'
             ),
@@ -503,6 +471,20 @@ class RepositoryCommands:
                 "A bucket created this way cannot hold immutable backups, because Object Lock is only "
                 "settable while a bucket is being created"
             ),
+        )
+        edit_default = edit.add_mutually_exclusive_group()
+        edit_default.add_argument(
+            "--default",
+            dest="default",
+            action="store_true",
+            default=None,
+            help="Make this the default repository, where a new backup job stores when none is named",
+        )
+        edit_default.add_argument(
+            "--no-default",
+            dest="default",
+            action="store_false",
+            help="Stop this being the default repository (then none is)",
         )
         edit.set_defaults(handler=self.edit)
 
@@ -627,45 +609,6 @@ class RepositoryCommands:
             print(f"{result.get('name')} is shared as {share}, account {result.get('username')}.", file=sys.stderr)
         return 0
 
-    def default(self, args: argparse.Namespace) -> int:
-        deps = CommandDependencies(args)
-        payload = {} if args.support_hyperv is None else {"support_hyperv": args.support_hyperv}
-        result = deps.context.api_client.post(
-            "api/v1/repositories/default", json=payload, timeout=DEFAULT_REPOSITORY_TIMEOUT_SECONDS
-        )
-        repository = result.get("repository") if isinstance(result.get("repository"), dict) else {}
-        hyperv = bool(repository.get("support_hyperv"))
-        summary = {
-            "id": repository.get("id"),
-            "name": repository.get("name"),
-            "path": repository.get("path"),
-            "status": repository.get("status"),
-            "support_hyperv": hyperv,
-            "share": repository.get("share") if hyperv else None,
-            "share_user": repository.get("username") if hyperv else None,
-            "created": bool(result.get("created")),
-            "changed": bool(result.get("changed")),
-        }
-        deps.context.print_output(
-            summary,
-            [
-                ("name", "NAME"),
-                ("path", "PATH"),
-                ("support_hyperv", "HYPER-V"),
-                ("share", "SHARE"),
-                ("share_user", "SHARE USER"),
-                ("status", "STATUS"),
-            ],
-        )
-        if summary["created"]:
-            print(f"Created {summary['name']}.", file=sys.stderr)
-        elif not summary["changed"]:
-            print(f"{summary['name']} already exists; nothing changed.", file=sys.stderr)
-        if summary["changed"]:
-            state = "on" if hyperv else "off"
-            print(f"Hyper-V support of {summary['name']} turned {state}.", file=sys.stderr)
-        return 0
-
     def share_show(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
         deps.context.print_output(deps.context.api_client.get("api/v1/repositories/shares"), SHARE_COLUMNS)
@@ -700,7 +643,10 @@ class RepositoryCommands:
     def list(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
         payload = deps.context.api_client.get("api/v1/repositories")
-        deps.context.print_output(payload, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("path", "PATH"), ("status", "STATUS")])
+        deps.context.print_output(
+            payload,
+            [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("path", "PATH"), ("default", "DEFAULT"), ("status", "STATUS")],
+        )
         return 0
 
     def info(self, args: argparse.Namespace) -> int:
@@ -727,6 +673,7 @@ class RepositoryCommands:
             "username": args.username,
             "password": args.password,
             "description": args.description,
+            "default": getattr(args, "default", None),
         }.items() if value is not None}
         if args.address:
             payload.update(_parse_remote_address(str(current.get("type") or ""), args.address))

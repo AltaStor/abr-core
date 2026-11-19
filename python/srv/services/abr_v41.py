@@ -250,6 +250,17 @@ def product_version() -> str:
     return installed or PRODUCT_VERSION
 
 REPO_TYPES = ("local", "nfs", "smb", "s3")
+# The repository a new backup job stores to when none is named (at most one), and the one the server made itself
+# at its first start, the Initial Repo.
+DEFAULT_REPOSITORY_MARK = "default_repository"
+INITIAL_REPOSITORY_MARK = "initial_repository"
+
+
+def is_initial_repository_metadata(metadata: dict[str, Any]) -> bool:
+    # Until 26.12 the repository the server made carried only default_repository, which then meant both.
+    if INITIAL_REPOSITORY_MARK in metadata:
+        return bool(metadata[INITIAL_REPOSITORY_MARK])
+    return bool(metadata.get(DEFAULT_REPOSITORY_MARK))
 
 PRODUCT_STORAGE_MODE = 0o750
 
@@ -1376,10 +1387,9 @@ def _ensure_hyperv_reaches_repository(inventory_id: Any, repository: dict[str, A
     try:
         ensure_hyperv_repository(stored)
     except VhdxToolError:
-        metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
         switch = (
-            ", or turn on the Hyper-V switch of the Default Repo (abr repo default --support-hyperv)"
-            if metadata.get("default_repository")
+            f", or share {repository.get('name')} over SMB (abr repo share add --name \"{repository.get('name')}\")"
+            if str(stored.get("type") or "").lower() == "local"
             else ""
         )
         raise api_error(
@@ -2248,7 +2258,8 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         item["username"] = metadata.get("username")
     if metadata.get("description") is not None:
         item["description"] = metadata.get("description")
-    item["default"] = bool(metadata.get("default_repository"))
+    item["default"] = bool(metadata.get(DEFAULT_REPOSITORY_MARK))
+    item["initial"] = is_initial_repository_metadata(metadata)
     item["support_hyperv"] = bool(metadata.get("support_hyperv"))
     if repo_type == "s3":
         s3_config = sanitize_s3_config(extract_s3_config(item))
@@ -2670,6 +2681,18 @@ def list_repository_records() -> list[dict[str, Any]]:
 
 def resolve_repository(name: str | None = None, record_id: str | None = None) -> dict[str, Any]:
     return normalize_repository_record(resolve_selector(catalog_records(REPOSITORIES), name=name, record_id=record_id, label="Repository"))
+
+
+def _default_repository_for_job() -> dict[str, Any]:
+    for record in catalog_records(REPOSITORIES):
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        if metadata.get(DEFAULT_REPOSITORY_MARK):
+            return normalize_repository_record(record)
+    raise api_error(
+        422,
+        "missing_selector",
+        "Name the repository the job stores to (--repository or --repository-id): no repository is set as the default",
+    )
 
 
 def _ensure_smb_repository_share(
@@ -5082,7 +5105,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     )
     _ensure(bool(vm_tokens), 422, "invalid_job", "Backup jobs require at least one VM")
     _ensure(not any(str(existing.get("name") or "").lower() == name.lower() for existing in catalog_records(JOBS)), 409, "job_name_exists", "Job name already exists", name=name)
-    repository = resolve_repository(name=repo_name, record_id=repo_id)
+    repository = resolve_repository(name=repo_name, record_id=repo_id) if (repo_name or repo_id) else _default_repository_for_job()
     tokens = vm_tokens if isinstance(vm_tokens, list) else _split_csv(str(vm_tokens))
     if inventory_name or inventory_id:
         inventory = resolve_inventory(name=inventory_name, record_id=inventory_id)

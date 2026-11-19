@@ -424,7 +424,11 @@ class JobCommands:
             parser.add_argument("--vm", action="append", default=[], help="VM name, ID, or path. Repeat as needed.")
             parser.add_argument("--vms", help="Protected VM names, IDs, or paths, comma-separated")
             parser.add_argument("--objects", help=argparse.SUPPRESS)
-        parser.add_argument("--repository", "--repo", dest="repo", help="Repository name")
+        repository_help = (
+            "Repository name" if editing or for_copy
+            else "Repository name (the default repository when neither this nor --repository-id is given)"
+        )
+        parser.add_argument("--repository", "--repo", dest="repo", help=repository_help)
         parser.add_argument("--repository-id", "--repo-id", dest="repo_id", help="Repository ID")
         parser.add_argument(
             "--schedule",

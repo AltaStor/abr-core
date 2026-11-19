@@ -79,7 +79,7 @@ from .services import (
     auth_service,
     backup_catalog,
     clock_guard,
-    default_repository,
+    initial_repository,
     notification_detectors,
     notification_service,
     repository_shares,
@@ -326,9 +326,9 @@ async def lifespan(_: FastAPI):
         auth_service.bootstrap_admin_if_needed()
 
         try:
-            default_repository.create_default_repository_at_startup()
+            initial_repository.create_initial_repository_at_startup()
         except Exception:
-            logger.exception("Could not check the default repository; continuing startup.")
+            logger.exception("Could not check the Initial Repo; continuing startup.")
 
         repository_shares.restore_shares_in_background()
 

@@ -89,10 +89,10 @@ class HyperVRepositoryRuleTests(unittest.TestCase):
 
         self.assertEqual(error.code, "hyperv_repository_unreachable")
 
-    def test_the_default_repo_with_its_switch_off_points_at_the_switch(self) -> None:
+    def test_an_unshared_local_repository_points_at_sharing_it(self) -> None:
         error = self._refused(lambda: self._create("hv-default", self.hyperv, "hv-01", "default"))
 
-        self.assertIn("abr repo default --support-hyperv", error.message)
+        self.assertIn('abr repo share add --name "Default Repo"', error.message)
 
     def test_hyperv_jobs_on_s3_and_smb_repositories_are_made(self) -> None:
         for repo_id in ("s3", "smb"):

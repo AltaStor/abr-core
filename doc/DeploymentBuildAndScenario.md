@@ -247,38 +247,48 @@ refuses to replace one as well; `--renew --force` replaces it with a
 self-signed certificate and a new key. Every refused or failed install is
 logged with its reason.
 
-At startup the server creates the **Default Repo** when there is none: a local
+At startup the server creates the **Initial Repo** when there is none: a local
 repository in `ABR_DEFAULT_REPOSITORY_PATH` (`/var/lib/altastor-backup/repository`),
-whose folder it creates with mode 0750. The repository is recognised by a mark,
-not by its name, so renaming it keeps it the default one, and deleting it brings
-it back at the next start. A repository already named Default Repo at that
-folder becomes the default one; one of that name anywhere else is left alone,
-and the server logs why it created none. When the folder cannot be created, or
-the catalog database is down, the server logs that and starts without it. A
-server run from a source checkout by a user who cannot create the folder puts
-the Default Repo in `backups/default-repo` of the checkout instead (git-ignored,
-created when missing), the way it keeps its TLS certificate and credential key
-in `python/tls/`; a server installed in `/opt/altastor-backup` never falls back
-next to its program files.
-`GET /api/v1/repositories/default` shows it, `POST /api/v1/repositories/default`
-creates it when it is missing and answers `created: false` when it is there.
-Every repository reports `default` and `support_hyperv`.
+whose folder it creates with mode 0750, shared over SMB like every new local
+repository (below). The repository is recognised by a mark
+(`metadata.initial_repository`), not by its name, so renaming it keeps it the
+initial one, and deleting it brings it back at the next start. A repository
+already named Initial Repo at that folder becomes the initial one; one of that
+name anywhere else is left alone, and the server logs why it created none. When
+the folder cannot be created, or the catalog database is down, the server logs
+that and starts without it. A server run from a source checkout by a user who
+cannot create the folder puts the Initial Repo in `backups/default-repo` of the
+checkout instead (git-ignored, created when missing), the way it keeps its TLS
+certificate and credential key in `python/tls/`; a server installed in
+`/opt/altastor-backup` never falls back next to its program files. Up to 26.11
+it was called the Default Repo: a catalog that still has it under that name gets
+the new one at startup (a name the operator gave it is kept), and its record is
+read as the initial one by its old mark.
 
-Hyper-V hosts cannot reach a folder of the appliance, so the Default Repo has a
-Hyper-V switch, off by default: `POST /api/v1/repositories/default` with
-`{"support_hyperv": true}` turns it on, `false` turns it off, and the answer says
-whether anything `changed`. Turning it on shares the repository's folder through
-Samba as a hidden share with a generated name (`abr-xxxxxxxx$`), open only to a
-generated system account (`abr-smb-xxxxxxxx`, no login, no home) with a generated
-40-character password, encrypted with the credential key in the catalog and
-never logged or shown. Backups and restores give each Hyper-V host the share at
-the address this appliance reaches that host from, with that account. Turning
-it off, or removing the Default Repo, removes the share and the account and
-keeps the backups. While it is on, the share, account and password of the
-repository cannot be edited by hand.
+One repository at most is the **default** one: a new backup job stores there
+unless another repository is named (`POST /api/v1/jobs` without `repo_id`, `abr
+job create` without `--repository`; with no default the job is refused). The
+Initial Repo is the default when the server creates it and no other repository
+is. `PATCH /api/v1/repositories/{id}` with `{"default": true}` (`abr repo edit
+--default`, "Set as default" in the web console) moves the mark there, `false`
+leaves no default, and deleting the default repository leaves none. Every
+repository reports `default`, `initial` and `support_hyperv`.
 
-Any other local repository is shared the same way from the CLI (or the API),
-the Default Repo included:
+Hyper-V hosts cannot reach a folder of the appliance, so every local repository
+is shared when it is added (`POST /api/v1/repositories` with type `local`; `"shared":
+false`, or `abr repo add --no-share`, adds it unshared): its folder is shared
+through Samba as a hidden share with a generated name (`abr-xxxxxxxx$`), open
+only to a generated system account (`abr-smb-xxxxxxxx`, no login, no home) with
+a generated 40-character password, encrypted with the credential key in the
+catalog and never logged or shown. When that fails the repository is added
+unshared, and the answer has the reason in `share_error` and `warnings`.
+Backups and restores give each Hyper-V host the share at the address this
+appliance reaches that host from, with that account. Removing the share, or the
+repository, removes the account and keeps the backups. While a repository is
+shared, its share, account and password cannot be edited by hand.
+
+Shares are listed, added, checked and removed from the CLI (or the API), and with
+the "Share over SMB" switch in a local repository's settings in the web console:
 
 ```bash
 abr repo share show                        # every local repository and its share: \\<host>\<share> or not shared
@@ -343,8 +353,9 @@ broker is away or refuses (smbd stopped, folder gone), the repository is left
 as it is and the next start tries again. A shares file the server cannot read
 is not acted on. A share is closed for good only with `abr repo share del`.
 
-Without Samba or the broker units the Default Repo still works as a local
-repository, and sharing answers why the share could not be made. Hyper-V hosts
+Without Samba or the broker units local repositories, the Initial Repo
+included, are added unshared and work as local ones; sharing answers why the
+share could not be made. Hyper-V hosts
 reach the share at this machine's address on port 445.
 
 Log in. Every `/api/v1` call needs a session, so this comes before anything

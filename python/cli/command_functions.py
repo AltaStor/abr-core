@@ -31,7 +31,6 @@ COMMAND_FUNCTIONS: dict[str, str] = {
     "role delete": "role.delete",
     "audit list": "audit.view",
     "repo add": "repository.create",
-    "repo default": "repository.create",
     "repo share show": "repository.view",
     "repo share add": "repository.edit",
     "repo share del": "repository.edit",
