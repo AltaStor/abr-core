@@ -279,7 +279,7 @@ abr notification set --disable
 
 abr notification test 
 
-Description: Send a test e-mail now and report whether the SMTP server took it, or why not: smtp_connection_failed, smtp_tls_failed, smtp_auth_failed, oauth_token_failed, smtp_sender_refused, smtp_recipients_refused or smtp_error, with the stage it reached (exit 1). The set options test a change without saving it. 
+Description: Send a test e-mail now and report whether the SMTP server took it, or why not: smtp_connection_failed, smtp_tls_failed, smtp_auth_failed, oauth_token_failed, smtp_sender_refused, smtp_recipients_refused or smtp_error, with the stage it reached (exit 1). The set options test a change without saving it. --to sends it to those addresses instead of the recipients, also while no recipients are saved; without --to at least one recipient must be saved. 
 
 abr notification test [--to <addresses>] [any abr notification set option except --enable, --disable and the recipient options] 
 

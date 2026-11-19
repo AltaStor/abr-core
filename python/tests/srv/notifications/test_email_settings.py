@@ -153,5 +153,46 @@ class TestRecipientsTests(_EmailCase):
             self.assertEqual(notification_service.send_test(COMPLETE, None)["recipients"], ["ops@example.test"])
 
 
+    def test_to_is_enough_while_no_recipients_are_saved(self) -> None:
+        self.store_raw(recipients=[])
+        with patch.object(email_channel, "deliver", return_value=[]) as deliver:
+            result = notification_service.send_test(None, ["qa@example.test"])
+        self.assertEqual(result["recipients"], ["qa@example.test"])
+        self.assertEqual(deliver.call_args.args[1], ["qa@example.test"])
+
+    def test_without_to_or_saved_recipients_the_test_is_refused(self) -> None:
+        self.store_raw(recipients=[])
+        with patch.object(email_channel, "deliver") as deliver:
+            error = self.refused(notification_service.send_test, None, None)
+        self.assertEqual(error.details["fields"], {"recipients": "Add at least one recipient"})
+        deliver.assert_not_called()
+
+    def test_to_of_blank_addresses_counts_as_no_to(self) -> None:
+        self.store_raw(recipients=[])
+        with patch.object(email_channel, "deliver") as deliver:
+            error = self.refused(notification_service.send_test, None, [" ", ""])
+        self.assertEqual(error.details["fields"], {"recipients": "Add at least one recipient"})
+        deliver.assert_not_called()
+
+    def test_to_does_not_excuse_other_missing_settings(self) -> None:
+        self.store_raw(recipients=[], sender={"address": "", "name": ""})
+        with patch.object(email_channel, "deliver") as deliver:
+            error = self.refused(notification_service.send_test, None, ["qa@example.test"])
+        self.assertIn("sender.address", error.details["fields"])
+        self.assertNotIn("recipients", error.details["fields"])
+        deliver.assert_not_called()
+
+    def test_to_does_not_excuse_bad_recipients_in_unsaved_changes(self) -> None:
+        self.store_raw(recipients=[])
+        with patch.object(email_channel, "deliver") as deliver:
+            error = self.refused(notification_service.send_test, {"recipients": ["bad"]}, ["qa@example.test"])
+        self.assertEqual(error.details["fields"], {"recipients": "Not an e-mail address: bad"})
+        deliver.assert_not_called()
+
+    def test_switching_on_still_needs_a_recipient(self) -> None:
+        self.store_raw(recipients=[])
+        fields = self.refused_fields({"enabled": True})
+        self.assertEqual(fields.get("recipients"), "Add at least one recipient")
+
 if __name__ == "__main__":
     unittest.main()
