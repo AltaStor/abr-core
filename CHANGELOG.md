@@ -202,6 +202,10 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
 
 ### Changed
 
+- A new local repository is shared over SMB right away, so Hyper-V hosts can
+  back up into it (`POST /api/v1/repositories`, `abr repo add`); `"shared":
+  false` (`--no-share`) adds it unshared, and when the share cannot be made it
+  is added unshared with the reason in `share_error` and its warnings.
 - `abr user add` and `POST /api/v1/users` need a role (`--role`). Users from
   before roles existed become Administrators when the server starts, which is
   what they could do before.

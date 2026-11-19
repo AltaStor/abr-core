@@ -278,7 +278,7 @@ class HyperVSwitchTests(_HyperVCase):
         self.assertTrue(changed)
         [(command, fields, socket_path)] = self.helper.calls
         self.assertEqual(command, "add-share")
-        self.assertEqual(socket_path, repository_shares.DEFAULT_SOCKET)
+        self.assertEqual(socket_path, repository_shares.broker_socket())
         self.assertRegex(fields["share"], r"^abr-[a-z0-9]{8}\$$")
         self.assertRegex(fields["user"], r"^abr-smb-[a-z0-9]{8}$")
         self.assertRegex(fields["password"], r"^[A-Za-z0-9]{40}$")

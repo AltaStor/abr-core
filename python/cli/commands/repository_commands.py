@@ -241,6 +241,9 @@ class RepositoryCommands:
             help="Add backup repository.",
             description=(
                 "Add backup repository.\n\n"
+                "A local repository is shared over SMB from this server right away, so Hyper-V hosts can back up "
+                "into it: a hidden share and an account the server generates (see abr repo share). --no-share adds it "
+                "unshared; when sharing fails it is added unshared with a warning.\n\n"
                 f"The SMB password is read from {REPO_PASSWORD_ENV_VAR} and the S3 secret key from "
                 f"{REPO_SECRET_KEY_ENV_VAR}, or prompted for when they are not set; avoid --password VALUE "
                 "and --secret-key VALUE, which show them to every local user.\n\n"
@@ -319,6 +322,16 @@ class RepositoryCommands:
                 "Create the S3 bucket when it does not exist. Without this the repository is refused. "
                 "A bucket created this way cannot hold immutable backups, because Object Lock is only "
                 "settable while a bucket is being created"
+            ),
+        )
+        add.add_argument(
+            "--no-share",
+            dest="shared",
+            action="store_false",
+            default=None,
+            help=(
+                "Add a local repository without sharing it. Without this a local repository is shared over SMB "
+                "from this server right away (see abr repo share)"
             ),
         )
         add.set_defaults(handler=self.create)
@@ -575,6 +588,8 @@ class RepositoryCommands:
             "description": args.description,
         }
         payload.update({k: v for k, v in _parse_remote_address(args.type, args.address).items() if payload.get(k) in {None, ""}})
+        if getattr(args, "shared", None) is False:
+            payload["shared"] = False
         if args.type == "s3":
             payload["s3"] = _build_s3_payload(args)
             if getattr(args, "create_bucket", None):
@@ -597,11 +612,19 @@ class RepositoryCommands:
                     else "Validating repository storage"
                 ),
             )
+        elif repo_type == "local" and payload.get("shared") is not False:
+            # Sharing the new folder runs smbpasswd and a Samba reload through the shares broker.
+            result = deps.context.api_client.post(
+                "api/v1/repositories", json=payload, timeout=DEFAULT_REPOSITORY_TIMEOUT_SECONDS
+            )
         else:
             result = deps.context.api_client.post("api/v1/repositories", json=payload)
         deps.context.print_output(result, [("id", "ID"), ("name", "NAME"), ("type", "TYPE"), ("path", "PATH"), ("status", "STATUS")])
         _print_repository_warnings(result)
         _print_immutability_effect(result)
+        if isinstance(result, dict) and result.get("support_hyperv"):
+            share = f"\\\\{result.get('server')}\\{result.get('share')}"
+            print(f"{result.get('name')} is shared as {share}, account {result.get('username')}.", file=sys.stderr)
         return 0
 
     def default(self, args: argparse.Namespace) -> int:

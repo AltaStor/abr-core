@@ -32,7 +32,12 @@ router = build_router("/repositories", tag="repositories")
 def create_repository(
     payload: CreateRepositoryRequest = Body(default_factory=CreateRepositoryRequest),
 ) -> RepositoryDTO:
-    return abr_v41.create_repository_record(unset_excluded(payload))
+    body = unset_excluded(payload)
+    shared = body.pop("shared", None)
+    created = abr_v41.create_repository_record(body)
+    if shared is False:
+        return created
+    return repository_shares.share_new_repository(created)
 
 
 def test_s3_connection(

@@ -525,6 +525,7 @@ class RepositoryDTO(_LenientModel):
     jobs_count: int = 0
     default: bool = False
     support_hyperv: bool = False
+    share_error: DocStrOrNull = Field(default=None, description="On create only: why the new local repository could not be shared; it is added unshared")
     backup_chain_count: int = 0
     restore_point_count: int = 0
     can_delete: bool = True
@@ -940,6 +941,13 @@ class CreateRepositoryRequest(_LenientModel):
     verify_tls: LaxBool | None = Field(default=None, description=S3_VERIFY_TLS)
     immutability: Annotated[SkipValidation[ImmutabilityRequest] | None, _checked_booleans(ImmutabilityRequest)] = None
     create_bucket: LaxBool | None = Field(default=None, description=CREATE_BUCKET)
+    shared: LaxBool | None = Field(
+        default=None,
+        description=(
+            "Local repositories only: a new local repository is shared over SMB from this server right away (left out "
+            "or true); false adds it unshared. When sharing fails it is added unshared, with share_error"
+        ),
+    )
 
 
 class UpdateRepositoryRequest(_LenientModel):

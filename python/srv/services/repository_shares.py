@@ -261,6 +261,22 @@ def share_repository(record: dict[str, Any]) -> dict[str, Any]:
         return updated
 
 
+def share_new_repository(created: dict[str, Any]) -> dict[str, Any]:
+    """Share a local repository right after it is added, as every local repository is unless asked not to be.
+    When that fails the repository stays, unshared, and the reason comes back as share_error (and a warning)."""
+    repository_id = str(created.get("id") or "")
+    stored = REPOSITORIES.get(repository_id)
+    if not isinstance(stored, dict) or str(stored.get("type") or "").lower() != "local":
+        return created
+    try:
+        share_repository(stored)
+    except ApiError as exc:
+        logger.warning("%s is added but not shared: %s", _name(stored), exc.message)
+        warning = f"{exc.message}. {_name(stored)} is added as a local repository; share it later (abr repo share add)"
+        return {**created, "share_error": exc.message, "warnings": [*(created.get("warnings") or []), warning]}
+    return {**abr_v41.resolve_repository(record_id=repository_id), "warnings": created.get("warnings") or []}
+
+
 def unshare_repository(record: dict[str, Any]) -> dict[str, Any]:
     with LOCK:
         if not is_shared(record):
