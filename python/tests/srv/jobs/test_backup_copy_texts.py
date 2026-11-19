@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+from python.srv.core import storage_tool
 from python.srv.core.mongo_db_wrapper import JOBS, REPOSITORIES
 from python.srv.core.storage_tool import StorageToolError
 from python.srv.services import abr_v41, backup_copy, synthetic_full
@@ -132,6 +133,43 @@ class CopySpaceMessageTests(_CopyRun):
 
         self.assertIn("this synthetic full needs about", message)
         self.assertIn("or merge into another repository", message)
+
+
+
+class CopyToolEndTests(_CopyRun):
+    def failure(self, text: str) -> str:
+        task = self.start()
+        with (
+            patch.object(backup_copy, "copy_disk_tool_chain", side_effect=StorageToolError(text)),
+            patch.object(backup_copy, "_free_bytes_at_start", return_value=None),
+            self.assertRaises(BackupCopyError) as caught,
+        ):
+            backup_copy.run_backup_copy(task)
+        return str(caught.exception)
+
+    def test_a_killed_tool_is_named_as_the_end_of_the_copy(self) -> None:
+        text = storage_tool.disk_tool_failure_text(-9, "", "")
+
+        message = self.failure(text)
+
+        self.assertTrue(message.startswith("Copying disk 1/1 failed: the copy of the restore point ended unexpectedly: abr-vmdk-tool was terminated by signal 9 (SIGKILL)"))
+        self.assertIn(storage_tool.OUT_OF_MEMORY_HINT, message)
+        self.assertNotIn("backup tool", message)
+
+    def test_an_interrupted_tool_speaks_of_the_copy_not_a_disk_or_a_vm(self) -> None:
+        message = self.failure(storage_tool.disk_tool_failure_text(1, "Interrupted, releasing the disk and the VM\n", ""))
+
+        self.assertEqual(
+            message,
+            "Copying disk 1/1 failed: abr-vmdk-tool was interrupted by a signal from outside the server (SIGTERM or SIGINT) "
+            "and stopped copying the restore point; what it had written is discarded",
+        )
+
+    def test_an_error_the_tool_describes_is_passed_on_as_it_is(self) -> None:
+        self.assertEqual(self.failure("cannot open the source backup"), "Copying disk 1/1 failed: cannot open the source backup")
+
+    def test_a_backup_keeps_its_own_words(self) -> None:
+        self.assertTrue(storage_tool.disk_tool_failure_text(-9, "", "").startswith("the backup tool ended unexpectedly"))
 
 
 class CopyManifestAlgorithmTests(_CopyRun):

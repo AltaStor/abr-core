@@ -26,6 +26,9 @@ from python.srv.core.mongo_db_wrapper import (
 )
 from python.srv.core.time_zones import RENAMED_ZONES
 from python.srv.core.storage_tool import (
+    DISK_TOOL_INTERRUPTED,
+    DISK_TOOL_NAME,
+    TOOL_ENDED_UNEXPECTEDLY,
     StorageToolError,
     chain_retention_till,
     copy_disk_tool_chain,
@@ -67,6 +70,17 @@ AVAILABLE_STATUSES = frozenset({"available", "completed", "healthy"})
 FINISHED_STATUSES = frozenset({"completed", "failed", "stopped", "canceled", "cancelled"})
 WINDOW_TIME = re.compile(r"^([01]\d|2[0-4]):([0-5]\d)$")
 WINDOW_STOP_REASON = "copy_window"
+
+
+COPY_ENDED_UNEXPECTEDLY = "the copy of the restore point ended unexpectedly"
+COPY_INTERRUPTED = (
+    f"{DISK_TOOL_NAME} was interrupted by a signal from outside the server (SIGTERM or SIGINT) and stopped copying "
+    "the restore point; what it had written is discarded"
+)
+
+
+def copy_tool_failure(text: str) -> str:
+    return text.replace(TOOL_ENDED_UNEXPECTEDLY, COPY_ENDED_UNEXPECTEDLY).replace(DISK_TOOL_INTERRUPTED, COPY_INTERRUPTED)
 
 
 class BackupCopyError(RuntimeError):
@@ -750,7 +764,7 @@ def _copy_once(
                 raise TaskStopRequested("Backup copy cancelled; what it had written was discarded") from exc
             except StorageToolError as exc:
                 detail = _no_room_detail(repository, points, free_at_start, copy=True)
-                raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {detail or exc}") from exc
+                raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {detail or copy_tool_failure(str(exc))}") from exc
             except OSError as exc:
                 if exc.errno == errno.ENOSPC:
                     raise BackupCopyError(

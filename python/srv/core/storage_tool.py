@@ -831,6 +831,8 @@ def probe_repository_access(
 
 
 DISK_TOOL_NAME = "abr-vmdk-tool"
+TOOL_ENDED_UNEXPECTEDLY = "the backup tool ended unexpectedly"
+DISK_TOOL_INTERRUPTED = "Interrupted, releasing the disk and the VM"
 OUT_OF_MEMORY_HINT = (
     "SIGKILL usually comes from the kernel's out-of-memory killer; journalctl -k on the backup server shows it"
 )
@@ -845,7 +847,7 @@ def disk_tool_failure_text(returncode: int, stderr: Any, stdout: Any) -> str:
     output = without_progress_lines(stderr) or without_progress_lines(stdout)
     if returncode > 0 and output:
         return output
-    message = f"the backup tool ended unexpectedly: {describe_process_end(DISK_TOOL_NAME, returncode)}"
+    message = f"{TOOL_ENDED_UNEXPECTEDLY}: {describe_process_end(DISK_TOOL_NAME, returncode)}"
     if returncode == -signal.SIGKILL:
         message += f" ({OUT_OF_MEMORY_HINT})"
     last_line = output.splitlines()[-1].strip() if output else ""
