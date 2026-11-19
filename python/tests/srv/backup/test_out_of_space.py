@@ -66,6 +66,32 @@ class DiskFailureMessageTests(unittest.TestCase):
 
         self.assertEqual(message, error)
 
+    def test_a_lost_smb_server_is_named_instead_of_a_full_share(self) -> None:
+        repository = {"id": "repo-3", "name": "nas", "type": "smb", "path": "/run/altastor-backup-mounts/repo-3", "metadata": {"server": "nas.example", "managed_mount": True}}
+
+        with patch("python.srv.services.repository_mounts.server_answers", return_value=False) as asked:
+            message = vcenter_backup._disk_failure_message(
+                repository, "write failed: No space left on device", needed_bytes=None, needed_is_disk_size=False, free_before=None
+            )
+
+        asked.assert_called_once_with("nas.example")
+        self.assertIn("failed because the server nas.example of its share stopped answering (port 445 or 139)", message)
+        self.assertIn("not a full share", message)
+        self.assertNotIn("ran out of space", message)
+
+    def test_an_smb_share_whose_server_answers_is_reported_full(self) -> None:
+        repository = {"id": "repo-3", "name": "nas", "type": "smb", "path": "/run/altastor-backup-mounts/repo-3", "metadata": {"server": "nas.example"}}
+
+        with (
+            patch("python.srv.services.repository_mounts.server_answers", return_value=True),
+            patch.object(vcenter_backup, "filesystem_free_bytes", return_value=0),
+        ):
+            message = vcenter_backup._disk_failure_message(
+                repository, "write failed: No space left on device", needed_bytes=None, needed_is_disk_size=False, free_before=None
+            )
+
+        self.assertIn("ran out of space (0 B free)", message)
+
     def test_an_s3_repository_keeps_the_tool_message(self) -> None:
         repository = {"id": "repo-2", "name": "bucket", "type": "s3", "s3": {"bucket": "b"}}
 

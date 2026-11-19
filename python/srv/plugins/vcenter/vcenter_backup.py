@@ -1386,6 +1386,11 @@ def _disk_failure_message(
     short_before = bool(needed_bytes) and free_before is not None and free_before < int(needed_bytes or 0)
     if not (short_before or _NO_SPACE.search(tool_error)):
         return tool_error
+    from ...services.repository_mounts import share_lost_message
+
+    lost = share_lost_message(repository)
+    if lost:
+        return lost
     name = str(repository.get("name") or repository.get("id") or "the destination")
     root = str(repository.get("path") or "").strip()
     label = f"repository {name!r}" + (f" at {root}" if root else "")

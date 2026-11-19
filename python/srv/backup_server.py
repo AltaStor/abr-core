@@ -82,6 +82,7 @@ from .services import (
     initial_repository,
     notification_detectors,
     notification_service,
+    repository_mounts,
     repository_shares,
     tls_certificate_service,
 )
@@ -331,6 +332,7 @@ async def lifespan(_: FastAPI):
             logger.exception("Could not check the Initial Repo; continuing startup.")
 
         repository_shares.restore_shares_in_background()
+        repository_mounts.mount_in_background()
 
         try:
             clock_guard.load()

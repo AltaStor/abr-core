@@ -286,16 +286,44 @@ def _account_comment(samba: Samba, user: str) -> str | None:
     return fields[4] if len(fields) > 4 else ""
 
 
-def _samba_account_exists(samba: Samba, user: str) -> bool:
+def _samba_account_state(samba: Samba, user: str) -> bool | None:
     if samba.which("pdbedit") is None:
         return False
-    return _command(samba, ["pdbedit", "-L", "-u", user], check=False).returncode == 0
+    done = _command(samba, ["pdbedit", "-L", "-u", user], check=False)
+    if done.returncode == 0:
+        return True
+    if "username not found" in f"{done.stdout}\n{done.stderr}".lower():
+        return False
+    return None
+
+
+def _reason(done: subprocess.CompletedProcess[str]) -> str:
+    lines = [line.strip() for line in (done.stderr or done.stdout or "").splitlines() if line.strip()]
+    return lines[-1] if lines else f"exit status {done.returncode}"
+
+
+def _remove_samba_account(samba: Samba, user: str) -> str | None:
+    problems = []
+    for argv in (["pdbedit", "-x", "-u", user], ["smbpasswd", "-x", user]):
+        if samba.which(argv[0]) is None:
+            continue
+        done = _command(samba, argv, check=False)
+        if done.returncode == 0 or _samba_account_state(samba, user) is False:
+            return None
+        problems.append(f"{argv[0]}: {_reason(done)}")
+    return "; ".join(problems) or "neither pdbedit nor smbpasswd is installed"
 
 
 def _remove_account(samba: Samba, user: str) -> bool:
     removed = False
-    if _samba_account_exists(samba, user):
-        _command(samba, ["pdbedit", "-x", "-u", user])
+    state = _samba_account_state(samba, user)
+    if state is not False:
+        problem = _remove_samba_account(samba, user)
+        if problem:
+            raise BrokerError(
+                FAILED,
+                f"the Samba account {user} could not be removed ({problem}); its system account is kept until it is",
+            )
         removed = True
     if _account_comment(samba, user) in OUR_ACCOUNT_COMMENTS:
         _command(samba, ["userdel", user])
@@ -367,23 +395,27 @@ def add_share(samba: Samba, arguments: Mapping[str, Any]) -> dict[str, Any]:
             _set_samba_password(samba, user, password)
             _reload(samba)
         except BaseException as exc:
-            _undo_add(samba, snapshot, user if created else None)
+            left = _undo_add(samba, snapshot, user if created else None)
             if isinstance(exc, BrokerError):
-                raise BrokerError(exc.code, f"{exc.message}; the previous Samba configuration is restored") from exc
+                undone = "the previous Samba configuration is restored" + (f", but {left}" if left else "")
+                raise BrokerError(exc.code, f"{exc.message}; {undone}") from exc
             raise
 
     return {"share": share, "user": user, "path": str(folder)}
 
 
-def _undo_add(samba: Samba, snapshot: _Snapshot, created_user: str | None) -> None:
+def _undo_add(samba: Samba, snapshot: _Snapshot, created_user: str | None) -> str | None:
     _restore(samba, snapshot)
+    left = None
     if created_user is not None:
         try:
             _remove_account(samba, created_user)
         except BrokerError as exc:
-            print(f"the account {created_user} made for the share could not be removed again: {exc.message}", file=sys.stderr, flush=True)
+            left = f"the account made for the share is left: {exc.message}"
+            print(f"the rollback is incomplete: {left}", file=sys.stderr, flush=True)
     if smbd_running(samba):
         _command(samba, ["smbcontrol", "smbd", "reload-config"], check=False)
+    return left
 
 
 def remove_share(samba: Samba, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -420,9 +452,21 @@ def remove_share(samba: Samba, arguments: Mapping[str, Any]) -> dict[str, Any]:
                 if isinstance(exc, BrokerError):
                     raise BrokerError(exc.code, f"{exc.message}; the share is kept") from exc
                 raise
-        removed_account = _remove_account(samba, user)
+        account_error = None
+        try:
+            removed_account = _remove_account(samba, user)
+        except BrokerError as exc:
+            removed_account, account_error = False, exc.message
+            print(f"{share} is removed, but {account_error}", file=sys.stderr, flush=True)
 
-    return {"share": share, "user": user, "removed_share": section is not None, "removed_account": removed_account, "reloaded": reloaded}
+    return {
+        "share": share,
+        "user": user,
+        "removed_share": section is not None,
+        "removed_account": removed_account,
+        "account_error": account_error,
+        "reloaded": reloaded,
+    }
 
 
 def close_shares(samba: Samba) -> dict[str, Any]:

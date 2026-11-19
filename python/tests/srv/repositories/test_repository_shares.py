@@ -33,12 +33,13 @@ class _Broker:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.error: Exception | None = None
+        self.extra: dict[str, dict] = {}
 
     def __call__(self, socket_path, operation, arguments, *, timeout):
         self.calls.append((operation, dict(arguments)))
         if self.error is not None:
             raise self.error
-        return {"share": arguments.get("share"), "user": arguments.get("user")}
+        return {"share": arguments.get("share"), "user": arguments.get("user"), **self.extra.get(operation, {})}
 
 
 class _Catalog(unittest.TestCase):
@@ -85,6 +86,18 @@ class _SharesCase(_Catalog):
 
     def unshare(self) -> dict:
         return repository_shares.unshare_repository(self.stored())
+
+
+class AccountLeftTests(_SharesCase):
+    def test_a_share_whose_account_is_left_is_still_unshared_and_the_account_is_named(self) -> None:
+        self.share()
+        self.broker.extra["remove-share"] = {"removed_share": True, "removed_account": False, "account_error": "the Samba account abr-smb-x could not be removed (pdbedit: locked)"}
+
+        with self.assertLogs(repository_shares.logger, "WARNING") as logs:
+            unshared = self.unshare()
+
+        self.assertFalse(repository_shares.is_shared(unshared))
+        self.assertIn("could not be removed (pdbedit: locked)", "\n".join(logs.output))
 
 
 class ShareTests(_SharesCase):
