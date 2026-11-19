@@ -28,9 +28,9 @@ def _unescape(value: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
 
 
-def read_mounts(mountinfo: Path = MOUNTINFO) -> list[Mount]:
+def read_mounts(mountinfo: Path | None = None) -> list[Mount]:
     mounts: list[Mount] = []
-    for line in mountinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in (mountinfo or MOUNTINFO).read_text(encoding="utf-8", errors="replace").splitlines():
         fields = line.split()
         if "-" not in fields:
             continue
@@ -104,12 +104,38 @@ def _check(status: str, message: str, **found: str) -> dict[str, Any]:
     return {"name": CHECK_NAME, "status": status, "message": message, **found}
 
 
-def share_mount_check(repository: dict[str, Any], mountinfo: Path = MOUNTINFO) -> dict[str, Any] | None:
+def _managed_check(repository: dict[str, Any], mountinfo: Path | None) -> dict[str, Any]:
+    from python.srv.services import repository_mounts
+
+    point = Path(str(repository.get("path") or ""))
+    unc = "\\\\" + "\\".join(unc_parts(repository_mounts.expected_source(repository)))
+    try:
+        found = [mount for mount in read_mounts(mountinfo) if mount.point == point]
+    except OSError as exc:
+        return _check("warning", f"Could not read what is mounted at {point} ({exc}), so it is not known to be {unc}")
+    mount = found[-1] if found else None
+    if mount is not None and repository_mounts._same_source(mount, repository):
+        return _check("ok", f"{point} is {unc}, mounted by this server")
+    reason = repository_mounts.problem(str(repository.get("id") or ""))
+    there = "nothing is mounted there" if mount is None else f"{mount.source} is mounted there instead"
+    return _check(
+        "failed",
+        f"The share {unc} is not mounted at {point}: {there}" + (f"; the last attempt said: {reason}" if reason else ""),
+        share=unc,
+        path=str(point),
+        found=there + (f"; the last attempt to mount it said: {reason}" if reason else ""),
+        managed=True,
+    )
+
+
+def share_mount_check(repository: dict[str, Any], mountinfo: Path | None = None) -> dict[str, Any] | None:
     if str(repository.get("type") or "").strip().lower() != "smb":
         return None
     metadata = repository.get("metadata") if isinstance(repository.get("metadata"), dict) else {}
     if metadata.get("support_hyperv"):
         return _check("ok", "The share is this appliance's own share of the folder")
+    if metadata.get("managed_mount"):
+        return _managed_check(repository, mountinfo)
     server = str(repository.get("server") or metadata.get("server") or "").strip().strip("\\/")
     share = unc_parts(str(repository.get("share") or metadata.get("share") or ""))
     if not server or not share:
@@ -202,20 +228,41 @@ class ShareNotMountedError(RuntimeError):
     pass
 
 
-def unmounted_share_message(repository: dict[str, Any], mountinfo: Path = MOUNTINFO) -> str | None:
+def unmounted_share_message(repository: dict[str, Any], mountinfo: Path | None = None) -> str | None:
     check = share_mount_check(repository, mountinfo)
     if not check or check.get("status") != "failed":
         return None
     name = str(repository.get("name") or repository.get("id") or "")
+    if check.get("managed"):
+        return (
+            f"The share {check['share']} of repository {name} is not mounted at {check['path']}: {check['found']}. "
+            "This server mounts it itself and keeps trying; edit the repository if its address or password changed"
+        )
     return (
         f"The share {check['share']} of repository {name} is not mounted at {check['path']}: {check['found']}. "
         "Mount it there, then try again"
     )
 
 
+def mount_if_managed(repository: dict[str, Any]) -> str | None:
+    from python.srv.services import repository_mounts
+    from python.srv.services.api_errors import ApiError
+
+    if not repository_mounts.is_managed(repository):
+        return None
+    try:
+        repository_mounts.ensure_mounted(repository)
+    except ApiError as exc:
+        return exc.message
+    return None
+
+
 def ensure_share_mounted(repository: dict[str, Any] | None) -> None:
     if not isinstance(repository, dict):
         return
+    failure = mount_if_managed(repository)
+    if failure:
+        raise ShareNotMountedError(failure)
     message = unmounted_share_message(repository)
     if message:
         raise ShareNotMountedError(message)

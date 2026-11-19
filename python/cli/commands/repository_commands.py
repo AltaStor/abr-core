@@ -148,8 +148,6 @@ def _validate_create_args(args: argparse.Namespace) -> None:
             raise ValueError("local repositories have no SMB share: use --type smb for a folder Hyper-V hosts reach")
         return
     if repo_type == "smb":
-        if not getattr(args, "path", None):
-            raise ValueError("smb repositories require --path, the folder this appliance mounts the share at")
         if not getattr(args, "address", None) and not (getattr(args, "server", None) and getattr(args, "share", None)):
             raise ValueError("smb repositories require --address \\\\server\\share, or --server and --share")
         return
@@ -241,6 +239,10 @@ class RepositoryCommands:
             help="Add backup repository.",
             description=(
                 "Add backup repository.\n\n"
+                "An SMB repository without --path is a share this server mounts itself, at "
+                "/run/altastor-backup-mounts/<repository id>, with --username (user, DOMAIN\\user or user@domain) and "
+                "--password; --address may name a folder inside the share. With --path it is a share mounted by hand at "
+                "that folder.\n\n"
                 "A local repository is shared over SMB from this server right away, so Hyper-V hosts can back up "
                 "into it: a hidden share and an account the server generates (see abr repo share). --no-share adds it "
                 "unshared; when sharing fails it is added unshared with a warning.\n\n"
@@ -249,6 +251,8 @@ class RepositoryCommands:
                 "and --secret-key VALUE, which show them to every local user.\n\n"
                 "Examples:\n"
                 '  abr repo add --name "Local-Repo-1" --type local --path /mnt/backups/repo1\n'
+                '  abr repo add --name "NAS" --type smb --address \'\\\\nas\\backups\\vm\' '
+                '--username "backup@corp.local"\n'
                 '  abr repo add --name "SMB-Repo" --type smb --path /mnt/hv --address \'\\\\fileserver\\hv\' '
                 '--username "CORP\\backupsvc"\n'
                 "  abr repo add --name \"SMB-Repo-2\" --type smb --path /mnt/hv2 --server backup01 --share hv2\n"
@@ -263,15 +267,16 @@ class RepositoryCommands:
         add.add_argument("--type", required=True, choices=("local", "nfs", "smb", "s3"), help="Repository type")
         add.add_argument(
             "--path",
-            help="Folder of a local repository, or the folder this appliance mounts an SMB repository's share at",
+            help="Folder of a local repository, or the folder an SMB repository's share is mounted at by hand "
+            "(without it, this server mounts the share itself)",
         )
         add.add_argument("--address", help="NFS host:/export, or the share of an SMB repository: \\\\server\\share")
         add.add_argument("--server", help="Remote repository server, or the server of an SMB repository's share")
         add.add_argument("--share", help="Remote repository share/export, or an SMB repository's share (and folder)")
         add.add_argument(
             "--username",
-            help="Repository username; for an SMB repository, the account Hyper-V hosts open its share with "
-            "(the inventory's when there is none)",
+            help="Repository username; for an SMB repository, the account this server mounts its share with and "
+            "Hyper-V hosts open it with: user, DOMAIN\\user or user@domain (with --path, the inventory's when there is none)",
         )
         add_secret_argument(add, "--password", env_var=REPO_PASSWORD_ENV_VAR, help_text="Repository password")
         add.add_argument("--description", help="Repository description")

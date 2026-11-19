@@ -227,6 +227,9 @@ def _no_room_detail(
     points: list[dict[str, Any]],
     free_at_start: int | None,
 ) -> str | None:
+    lost = _lost_share(repository)
+    if lost:
+        return lost
     if free_at_start is None:
         return None
     needed = _largest_point_bytes(points)
@@ -244,7 +247,16 @@ def _repository_label(repository: dict[str, Any]) -> str:
     return f"repository {name!r}" + (f" at {root}" if root else "")
 
 
+def _lost_share(repository: dict[str, Any]) -> str | None:
+    from python.srv.services.repository_mounts import share_lost_message
+
+    return share_lost_message(repository)
+
+
 def _out_of_space_message(repository: dict[str, Any], free_bytes: int | None) -> str:
+    lost = _lost_share(repository)
+    if lost:
+        return lost
     free = f" ({describe_bytes(free_bytes)} free)" if free_bytes is not None else ""
     return f"The {_repository_label(repository)} ran out of space{free}. {FREE_SPACE_HINT}"
 

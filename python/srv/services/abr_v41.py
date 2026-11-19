@@ -138,7 +138,7 @@ from python.srv.services.backup_copy import (
 )
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
-from python.srv.services.share_mount import share_mount_check, unmounted_share_message
+from python.srv.services.share_mount import mount_if_managed, share_mount_check, unmounted_share_message
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.hyperv.vhdx_tool import VhdxToolError, ensure_hyperv_repository
 from python.srv.plugins.vcenter import disk_transport
@@ -2318,7 +2318,7 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
                 )
             except OSError as exc:
                 storage["error"] = str(exc)
-            unmounted = unmounted_share_message(item) if storage["available"] else None
+            unmounted = unmounted_share_message(item) if storage["available"] or item_is_managed_mount(item) else None
             if unmounted:
                 storage.update({"available": False, "error": unmounted, "capacity_bytes": None, "used_bytes": None, "free_bytes": None})
         else:
@@ -2761,7 +2761,48 @@ def _ensure_appliance_folder(repo_type: str, path: str) -> None:
     )
 
 
-def create_repository_record(payload: dict[str, Any], *, metadata_flags: dict[str, Any] | None = None) -> dict[str, Any]:
+def _create_managed_smb_repository(
+    payload: dict[str, Any], *, name: str, server: str | None, share: str | None, username: str | None, password: str | None
+) -> dict[str, Any]:
+    from python.srv.services import repository_mounts
+
+    _ensure(
+        bool(server) and bool(share),
+        422,
+        "invalid_repository",
+        "smb repositories require --address \\\\server\\share, or --server and --share",
+    )
+    _ensure(
+        bool(username) and bool(password),
+        422,
+        "invalid_repository",
+        "A share this server mounts needs --username and --password: its traffic is encrypted, which needs an account. "
+        "Give --path for a share mounted by hand",
+    )
+    for existing in catalog_records(REPOSITORIES):
+        if str(existing.get("name") or "").lower() == name.lower():
+            raise api_error(409, "repository_name_exists", "Repository name already exists", name=name)
+    record_id = str(uuid4())
+    repository_mounts.mount_arguments(record_id, str(server), str(share), str(username), str(password))
+    probe = {"id": record_id, "name": name, "type": "smb", "metadata": {"server": server, "share": share, "username": username, "password": password}}
+    repository_mounts.mount(probe)
+    try:
+        return create_repository_record(
+            {**payload, "path": repository_mounts.mount_point(record_id), "server": server, "share": share},
+            metadata_flags={repository_mounts.MANAGED_MARK: True},
+            record_id=record_id,
+        )
+    except BaseException:
+        try:
+            repository_mounts.unmount(probe)
+        except ApiError:
+            LOGGER.exception("The share mounted for repository %s could not be unmounted after its creation failed", name)
+        raise
+
+
+def create_repository_record(
+    payload: dict[str, Any], *, metadata_flags: dict[str, Any] | None = None, record_id: str | None = None
+) -> dict[str, Any]:
     name = str(payload.get("name") or "")
     repo_type = str(payload.get("type") or "").strip().lower()
     path = str(payload.get("path") or "").strip() or None
@@ -2782,6 +2823,8 @@ def create_repository_record(payload: dict[str, Any], *, metadata_flags: dict[st
         share = share or parsed_share
     elif repo_type == "local" and not path and address:
         path = address
+    if repo_type == "smb" and not path and record_id is None and not (metadata_flags or {}).get("support_hyperv"):
+        return _create_managed_smb_repository(payload, name=name, server=server, share=share, username=username, password=password)
     if is_file_repository({"type": repo_type}):
         _ensure_appliance_folder(repo_type, path or "")
         local_path = Path(path)
@@ -2827,7 +2870,7 @@ def create_repository_record(payload: dict[str, Any], *, metadata_flags: dict[st
             )
     now = utc_now()
     record = {
-        "id": str(uuid4()),
+        "id": record_id or str(uuid4()),
         "name": name,
         "type": repo_type,
         "path": path,
@@ -2909,9 +2952,11 @@ def _reject_storage_location_change_if_repository_has_backups(
 
 def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     record = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
+    from python.srv.services import repository_mounts
     from python.srv.services.repository_shares import refuse_managed_share_edit
 
     refuse_managed_share_edit(record, payload)
+    repository_mounts.refuse_path_edit(record, payload)
     original_path = str(record.get("path") or "")
     _validate_text_fields(payload, REPOSITORY_TEXT_FIELDS, code="invalid_repository")
     updated = _json_clone(record)
@@ -3048,6 +3093,7 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
                     path=updated.get("path"),
                 )
     _ensure(changed, 422, "invalid_repository", "repo edit requires at least one editable option")
+    repository_mounts.apply_change(record, updated)
     registration_check = None
     if _repository_connection_identity(updated) != _repository_connection_identity(record):
         registration_check = _assert_repository_is_usable(
@@ -4128,7 +4174,21 @@ def verify_repository(record_id: str) -> dict[str, Any]:
     return payload
 
 
+def item_is_managed_mount(item: dict[str, Any]) -> bool:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    return str(item.get("type") or "").lower() == "smb" and bool(metadata.get("managed_mount"))
+
+
 def _ensure_share_mounted(repository: dict[str, Any] | None) -> None:
+    failure = mount_if_managed(repository) if isinstance(repository, dict) else None
+    _ensure(
+        not failure,
+        409,
+        "repository_share_not_mounted",
+        str(failure),
+        repository=(repository or {}).get("name"),
+        path=(repository or {}).get("path"),
+    )
     message = unmounted_share_message(repository) if isinstance(repository, dict) else None
     _ensure(
         not message,
@@ -4176,8 +4236,10 @@ def remove_repository_record(record_id: str) -> dict[str, Any]:
     repo_points = [point for point in normalized_backup_points() if str(point.get("repository_id") or "") == record_id]
     if repo_points:
         raise api_error(409, "repository_has_backups", "Repository cannot be removed while backup chains still reference it", restore_point_count=len(repo_points))
+    from python.srv.services import repository_mounts
     from python.srv.services.repository_shares import remove_repository_share
 
+    repository_mounts.remove(repository)
     remove_repository_share(repository)
     delete_repository(record_id)
     return {"id": str(repository.get("id") or record_id), "removed": True}
