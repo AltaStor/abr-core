@@ -343,7 +343,6 @@ def _nothing_to_merge(job: dict[str, Any] | None, parameters: dict[str, Any], po
     return (
         isinstance(job, dict)
         and str(job.get("job_type") or "") == "backup-copy"
-        and str(parameters.get("resolved_backup_reason") or "") != "ForceSynthetic"
         and len(points) == 1
         and str(points[0].get("execution_type") or "") in FULL_EXECUTION_TYPES
     )
