@@ -484,7 +484,7 @@ abr inventory add
 
 Description: Register a new virtualization inventory source. 
 
-abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --address <host/ip> [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--api <vddk|soap>] [--vddk-lib <path>] 
+abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --address <host/ip> [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--api <vddk|soap>] [--vddk-lib <path|ovddk>] 
 
 The password comes from ABR_INVENTORY_PASSWORD and the token from ABR_INVENTORY_TOKEN, or the password is asked for interactively. A value typed after --password or --token is still accepted, but every local user can read it (ps, /proc) while the command runs, and it stays in the shell history. 
 
@@ -519,7 +519,9 @@ replication always use the API of their target inventory.
 VDDK library. --vddk-lib names the VDDK library file the inventory's VDDK
 sessions load, under whatever name it has: VMware's VDDK
 (lib64/libvixDiskLib.so.9.1.0.0), openVDDK or our oVDDK build. It must be a full
-path to a file the backup service can read on the backup server, and export
+path to a file the backup service can read on the backup server, or ovddk, which
+takes the oVDDK library the backup server has (as abr settings vsphere set does)
+and is refused when it has none; the file must export
 VixDiskLib_InitEx; anything else is refused with the reason
 (invalid_vddk_library). A VMware VDDK's file has to stay in its bundle's lib64,
 where its transport plugins are. Without it, or after inventory edit
@@ -593,7 +595,7 @@ abr inventory edit
 
 Description: Update server connection attributes or credentials. 
 
-abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--api <vddk|soap> | --reset-api] [--vddk-lib <path> | --reset-vddk-lib] 
+abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--api <vddk|soap> | --reset-api] [--vddk-lib <path|ovddk> | --reset-vddk-lib] 
 
 Changing --protocol of a hyper-v inventory moves a standard port along with it
 (5986 for https, 5985 for http); a port of your own stays as it is.

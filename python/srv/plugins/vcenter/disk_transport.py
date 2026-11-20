@@ -288,7 +288,7 @@ def library_problem(value: str) -> str | None:
     """Why a VDDK library file cannot be used, checked on this server, which is where abr-vmdk-tool runs."""
     path = Path(value)
     if not path.is_absolute():
-        return f"The VDDK library must be a full path that starts with /, not {value}"
+        return f"The VDDK library must be a full path that starts with /, or ovddk for the oVDDK library of the backup server, not {value}"
     if not path.exists():
         return f"There is no file {value} on the backup server"
     if not path.is_file():

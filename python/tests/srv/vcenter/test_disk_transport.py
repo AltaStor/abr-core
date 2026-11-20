@@ -492,6 +492,31 @@ class ServerWideSettingsTests(_Catalog):
         cleared = abr_v41.edit_inventory_record(inventory["id"], {"vddk_library": "inherit"})
         self.assertEqual((cleared["vddk_library"], cleared["vddk_library_source"]), (None, "vddk_directory"))
 
+    def test_ovddk_takes_the_ovddk_library_of_the_server_for_an_inventory_and_server_wide(self) -> None:
+        with patch.object(disk_transport, "ovddk_library", return_value=Path(self.library)):
+            created = self._vsphere(vddk_library="ovddk")
+            plain = self._vsphere("vc2")
+            edited = abr_v41.edit_inventory_record(plain["id"], {"vddk_library": "oVDDK"})
+            settings, changed, _updated = vsphere_access.update_settings({"vddk_library": "ovddk"}, updated_by="admin")
+
+        self.assertEqual((created["vddk_library"], created["vddk_library_source"]), (self.library, "hypervisor"))
+        self.assertEqual((edited["vddk_library"], edited["vddk_library_source"]), (self.library, "hypervisor"))
+        self.assertEqual((settings["vddk_library"], changed), (self.library, ["vddk_library"]))
+
+    def test_ovddk_without_ovddk_installed_is_refused_and_changes_nothing(self) -> None:
+        inventory = self._vsphere()
+        with patch.object(disk_transport, "ovddk_library", return_value=self.root / "missing" / "libvixDiskLib.so"):
+            error = self._refused(lambda: abr_v41.edit_inventory_record(inventory["id"], {"vddk_library": "ovddk"}))
+
+        self.assertEqual((error.status_code, error.code), (422, "invalid_vddk_library"))
+        self.assertIn("oVDDK is not installed on the backup server", error.details["fields"]["vddk_library"])
+        self.assertIsNone(abr_v41.resolve_inventory(record_id=inventory["id"])["vddk_library"])
+
+    def test_a_relative_library_is_refused_with_both_forms_named(self) -> None:
+        error = self._refused(self._vsphere, vddk_library="lib64/libvixDiskLib.so")
+
+        self.assertIn("full path that starts with /, or ovddk", error.message)
+
     def test_a_session_records_and_shows_what_it_uses(self) -> None:
         inventory = self._vsphere(vddk_library=self.library)
         parameters = abr_v41.session_transport_parameters(HYPERVISORS[inventory["id"]])
