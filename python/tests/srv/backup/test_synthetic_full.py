@@ -172,6 +172,31 @@ class SyntheticFullDiskMergeTests(unittest.TestCase):
             merges["abr_backup_name:02-disk.vmdk"]["source_names"], ["task-a/02-disk.vmdk", "task-b/02-disk.vmdk"]
         )
 
+    def test_a_disk_backed_up_in_full_within_an_incremental_starts_its_chain_there(self) -> None:
+        def disks(task_id: str, tpm_mode: str, data_mode: str) -> list[dict[str, object]]:
+            data = {**_disk(task_id, "scsi0", "2000"), "store_mode": data_mode}
+            tpm = {**_disk(task_id, "tpmstate0", "2001"), "store_mode": tpm_mode}
+            return [data, tpm]
+
+        chain = [
+            _point("p1", "ActiveFull", "2026-01-01T00:00:00Z", disks("task-a", "full", "full")),
+            _point("p2", "Incremental", "2026-01-02T00:00:00Z", disks("task-b", "full", "incremental")),
+            _point("p3", "Incremental", "2026-01-03T00:00:00Z", disks("task-c", "full", "full-new-disk")),
+        ]
+
+        merges = {merge["identity"]: merge for merge in build_disk_merges(chain)}
+
+        self.assertEqual(merges["abr_backup_name:tpmstate0"]["source_names"], ["tpmstate0"])
+        self.assertEqual(merges["abr_backup_name:tpmstate0"]["source_path"], "lab/web01/task-c")
+        self.assertEqual(merges["abr_backup_name:scsi0"]["source_names"], ["scsi0"])
+        self.assertTrue(merges["abr_backup_name:scsi0"]["starts_full"])
+
+    def test_entries_without_a_store_mode_continue_the_chain_as_before(self) -> None:
+        merges = build_disk_merges(_chain())
+
+        self.assertEqual(len(merges[0]["source_names"]), 3)
+        self.assertFalse(merges[0]["starts_full"])
+
     def test_a_full_without_a_cbt_disk_key_still_pairs_with_its_incremental(self) -> None:
         full_disk = {**_disk("task-a"), "disk_key": None}
         incremental_disk = {**_disk("task-b"), "disk_key": "2000"}

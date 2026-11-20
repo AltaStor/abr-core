@@ -599,13 +599,16 @@ def _disk_entry(merge: dict[str, Any], result: dict[str, Any], **extra: Any) -> 
             "logical_bytes": logical,
             "stored_bytes": stored,
             "compression_ratio": (round(stored / logical, 6) if logical else None),
-            "store_mode": "full" if merge.get("kind") == "full" else "incremental",
+            # A disk whose chain starts again among the copied points is copied whole, whatever the copy's kind.
+            "store_mode": "full" if merge.get("kind") == "full" or merge.get("starts_full") else "incremental",
             "copied": True,
             "merged_from": len(merge["source_names"]),
             "destination_path": "",
             "parent_path": "",
             "change_id": str(merge["newest"].get("change_id") or merge["newest"].get("next_change_id") or "").strip(),
-            "previous_change_id": str(first.get("previous_change_id") or "").strip(),
+            "previous_change_id": (
+                "" if merge.get("starts_full") else str(first.get("previous_change_id") or "").strip()
+            ),
             "utility_change_id": "",
         }
     )

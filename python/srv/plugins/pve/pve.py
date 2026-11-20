@@ -477,7 +477,9 @@ class PveNode(Hypervisor):
     # ---- backup and restore -----------------------------------------------------------------------------------------
 
     def backup(self, task: dict[str, Any], progress_callback: ProgressCallback = None) -> dict[str, Any]:
-        raise PveError("Backups of Proxmox VE VMs are not available in this build yet")
+        from .pve_backup import run_pve_backup
+
+        return run_pve_backup(task, progress_callback=progress_callback)
 
     def restore(self, task: dict[str, Any], progress_callback: ProgressCallback = None) -> dict[str, Any]:
         raise PveError("Restores to Proxmox VE are not available in this build yet")

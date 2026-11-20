@@ -1093,7 +1093,41 @@ def discard_unregistered_output(task: dict[str, Any]) -> bool:
     return removed_all
 
 
+def _follows_a_platform_task(record: dict[str, Any]) -> bool:
+    """A Proxmox VE backup whose vzdump task had started: the task runs on in PVE without the server, and the session
+    follows it again by its UPID when it runs once more."""
+    result = record.get("result") if isinstance(record.get("result"), dict) else {}
+    run = result.get("pve_run") if isinstance(result.get("pve_run"), dict) else {}
+    return str(record.get("task_type") or "") == "backup" and bool(run.get("upid"))
+
+
+def _queue_again(record: dict[str, Any]) -> None:
+    updated = dict(record)
+    updated["status"] = "queued"
+    updated["updated_at"] = utc_now()
+    run = (updated.get("result") or {}).get("pve_run") or {}
+    _append_task_log(
+        updated,
+        level="warn",
+        message=(
+            f"The server stopped while vzdump task {run.get('upid')} ran on node {run.get('node')}; the session "
+            "follows that task again and registers its backup"
+        ),
+    )
+    persist_task(updated)
+    logger.warning("Task %s was following a vzdump task when the server last stopped; it runs again.", record.get("id"))
+
+
 def fail_interrupted_tasks() -> int:
+    running = [record for record in catalog_records(TASKS) if str(record.get("status") or "") == "running"]
+    for record in running:
+        if _follows_a_platform_task(record):
+            try:
+                _queue_again(record)
+            except Exception:
+                logger.exception("Could not queue task %s again; it is abandoned instead", record.get("id"))
+            else:
+                continue
     interrupted = [
         record
         for record in catalog_records(TASKS)

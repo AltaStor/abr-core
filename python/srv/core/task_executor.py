@@ -37,6 +37,7 @@ def task_status(task_id: str) -> str | None:
 WORKER_MODES = {
     "vcenter": "vcenter-abr-vmdk-tool",
     "hyper-v": "hyperv-abr-vhdx-tool",
+    "proxmox-ve": "pve-abr-nbd-tool",
 }
 
 

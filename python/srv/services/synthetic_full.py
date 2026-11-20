@@ -117,6 +117,18 @@ def validate_chain(points: list[dict[str, Any]]) -> None:
             )
 
 
+def starts_disk_chain(disk: dict[str, Any]) -> bool:
+    """A disk backup that holds the whole disk, from which that disk's chain starts.
+
+    One session can hold a full backup of one disk among incrementals of the others: vCenter backs up a disk added
+    or resized since the previous backup in full, and Proxmox VE gives the TPM state a new dirty bitmap every time,
+    and any disk whose bitmap a restart or migration lost.
+    An entry without a store mode, from an older manifest, continues the chain as before.
+    """
+    mode = str(disk.get("store_mode") or "").strip().lower()
+    return mode.startswith("full") or mode == "synthetic-full"
+
+
 def build_disk_merges(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ordered: dict[str, list[dict[str, Any]]] = {}
     template: dict[str, dict[str, Any]] = {}
@@ -130,6 +142,9 @@ def build_disk_merges(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     merges: list[dict[str, Any]] = []
     for identity, disks in ordered.items():
+        # The merge accepts a full backup only as the first of a chain, and the layers before it are not needed.
+        start = max((position for position, disk in enumerate(disks) if starts_disk_chain(disk)), default=0)
+        disks = disks[start:]
         paths = [str(disk.get("abr_path") or "") for disk in disks]
         names = [str(disk.get("abr_backup_name") or "") for disk in disks]
         if not all(paths) or not all(names):
@@ -144,6 +159,7 @@ def build_disk_merges(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "source_names": qualified,
                 "template": template[identity],
                 "newest": disks[-1],
+                "starts_full": starts_disk_chain(disks[0]),
             }
         )
     return merges

@@ -334,10 +334,10 @@ class NodeTests(unittest.TestCase):
             node.locate_vm("9999")
         self.assertEqual(fake.requests[-1].url.params["type"], "vm")
 
-    def test_backup_and_restore_are_not_there_yet(self):
+    def test_restores_are_not_there_yet(self):
         node = self.node(_cluster())
         with self.assertRaisesRegex(PveError, "not available in this build yet"):
-            node.backup({})
+            node.restore({})
 
 
 if __name__ == "__main__":

@@ -9252,7 +9252,7 @@ def _capacity_bytes_from_disk_entry(disk: dict[str, Any]) -> int | None:
 
 
 _PLATFORM_LABELS = {"vsphere": "VMware", "hyper-v": "Hyper-V", "proxmox-ve": "Proxmox VE", "xcp-ng": "XCP-ng"}
-_POINT_KIND_TO_INVENTORY_TYPE = {"vcenter": "vsphere", "hyper-v": "hyper-v"}
+_POINT_KIND_TO_INVENTORY_TYPE = {"vcenter": "vsphere", "hyper-v": "hyper-v", "proxmox-ve": "proxmox-ve"}
 
 
 def _point_inventory_type(point: dict[str, Any]) -> str | None:
