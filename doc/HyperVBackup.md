@@ -214,9 +214,10 @@ host: the disks go under `<volume>\Hyper-V\<new name>\Virtual Hard Disks`
 (at the root of a Cluster Shared Volume or share), the VM gets the backup's
 generation, processors, memory, Secure Boot settings and adapters, each adapter
 on the virtual switch the network mapping names, and boots from the disk it
-booted from. `--datastore-map` places the disks of each source storage location,
+booted from. The VM's configuration goes to the `--datastore` volume, under
+`<volume>\Hyper-V\<new name>`. `--datastore-map` places the disks of each source storage location,
 and `--disk-datastore "SCSI0:1=E:"` one disk by its slot, which wins over the
-mapping of its location; `--network-map` connects the adapters of each source
+mapping of its location; both move only disks, never the configuration; `--network-map` connects the adapters of each source
 switch, and `--nic-network "nic2=Isolated"` one adapter by its name, so two
 adapters on one switch can land on different ones. The source VM is not touched. Before anything is written the
 restore checks, on the host itself, that every target storage location exists

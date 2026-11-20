@@ -39,6 +39,32 @@ class DiskPlacementTests(unittest.TestCase):
         self.assertEqual(hyperv_restore._disk_placements({}, [{"slot": "SCSI0:0"}]), {})
 
 
+
+def planned(datastore: str, needed: int = 10, written: int = 4, provisioning: str = "dynamic") -> dict:
+    return {"datastore": datastore, "needed_bytes": needed, "written_bytes": written, "provisioning": provisioning}
+
+
+class VmConfigurationVolumeTests(unittest.TestCase):
+    def test_the_configuration_goes_to_the_datastore_asked_for_not_to_the_first_disk(self) -> None:
+        plan = [planned("C:"), planned("C:\\ClusterStorage\\Volume2")]
+
+        self.assertEqual(hyperv_restore.vm_config_datastore("C:\\ClusterStorage\\Volume2", plan), "C:\\ClusterStorage\\Volume2")
+        self.assertEqual(hyperv_restore.vm_config_datastore("D:", [planned("E:")]), "D:")
+
+    def test_without_a_datastore_it_follows_the_first_disk_as_before(self) -> None:
+        self.assertEqual(hyperv_restore.vm_config_datastore("", [planned("E:"), planned("D:")]), "E:")
+        self.assertEqual(hyperv_restore.vm_config_datastore("", []), "")
+
+    def test_the_configuration_volume_is_checked_even_when_every_disk_goes_elsewhere(self) -> None:
+        needs = hyperv_restore.storage_needs([planned("C:"), planned("C:", provisioning="fixed")], "Z:")
+
+        self.assertEqual(needs, {"C:": 10 + 10 + 4, "Z:": 0})
+
+    def test_a_configuration_volume_that_also_takes_disks_is_counted_once(self) -> None:
+        self.assertEqual(hyperv_restore.storage_needs([planned("D:")], "d:"), {"D:": 10})
+        self.assertEqual(hyperv_restore.storage_needs([planned("D:")], ""), {"D:": 10})
+
+
 class AdapterPlacementTests(unittest.TestCase):
     def test_two_adapters_on_one_network_can_land_on_different_switches(self) -> None:
         vm_config = {"network_adapters": [{"label": "nic1", "network": "Management"}, {"label": "nic2", "network": "Management"}]}

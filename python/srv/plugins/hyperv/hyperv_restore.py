@@ -269,6 +269,21 @@ def vm_base_folder(datastore: str) -> str:
     return root
 
 
+def vm_config_datastore(default_datastore: str, plan: list[dict[str, Any]]) -> str:
+    return default_datastore or (str(plan[0]["datastore"]) if plan else "")
+
+
+def storage_needs(plan: list[dict[str, Any]], config_datastore: str) -> dict[str, int]:
+    needs: dict[str, int] = {}
+    for item in plan:
+        needs[item["datastore"]] = needs.get(item["datastore"], 0) + item["needed_bytes"] + (
+            item["written_bytes"] if item["provisioning"] == "fixed" else 0
+        )
+    if config_datastore and config_datastore.lower() not in {name.lower() for name in needs}:
+        needs[config_datastore] = 0
+    return needs
+
+
 def _disk_slot(disk: dict[str, Any]) -> str:
     return str(disk.get("slot") or disk.get("disk_label") or "")
 
@@ -519,13 +534,7 @@ def run_hyperv_restore(
 
             # Storage: every target location is on this host and has room.
             volumes = {str(item.get("name") or "").lower(): item for item in resources["volumes"]}
-            needs: dict[str, int] = {}
-            for item in plan:
-                needs[item["datastore"]] = needs.get(item["datastore"], 0) + item["needed_bytes"] + (
-                    # A fixed disk is written dynamic first and converted, so
-                    # both exist for a moment.
-                    item["written_bytes"] if item["provisioning"] == "fixed" else 0
-                )
+            needs = storage_needs(plan, vm_config_datastore(default_datastore, plan) if mode == "new_vm" else "")
             for datastore, needed in needs.items():
                 volume = volumes.get(datastore.lower())
                 if volume is None and datastore.startswith("\\\\"):
@@ -547,7 +556,8 @@ def run_hyperv_restore(
                     progress_callback,
                     "validate",
                     8,
-                    f"Storage location {datastore} on {node_name}: {_gib(free)} free, {_gib(needed)} needed",
+                    f"Storage location {datastore} on {node_name}: {_gib(free)} free, "
+                    + (f"{_gib(needed)} needed" if needed else "the VM's configuration goes there"),
                 )
 
             if mode == "in_place":
@@ -724,7 +734,7 @@ def run_hyperv_restore(
                 plan[0]["slot"],
             )
             if mode == "new_vm":
-                primary = plan[0]["datastore"]
+                primary = vm_config_datastore(default_datastore, plan)
                 _emit(
                     progress_callback,
                     "configure",
@@ -863,7 +873,7 @@ def run_hyperv_restore(
             "target_vm_name": target_vm_name,
             "target_vm_id": target_vm_id,
             "target_host_name": node_name,
-            "target_datastore_name": plan[0]["datastore"] if plan else default_datastore,
+            "target_datastore_name": vm_config_datastore(default_datastore, plan) if mode == "new_vm" else (plan[0]["datastore"] if plan else default_datastore),
             "datastore_map": datastore_map or None,
             "disk_placements": disk_placements or None,
             "network_adapters": [
