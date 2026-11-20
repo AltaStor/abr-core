@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 
@@ -430,15 +431,11 @@ def _access_token(settings: dict[str, Any]) -> str:
         form["client_secret"] = client_secret
     if grant == "refresh_token":
         form["refresh_token"] = _secret(oauth.get("refresh_token"))
+    timeout = settings["smtp"].get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS
     try:
-        response = requests.post(token_url, data=form, timeout=settings["smtp"].get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
+        response = requests.post(token_url, data=form, timeout=timeout)
     except requests.RequestException as exc:
-        raise DeliveryError(
-            "oauth_token_failed",
-            f"Could not reach the OAuth 2.0 token endpoint {token_url}: {exc}",
-            stage="oauth",
-            retryable=True,
-        ) from exc
+        raise token_endpoint_failure(token_url, exc, timeout) from exc
     try:
         body = response.json()
     except ValueError:
@@ -457,6 +454,59 @@ def _access_token(settings: dict[str, Any]) -> str:
     if grant == "refresh_token" and rotated and rotated != form.get("refresh_token"):
         _store_rotated_refresh_token(str(rotated))
     return token.value
+
+
+def _causes(exc: BaseException) -> list[BaseException]:
+    found: list[BaseException] = []
+    stack: list[Any] = [exc]
+    while stack:
+        item = stack.pop(0)
+        if not isinstance(item, BaseException) or any(item is seen for seen in found):
+            continue
+        found.append(item)
+        stack.extend([getattr(item, "reason", None), item.__cause__, item.__context__, *item.args])
+    return found
+
+
+def _innermost_text(causes: list[BaseException]) -> str:
+    for cause in reversed(causes):
+        text = str(cause.strerror if isinstance(cause, OSError) and cause.strerror else cause).strip()
+        if text and "object at 0x" not in text and "Max retries" not in text:
+            return text
+    return type(causes[-1]).__name__
+
+
+def token_endpoint_failure(token_url: str, exc: BaseException, timeout: float) -> DeliveryError:
+    parts = urlsplit(token_url)
+    host = parts.hostname or token_url
+    where = f"{host}:{parts.port or (443 if parts.scheme == 'https' else 80)}"
+    causes = _causes(exc)
+
+    def fail(message: str, *, retryable: bool) -> DeliveryError:
+        return DeliveryError("oauth_token_failed", message, stage="oauth", retryable=retryable)
+
+    untrusted = next((cause for cause in causes if isinstance(cause, ssl.SSLCertVerificationError)), None)
+    if untrusted is not None:
+        return fail(
+            f"The certificate of the OAuth 2.0 token endpoint {where} is not trusted: {getattr(untrusted, 'verify_message', None) or untrusted}. "
+            "The client secret is sent there, so the endpoint needs a certificate the appliance trusts; certificate "
+            "verification is not switched off for it",
+            retryable=False,
+        )
+    if any(isinstance(cause, ssl.SSLError) for cause in causes):
+        return fail(f"The TLS handshake with the OAuth 2.0 token endpoint {where} failed: {_innermost_text(causes)}", retryable=False)
+    if isinstance(exc, (requests.exceptions.InvalidURL, requests.exceptions.MissingSchema, requests.exceptions.InvalidSchema)):
+        return fail(f"The OAuth 2.0 token endpoint URL {token_url} is not valid: {_innermost_text(causes)}", retryable=False)
+    if isinstance(exc, requests.Timeout) or any(isinstance(cause, (TimeoutError, socket.timeout)) for cause in causes):
+        return fail(f"The OAuth 2.0 token endpoint {where} did not answer within {timeout} seconds", retryable=True)
+    if any(isinstance(cause, socket.gaierror) or type(cause).__name__ == "NameResolutionError" for cause in causes):
+        return fail(f"The name {host} of the OAuth 2.0 token endpoint does not resolve; check the token endpoint URL", retryable=True)
+    if any(isinstance(cause, ConnectionRefusedError) for cause in causes):
+        return fail(
+            f"The OAuth 2.0 token endpoint {where} refused the connection: nothing answers on that port. Check the token endpoint URL",
+            retryable=True,
+        )
+    return fail(f"Could not reach the OAuth 2.0 token endpoint {where}: {_innermost_text(causes)}", retryable=True)
 
 
 def _store_rotated_refresh_token(token: str) -> None:

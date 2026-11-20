@@ -192,7 +192,7 @@ how long it took, or `502` naming why it did not go:
 | `smtp_connection_failed` | connect, send | The name does not resolve, the port refuses or does not answer within the timeout, or the connection broke. |
 | `smtp_tls_failed` | tls | The certificate is not trusted, the handshake failed (often `ssl` on a STARTTLS port or the other way round), or the server offers no STARTTLS. |
 | `smtp_auth_failed` | auth | The server refused the sign-in, offers none on this connection, or a stored password can no longer be decrypted. |
-| `oauth_token_failed` | oauth | The token endpoint could not be reached or refused the client, secret or refresh token; its reason is quoted. |
+| `oauth_token_failed` | oauth | The token endpoint's certificate is not trusted (the client secret is sent there, so certificate verification is never switched off for it), the TLS handshake failed, its name does not resolve, it refused the connection or did not answer within the timeout, or it refused the client, secret or refresh token (its reason is quoted). An untrusted certificate, a failed handshake and a refused client are not retried; the others are. |
 | `smtp_sender_refused` | send | The server refused the From address. |
 | `smtp_recipients_refused` | send | The server refused every recipient. |
 | `smtp_error` | send | Another refusal of the message. |
