@@ -1533,6 +1533,11 @@ class JobDeletedResult(DeletedResult):
 class RemovedResult(_LenientModel):
     id: DocStr = None
     removed: DocBool = None
+    warnings: DocStrArray = Field(
+        default=None,
+        description="What could not be cleaned up, such as a Proxmox VE inventory's token and SSH key on a cluster "
+        "that did not answer",
+    )
 
 
 

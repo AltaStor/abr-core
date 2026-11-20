@@ -42,6 +42,11 @@ def build_hypervisor_plugin(record: dict[str, object]) -> Hypervisor:
             **node_options(metadata),
         )
 
+    if kind == "proxmox-ve":
+        from .pve.pve import PveNode
+
+        return PveNode.from_record(record)
+
     if kind == "mock":
         from .mock import MockHypervisor
 

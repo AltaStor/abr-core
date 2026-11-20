@@ -167,7 +167,12 @@ def close_database() -> None:
         _DATABASE = None
 
 
-HYPERVISOR_SECRET_PATHS = (("metadata", "credentials", "password"), ("metadata", "token"))
+# A Proxmox VE inventory keeps its API token in metadata.token and its SSH key in metadata.pve.ssh_key.
+HYPERVISOR_SECRET_PATHS = (
+    ("metadata", "credentials", "password"),
+    ("metadata", "token"),
+    ("metadata", "pve", "ssh_key"),
+)
 
 
 def _hypervisor_secret_holders(record: dict[str, Any]) -> list[tuple[dict[str, Any], str]]:

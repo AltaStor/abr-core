@@ -50,9 +50,15 @@ class InventoryCommands:
                 f'  {INVENTORY_PASSWORD_ENV_VAR}=... abr inventory add --name "HyperV-Host1" --type hyper-v '
                 "--address 10.0.0.5 --username Administrator --insecure\n"
                 f'  {INVENTORY_PASSWORD_ENV_VAR}=... abr inventory add --name "HyperV-Host2" --type hyper-v '
-                "--address 10.0.0.6 --protocol http --username Administrator\n\n"
+                "--address 10.0.0.6 --protocol http --username Administrator\n"
+                f'  {INVENTORY_PASSWORD_ENV_VAR}=... abr inventory add --name "PVE-Cluster" --type proxmox-ve '
+                "--address pve1.example.com --username root@pam\n\n"
                 "A Hyper-V inventory speaks WinRM over HTTPS (port 5986) unless --protocol http "
-                "(port 5985) is given; --port overrides the port, not the protocol."
+                "(port 5985) is given; --port overrides the port, not the protocol.\n\n"
+                "A Proxmox VE inventory is the cluster of the node at --address. Root's password is used once, over "
+                "SSH, to set the cluster up: AltaStor installs its own SSH key, creates the PVE user abr@pve with an API "
+                "token, installs the abr-pve-backup package on every node and adds a backup storage named abr. The password is "
+                "not kept; inventory edit --password sets the cluster up again."
             ),
             formatter_class=CompactHelpFormatter,
         )

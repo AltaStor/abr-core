@@ -128,7 +128,7 @@ def key_fingerprint(line: str) -> str:
     return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
 
 
-def _normalized_key(line: str) -> str:
+def normalized_key(line: str) -> str:
     parts = str(line or "").split()
     if len(parts) < 2:
         raise ValueError(f"not an SSH public key: {line!r}")
@@ -164,7 +164,7 @@ class NodeShell:
         self.user = user
         self._private_key = private_key
         self._password = password
-        self._pinned = [_normalized_key(line) for line in host_keys or []]
+        self._pinned = [normalized_key(line) for line in host_keys or []]
         self._timeout = timeout
         self._transport: paramiko.Transport | None = None
         self._sftp: paramiko.SFTPClient | None = None
@@ -194,6 +194,8 @@ class NodeShell:
             sock = socket.create_connection((self.address, self.port), timeout=self._timeout)
         except OSError as exc:
             raise SshUnreachableError(f"SSH to {self.address}:{self.port} cannot be reached: {exc}") from exc
+        # Every command is a few small packets each way; without this each waits for the peer's delayed ACK.
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         transport = paramiko.Transport(sock, disabled_algorithms={"keys": self._disabled_host_key_algorithms()})
         try:
             try:
@@ -215,7 +217,7 @@ class NodeShell:
                     transport.auth_password(self.user, self._password or "")
             except paramiko.AuthenticationException as exc:
                 how = "AltaStor's SSH key" if self._private_key else "this password"
-                raise SshAuthError(f"{self.target} refused {how}: {exc}") from exc
+                raise SshAuthError(f"{self.target} refused {how}: {str(exc).rstrip('.')}") from exc
             except (paramiko.SSHException, OSError, EOFError) as exc:
                 raise SshUnreachableError(f"SSH to {self.address}:{self.port} failed while logging in: {exc}") from exc
             transport.set_keepalive(KEEPALIVE_SECONDS)
@@ -289,7 +291,9 @@ class NodeShell:
                     time.sleep(POLL_SECONDS)
             status = channel.recv_exit_status()
         except (paramiko.SSHException, OSError, EOFError) as exc:
-            raise SshUnreachableError(f"The SSH connection to {self.address} broke while running {text}: {exc}") from exc
+            raise SshUnreachableError(
+                f"The SSH connection to {self.address} broke while running {text}: {exc}"
+            ) from exc
         finally:
             channel.close()
         result = CommandResult(status, bytes(stdout), bytes(stderr))
@@ -334,11 +338,11 @@ class NodeShell:
         except (paramiko.SSHException, EOFError) as exc:
             raise SshUnreachableError(f"Reading {path} on {self.address} failed: {exc}") from exc
 
-    def write_file(self, path: str, data: bytes | str, *, mode: int = 0o600) -> None:
+    def write_file(self, path: str, data: bytes | str, *, mode: int | None = 0o600) -> None:
         """Writes a file whole: readers see the old content or the new one, never part of it.
 
         The content goes to a temporary file in the same folder, which gets its mode before any data, and replaces the
-        file by a rename.
+        file by a rename. A file in /etc/pve takes no mode, since the cluster file system sets every file's mode itself.
         """
         sftp = self._files()
         folder, name = posixpath.split(path)
@@ -346,7 +350,8 @@ class NodeShell:
         payload = data.encode() if isinstance(data, str) else data
         try:
             with sftp.open(temporary, "wbx") as handle:
-                sftp.chmod(temporary, mode)
+                if mode is not None:
+                    sftp.chmod(temporary, mode)
                 handle.write(payload)
             sftp.posix_rename(temporary, path)
         except BaseException:

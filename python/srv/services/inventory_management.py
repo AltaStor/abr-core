@@ -20,8 +20,10 @@ from python.srv.plugins.hyperv import (
     HyperVUnreachableError,
 )
 from python.srv.plugins.hyperv.hyperv import DEFAULT_WINRM_PROTOCOL, WINRM_PORTS, winrm_protocol, with_protocol
+from python.srv.plugins.pve import inventory as pve_inventory
 from python.srv.services.discovery import (
     build_hyperv_resources,
+    build_pve_resources,
     build_vcenter_resources,
     generate_inventory_discovery,
 )
@@ -228,8 +230,12 @@ class HyperVInventoryProvider(InventoryProvider):
         return build_hyperv_resources(record)
 
 
-class ProxmoxInventoryProvider(_StubInventoryProvider):
-    pass
+class PveInventoryProvider(InventoryProvider):
+    def test_connection(self, record: dict[str, Any]) -> dict[str, Any]:
+        return pve_inventory.test_connection(record)
+
+    def rescan(self, record: dict[str, Any]) -> list[dict[str, Any]]:
+        return build_pve_resources(record)
 
 
 class XcpNgInventoryProvider(_StubInventoryProvider):
@@ -244,7 +250,7 @@ class InventoryProviderRegistry:
     _providers = {
         "vsphere": VsphereInventoryProvider(),
         "hyper-v": HyperVInventoryProvider(),
-        "proxmox-ve": ProxmoxInventoryProvider(),
+        "proxmox-ve": PveInventoryProvider(),
         "xcp-ng": XcpNgInventoryProvider(),
         "mock": MockInventoryProvider(),
     }
@@ -461,6 +467,12 @@ def assert_inventory_registrable(record: dict[str, Any]) -> dict[str, Any]:
     inventory still happens in the background after registration succeeds.
     """
     inventory_type = inventory_type_from_record(record)
+    if inventory_type == "proxmox-ve":
+        # With the root password this sets the cluster up; without it, it checks the token and key kept from then.
+        try:
+            return pve_inventory.register(record)
+        except pve_inventory.PveRegistrationError as exc:
+            raise InventoryUnreachableError(str(exc), reason=exc.reason) from exc
     if inventory_type not in ("vsphere", "hyper-v"):
         return {}
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
@@ -500,6 +512,8 @@ def assert_inventory_registrable(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def assert_hyperv_identity_is_new(record: dict[str, Any], identity: dict[str, Any]) -> None:
+    if inventory_type_from_record(record) != "hyper-v":
+        return
     cluster = str(identity.get("cluster") or "").strip()
     computer = str(identity.get("computer") or "").strip()
     record_id = str(record.get("id") or "")

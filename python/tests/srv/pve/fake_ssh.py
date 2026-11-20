@@ -10,6 +10,7 @@ its root, so /run/abr on the fake node is <folder>/run/abr. It records every com
 from __future__ import annotations
 
 import io
+import logging
 import os
 import socket
 import subprocess
@@ -20,6 +21,9 @@ from typing import Callable
 import paramiko
 
 from python.srv.plugins.pve.ssh import generate_key_pair
+
+# The server side logs every connection a client closes as a socket error.
+logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
 
 Handler = Callable[[str, bytes], tuple[int, bytes, bytes] | None]
 
@@ -43,7 +47,8 @@ class _Files(paramiko.SFTPServerInterface):
         try:
             folder = self._path(path)
             return [
-                paramiko.SFTPAttributes.from_stat(os.lstat(os.path.join(folder, name)), name) for name in os.listdir(folder)
+                paramiko.SFTPAttributes.from_stat(os.lstat(os.path.join(folder, name)), name)
+                for name in os.listdir(folder)
             ]
         except OSError as exc:
             return paramiko.SFTPServer.convert_errno(exc.errno)
@@ -123,6 +128,7 @@ class FakeSshNode(paramiko.ServerInterface):
                 connection, _address = self._listener.accept()
             except OSError:
                 return
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             transport = paramiko.Transport(connection)
             for key in self.host_keys:
                 transport.add_server_key(key)
@@ -145,10 +151,16 @@ class FakeSshNode(paramiko.ServerInterface):
         return paramiko.AUTH_FAILED
 
     def check_auth_publickey(self, username, key):
-        if username == "root" and f"{key.get_name()} {key.get_base64()}" in self.authorized_keys:
+        line = f"{key.get_name()} {key.get_base64()}"
+        if username == "root" and (line in self.authorized_keys or line in self._authorized_file()):
             self.logins.append("key")
             return paramiko.AUTH_SUCCESSFUL
         return paramiko.AUTH_FAILED
+
+    def _authorized_file(self) -> str:
+        """Root's authorized_keys as PVE keeps it, in /etc/pve/priv."""
+        path = self.root / "etc" / "pve" / "priv" / "authorized_keys"
+        return path.read_text() if path.exists() else ""
 
     # ---- sessions ---------------------------------------------------------------------------------------------------
 

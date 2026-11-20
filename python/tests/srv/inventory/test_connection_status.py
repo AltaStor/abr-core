@@ -90,7 +90,7 @@ class InventoryStatusAfterRegistrationTests(unittest.TestCase):
         self.assertTrue(created["status_checked_at"])
 
     def test_a_type_the_server_cannot_prove_stays_unknown(self) -> None:
-        payload = {"name": "pve-01", "type": "proxmox-ve", "address": "10.0.0.5", "token": "t"}
+        payload = {"name": "xcp-01", "type": "xcp-ng", "address": "10.0.0.5", "token": "t"}
 
         created = abr_v41.create_inventory_record(payload)
 

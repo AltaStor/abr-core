@@ -126,6 +126,7 @@ from python.srv.services.inventory_management import (
     inventory_type_from_record,
     normalize_inventory_type,
 )
+from python.srv.plugins.pve import inventory as pve_inventory
 from python.srv.services import audit_service, replication_service
 from python.srv.services.backup_copy import (
     apply_copy_settings,
@@ -1783,6 +1784,13 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
     if inventory_type == "vsphere":
         _ensure(bool(username), 422, "invalid_inventory", "vSphere inventory requires username")
         _ensure(bool(password), 422, "invalid_inventory", "vSphere inventory requires password")
+    elif inventory_type == "proxmox-ve":
+        try:
+            pve_inventory.check_root_user(username)
+        except ValueError as exc:
+            raise api_error(422, "invalid_inventory", str(exc)) from exc
+        _ensure(bool(password), 422, "invalid_inventory", "Proxmox VE inventory requires root's password")
+        _ensure(not token, 422, "invalid_inventory", "Proxmox VE inventory takes no token: AltaStor creates its own")
     else:
         _ensure(bool(token or (username and password)), 422, "invalid_inventory", "Inventory requires either token or username/password")
     created_at = utc_now()
@@ -1860,6 +1868,9 @@ def create_inventory_record(payload: dict[str, Any]) -> dict[str, Any]:
             port=effective_port,
             reason=exc.reason,
         ) from exc
+    except pve_inventory.PveAlreadyRegisteredError as exc:
+        raise _already_registered_error(exc) from exc
+    record = pve_inventory.apply_setup(record, proof)
     try:
         record = _apply_inventory_identity(record, proof.get("identity") or {})
     except HyperVAlreadyRegisteredError as exc:
@@ -1884,7 +1895,7 @@ def _proof_of_connection(result: Any) -> dict[str, Any]:
     return result if isinstance(result, dict) else {}
 
 
-def _already_registered_error(exc: HyperVAlreadyRegisteredError) -> ApiError:
+def _already_registered_error(exc: HyperVAlreadyRegisteredError | pve_inventory.PveAlreadyRegisteredError) -> ApiError:
     return api_error(
         409,
         "inventory_already_registered",
@@ -1929,6 +1940,8 @@ def _recheck_inventory_connection(record: dict[str, Any]) -> dict[str, Any]:
         updated["status_checked_at"] = checked_at
         updated["updated_at"] = checked_at
         return updated
+    except pve_inventory.PveAlreadyRegisteredError:
+        raise
     except Exception as exc:
         LOGGER.warning(
             "Could not re-check inventory %s after an edit: %s", record.get("id"), exc
@@ -1940,6 +1953,7 @@ def _recheck_inventory_connection(record: dict[str, Any]) -> dict[str, Any]:
         return updated
     if not proof:
         return updated
+    updated = pve_inventory.apply_setup(updated, proof)
     updated = _apply_inventory_identity(updated, proof.get("identity") or {})
     updated["status"] = "available"
     updated["status_error"] = None
@@ -1978,7 +1992,7 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
     if connection_fields_changed(payload):
         try:
             normalized = _recheck_inventory_connection(normalized)
-        except HyperVAlreadyRegisteredError as exc:
+        except (HyperVAlreadyRegisteredError, pve_inventory.PveAlreadyRegisteredError) as exc:
             raise _already_registered_error(exc) from exc
     persist_hypervisor(normalized)
     return normalize_inventory_record(normalized)
@@ -2237,8 +2251,11 @@ def remove_inventory_record(record_id: str) -> dict[str, Any]:
             jobs=refs["jobs"],
             sessions=refs["tasks"],
         )
+    # A Proxmox VE cluster keeps the inventory's API token and SSH key until they are taken back.
+    warnings = pve_inventory.release(inventory) if inventory_type_from_record(inventory) == "proxmox-ve" else []
     delete_hypervisor(record_id)
-    return {"id": str(inventory.get("id") or record_id), "removed": True}
+    removed = {"id": str(inventory.get("id") or record_id), "removed": True}
+    return {**removed, "warnings": warnings} if warnings else removed
 
 
 def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -9234,7 +9251,7 @@ def _capacity_bytes_from_disk_entry(disk: dict[str, Any]) -> int | None:
     return None
 
 
-_PLATFORM_LABELS = {"vsphere": "VMware", "hyper-v": "Hyper-V", "proxmox-ve": "Proxmox", "xcp-ng": "XCP-ng"}
+_PLATFORM_LABELS = {"vsphere": "VMware", "hyper-v": "Hyper-V", "proxmox-ve": "Proxmox VE", "xcp-ng": "XCP-ng"}
 _POINT_KIND_TO_INVENTORY_TYPE = {"vcenter": "vsphere", "hyper-v": "hyper-v"}
 
 

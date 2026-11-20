@@ -11,7 +11,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from urllib.parse import parse_qs, quote
+from urllib.parse import quote
 
 import httpx
 from cryptography import x509
@@ -30,35 +30,10 @@ from python.srv.plugins.pve.pve_api import (
     task_error,
     task_succeeded,
 )
+from python.tests.srv.pve.fake_api import FakePve
 
 UPID = "UPID:node1:0004B3A2:01C9F3E1:691F0A2B:vzdump:9002:abr@pve!abr:"
 TOKEN = dict(token_id="abr@pve!abr", token_secret="5e3c-secret")
-
-
-class FakePve:
-    """Answers like PVE's API from a table of paths, and records every request."""
-
-    def __init__(self, routes: dict[tuple[str, str], object] | None = None, down: set[str] | None = None) -> None:
-        self.routes = dict(routes or {})
-        self.down = set(down or ())
-        self.requests: list[httpx.Request] = []
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        if request.url.host in self.down:
-            raise httpx.ConnectError("connection refused", request=request)
-        self.requests.append(request)
-        path = request.url.path.removeprefix("/api2/json")
-        answer = self.routes.get((request.method, path))
-        if callable(answer):
-            answer = answer(request)
-        if answer is None:
-            return httpx.Response(501, json={"data": None}, extensions={"reason_phrase": b"Method not implemented"})
-        if isinstance(answer, httpx.Response):
-            return answer
-        return httpx.Response(200, json=answer)
-
-    def form(self, index: int = -1) -> dict[str, list[str]]:
-        return parse_qs(self.requests[index].content.decode())
 
 
 def api(fake: FakePve, addresses: list[str] | str = "pve1") -> PveApi:
@@ -86,14 +61,18 @@ class TaskIdTests(unittest.TestCase):
         self.assertTrue(task_succeeded({"status": "stopped", "exitstatus": "OK"}))
         self.assertTrue(task_succeeded({"status": "stopped", "exitstatus": "WARNINGS: 2"}))
         self.assertFalse(task_succeeded({"status": "running"}))
-        self.assertEqual(task_error({"status": "stopped", "exitstatus": "interrupted by signal"}), "interrupted by signal")
+        self.assertEqual(
+            task_error({"status": "stopped", "exitstatus": "interrupted by signal"}), "interrupted by signal"
+        )
         self.assertEqual(task_error({"status": "stopped", "exitstatus": "OK"}), "")
         self.assertEqual(task_error({"status": "running"}), "")
 
 
 class RequestTests(unittest.TestCase):
     def test_requests_carry_the_token_and_pve_parameters(self):
-        fake = FakePve({("POST", "/nodes/node1/vzdump"): {"data": UPID}, ("GET", "/version"): {"data": {"version": "9.2.26"}}})
+        fake = FakePve(
+            {("POST", "/nodes/node1/vzdump"): {"data": UPID}, ("GET", "/version"): {"data": {"version": "9.2.26"}}}
+        )
         with api(fake) as client:
             self.assertEqual(client.get("/version", verbose=True, skip=None), {"version": "9.2.26"})
             upid = client.start_task("/nodes/node1/vzdump", vmid=9002, remove=False, storage="abr", bwlimit=None)
@@ -114,11 +93,15 @@ class RequestTests(unittest.TestCase):
                 ("GET", "/denied"): failure(403, "Permission check failed (/vms/9002, VM.Backup)"),
                 ("GET", "/token"): failure(401, "invalid token value!"),
                 ("GET", "/vm"): failure(500, "unused", {"data": None, "message": "VM 9002 not running\n"}),
-                ("POST", "/params"): failure(400, "Parameter verification failed.", {"data": None, "errors": {"vmid": "invalid format\n"}}),
+                ("POST", "/params"): failure(
+                    400, "Parameter verification failed.", {"data": None, "errors": {"vmid": "invalid format\n"}}
+                ),
             }
         )
         with api(fake) as client:
-            with self.assertRaisesRegex(PvePermissionError, r"GET /denied: Permission check failed \(/vms/9002, VM.Backup\)"):
+            with self.assertRaisesRegex(
+                PvePermissionError, r"GET /denied: Permission check failed \(/vms/9002, VM.Backup\)"
+            ):
                 client.get("/denied")
             with self.assertRaisesRegex(PveAuthError, "refused AltaStor's API token"):
                 client.get("/token")
@@ -140,7 +123,9 @@ class RequestTests(unittest.TestCase):
 
     def test_no_node_answering_is_an_unreachable_cluster(self):
         fake = FakePve(down={"pve1", "pve2"})
-        with api(fake, ["pve1", "pve2"]) as client, self.assertRaisesRegex(PveUnreachableError, "No node of the PVE cluster answers on port 8006"):
+        with api(fake, ["pve1", "pve2"]) as client, self.assertRaisesRegex(
+            PveUnreachableError, "No node of the PVE cluster answers on port 8006"
+        ):
             client.get("/version")
 
 
@@ -152,7 +137,9 @@ class TaskTests(unittest.TestCase):
             start, limit = int(request.url.params["start"]), int(request.url.params["limit"])
             page = [{"n": start + index + 1, "t": text} for index, text in enumerate(lines[start : start + limit])]
             # An empty log answers with one line that is not in the log.
-            return httpx.Response(200, json={"data": page or [{"n": start + 1, "t": "no content"}], "total": len(lines)})
+            return httpx.Response(
+                200, json={"data": page or [{"n": start + 1, "t": "no content"}], "total": len(lines)}
+            )
 
         return answer
 
@@ -204,7 +191,11 @@ class TaskTests(unittest.TestCase):
 
     def test_following_a_task_passes_each_log_line_on_once(self):
         final, seen, stops, sleeps = self.follow(
-            [("running", ["INFO: starting"]), ("running", ["INFO: starting", "INFO: 50%"]), ("OK", ["INFO: starting", "INFO: 50%", "TASK OK"])]
+            [
+                ("running", ["INFO: starting"]),
+                ("running", ["INFO: starting", "INFO: 50%"]),
+                ("OK", ["INFO: starting", "INFO: 50%", "TASK OK"]),
+            ]
         )
         self.assertEqual(final, {"status": "stopped", "exitstatus": "OK"})
         self.assertEqual(seen, ["INFO: starting", "INFO: 50%", "TASK OK"])
@@ -216,7 +207,12 @@ class TaskTests(unittest.TestCase):
 
     def test_a_stop_is_sent_once_and_the_task_followed_to_its_end(self):
         final, seen, stops, _sleeps = self.follow(
-            [("running", ["a"]), ("running", ["a"]), ("running", ["a", "b"]), ("interrupted by signal", ["a", "b", "TASK ERROR: interrupted by signal"])],
+            [
+                ("running", ["a"]),
+                ("running", ["a"]),
+                ("running", ["a", "b"]),
+                ("interrupted by signal", ["a", "b", "TASK ERROR: interrupted by signal"]),
+            ],
             should_stop=lambda: True,
         )
         self.assertEqual(len(stops), 1)
@@ -277,7 +273,9 @@ class PinnedCertificateTests(unittest.TestCase):
         folder = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
         (folder / "node.pem").write_text(_pem(cls.node))
         (folder / "node.key").write_bytes(
-            node_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+            node_key.private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+            )
         )
         cls.headers: list[dict[str, str]] = []
 

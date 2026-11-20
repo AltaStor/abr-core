@@ -241,7 +241,9 @@ class PveApi:
             body = None
         if response.status_code < 400:
             if not isinstance(body, dict):
-                raise PveApiError(f"{method} {path}: the PVE API answered without JSON", status=response.status_code, path=path)
+                raise PveApiError(
+                    f"{method} {path}: the PVE API answered without JSON", status=response.status_code, path=path
+                )
             return body
         message = str((body or {}).get("message") or "").strip() if isinstance(body, dict) else ""
         message = message or response.reason_phrase or f"HTTP {response.status_code}"

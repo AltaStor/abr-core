@@ -73,7 +73,9 @@ class NodeShellTests(unittest.TestCase):
 
     def test_a_node_without_the_pinned_key_is_refused_before_login(self):
         other = paramiko.RSAKey.generate(2048)
-        with self.assertRaisesRegex(SshHostKeyError, r"The SSH host key of 127.0.0.1 \(SHA256:.*\) is not the one AltaStor pinned"):
+        with self.assertRaisesRegex(
+            SshHostKeyError, r"The SSH host key of 127.0.0.1 \(SHA256:.*\) is not the one AltaStor pinned"
+        ):
             self.shell(host_keys=[key_line(other)]).connect()
         self.assertEqual(self.node.logins, [])
 

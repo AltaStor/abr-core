@@ -39,6 +39,11 @@ class QuiesceFailedError(RuntimeError):
 class Hypervisor(ABC):
     """Abstract class for all hypervisor plugins"""
 
+    # Snapshots, changed block tracking and building a VM disk by disk are how vCenter and Hyper-V back up and restore.
+    # A platform that backs up and restores through its own tasks, as Proxmox VE does, leaves these methods out.
+    def _unsupported(self, method: str) -> NotImplementedError:
+        return NotImplementedError(f"{type(self).__name__} has no {method}: its platform does not work that way")
+
     def __enter__(self) -> "Hypervisor":
         self.connect()
         return self
@@ -65,27 +70,22 @@ class Hypervisor(ABC):
         """Get the specific type of the hypervisor API service."""
         pass
 
-    @abstractmethod
     def get_backup_parameters(self, vm_name: str, snapshot_name: str) -> Dict[str, str]:
         """Collect specific parameters for the backup utility."""
-        pass
+        raise self._unsupported("get_backup_parameters")
 
-    @abstractmethod
     def create_backup_snapshot(self, vm_name: str, *, quiesce: bool = True) -> str:
         """Creating backup snapshot and return its id."""
-        pass
+        raise self._unsupported("create_backup_snapshot")
 
-    @abstractmethod
     def ensure_cbt_enabled(self, vm_name: str) -> bool:
         """Enable changed block tracking for a VM if it is currently disabled."""
-        pass
+        raise self._unsupported("ensure_cbt_enabled")
 
-    @abstractmethod
     def get_snapshot_change_ids(self, vm_name: str, snapshot_name: str) -> List[Dict[str, Any]]:
         """Collect per-disk CBT change IDs from the given VM snapshot."""
-        pass
+        raise self._unsupported("get_snapshot_change_ids")
 
-    @abstractmethod
     def query_changed_disk_areas(
         self,
         vm_name: str,
@@ -94,7 +94,7 @@ class Hypervisor(ABC):
         change_id: str,
     ) -> List[Dict[str, int]]:
         """Collect CBT changed disk extents for a snapshot disk since the given change ID."""
-        pass
+        raise self._unsupported("query_changed_disk_areas")
 
     @abstractmethod
     def get_vm_disks(self, vm_name: str) -> List[Dict[str, Any]]:
@@ -111,7 +111,6 @@ class Hypervisor(ABC):
         """Get a list of available physical hosts and their accessible datastores."""
         pass
 
-    @abstractmethod
     def create_vm_shell(
         self,
         *,
@@ -122,17 +121,15 @@ class Hypervisor(ABC):
         disk_layout: List[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         """Create a new virtual machine with specified hardware and empty disks."""
-        pass
+        raise self._unsupported("create_vm_shell")
 
-    @abstractmethod
     def remove_snapshot(self, vm_name: str, snapshot_name: str) -> None:
         """Delete snapshot from virtual machine."""
-        pass
+        raise self._unsupported("remove_snapshot")
 
     def consolidate_disks(self, vm_name: str) -> bool:
         return False
 
-    @abstractmethod
     def attach_existing_disk(
         self,
         vm_name: str,
@@ -140,7 +137,7 @@ class Hypervisor(ABC):
         disk_label: str | None = None,
     ) -> dict[str, Any]:
         """Attach an existing virtual disk file from a datastore to the specified virtual machine."""
-        pass
+        raise self._unsupported("attach_existing_disk")
 
     @abstractmethod
     def get_all_vms(self) -> List[Dict[str, Any]]:

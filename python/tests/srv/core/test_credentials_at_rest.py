@@ -143,6 +143,29 @@ class InventoryCredentialStorageTests(_KeyFileTestCase):
         self.assertEqual(HYPERVISORS["inv-1"]["metadata"]["credentials"]["password"], VCENTER_PASSWORD)
         self.assertEqual(HYPERVISORS["inv-1"]["metadata"]["token"], "vc-session-token")
 
+    def test_a_proxmox_inventorys_ssh_key_and_api_token_reach_the_database_encrypted(self) -> None:
+        private_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+        record = {
+            "id": "inv-1",
+            "name": "PVE-Cluster",
+            "type": "proxmox-ve",
+            "metadata": {
+                "host": "pve.local",
+                "credentials": {"username": "root@pam", "password": None},
+                "token": "6f1d2e3c-pve-token-secret",
+                "pve": {"token_id": "abr@pve!altastor-inv1", "ssh_key": private_key, "nodes": []},
+            },
+        }
+
+        mongo_db_wrapper.persist_hypervisor(record)
+
+        written = self.db.everything_written()
+        self.assertNotIn("6f1d2e3c-pve-token-secret", written)
+        self.assertNotIn("b3BlbnNzaC1rZXktdjEAAAAA", written)
+        self.assertIn("abr@pve!altastor-inv1", written)
+        self.assertEqual(HYPERVISORS["inv-1"]["metadata"]["pve"]["ssh_key"], private_key)
+        self.assertEqual(HYPERVISORS["inv-1"]["metadata"]["token"], "6f1d2e3c-pve-token-secret")
+
     def test_an_updated_inventory_is_written_back_encrypted(self) -> None:
         mongo_db_wrapper.persist_hypervisor(_inventory())
         self.db.upserts.clear()

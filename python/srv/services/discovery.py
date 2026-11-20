@@ -438,6 +438,148 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
     return resources
 
 
+def build_pve_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
+    from ..plugins.pve.pve import PveNode
+
+    started = time.monotonic()
+    discovery_logger.info("Proxmox VE discovery of inventory %s started", hv.get("name"))
+    try:
+        with PveNode.from_record(hv) as node:
+            hosts = node.list_hosts()
+            inventory = node.get_inventory()
+            cluster_name = node.cluster_name
+    except Exception as exc:
+        discovery_logger.warning(
+            "Proxmox VE discovery of inventory %s failed after %.1fs: %s",
+            hv.get("name"),
+            time.monotonic() - started,
+            exc,
+        )
+        raise
+    discovery_logger.info(
+        "Proxmox VE discovery of inventory %s found %s: %d node(s), %d VM(s), %d disk(s), %d network adapter(s) "
+        "in %.1fs",
+        hv.get("name"),
+        f"cluster {cluster_name}" if cluster_name else "a single node",
+        len(hosts),
+        len(inventory["virtual_machines"]),
+        len(inventory["disks"]),
+        len(inventory["network_adapters"]),
+        time.monotonic() - started,
+    )
+    metadata = hv.get("metadata") if isinstance(hv.get("metadata"), dict) else {}
+    resources: list[dict[str, Any]] = [
+        {
+            "resource_type": "hypervisor",
+            "external_id": hv["id"],
+            "name": hv["name"],
+            "payload": {
+                "inventory": "proxmox-ve",
+                "host": metadata.get("host"),
+                "endpoint": hv.get("endpoint"),
+                "cluster_name": cluster_name,
+            },
+        }
+    ]
+    if cluster_name:
+        resources.append(
+            {
+                "resource_type": "cluster",
+                "external_id": cluster_name,
+                "name": cluster_name,
+                "payload": {"node_count": len(hosts)},
+            }
+        )
+    for host_item in hosts:
+        resources.append(
+            {
+                "resource_type": "host",
+                "external_id": host_item["name"],
+                "name": host_item["name"],
+                "payload": {
+                    "datacenter": None,
+                    "cluster_name": cluster_name,
+                    "cluster_external_id": cluster_name,
+                    "dns_name": host_item.get("dns_name"),
+                    "address": host_item.get("address"),
+                    "version": host_item.get("version"),
+                    # Storages that hold VM disks: where a restore can put them.
+                    "datastores": host_item.get("datastores", []),
+                    "datastore_capacity": host_item.get("datastore_capacity", {}),
+                    "networks": host_item.get("networks", []),
+                    "backup_storage_active": host_item.get("backup_storage_active"),
+                    "cpu_count": host_item.get("cpu_count"),
+                    "memory_bytes": host_item.get("memory_bytes"),
+                    "status": host_item.get("status"),
+                },
+            }
+        )
+    unread: set[str] = set()
+    for vm in inventory["virtual_machines"]:
+        if not vm.get("config_read", True):
+            unread.add(str(vm["vm_id"]))
+        resources.append(
+            {
+                "resource_type": "virtual_machine",
+                "external_id": vm["vm_id"],
+                "name": vm["name"],
+                "payload": {
+                    "power_state": vm["power_state"],
+                    "num_cpu": vm["num_cpu"],
+                    "memory_mb": vm["memory_mb"],
+                    "guest_os": vm["guest_os"],
+                    "os_type": vm.get("os_type"),
+                    "ip_address": vm.get("ip_address"),
+                    "firmware": vm.get("firmware"),
+                    "machine": vm.get("machine"),
+                    "host_name": vm.get("host"),
+                    "cluster_name": cluster_name,
+                    "cluster_external_id": cluster_name,
+                    "template": vm.get("template"),
+                    "lock": vm.get("lock"),
+                    "ha_state": vm.get("ha_state"),
+                    "tags": vm.get("tags"),
+                    "config_digest": vm.get("config_digest"),
+                },
+            }
+        )
+    for disk in inventory["disks"]:
+        resources.append(
+            {
+                "resource_type": "disk",
+                "external_id": disk["external_id"],
+                "name": disk["name"],
+                "payload": {
+                    key: disk.get(key)
+                    for key in (
+                        "vm_id", "capacity_gb", "capacity_bytes", "datastore_path", "uuid", "controller", "drive_id",
+                        "storage", "format", "backup",
+                    )
+                },
+            }
+        )
+    for nic in inventory["network_adapters"]:
+        resources.append(
+            {
+                "resource_type": "network_adapter",
+                "external_id": nic["external_id"],
+                "name": nic["name"],
+                "payload": {
+                    key: nic.get(key) for key in ("vm_id", "mac", "network", "connected", "model", "vlan", "firewall")
+                },
+            }
+        )
+    if unread:
+        # The API reads a VM's configuration on the VM's node; while that node is down its disks are as found last time.
+        previous = dict(list(RESOURCES_BY_HV.get(str(hv.get("id") or ""), {}).items()))
+        for (resource_type, _external_id), item in previous.items():
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            if resource_type in ("disk", "network_adapter") and str(payload.get("vm_id") or "") in unread:
+                kept = ("resource_type", "external_id", "name", "payload")
+                resources.append({key: item[key] for key in kept if key in item})
+    return resources
+
+
 def _known_names_of_unavailable_nodes(hv: dict[str, Any], hosts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     previous = dict(list(RESOURCES_BY_HV.get(str(hv.get("id") or ""), {}).items()))
     known = {
