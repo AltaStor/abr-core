@@ -25,7 +25,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Collection, Mapping
 from urllib.parse import quote
 
 from ...core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES
@@ -46,7 +46,7 @@ from .pve import (
     volume_storage,
 )
 from .pve_api import PveApiError, Upid, task_error, task_succeeded
-from .pve_backup import RUN_FOLDER, WORKER_MODE, drive_device, node_repository
+from .pve_backup import RUN_FOLDER, STARTING, WORKER_MODE, drive_device, find_started_task, node_repository
 from .setup import PveSetupError, ensure_package, package_path
 from .ssh import NodeShell, SshError
 
@@ -179,9 +179,11 @@ def restore_guest_config(
     storages: Mapping[str, str] | None = None,
     bridges: Mapping[str, str] | None = None,
     link_down: bool = False,
+    left_out: Collection[str] = (),
 ) -> str:
     """The guest configuration PVE restores the VM from: the backup's, with the VM's name, the storage of each disk
-    and the bridge of each network adapter changed, and the adapters' links down when asked."""
+    and the bridge of each network adapter changed, and the adapters' links down when asked. A disk left out loses its
+    map line, so PVE keeps its config line as it is and restores nothing to it."""
     storages = storages or {}
     bridges = bridges or {}
     lines = []
@@ -191,6 +193,8 @@ def restore_guest_config(
         in_main = in_main and not line.startswith("[")
         disk = _MAP_LINE.match(line)
         net = _NET_LINE.match(line) if in_main else None
+        if disk and disk.group(1) in left_out:
+            continue
         if disk and disk.group(1) in storages:
             key, device, _storage, image_format = disk.groups()
             line = f"#qmdump#map:{key}:{device}:{storages[key]}:{image_format}:"
@@ -203,6 +207,11 @@ def restore_guest_config(
     if name is not None and not named:
         lines.insert(0, f"name: {name}")
     return "\n".join(lines) + "\n"
+
+
+def is_passthrough(disk: Mapping[str, Any]) -> bool:
+    """A physical disk the VM uses by its path, which no storage holds."""
+    return str(disk.get("datastore_path") or "").startswith("/")
 
 
 def backup_adapters(vm_config: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -540,6 +549,32 @@ def _check_bridges(cluster: PveNode, node: str, adapters: list[dict[str, Any]]) 
             )
 
 
+def _find_unrecorded(
+    cluster: PveNode, earlier_run: dict[str, Any], task_id: str, emit: Callable[..., None]
+) -> dict[str, Any] | None:
+    """The restore task a session started before the server stopped, to follow again, or None when it never started."""
+    node = str(earlier_run.get("node") or "")
+    target_vmid = str(earlier_run.get("target_vmid") or "")
+    upid = find_started_task(
+        cluster.api,
+        node,
+        vmid=target_vmid,
+        task_type="qmrestore",
+        user=cluster.access.token_id,
+        run_id=str(earlier_run.get("run_id") or task_id),
+        since=float(earlier_run.get("prepared_at") or 0),
+        # A VMID the session chose for a new VM is its own, even when the provider refused the run before it logged it.
+        any_of_vm=bool(earlier_run.get("created_vm")),
+    )
+    if upid is None:
+        emit("prepare", 8, f"The restore this session prepared on node {node} before the server stopped never started")
+        return None
+    emit(
+        "prepare", 8, f"Found restore task {upid} on node {node}, which this session started before the server stopped"
+    )
+    return {**earlier_run, "upid": upid, "started_at": utc_now()}
+
+
 def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = None) -> dict[str, Any]:
     start_time = time.time()
     task_id = str(task.get("id") or "")
@@ -548,6 +583,8 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
     existing = task.get("result") if isinstance(task.get("result"), dict) else {}
     earlier_run = existing.get("pve_run") if isinstance(existing.get("pve_run"), dict) else {}
     resumed = earlier_run if earlier_run.get("upid") else None
+    # The server stopped after the session prepared its restore and before it recorded the task's UPID.
+    unrecorded = resumed is None and earlier_run.get("state") == STARTING
 
     point_id = str(parameters.get("point_id") or "")
     point = BACKUPS.get(point_id) if point_id else None
@@ -634,8 +671,11 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
     target_vmid = ""
     created = False
     run_state: dict[str, Any] = {}
+    left_out: set[str] = set()
     try:
         with PveNode.from_record(hypervisor) as cluster:
+            if unrecorded:
+                resumed = _find_unrecorded(cluster, earlier_run, task_id, emit)
             if resumed is not None:
                 node = str(resumed.get("node") or "")
                 target_vmid = str(resumed.get("target_vmid") or "")
@@ -686,6 +726,33 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
                         raise PveRestoreError(f"Node {node} is offline")
                     storages = disk_targets(disks, parameters, None)
                     _check_bridges(cluster, node, adapters)
+                for disk in [disk for disk in disks if is_passthrough(disk)]:
+                    if mode == "in_place":
+                        left_out.add(disk["drive"])
+                        storages.pop(disk["drive"], None)
+                        emit(
+                            "validate",
+                            6,
+                            f"{disk['drive']} is a physical disk ({disk['datastore_path']}); an in-place restore "
+                            "leaves it as it is, without the backup's data of it",
+                            log_level="warn",
+                        )
+                    else:
+                        emit(
+                            "validate",
+                            6,
+                            f"{disk['drive']} was a physical disk ({disk['datastore_path']}); the new VM gets it as a "
+                            f"volume on {storages[disk['drive']]}",
+                            log_level="warn",
+                        )
+                disks = [disk for disk in disks if disk["drive"] not in left_out]
+                if not disks:
+                    raise PveRestoreError(
+                        f"{source_name} has only physical disks, which an in-place restore leaves as they are; restore "
+                        "it as a new VM"
+                    )
+                sizes = {drive_device(disk["drive"]): int(disk.get("capacity_bytes") or 0) for disk in disks}
+                total_bytes = sum(sizes.values())
                 _check_storages(cluster, node, storages)
                 emit(
                     "validate",
@@ -728,6 +795,7 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
                         storages=storages,
                         bridges={adapter["label"]: adapter["target_network"] for adapter in adapters},
                         link_down=mode == "new_vm" and not connect,
+                        left_out=left_out,
                     )
                     if mode == "in_place":
                         _stop_vm(cluster, node, source_vmid, source_name, emit)
@@ -760,6 +828,20 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
                         _remove_run_files(shell, source_vmid, ctime)
                         shell.write_file(run_file_path(source_vmid, ctime), json.dumps(run, indent=2), mode=0o600)
                         options = {"force": 1} if mode == "in_place" else {"unique": 1}
+                        _record_run(
+                            progress_callback,
+                            {
+                                "kind": "restore",
+                                "state": STARTING,
+                                "node": node,
+                                "target_vmid": target_vmid,
+                                "created_vm": mode == "new_vm",
+                                "ctime": ctime,
+                                "run_id": task_id,
+                                "storages": storages,
+                                "prepared_at": time.time(),
+                            },
+                        )
                         try:
                             upid = cluster.api.start_task(
                                 f"/nodes/{quote(node, safe='')}/qemu",

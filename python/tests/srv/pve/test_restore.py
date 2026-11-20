@@ -194,6 +194,13 @@ class GuestConfigTests(unittest.TestCase):
         text = restore_guest_config("memory: 512\n", name="web-restored")
         self.assertEqual(text, "name: web-restored\nmemory: 512\n")
 
+    def test_a_disk_left_out_loses_its_map_line_and_keeps_its_config_line(self):
+        config = GUEST_CONFIG + "scsi10: /dev/disk/by-id/ata-disk-1,size=5G\n#qmdump#map:scsi10:drive-scsi10::raw:\n"
+        lines = restore_guest_config(config, left_out={"scsi10"}).splitlines()
+        self.assertIn("scsi10: /dev/disk/by-id/ata-disk-1,size=5G", lines)
+        self.assertNotIn("#qmdump#map:scsi10:drive-scsi10::raw:", lines)
+        self.assertIn("#qmdump#map:scsi0:drive-scsi0:local-lvm:raw:", lines)
+
     def test_the_map_lines_tell_which_disks_pve_restores(self):
         self.assertEqual(
             map_lines(GUEST_CONFIG)["tpmstate0"],
@@ -360,6 +367,13 @@ class FakeApi:
         self.started: list[tuple[str, dict]] = []
         self.followed: list[dict] = []
 
+    def tasks(self, node, **filters):
+        self.cluster.task_queries.append(filters)
+        return list(self.cluster.pve_tasks)
+
+    def task_log(self, upid, start=0, limit=None):
+        return list(self.cluster.task_logs.get(upid, []))
+
     def start_task(self, path, method="POST", **params):
         self.started.append((path if method == "POST" else f"{method} {path}", params))
         if path.endswith("/qemu"):
@@ -417,6 +431,9 @@ class FakeCluster:
         self.stopped_by_task = None
         self.other_tasks: list[str] = []
         self.destroyed: list[tuple] = []
+        self.pve_tasks: list[dict] = []
+        self.task_logs: dict[str, list[str]] = {}
+        self.task_queries: list[dict] = []
 
     def __enter__(self):
         return self
@@ -502,6 +519,30 @@ class SessionTests(unittest.TestCase):
         }
         with patch.object(pve_restore.PveNode, "from_record", return_value=cluster):
             return run_pve_restore(task, progress_callback=self.progress.append)
+
+    def add_physical_disk(self) -> None:
+        """The VM gets a physical disk, which vzdump backs up in every session like the others."""
+        for point_id, task, modes in CHAIN:
+            path = Path(BACKUPS[point_id]["artifact"]["manifest_path"])
+            manifest = json.loads(path.read_text())
+            manifest["disks"].append(
+                {
+                    **_disk("scsi0", task, modes["scsi0"]),
+                    "index": 4,
+                    "drive": "scsi10",
+                    "disk_label": "scsi10",
+                    "datastore_path": "/dev/disk/by-id/ata-disk-1",
+                    "storage": "",
+                    "abr_backup_name": "scsi10",
+                }
+            )
+            manifest["vm_config"][
+                "guest_config"
+            ] += "scsi10: /dev/disk/by-id/ata-disk-1,size=5G\n#qmdump#map:scsi10:drive-scsi10::raw:\n"
+            path.write_text(json.dumps(manifest))
+
+    def runs(self) -> list[dict]:
+        return [item["pve_run"] for item in self.progress if "pve_run" in item]
 
     def messages(self) -> list[str]:
         return [str(item.get("message")) for item in self.progress if item.get("message")]
@@ -633,6 +674,86 @@ class SessionTests(unittest.TestCase):
         self.assertIn("#qmdump#map:scsi0:drive-scsi0:local-zfs:raw:", config)
         self.assertEqual((outcome["target_vm_id"], outcome["identity_preserved"]), ("9002", True))
 
+    def test_an_in_place_restore_leaves_a_physical_disk_as_it_is(self):
+        self.add_physical_disk()
+        cluster = FakeCluster()
+        cluster.config["scsi10"] = "/dev/disk/by-id/ata-disk-1,size=5G"
+        outcome = self.run_session(cluster, {"restore_mode": "in_place", "force": True})
+        run = next(iter(cluster.shell_.written.values()))
+        self.assertNotIn("drive-scsi10", run["disks"])
+        config = run["guest_config"].splitlines()
+        self.assertNotIn("#qmdump#map:scsi10:drive-scsi10::raw:", config)
+        self.assertIn("scsi10: /dev/disk/by-id/ata-disk-1,size=5G", config)
+        self.assertIn(
+            "scsi10 is a physical disk (/dev/disk/by-id/ata-disk-1); an in-place restore leaves it as it is, without "
+            "the backup's data of it",
+            outcome["warnings"],
+        )
+        self.assertEqual(outcome["disk_count"], 3)
+
+    def test_a_new_vm_gets_a_physical_disk_as_a_volume(self):
+        self.add_physical_disk()
+        cluster = FakeCluster()
+        outcome = self.run_session(cluster)
+        run = next(iter(cluster.shell_.written.values()))
+        self.assertEqual(run["disks"]["drive-scsi10"]["chain"], ["task-a/scsi10", "task-b/scsi10", "task-c/scsi10"])
+        self.assertIn("#qmdump#map:scsi10:drive-scsi10:local-lvm:raw:", run["guest_config"].splitlines())
+        self.assertIn(
+            "scsi10 was a physical disk (/dev/disk/by-id/ata-disk-1); the new VM gets it as a volume on local-lvm",
+            outcome["warnings"],
+        )
+
+    def test_the_session_records_that_it_starts_a_restore_before_it_starts_it(self):
+        self.run_session(cluster := FakeCluster())
+        runs = self.runs()
+        self.assertEqual((runs[0]["state"], runs[0]["target_vmid"], runs[0]["created_vm"]), ("starting", "120", True))
+        self.assertNotIn("upid", runs[0])
+        self.assertEqual(runs[1]["upid"], UPID)
+        self.assertEqual(len(cluster.api.started), 1)
+
+    def starting(self, **changes) -> dict:
+        return {
+            "pve_run": {
+                "kind": "restore",
+                "state": "starting",
+                "node": NODE,
+                "target_vmid": "120",
+                "created_vm": True,
+                "ctime": point_ctime(BACKUPS["point-c"]),
+                "run_id": "task-9",
+                "storages": {"scsi0": "local-lvm"},
+                "prepared_at": 1795000000.0,
+                **changes,
+            }
+        }
+
+    def test_a_restore_the_server_lost_while_starting_it_is_found_by_its_run_and_followed(self):
+        cluster = FakeCluster()
+        ctime = point_ctime(BACKUPS["point-c"])
+        cluster.shell_.files[f"/run/abr/restore-9002-{ctime}.result.json"] = json.dumps(cluster.result).encode()
+        other = "UPID:node1:0004B3A9:01C9F3E9:691F0A30:qmrestore:120:root@pam:"
+        cluster.pve_tasks = [
+            {"upid": other, "user": "root@pam", "starttime": 1795000001},
+            {"upid": UPID, "user": "abr@pve!altastor-inv1", "starttime": 1795000002},
+        ]
+        cluster.task_logs[UPID] = ["INFO: run task-9: restore of backup/9002/qemu-1 to VM 120 from s3://backups/pve"]
+        outcome = self.run_session(cluster, result=self.starting())
+        self.assertEqual(cluster.api.started, [])
+        self.assertEqual(cluster.api.followed, [{"upid": UPID, "log_start": 0}])
+        self.assertEqual(
+            cluster.task_queries,
+            [{"vmid": "120", "typefilter": "qmrestore", "since": 1794999400, "source": "all", "limit": 100}],
+        )
+        self.assertEqual(outcome["target_vm_id"], "120")
+        self.assertTrue(any("which this session started before the server stopped" in m for m in self.messages()))
+
+    def test_a_restore_that_never_started_starts_again(self):
+        cluster = FakeCluster()
+        outcome = self.run_session(cluster, result=self.starting())
+        self.assertEqual(cluster.api.started[0][0], f"/nodes/{NODE}/qemu")
+        self.assertEqual(outcome["target_vm_id"], "120")
+        self.assertTrue(any("never started" in m for m in self.messages()))
+
     def test_an_in_place_restore_that_failed_says_whether_the_vm_kept_its_disks(self):
         cluster = FakeCluster({"status": "stopped", "exitstatus": "command failed"})
         cluster.state = "stopped"
@@ -672,6 +793,12 @@ class SessionTests(unittest.TestCase):
 class InterruptedRestoreTests(unittest.TestCase):
     def test_a_restore_following_its_pve_task_runs_again_and_one_before_it_fails(self):
         records = {
+            "starting": {
+                "id": "starting",
+                "status": "running",
+                "task_type": "restore",
+                "result": {"pve_run": {"state": "starting", "node": NODE}},
+            },
             "following": {
                 "id": "following",
                 "status": "running",
@@ -694,6 +821,8 @@ class InterruptedRestoreTests(unittest.TestCase):
         self.assertEqual((persisted["following"]["status"], persisted["before-start"]["status"]), ("queued", "failed"))
         self.assertIn("restore task", persisted["following"]["logs"][-1]["message"])
         self.assertIn("finishes the restore", persisted["following"]["logs"][-1]["message"])
+        self.assertEqual(persisted["starting"]["status"], "queued")
+        self.assertIn("looks for that task", persisted["starting"]["logs"][-1]["message"])
 
 
 class RestoreContextTests(unittest.TestCase):

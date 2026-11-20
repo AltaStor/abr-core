@@ -293,17 +293,18 @@ class PveApi:
         """status is "running" or "stopped"; a stopped task has its exitstatus, "OK" when it succeeded."""
         return dict(self.get(f"{self._task_path(upid)}/status"))
 
-    def task_log(self, upid: str, start: int = 0) -> list[str]:
-        """The task's log lines from line start on, counted from 0."""
+    def task_log(self, upid: str, start: int = 0, limit: int | None = None) -> list[str]:
+        """The task's log lines from line start on, counted from 0; at most limit of them when given."""
         lines: list[str] = []
         while True:
-            answer = self.request("GET", f"{self._task_path(upid)}/log", {"start": start, "limit": LOG_PAGE_LINES})
+            page_size = LOG_PAGE_LINES if limit is None else min(LOG_PAGE_LINES, limit - len(lines))
+            answer = self.request("GET", f"{self._task_path(upid)}/log", {"start": start, "limit": page_size})
             total = int(answer.get("total") or 0)
             # An empty log answers with one "no content" line; the total tells it apart from a real line.
             page = [str(item.get("t") or "") for item in answer.get("data") or []][: max(total - start, 0)]
             lines.extend(page)
             start += len(page)
-            if len(page) < LOG_PAGE_LINES or start >= total:
+            if len(page) < page_size or start >= total or (limit is not None and len(lines) >= limit):
                 return lines
 
     def stop_task(self, upid: str) -> None:

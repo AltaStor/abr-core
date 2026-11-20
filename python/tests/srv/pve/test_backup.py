@@ -421,6 +421,9 @@ class FakeApi:
         self.cluster.task_queries.append(filters)
         return list(self.cluster.tasks)
 
+    def task_log(self, upid, start=0, limit=None):
+        return list(self.cluster.task_logs.get(upid, []))
+
     def start_task(self, path, **params):
         """The provider writes the result file once vzdump runs."""
         self.started.append((path, params))
@@ -457,6 +460,7 @@ class FakeCluster:
         self.firewall = "fw-1"
         self.tasks: list[dict] = []
         self.task_queries: list[dict] = []
+        self.task_logs: dict[str, list[str]] = {}
 
     def vm_state(self, node, vmid):
         return self.state
@@ -718,15 +722,85 @@ class SessionTests(unittest.TestCase):
                 }
             )
         )
-        earlier = {
-            "pve_run": {"upid": UPID, "node": "node1", "vmid": "9002", "run_id": "task-1", "log_lines": 120}
-        }
+        earlier = {"pve_run": {"upid": UPID, "node": "node1", "vmid": "9002", "run_id": "task-1", "log_lines": 120}}
         cluster.shell_.files[RESULT_FILE] = json.dumps(cluster.result).encode()
         outcome = self.run_session(cluster, result=earlier)
         self.assertEqual(cluster.api.started, [])
         self.assertEqual(cluster.api.followed, [{"upid": UPID, "log_start": 120}])
         self.assertNotIn("/run/abr/backup-9002.json", cluster.shell_.written)
         self.assertEqual(outcome["pve_run"]["log_lines"], 121)
+
+    def test_a_vzdump_run_the_server_lost_while_starting_it_is_found_by_its_run_and_registered(self):
+        cluster = FakeCluster(
+            _result(
+                {
+                    "scsi0": ("new", "new", "full"),
+                    "efidisk0": ("new", "new", "full"),
+                    "tpmstate0": ("new", "new", "full"),
+                }
+            )
+        )
+        cluster.shell_.files[RESULT_FILE] = json.dumps(cluster.result).encode()
+        cluster.tasks = [{"upid": UPID, "user": "abr@pve!altastor-inv1", "starttime": 1795000002}]
+        cluster.task_logs[UPID] = ["INFO: run task-1: backup of VM 9002 to s3://backups/pve"]
+        earlier = {
+            "pve_run": {
+                "state": "starting",
+                "node": "node1",
+                "vmid": "9002",
+                "run_id": "task-1",
+                "prepared_at": 1795000000.0,
+            }
+        }
+        removed = []
+        with patch.object(pve_backup, "_remove_left_session_data", lambda *args: removed.append(args)):
+            outcome = self.run_session(cluster, result=earlier)
+        self.assertEqual(cluster.api.started, [])
+        self.assertEqual(cluster.api.followed, [{"upid": UPID, "log_start": 0}])
+        self.assertEqual(removed, [])
+        self.assertEqual(outcome["pve_run"]["upid"], UPID)
+
+    def test_a_vzdump_run_that_never_started_starts_again_from_a_clean_folder(self):
+        cluster = FakeCluster(
+            _result(
+                {
+                    "scsi0": ("new", "new", "full"),
+                    "efidisk0": ("new", "new", "full"),
+                    "tpmstate0": ("new", "new", "full"),
+                }
+            )
+        )
+        cluster.task_logs[UPID] = ["INFO: run another-session: backup of VM 9002"]
+        cluster.tasks = [{"upid": UPID, "user": "abr@pve!altastor-inv1", "starttime": 1795000002}]
+        earlier = {
+            "pve_run": {
+                "state": "starting",
+                "node": "node1",
+                "vmid": "9002",
+                "run_id": "task-1",
+                "prepared_at": 1795000000.0,
+            }
+        }
+        removed = []
+        with patch.object(pve_backup, "_remove_left_session_data", lambda *args: removed.append(args)):
+            self.run_session(cluster, result=earlier)
+        self.assertEqual(len(cluster.api.started), 1)
+        self.assertEqual(len(removed), 1)
+
+    def test_the_session_records_that_it_starts_vzdump_before_it_starts_it(self):
+        cluster = FakeCluster(
+            _result(
+                {
+                    "scsi0": ("new", "new", "full"),
+                    "efidisk0": ("new", "new", "full"),
+                    "tpmstate0": ("new", "new", "full"),
+                }
+            )
+        )
+        self.run_session(cluster)
+        runs = [item["pve_run"] for item in self.progress if "pve_run" in item]
+        self.assertEqual((runs[0]["state"], runs[0]["run_id"]), ("starting", "task-1"))
+        self.assertEqual(runs[1]["upid"], UPID)
 
     def test_a_disk_level_backup_is_refused(self):
         task = {"id": "t", "hypervisor_id": "inv-1", "resource_type": "disk", "resource_external_id": "9002:scsi0"}
@@ -951,6 +1025,46 @@ class JobOptionTests(unittest.TestCase):
         with self.assertRaises(abr_v41.ApiError) as raised:
             abr_v41._validate_task_parameters({"pve_unchanged_stopped_vm": "never"})
         self.assertIn("task_parameters.pve_unchanged_stopped_vm must be one of: skip, full", raised.exception.message)
+
+
+class StartedTaskTests(unittest.TestCase):
+    """A task started by abr-core's token for the VM, found after the server lost its UPID."""
+
+    class Api:
+        def __init__(self, tasks, logs):
+            self.tasks_, self.logs = tasks, logs
+
+        def tasks(self, node, **filters):
+            return list(self.tasks_)
+
+        def task_log(self, upid, start=0, limit=None):
+            return self.logs.get(upid, [])
+
+    def find(self, tasks, logs, **options):
+        return pve_backup.find_started_task(
+            self.Api(tasks, logs),
+            "node1",
+            vmid="9002",
+            task_type="vzdump",
+            user="abr@pve!t",
+            run_id="run-1",
+            since=1795000000,
+            **options,
+        )
+
+    def test_the_task_that_names_the_run_is_found_among_other_users_and_runs(self):
+        tasks = [
+            {"upid": "U1", "user": "root@pam", "starttime": 1795000001},
+            {"upid": "U2", "user": "abr@pve!t", "starttime": 1795000002},
+            {"upid": "U3", "user": "abr@pve!t", "starttime": 1795000003},
+        ]
+        logs = {"U1": ["INFO: run run-1: backup"], "U2": ["INFO: run run-0: backup"], "U3": ["INFO: run run-1: backup"]}
+        self.assertEqual(self.find(tasks, logs), "U3")
+
+    def test_a_vmid_the_session_chose_takes_its_newest_task_when_none_names_the_run(self):
+        tasks = [{"upid": "U2", "user": "abr@pve!t", "starttime": 1795000002}]
+        self.assertIsNone(self.find(tasks, {}))
+        self.assertEqual(self.find(tasks, {}, any_of_vm=True), "U2")
 
 
 class BandwidthTests(unittest.TestCase):

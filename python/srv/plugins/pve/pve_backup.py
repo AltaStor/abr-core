@@ -499,6 +499,39 @@ def _record_run(progress_callback: ProgressCallback, run: dict[str, Any]) -> Non
         pass
 
 
+# A session records this state before it starts its PVE task, and the task's UPID once PVE has answered.
+STARTING = "starting"
+# How far apart the clocks of the appliance and a node may be when a session looks for the task it started.
+START_SLACK_SECONDS = 600
+
+
+def find_started_task(
+    api: Any, node: str, *, vmid: str, task_type: str, user: str, run_id: str, since: float, any_of_vm: bool = False
+) -> str | None:
+    """The task a session started but did not record, because abr-core stopped in between: a task of the VM started by
+    abr-core's token since the session prepared it, whose log names the run, as the provider's first line does. With
+    any_of_vm, the newest such task counts too when none names the run, for a VMID the session chose for itself."""
+    candidates = sorted(
+        (
+            item
+            for item in api.tasks(
+                node,
+                vmid=vmid,
+                typefilter=task_type,
+                since=max(int(since) - START_SLACK_SECONDS, 0),
+                source="all",
+                limit=100,
+            )
+            if str(item.get("user") or "") == user and item.get("upid")
+        ),
+        key=lambda item: int(item.get("starttime") or 0),
+    )
+    for item in candidates:
+        if any(f"run {run_id}:" in line for line in api.task_log(str(item["upid"]), 0, limit=50)):
+            return str(item["upid"])
+    return str(candidates[-1]["upid"]) if any_of_vm and candidates else None
+
+
 def _remove_run_files(shell: NodeShell, vmid: str) -> None:
     for suffix in ("json", "result.json", "log"):
         try:
@@ -530,6 +563,29 @@ def _failure(vmid: str, node: str, status: dict[str, Any], result: dict[str, Any
     return f"vzdump of VM {vmid} on node {node} failed: {reason}" + (f"; the task log says: {more[0]}" if more else "")
 
 
+def _find_unrecorded(
+    cluster: PveNode, earlier_run: dict[str, Any], vmid: str, task_id: str, emit: Callable[..., None]
+) -> dict[str, Any] | None:
+    """The vzdump run a session started before the server stopped, to follow again, or None when it never started."""
+    node = str(earlier_run.get("node") or "")
+    upid = find_started_task(
+        cluster.api,
+        node,
+        vmid=vmid,
+        task_type="vzdump",
+        user=cluster.access.token_id,
+        run_id=str(earlier_run.get("run_id") or task_id),
+        since=float(earlier_run.get("prepared_at") or 0),
+    )
+    if upid is None:
+        emit(
+            "prepare", 8, f"The vzdump run this session prepared on node {node} before the server stopped never started"
+        )
+        return None
+    emit("prepare", 8, f"Found vzdump task {upid} on node {node}, which this session started before the server stopped")
+    return {**earlier_run, "upid": upid, "started_at": utc_now()}
+
+
 def run_pve_backup(task: dict[str, Any], progress_callback: ProgressCallback = None) -> dict[str, Any]:
     start_time = time.time()
     hypervisor = _hypervisor(task)
@@ -541,6 +597,8 @@ def run_pve_backup(task: dict[str, Any], progress_callback: ProgressCallback = N
     existing = task.get("result") if isinstance(task.get("result"), dict) else {}
     earlier_run = existing.get("pve_run") if isinstance(existing.get("pve_run"), dict) else {}
     resumed = earlier_run if earlier_run.get("upid") else None
+    # The server stopped after the session prepared its vzdump run and before it recorded the task's UPID.
+    unrecorded = resumed is None and earlier_run.get("state") == STARTING
 
     try:
         compression_level = _resolve_compression_level(parameters)
@@ -567,7 +625,7 @@ def run_pve_backup(task: dict[str, Any], progress_callback: ProgressCallback = N
     )
     abr_path = str(abr_path)
     _make_task_root(repository, task_root)
-    if resumed is None:
+    if resumed is None and not unrecorded:
         _remove_left_session_data(task, repository, progress_callback)
     previous_path, previous = _previous_manifest(
         parameters=parameters, destination_root=destination_root, vm_name=vm_name, task_root=task_root, vm_id=vmid
@@ -591,6 +649,10 @@ def run_pve_backup(task: dict[str, Any], progress_callback: ProgressCallback = N
 
     try:
         with PveNode.from_record(hypervisor) as cluster:
+            if unrecorded:
+                resumed = _find_unrecorded(cluster, earlier_run, vmid, task_id, emit)
+                if resumed is None:
+                    _remove_left_session_data(task, repository, progress_callback)
             located = cluster.locate_vm(vmid)
             node = str((resumed or {}).get("node") or located.get("node") or "")
             located["status"] = cluster.vm_state(node, vmid) or located.get("status")
@@ -1209,6 +1271,10 @@ def _start(
     shell.make_directory(RUN_FOLDER, mode=0o700)
     _remove_run_files(shell, vmid)
     shell.write_file(run_file_path(vmid), json.dumps(run, indent=2), mode=0o600)
+    _record_run(
+        progress_callback,
+        {"state": STARTING, "node": node, "vmid": vmid, "run_id": task_id, "prepared_at": time.time()},
+    )
     try:
         upid = cluster.api.start_task(
             f"/nodes/{node}/vzdump",
