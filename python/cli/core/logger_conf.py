@@ -216,6 +216,12 @@ def _build_logging_config(log_dir: str, component: str, file_level: str = "DEBUG
                 "handlers": ["console", "file"],
                 "propagate": False,
             },
+            # SSH to PVE nodes: paramiko logs every connection and login.
+            "paramiko": {
+                "level": "WARNING",
+                "handlers": ["console", "file"],
+                "propagate": False,
+            },
         },
         "root": {
             "level": "INFO",
