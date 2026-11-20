@@ -351,6 +351,12 @@ ABR_REPO_SECRET_KEY='...' abr repo add --name MyWorm --type s3 --bucket altastor
 Note: a local path that is world-writable is refused - its directory mode is the 
 only thing keeping other accounts on the host away from the backup data. Restrict 
 it to 750, the mode the product uses for its own storage, and add it again. 
+abr-vmdk-tool reads a backup only from a folder of mode 0750 or stricter (no write for 
+the group, nothing for others); the server makes every backup folder 0750 itself, but 
+on an SMB share every folder gets the mount's dir_mode, so a path on an SMB mount whose 
+folders have a wider mode (dir_mode=0770 or 0755) is refused (422 repository_folder_mode) 
+at repo add and when repo edit moves a repository there: mount the share with 
+dir_mode=0750, as the server does for the shares it mounts itself. 
 
 A repository is checked against its storage before it is registered, and refused if it 
 cannot be used: the endpoint has to answer, the credentials have to authenticate, and the 
@@ -456,7 +462,7 @@ abr repo rescan --name <name> [--id <id>]
 
 abr repo verify 
 
-Description: Validate filesystem availability, permissions, and block consistency. Runs as a single synchronous server call (no percentage progress channel), so when the console is an interactive terminal the CLI shows an elapsed-time indicator ("Verifying repository... Ns elapsed") automatically while it waits -- no flag needed, and it's silent when output isn't a terminal (redirected/CI). Exits non-zero when the verdict is not a clean pass, so `abr repo verify --name r1 || alert ...` reacts to it. 
+Description: Validate filesystem availability, permissions, and block consistency. The permissions check fails, and names the folders and the fix, when a backup folder of the repository has a mode abr-vmdk-tool refuses (anything wider than 0750: write for the group or anything for others), or when the repository is on an SMB mount whose dir_mode gives its folders such a mode; verify and restore of those backups by this server fail until the mode is 0750. Runs as a single synchronous server call (no percentage progress channel), so when the console is an interactive terminal the CLI shows an elapsed-time indicator ("Verifying repository... Ns elapsed") automatically while it waits -- no flag needed, and it's silent when output isn't a terminal (redirected/CI). Exits non-zero when the verdict is not a clean pass, so `abr repo verify --name r1 || alert ...` reacts to it. 
 
 abr repo verify --name <name> [--id <id>] 
 

@@ -139,7 +139,14 @@ from python.srv.services.backup_copy import (
 )
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
-from python.srv.services.share_mount import mount_if_managed, share_mount_check, unmounted_share_message
+from python.srv.services.share_mount import (
+    SMB_FILESYSTEMS,
+    mount_holding,
+    mount_if_managed,
+    read_mounts,
+    share_mount_check,
+    unmounted_share_message,
+)
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.hyperv.vhdx_tool import VhdxToolError, ensure_hyperv_repository
 from python.srv.plugins.vcenter import disk_transport
@@ -264,6 +271,7 @@ def is_initial_repository_metadata(metadata: dict[str, Any]) -> bool:
     return bool(metadata.get(DEFAULT_REPOSITORY_MARK))
 
 PRODUCT_STORAGE_MODE = 0o750
+BACKUP_READER_FOLDER_MODE = 0o750
 
 EXECUTION_TYPES = ("Incremental", "ActiveFull", "SyntheticFull")
 EXECUTION_REASONS = (
@@ -2654,7 +2662,65 @@ def _local_repository_permission_warnings(path: Path, permissions: dict[str, Any
     return warnings
 
 
-def _reject_insecure_local_repository_path(path: Path) -> None:
+def _reader_refuses_folder_mode(mode: int) -> bool:
+    return bool(mode & 0o777 & ~BACKUP_READER_FOLDER_MODE)
+
+
+def _share_folder_mode_problem(path: Path) -> str | None:
+    try:
+        mount = mount_holding(path.resolve(), read_mounts())
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return None
+    if mount is None or mount.fstype not in SMB_FILESYSTEMS or not _reader_refuses_folder_mode(mode):
+        return None
+    return (
+        f"{path} is on the SMB share {mount.source} mounted at {mount.point}, where every folder gets mode "
+        f"{mode & 0o777:04o} from the mount (dir_mode). abr-vmdk-tool reads a backup only from a folder of mode "
+        f"{BACKUP_READER_FOLDER_MODE:04o} or stricter, so backups written there could not be verified or restored by this server. "
+        f"Mount the share with dir_mode=0{BACKUP_READER_FOLDER_MODE:o}"
+    )
+
+
+def _repository_backup_folders(repository: dict[str, Any], path: Path) -> list[Path]:
+    repository_id = str(repository.get("id") or "")
+    root = path.resolve()
+    folders: set[Path] = set()
+    for point in catalog_records(BACKUPS):
+        if str(point.get("repository_id") or "") != repository_id:
+            continue
+        artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+        for disk in artifact.get("disks") or []:
+            folder = Path(str((disk or {}).get("abr_path") or "")) if isinstance(disk, dict) else None
+            if folder is not None and folder.is_absolute() and (folder == root or root in folder.parents):
+                folders.add(folder)
+    return sorted(folders)
+
+
+def _backup_folder_mode_problem(repository: dict[str, Any], path: Path) -> str | None:
+    refused: list[tuple[Path, int]] = []
+    for folder in _repository_backup_folders(repository, path):
+        try:
+            mode = stat.S_IMODE(folder.stat().st_mode)
+        except OSError:
+            continue
+        if _reader_refuses_folder_mode(mode):
+            refused.append((folder, mode))
+    if not refused:
+        return None
+    shown = ", ".join(f"{folder} ({mode & 0o777:04o})" for folder, mode in refused[:3])
+    more = f" and {len(refused) - 3} more" if len(refused) > 3 else ""
+    return (
+        f"{len(refused)} backup folder(s) of this repository have a mode abr-vmdk-tool refuses: {shown}{more}. It reads "
+        f"a backup only from a folder of mode {BACKUP_READER_FOLDER_MODE:04o} or stricter, so verify and restore of those "
+        f"backups by this server fail. Run: find {path} -type d -exec chmod {BACKUP_READER_FOLDER_MODE:o} {{}} +"
+    )
+
+
+def _reject_insecure_local_repository_path(path: Path, *, mounted_by_server: bool = False) -> None:
+    share_problem = None if mounted_by_server else _share_folder_mode_problem(path)
+    if share_problem:
+        raise api_error(422, "repository_folder_mode", share_problem, path=str(path))
     permissions = _local_path_permissions(path)
     if permissions is None or not permissions["world_writable"]:
         return
@@ -2842,7 +2908,7 @@ def create_repository_record(
             raise api_error(422, "invalid_repository", f"Path is not accessible: {local_path} ({access_error})", path=path)
         _ensure(exists, 422, "invalid_repository", f"Path does not exist: {local_path}", path=path)
         _ensure(is_dir, 422, "invalid_repository", f"Path is not a directory: {local_path}", path=path)
-        _reject_insecure_local_repository_path(local_path)
+        _reject_insecure_local_repository_path(local_path, mounted_by_server=bool((metadata_flags or {}).get("managed_mount")))
         if repo_type == "smb":
             _ensure_smb_repository_share(server, share, username, password)
             password = password if username else None
@@ -3192,11 +3258,14 @@ def _verify_local_repository(
         return {"status": "error", "checks": checks, "message": f"Path is not readable and writable: {path}"}
     permissions = _local_path_permissions(path)
     permission_warnings = _local_repository_permission_warnings(path, permissions)
+    mounted_by_server = bool((repository.get("metadata") or {}).get("managed_mount"))
+    mode_problem = (None if mounted_by_server else _share_folder_mode_problem(path)) or _backup_folder_mode_problem(repository, path)
     checks.append(
         {
             "name": "permissions",
-            "status": "warning" if permission_warnings else "ok",
-            "message": " ".join(permission_warnings)
+            "status": "failed" if mode_problem else "warning" if permission_warnings else "ok",
+            "message": mode_problem
+            or " ".join(permission_warnings)
             or (
                 f"mode {permissions['mode']} {permissions['owner']}:{permissions['group']}"
                 if permissions
@@ -3241,9 +3310,11 @@ def _verify_local_repository(
                 **({"errors": backup_health["errors"]} if backup_health["errors"] else {}),
             }
         )
-        if backup_health["status"] == "failed":
+        if backup_health["status"] == "failed" and not mode_problem:
             return {"status": "error", "checks": checks, "message": f"Backup integrity check failed: {backup_health['message']}"}
 
+    if mode_problem:
+        return {"status": "error", "checks": checks, "message": mode_problem}
     message = "Repository is available"
     if permission_warnings:
         message = f"{message}. Warning: {' '.join(permission_warnings)}"

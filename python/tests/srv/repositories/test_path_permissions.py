@@ -9,6 +9,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from python.srv.core.mongo_db_wrapper import (
     BACKUPS,
@@ -18,7 +19,7 @@ from python.srv.core.mongo_db_wrapper import (
     RESOURCES_BY_HV,
     TASKS,
 )
-from python.srv.services import abr_v41
+from python.srv.services import abr_v41, share_mount
 from python.srv.services.api_errors import ApiError
 
 
@@ -188,6 +189,110 @@ class LocalRepositoryPathPermissionTests(unittest.TestCase):
         permissions_check = next(check for check in result["checks"] if check["name"] == "permissions")
         self.assertEqual(permissions_check["status"], "ok")
         self.assertIn("0750", permissions_check["message"])
+
+    def _point_in(self, record: dict, folder: Path, point_id: str = "p1") -> None:
+        BACKUPS[point_id] = {
+            "id": point_id,
+            "repository_id": record["id"],
+            "status": "available",
+            "artifact": {"disks": [{"abr_path": str(folder), "abr_backup_name": "disk.vmdk"}]},
+        }
+
+    def _on_smb_mount(self, point: Path):
+        return patch.object(abr_v41, "read_mounts", return_value=[share_mount.Mount(point, "cifs", "//nas.example.test/backups")])
+
+    def _permissions_check(self, record: dict) -> dict:
+        result = abr_v41.verify_repository(record["id"])
+        return next(check for check in result["checks"] if check["name"] == "permissions")
+
+    def test_repo_verify_fails_the_permissions_check_for_a_backup_folder_the_reader_refuses(self) -> None:
+        for mode in (0o770, 0o755):
+            with self.subTest(mode=oct(mode)):
+                record = self._add(f"Loose{mode:o}", self._dir(f"loose-{mode:o}", 0o750))
+                folder = self._dir(f"loose-{mode:o}/job/vm/session", mode)
+                self._point_in(record, folder, point_id=f"p{mode:o}")
+
+                result = abr_v41.verify_repository(record["id"])
+
+                permissions_check = next(check for check in result["checks"] if check["name"] == "permissions")
+                self.assertEqual((result["status"], permissions_check["status"]), ("error", "failed"))
+                self.assertIn(f"{folder} ({mode:04o})", result["message"])
+                self.assertIn("0750 or stricter", result["message"])
+                self.assertIn("-exec chmod 750", result["message"])
+
+    def test_backup_folders_the_reader_takes_pass(self) -> None:
+        for mode in (0o750, 0o700, 0o2750):
+            with self.subTest(mode=oct(mode)):
+                record = self._add(f"Tight{mode:o}", self._dir(f"tight-{mode:o}", 0o750))
+                self._point_in(record, self._dir(f"tight-{mode:o}/job/vm/session", mode), point_id=f"t{mode:o}")
+
+                self.assertEqual(self._permissions_check(record)["status"], "ok")
+
+    def test_a_loose_root_of_a_local_repository_is_not_what_the_reader_checks(self) -> None:
+        record = self._add("LooseRoot", self._dir("loose-root", 0o775))
+        self._point_in(record, self._dir("loose-root/job/vm/session", 0o750))
+
+        self.assertEqual(self._permissions_check(record)["status"], "ok")
+
+    def test_backup_folders_of_other_repositories_are_not_counted(self) -> None:
+        record = self._add("Mine", self._dir("mine", 0o750))
+        other = self._add("Other", self._dir("other", 0o750))
+        self._point_in(other, self._dir("other/job/vm/session", 0o770))
+
+        self.assertEqual(abr_v41.verify_repository(record["id"])["status"], "success")
+
+    def test_repo_add_refuses_an_smb_mount_whose_folders_the_reader_refuses(self) -> None:
+        path = self._dir("cifs-0770", 0o2770)
+
+        with self._on_smb_mount(path), self.assertRaises(ApiError) as ctx:
+            self._add("Cifs", path)
+
+        self.assertEqual((ctx.exception.status_code, ctx.exception.code), (422, "repository_folder_mode"))
+        self.assertIn("mode 0770 from the mount (dir_mode)", ctx.exception.message)
+        self.assertIn("dir_mode=0750", ctx.exception.message)
+        self.assertEqual(REPOSITORIES, {})
+
+    def test_an_smb_mount_with_dir_mode_0750_is_accepted(self) -> None:
+        path = self._dir("cifs-0750", 0o750)
+
+        with self._on_smb_mount(path):
+            record = self._add("Cifs", path)
+
+        self.assertEqual(record["status"], "available")
+
+    def test_a_group_writable_folder_on_another_filesystem_is_still_accepted(self) -> None:
+        path = self._dir("nfs-0770", 0o770)
+
+        with patch.object(abr_v41, "read_mounts", return_value=[share_mount.Mount(path, "nfs4", "nas:/backups")]):
+            record = self._add("Nfs", path)
+
+        self.assertEqual(record["status"], "available")
+
+    def test_a_share_the_server_mounts_itself_is_not_held_to_the_mount_mode_check(self) -> None:
+        path = self._dir("managed", 0o755)
+
+        with self._on_smb_mount(path):
+            record = abr_v41.create_repository_record(
+                {"name": "Managed", "type": "local", "path": str(path)}, metadata_flags={"managed_mount": True}
+            )
+            permissions = self._permissions_check(record)
+
+        self.assertEqual((record["status"], permissions["status"]), ("available", "ok"))
+
+    def test_repo_edit_refuses_to_repoint_at_such_an_smb_mount_and_repo_verify_names_it(self) -> None:
+        record = self._add("Movable", self._dir("start", 0o750))
+        loose = self._dir("cifs-dest", 0o770)
+
+        with self._on_smb_mount(loose), self.assertRaises(ApiError) as ctx:
+            abr_v41.edit_repository_record(record["id"], {"path": str(loose)})
+        self.assertEqual(ctx.exception.code, "repository_folder_mode")
+
+        start = Path(self._root) / "start"
+        os.chmod(start, 0o770)
+        with self._on_smb_mount(start):
+            result = abr_v41.verify_repository(record["id"])
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Mount the share with dir_mode=0750", result["message"])
 
     def test_a_remote_repository_carries_no_local_permission_probe(self) -> None:
         record = abr_v41.create_repository_record(

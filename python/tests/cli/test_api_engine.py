@@ -2641,6 +2641,7 @@ class AbrV41EngineTests(unittest.TestCase):
         path = tempfile.mkdtemp(prefix="abr-repo-")
         artifact_dir = Path(path) / "vm-1" / "task-1"
         artifact_dir.mkdir(parents=True)
+        artifact_dir.chmod(0o750)
         artifact_file = artifact_dir / "01-vm.vmdk"
         artifact_file.write_bytes(b"fake disk data")
         repository = abr_v41.create_repository_record({"name": "repo-d34", "type": "local", "path": path})
