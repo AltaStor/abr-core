@@ -74,7 +74,7 @@ from ..vcenter.vcenter_backup import (
     _resolve_immutability_plan,
     _resolve_repository,
 )
-from .pve import PveError, PveNode, vm_disks
+from .pve import PveError, PveNode, restore_metadata, vm_disks
 from .pve_api import PveApiError, Upid, task_error, task_succeeded
 from .setup import PveSetupError, ensure_package, package_path
 from .ssh import NodeShell, SshError
@@ -829,10 +829,7 @@ def _register(
         "finalize", 90, f"Writing the manifest of {vm_name}", processed_bytes=total_read, transferred_bytes=total_stored
     )
     vm_config = {
-        "vmid": vmid,
-        "name": vm_name,
-        "node": node,
-        "config": config,
+        **restore_metadata(vmid, vm_name, node, config),
         "guest_config": result.get("guest_config"),
         "firewall_config": result.get("firewall_config"),
     }

@@ -79,6 +79,10 @@ class RestoreCommands:
                 "to switches on the target host; the VM's files go under <volume>\\Hyper-V\\<new name>.\n"
                 "An in-place Hyper-V restore keeps the VM and replaces its disks; it is refused while the\n"
                 "VM has checkpoints.\n\n"
+                "For Proxmox VE, --target-host names a node, --datastore and --datastore-map name storages\n"
+                "that hold VM disks there, and --network-map maps bridges; a new VM gets the next free VMID\n"
+                "and new MAC addresses. An in-place Proxmox VE restore turns the VM off and restores over\n"
+                "it; PVE removes its disks before it writes the restored ones.\n\n"
                 "Examples:\n"
                 '  abr restore start --restore-point <point-id> --new-name "sql-01-restored"\n'
                 '  abr restore start --backup <backup-id> --vm "sql-01" --target-inventory "vCenter-Prod" '

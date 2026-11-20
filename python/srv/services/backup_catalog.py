@@ -1094,11 +1094,11 @@ def discard_unregistered_output(task: dict[str, Any]) -> bool:
 
 
 def _follows_a_platform_task(record: dict[str, Any]) -> bool:
-    """A Proxmox VE backup whose vzdump task had started: the task runs on in PVE without the server, and the session
-    follows it again by its UPID when it runs once more."""
+    """A Proxmox VE backup or restore whose PVE task had started: the task runs on in PVE without the server, and the
+    session follows it again by its UPID when it runs once more."""
     result = record.get("result") if isinstance(record.get("result"), dict) else {}
     run = result.get("pve_run") if isinstance(result.get("pve_run"), dict) else {}
-    return str(record.get("task_type") or "") == "backup" and bool(run.get("upid"))
+    return str(record.get("task_type") or "") in ("backup", "restore") and bool(run.get("upid"))
 
 
 def _queue_again(record: dict[str, Any]) -> None:
@@ -1106,16 +1106,18 @@ def _queue_again(record: dict[str, Any]) -> None:
     updated["status"] = "queued"
     updated["updated_at"] = utc_now()
     run = (updated.get("result") or {}).get("pve_run") or {}
+    restore = str(record.get("task_type") or "") == "restore"
     _append_task_log(
         updated,
         level="warn",
         message=(
-            f"The server stopped while vzdump task {run.get('upid')} ran on node {run.get('node')}; the session "
-            "follows that task again and registers its backup"
+            f"The server stopped while {'restore' if restore else 'vzdump'} task {run.get('upid')} ran on node "
+            f"{run.get('node')}; the session follows that task again and "
+            + ("finishes the restore" if restore else "registers its backup")
         ),
     )
     persist_task(updated)
-    logger.warning("Task %s was following a vzdump task when the server last stopped; it runs again.", record.get("id"))
+    logger.warning("Task %s was following a PVE task when the server last stopped; it runs again.", record.get("id"))
 
 
 def fail_interrupted_tasks() -> int:

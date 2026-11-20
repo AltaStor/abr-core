@@ -334,10 +334,28 @@ class NodeTests(unittest.TestCase):
             node.locate_vm("9999")
         self.assertEqual(fake.requests[-1].url.params["type"], "vm")
 
-    def test_restores_are_not_there_yet(self):
-        node = self.node(_cluster())
-        with self.assertRaisesRegex(PveError, "not available in this build yet"):
-            node.restore({})
+    def test_restore_metadata_tells_the_vms_node_hardware_and_adapters_as_every_platform_does(self):
+        metadata = self.node(_cluster()).get_vm_restore_metadata("9002")
+        self.assertEqual(
+            {key: metadata[key] for key in ("vm_id", "name", "source_host", "firmware", "num_cpu", "memory_mb")},
+            {
+                "vm_id": "9002",
+                "name": "uefi-vm",
+                "source_host": "node1",
+                "firmware": "efi",
+                "num_cpu": 1,
+                "memory_mb": 512,
+            },
+        )
+        self.assertEqual(
+            [
+                (nic["label"], nic["network"], nic["mac_address"], nic["connected"])
+                for nic in metadata["network_adapters"]
+            ],
+            [("net0", "vmbr0", "BC:24:11:3A:42:7E", False), ("net1", "internal", "BC:24:11:00:00:01", True)],
+        )
+        self.assertEqual(metadata["config"]["digest"], "2365dec717aef5b6")
+        self.assertEqual([disk["drive"] for disk in metadata["disks"]][:2], ["scsi0", "scsi1"])
 
 
 if __name__ == "__main__":

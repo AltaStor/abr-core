@@ -127,6 +127,7 @@ from python.srv.services.inventory_management import (
     normalize_inventory_type,
 )
 from python.srv.plugins.pve import inventory as pve_inventory
+from python.srv.plugins.pve.pve import vm_name_problem
 from python.srv.services import audit_service, replication_service
 from python.srv.services.backup_copy import (
     apply_copy_settings,
@@ -9284,6 +9285,8 @@ def _restore_target_kind_matches(point: dict[str, Any], inventory: dict[str, Any
 _CSV_PATH = re.compile(r"^([A-Za-z]:\\ClusterStorage\\[^\\]+)(?:\\(.*))?$", re.IGNORECASE)
 _DRIVE_PATH = re.compile(r"^([A-Za-z]:)(?:\\(.*))?$")
 _UNC_PATH = re.compile(r"^(\\\\[^\\]+\\[^\\]+)(?:\\(.*))?$")
+# A Proxmox VE volume ID: a storage of two characters or more, which a Windows drive letter is not, and its volume.
+_PVE_VOLUME = re.compile(r"^([A-Za-z][A-Za-z0-9_.-]*[A-Za-z0-9]):([^/\\:]\S*)$")
 
 
 def _parse_windows_storage_path(raw: str) -> tuple[str | None, str | None, str | None]:
@@ -9309,6 +9312,9 @@ def _parse_windows_storage_path(raw: str) -> tuple[str | None, str | None, str |
 
 def _parse_datastore_path_parts(datastore_path: str | None) -> tuple[str | None, str | None, str | None]:
     raw = str(datastore_path or "").strip()
+    volume = _PVE_VOLUME.match(raw)
+    if volume:
+        return volume.group(1), None, volume.group(2)
     if not raw.startswith("["):
         return _parse_windows_storage_path(raw) if raw else (None, None, None)
     if "]" not in raw:
@@ -11210,6 +11216,12 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
         target_vm_name = str(request.get("target_vm_name") or defaults.get("target_vm_name") or point.get("vm_name") or "").strip()
     _ensure(bool(target_vm_name), 422, "invalid_restore", "Restore target VM name is required")
     _ensure_ascii_text(target_vm_name, field="Restore target VM name", code="invalid_restore", max_length=MAX_NAME_LENGTH)
+    pve_name_problem = (
+        vm_name_problem(target_vm_name)
+        if restore_mode != "in_place" and str(target_inventory.get("kind") or "") == "proxmox-ve"
+        else None
+    )
+    _ensure(pve_name_problem is None, 422, "invalid_restore", str(pve_name_problem))
     if restore_mode == "in_place":
         _ensure(
             _inventory_vm_name_exists(str(target_inventory["id"]), target_vm_name),

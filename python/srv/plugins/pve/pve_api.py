@@ -279,13 +279,13 @@ class PveApi:
     def _task_path(upid: str) -> str:
         return f"/nodes/{quote(Upid.parse(upid).node, safe='')}/tasks/{quote(upid, safe='')}"
 
-    def start_task(self, path: str, **params: Any) -> str:
-        """Starts a task, such as POST /nodes/{node}/vzdump, and returns its UPID."""
-        upid = self.post(path, **params)
+    def start_task(self, path: str, *, method: str = "POST", **params: Any) -> str:
+        """Starts a task, such as POST /nodes/{node}/vzdump or DELETE /nodes/{node}/qemu/{vmid}; returns its UPID."""
+        upid = self.request(method, path, params)["data"]
         try:
             Upid.parse(str(upid or ""))
         except ValueError as exc:
-            raise PveApiError(f"POST {path} started no task: the PVE API answered {upid!r}", path=path) from exc
+            raise PveApiError(f"{method} {path} started no task: the PVE API answered {upid!r}", path=path) from exc
         return str(upid)
 
     def task_status(self, upid: str) -> dict[str, Any]:

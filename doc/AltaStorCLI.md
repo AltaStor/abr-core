@@ -934,6 +934,12 @@ abr restore start --backup <backup-id> [--vm <name-or-id>] --target-inventory <n
 Legacy compatibility:
 abr restore start --point-id <id> [--name <new-name>] [--target-inventory <name>] [--target-host <host>] [--target-datastore <name>] [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--repo <name>] [--power-on] [--in-place] [--force] [--wait] 
 
+Proxmox VE restore points:
+A Proxmox VE restore point goes back to a Proxmox VE inventory. --target-host names a node, --datastore and --datastore-map name storages that hold VM disks on that node, --disk-datastore takes a disk's config key (scsi0, efidisk0, tpmstate0), and --network-map and --nic-network map the bridges of the adapters (net0, net1). PVE restores the VM from the configuration its backup recorded, and each disk from its newest full backup and the incrementals on top of it.
+• A new VM gets the cluster's next free VMID, new MAC addresses and a new SMBIOS uuid. Its name must suit PVE: letters, digits and hyphens, in parts separated by dots, up to 63 characters. A restore to a new VM that fails or is stopped removes the VM it had created.
+• An in-place restore turns the VM off and restores over it, keeping its VMID, MAC addresses and SMBIOS uuid, with each disk on the storage the VM keeps it on now. PVE removes the VM's disks before it writes the restored ones, so an in-place restore that fails leaves the VM without them; restore it again. It is refused while the VM is protected or locked, and when the VM with the backup's VMID is no longer named as it was at the backup.
+• The storage decides how a restored disk is provisioned, so a disk type is not applied.
+
 Targeted Restore Scenarios: 
  
 1. In-Place Recovery (Replace the original VM) 

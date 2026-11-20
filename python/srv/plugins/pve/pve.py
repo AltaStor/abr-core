@@ -75,6 +75,20 @@ class PveError(RuntimeError):
 # ---- VM configuration ------------------------------------------------------------------------------------------------
 
 
+# PVE's dns-name format, which a VM's name must follow.
+VM_NAME = re.compile(r"^(?=.{1,63}$)[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$")
+
+
+def vm_name_problem(name: str) -> str | None:
+    """Why PVE would not take a VM name, or None when it would."""
+    if VM_NAME.match(name):
+        return None
+    return (
+        f"{name!r} cannot name a Proxmox VE VM: PVE takes letters, digits and hyphens, in parts separated by dots, up "
+        "to 63 characters"
+    )
+
+
 def parse_property_string(value: str, default_key: str = "") -> dict[str, str]:
     """A PVE property string such as "local-lvm:vm-9002-disk-0,size=32G".
 
@@ -167,6 +181,35 @@ def vm_network_adapters(vm_id: str, config: Mapping[str, Any]) -> list[dict[str,
             }
         )
     return adapters
+
+
+def restore_metadata(vm_id: str, name: str, node: str, config: Mapping[str, Any]) -> dict[str, Any]:
+    """What a restore offers of a VM, in the terms the restore wizard uses for every platform, with its PVE config."""
+    os_type = str(config.get("ostype") or "")
+    memory = parse_property_string(str(config.get("memory") or ""), "current").get("current", "")
+    cores = int(config.get("cores") or 1) * int(config.get("sockets") or 1)
+    return {
+        "vmid": str(vm_id),
+        "name": name,
+        "node": node,
+        "source_host": node,
+        "firmware": "efi" if config.get("bios") == "ovmf" else "bios",
+        "num_cpu": int(config.get("vcpus") or cores),
+        "memory_mb": int(memory) if memory.isdigit() else 512,
+        "guest_os": GUEST_OS.get(os_type, os_type),
+        "config": dict(config),
+        "network_adapters": [
+            {
+                "label": adapter["name"],
+                "network": adapter["network"],
+                "mac_address": adapter["mac"],
+                "connected": adapter["connected"],
+                "model": adapter["model"],
+                "vlan": adapter["vlan"],
+            }
+            for adapter in vm_network_adapters(str(vm_id), config)
+        ],
+    }
 
 
 def _drive_order(key: str) -> tuple[int, int, str]:
@@ -371,7 +414,7 @@ class PveNode(Hypervisor):
                     "datastores": images,
                     "datastore_capacity": {store: storages[store] for store in images},
                     "backup_storage_active": bool(storages.get(self.access.storage, {}).get("active")),
-                    "networks": self._bridges(name) if available else [],
+                    "networks": self.bridges(name) if available else [],
                     "cpu_count": int(item.get("maxcpu") or 0),
                     "memory_bytes": int(item.get("maxmem") or 0),
                     "status": "connected" if available else "unavailable",
@@ -386,13 +429,21 @@ class PveNode(Hypervisor):
             logger.warning("Could not read the PVE version of node %s: %s", node, exc)
             return ""
 
-    def _bridges(self, node: str) -> list[str]:
+    def bridges(self, node: str) -> list[str]:
         try:
             rows = self.api.get(f"/nodes/{quote(node, safe='')}/network", type="any_bridge") or []
         except PveApiError as exc:
             logger.warning("Could not list the bridges of node %s: %s", node, exc)
             return []
         return sorted(str(row.get("iface")) for row in rows if row.get("iface"))
+
+    def image_storages(self, node: str) -> dict[str, dict[str, Any]]:
+        """The enabled storages of a node that hold VM disks, by name, with whether they are active and their room."""
+        rows = self.api.get(f"/nodes/{quote(node, safe='')}/storage", content="images", enabled=1) or []
+        return {str(row.get("storage")): dict(row) for row in rows if row.get("storage")}
+
+    def next_vm_id(self) -> str:
+        return str(self.api.get("/cluster/nextid"))
 
     def vm_state(self, node: str, vm_id: str) -> str:
         """running or stopped as the VM's node tells it now; the cluster's resource list lags by several seconds."""
@@ -474,15 +525,10 @@ class PveNode(Hypervisor):
 
     def get_vm_restore_metadata(self, vm_name: str) -> Dict[str, Any]:
         located = self.locate_vm(vm_name)
-        config = self.vm_config(str(located.get("node")), str(located.get("vmid")))
-        return {
-            "vm_id": str(located.get("vmid")),
-            "name": str(located.get("name") or config.get("name") or ""),
-            "node": str(located.get("node") or ""),
-            "config": config,
-            "disks": vm_disks(str(located.get("vmid")), config),
-            "network_adapters": vm_network_adapters(str(located.get("vmid")), config),
-        }
+        vm_id, node = str(located.get("vmid")), str(located.get("node") or "")
+        config = self.vm_config(node, vm_id)
+        metadata = restore_metadata(vm_id, str(located.get("name") or config.get("name") or ""), node, config)
+        return {**metadata, "vm_id": vm_id, "disks": vm_disks(vm_id, config)}
 
     # ---- backup and restore -----------------------------------------------------------------------------------------
 
@@ -492,4 +538,6 @@ class PveNode(Hypervisor):
         return run_pve_backup(task, progress_callback=progress_callback)
 
     def restore(self, task: dict[str, Any], progress_callback: ProgressCallback = None) -> dict[str, Any]:
-        raise PveError("Restores to Proxmox VE are not available in this build yet")
+        from .pve_restore import run_pve_restore
+
+        return run_pve_restore(task, progress_callback=progress_callback)

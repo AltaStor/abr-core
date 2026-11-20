@@ -82,6 +82,13 @@ class RequestTests(unittest.TestCase):
         self.assertNotIn("skip", fake.requests[0].url.params)
         self.assertEqual(fake.form(), {"vmid": ["9002"], "remove": ["0"], "storage": ["abr"]})
 
+    def test_a_task_that_deletes_starts_with_its_parameters_in_the_query(self):
+        fake = FakePve({("DELETE", "/nodes/node1/qemu/120"): {"data": UPID}})
+        with api(fake) as client:
+            upid = client.start_task("/nodes/node1/qemu/120", method="DELETE", purge=True)
+        self.assertEqual(upid, UPID)
+        self.assertEqual((fake.requests[0].method, fake.requests[0].url.params["purge"]), ("DELETE", "1"))
+
     def test_a_start_that_returns_no_task_id_fails(self):
         fake = FakePve({("POST", "/nodes/node1/vzdump"): {"data": None}})
         with api(fake) as client, self.assertRaisesRegex(PveApiError, "started no task"):
