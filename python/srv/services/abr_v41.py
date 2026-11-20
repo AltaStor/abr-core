@@ -9465,6 +9465,7 @@ def _build_restore_source_vm(point: dict[str, Any], manifest: dict[str, Any]) ->
                 break
         discovered_payload = discovered.get("payload") if isinstance(discovered, dict) and isinstance(discovered.get("payload"), dict) else {}
         effective_path = datastore_path or str(discovered_payload.get("datastore_path") or "").strip() or None
+        host_bytes = _restore_disk_host_bytes(artifact_disks, disk_entry)
         datastore_name, folder_name, _filename = _parse_datastore_path_parts(effective_path)
         if original_datastore is None and datastore_name:
             original_datastore = datastore_name
@@ -9475,7 +9476,8 @@ def _build_restore_source_vm(point: dict[str, Any], manifest: dict[str, Any]) ->
                 "id": _source_disk_id(vm_id, index, disk_entry, discovered),
                 "label": str(disk_entry.get("disk_label") or (discovered or {}).get("name") or f"Hard disk {index}"),
                 "capacity_bytes": _capacity_bytes_from_disk_entry(disk_entry) or _capacity_bytes_from_disk_entry(discovered_payload),
-                "used_bytes": _restore_disk_used_bytes(manifest, disk_entry),
+                "used_bytes": host_bytes or _restore_disk_used_bytes(manifest, disk_entry),
+                "used_bytes_on_host": bool(host_bytes),
                 "provisioning": str(disk_entry.get("source_disk_type_name") or discovered_payload.get("source_disk_type_name") or "").strip() or None,
                 "controller_type": str(disk_entry.get("controller_type") or discovered_payload.get("bus") or "scsi").strip() or None,
                 "datastore_path": effective_path,
@@ -9897,6 +9899,20 @@ _THIN_SOURCE_DISK_TYPES = {"vmfs_thin", "vmfs_sparse", "monolithic_sparse", "spl
 _WHOLE_DISK_BACKUP_MODES = {"full", "incremental-full-fallback"}
 
 
+def _restore_disk_host_bytes(artifact_disks: list[Any], disk_entry: dict[str, Any]) -> int | None:
+    slot = str(disk_entry.get("slot") or disk_entry.get("disk_label") or "").strip()
+    recorded = [
+        disk
+        for disk in artifact_disks
+        if isinstance(disk, dict) and slot and str(disk.get("slot") or disk.get("disk_label") or "").strip() == slot
+    ]
+    for disk in (*recorded, disk_entry):
+        allocated = _safe_int(disk.get("allocated_bytes"))
+        if allocated:
+            return allocated
+    return None
+
+
 def _restore_disk_used_bytes(manifest: dict[str, Any], disk_entry: dict[str, Any]) -> int | None:
     store_mode = str(disk_entry.get("store_mode") or "").strip().lower()
     backup_mode = str(manifest.get("backup_mode") or "").strip().lower()
@@ -9941,11 +9957,13 @@ def _ensure_restore_target_capacity(
     """
     requirements: list[int | None] = []
     thin_target = False
+    host_measured = False
     for disk in disks:
         if not isinstance(disk, dict):
             continue
         if _restore_disk_target_is_thin(disk, disk_provisioning):
             thin_target = True
+            host_measured = host_measured or bool(disk.get("used_bytes_on_host"))
             requirements.append(_safe_int(disk.get("used_bytes")))
         else:
             requirements.append(_safe_int(disk.get("capacity_bytes")))
@@ -9961,7 +9979,10 @@ def _ensure_restore_target_capacity(
         f"Datastore '{datastore.get('name')}' does not have enough free space for the disks that land on it: "
         f"{_gib(required_total)} required, {_gib(free_bytes)} free"
         + (
-            " — thin-provisioned disks are measured by the data the backup holds, "
+            " — a dynamic disk is measured by what it took on the host when the backup was made, "
+            "not by its provisioned size"
+            if host_measured
+            else " — thin-provisioned disks are measured by the data the backup holds, "
             "not by their provisioned size"
             if thin_target
             else ""

@@ -1146,6 +1146,8 @@ class AbrV41EngineTests(unittest.TestCase):
         disk_type_name: str | None = None,
         logical_bytes: int | None = None,
         backup_mode: str = "full",
+        allocated_bytes: int | None = None,
+        artifact_allocated_bytes: int | None = None,
     ) -> tuple[dict, str]:
         """A vCenter inventory with a host/datastore matching a backup's
         manifest (source_host=esx-01.local, disk on [tstds]) — the shared
@@ -1198,11 +1200,17 @@ class AbrV41EngineTests(unittest.TestCase):
                             "datastore_path": "[tstds] tstvm/tstvm.vmdk",
                             **({"source_disk_type_name": disk_type_name} if disk_type_name else {}),
                             **({"logical_bytes": logical_bytes} if logical_bytes is not None else {}),
+                            **({"allocated_bytes": allocated_bytes} if allocated_bytes is not None else {}),
                         }
                     ],
                 },
                 handle,
             )
+        artifact_disks = (
+            {"disks": [{"disk_label": "Hard disk 1", "allocated_bytes": artifact_allocated_bytes}]}
+            if artifact_allocated_bytes is not None
+            else {}
+        )
         point_id = f"p-ip-{len(BACKUPS)}"
         BACKUPS[point_id] = abr_v41.normalize_backup_point(
             {
@@ -1216,7 +1224,7 @@ class AbrV41EngineTests(unittest.TestCase):
                 "repository_name": "Repo",
                 "execution_type": "ActiveFull",
                 "status": "available",
-                "artifact": {"manifest_path": manifest_path, "backup_root": tmpdir},
+                "artifact": {"manifest_path": manifest_path, "backup_root": tmpdir, **artifact_disks},
                 "placements": [{"repository_id": "repo-1", "repository_name": "Repo", "manifest_path": manifest_path, "backup_root": tmpdir}],
             }
         )
@@ -1433,6 +1441,85 @@ class AbrV41EngineTests(unittest.TestCase):
         )
 
         self.assertEqual(session["restore_mode"], "new_vm")
+
+    def _start_new_vm(self, point_id: str) -> dict:
+        return abr_v41.restore_start({"restore_point_id": point_id, "restore_mode": "new_vm", "target_vm_name": "restoredtstvm"})
+
+    def test_a_dynamic_disk_is_measured_by_what_it_took_on_the_host_not_by_its_data(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=20 * 1024**2, disk_type_name="dynamic", logical_bytes=4 * 1024**2, allocated_bytes=36 * 1024**2
+        )
+
+        with self.assertRaises(ApiError) as ctx:
+            self._start_new_vm(point_id)
+
+        self.assertEqual(ctx.exception.code, "insufficient_datastore_space")
+        self.assertEqual(ctx.exception.details["required_bytes"], 36 * 1024**2)
+        self.assertIn("what it took on the host when the backup was made", ctx.exception.message)
+        self.assertEqual(TASKS, {})
+
+    def test_a_dynamic_disk_with_room_for_what_it_took_on_the_host_starts(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=60 * 1024**2, disk_type_name="dynamic", logical_bytes=4 * 1024**2, allocated_bytes=36 * 1024**2
+        )
+
+        self.assertEqual(self._start_new_vm(point_id)["restore_mode"], "new_vm")
+
+    def test_the_context_gives_what_the_disk_took_on_the_host_as_its_used_bytes(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            disk_type_name="dynamic", logical_bytes=4 * 1024**2, allocated_bytes=36 * 1024**2
+        )
+
+        disk = abr_v41.get_restore_context(point_id)["source_vm"]["disks"][0]
+
+        self.assertEqual((disk["used_bytes"], disk["used_bytes_on_host"]), (36 * 1024**2, True))
+
+    def test_the_size_the_point_itself_carries_wins_over_the_manifest(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=20 * 1024**2,
+            disk_type_name="dynamic",
+            logical_bytes=4 * 1024**2,
+            artifact_allocated_bytes=36 * 1024**2,
+        )
+
+        with self.assertRaises(ApiError) as ctx:
+            self._start_new_vm(point_id)
+
+        self.assertEqual(ctx.exception.details["required_bytes"], 36 * 1024**2)
+
+    def test_a_point_that_recorded_no_host_size_is_still_measured_by_its_data(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=20 * 1024**2, disk_type_name="dynamic", logical_bytes=4 * 1024**2
+        )
+
+        disk = abr_v41.get_restore_context(point_id)["source_vm"]["disks"][0]
+
+        self.assertEqual((disk["used_bytes"], disk["used_bytes_on_host"]), (4 * 1024**2, False))
+        self.assertEqual(self._start_new_vm(point_id)["restore_mode"], "new_vm")
+
+    def test_a_fixed_disk_still_needs_its_capacity_whatever_it_took_on_the_host(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=10_000_000_000, disk_type_name="fixed", logical_bytes=4 * 1024**2, allocated_bytes=36 * 1024**2
+        )
+
+        with self.assertRaises(ApiError) as ctx:
+            self._start_new_vm(point_id)
+
+        self.assertEqual(ctx.exception.details["required_bytes"], 40 * 1024**3)
+
+    def test_an_incremental_point_that_recorded_its_host_size_is_checked_too(self) -> None:
+        _inventory, point_id = self._register_in_place_fixture(
+            free_bytes=20 * 1024**2,
+            disk_type_name="dynamic",
+            logical_bytes=40_000,
+            backup_mode="incremental",
+            allocated_bytes=36 * 1024**2,
+        )
+
+        with self.assertRaises(ApiError) as ctx:
+            self._start_new_vm(point_id)
+
+        self.assertEqual(ctx.exception.details["required_bytes"], 36 * 1024**2)
 
     def test_inventory_test_success_persists_available_status(self) -> None:
         inventory = abr_v41.create_inventory_record(

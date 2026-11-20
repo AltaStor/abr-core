@@ -228,7 +228,10 @@ at a later backup of it, else what the source VM's disk takes now (asked of the
 source VM's own inventory when the restore goes to another one, for up to
 `ALTASTOR_HYPERV_SOURCE_SIZE_SECONDS`), and only without any of these the data
 of the chain's backups, at most the disk's capacity. The session log names, per
-disk, how much it needs and where that figure comes from. A VM that had a virtual TPM gets a new one, so secrets sealed to the
+disk, how much it needs and where that figure comes from. For a backup that
+recorded what its disks took on the host, `abr restore context` gives that figure
+as the disk's `used_bytes`, and `abr restore start` refuses a target storage
+location with less free space at its last scan before the session starts. A VM that had a virtual TPM gets a new one, so secrets sealed to the
 old TPM (BitLocker keys, for one) need their recovery keys; the session warns
 about it.
 
