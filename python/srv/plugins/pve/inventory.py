@@ -16,7 +16,7 @@ from typing import Any, Mapping
 from ...core.mongo_db_wrapper import HYPERVISORS, catalog_records
 from .pve import PLATFORM, PveError, PveNode, access_from_record
 from .pve_api import PveApiError, PveAuthError, PveCertificateError, PvePermissionError, PveUnreachableError
-from .setup import PveSetupError, package_path, set_up_cluster, tear_down, token_name
+from .setup import PveSetupError, cluster_view, package_path, set_up_cluster, tear_down, token_name
 from .ssh import NodeShell, SshAuthError, SshError, SshHostKeyError, SshUnreachableError
 
 logger = logging.getLogger(__name__)
@@ -177,6 +177,53 @@ def test_connection(record: Mapping[str, Any]) -> dict[str, Any]:
     except (SshError, PveApiError, PveError) as exc:
         raise _registration_error(exc, address) from exc
     return identity
+
+
+def refresh_access(record: dict[str, Any]) -> list[str]:
+    """Brings the inventory's nodes and API certificates up to date, read over SSH from the first node AltaStor has
+    pinned that answers: a node that joined gets its address and host keys, a node that left goes, and renewed
+    certificates replace the old ones. No password is needed. Changes the record's metadata in place, for the caller
+    to save; returns what changed."""
+    access = access_from_record(record)
+    failures = []
+    for node in access.nodes:
+        address = str(node.get("address") or node.get("name"))
+        try:
+            with NodeShell(
+                address,
+                port=access.ssh_port,
+                private_key=access.ssh_key,
+                host_keys=[str(key) for key in node.get("host_keys") or []],
+            ) as shell:
+                nodes, certificates = cluster_view(shell, access.nodes)
+            break
+        except (SshError, PveSetupError, ValueError) as exc:
+            failures.append(f"{node.get('name')}: {exc}")
+    else:
+        raise PveError("No node of the cluster could tell its nodes and certificates: " + "; ".join(failures))
+
+    known = {str(node.get("name")): node for node in access.nodes}
+    current = {node["name"]: node for node in nodes}
+    changes = [f"node {name} at {node['address']} joined" for name, node in current.items() if name not in known]
+    changes += [f"node {name} left" for name in known if name not in current]
+    changes += [
+        f"node {name} has a new address, {node['address']}"
+        for name, node in current.items()
+        if name in known and known[name].get("address") and known[name].get("address") != node["address"]
+    ]
+    changes += [
+        f"node {name} has new SSH host keys"
+        for name, node in current.items()
+        if name in known and node["host_keys"] != list(known[name].get("host_keys") or [])
+    ]
+    if certificates != access.certificates:
+        changes.append("the API certificates changed")
+    if changes:
+        metadata = dict(_metadata(record))
+        metadata["pve"] = {**(metadata.get("pve") or {}), "nodes": nodes, "certificates": certificates}
+        record["metadata"] = metadata
+        logger.info("Proxmox VE inventory %s: %s", record.get("name"), "; ".join(changes))
+    return changes
 
 
 def release(record: Mapping[str, Any]) -> list[str]:

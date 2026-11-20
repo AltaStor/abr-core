@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import patch
 
+from python.srv.core import mongo_db_wrapper
 from python.srv.core.mongo_db_wrapper import HYPERVISORS, RESOURCES_BY_HV
 from python.srv.plugins import build_hypervisor_plugin
 from python.srv.plugins.pve import inventory as pve_inventory
@@ -206,6 +208,108 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(node.access.api_addresses, ["pve1.example.com", "pve2.example.com"])
 
 
+MEMBERS = {
+    "nodename": "node1",
+    "cluster": {"name": "cluster1", "nodes": 3, "quorate": 1},
+    "nodelist": {
+        "node1": {"id": 1, "online": 1, "ip": "pve1.example.com"},
+        "node2": {"id": 2, "online": 1, "ip": "pve2.example.com"},
+        "node3": {"id": 3, "online": 1, "ip": "pve3.example.com"},
+    },
+}
+
+
+class ClusterShell:
+    """A node's /etc/pve as seen over SSH; refuses connections to the addresses given."""
+
+    files: dict[str, str] = {}
+    unreachable: set[str] = set()
+    reached: list[str] = []
+
+    def __init__(self, address, **options):
+        self.address = address
+        self.options = options
+
+    def __enter__(self):
+        ClusterShell.reached.append(self.address)
+        if self.address in self.unreachable:
+            raise SshError(f"SSH to {self.address}:22 cannot be reached")
+        return self
+
+    def __exit__(self, *exc_info):
+        pass
+
+    def read_file(self, path):
+        text = self.files.get(path)
+        return None if text is None else text.encode()
+
+
+def _cluster_files(**changes) -> dict[str, str]:
+    files = {
+        "/etc/pve/.members": json.dumps(MEMBERS),
+        "/etc/pve/pve-root-ca.pem": "CA",
+        "/etc/pve/nodes/node1/ssh_known_hosts": "node1 ssh-ed25519 AAAA1\n",
+        "/etc/pve/nodes/node2/ssh_known_hosts": "node2 ssh-ed25519 AAAA2\n",
+        "/etc/pve/nodes/node3/ssh_known_hosts": "node3 ssh-rsa BBBB3\n",
+    }
+    files.update(changes)
+    return files
+
+
+class AccessRefreshTests(unittest.TestCase):
+    def record(self) -> dict:
+        setup = _setup()
+        return {
+            "id": "inv-1",
+            "name": "PVE-Cluster",
+            "kind": "proxmox-ve",
+            "metadata": {"host": "pve1.example.com", "token": setup["token"], "pve": setup["pve"]},
+        }
+
+    def refresh(self, record: dict, files: dict[str, str], unreachable=()) -> list[str]:
+        ClusterShell.files, ClusterShell.unreachable, ClusterShell.reached = files, set(unreachable), []
+        with patch.object(pve_inventory, "NodeShell", ClusterShell):
+            return pve_inventory.refresh_access(record)
+
+    def test_a_node_that_joined_is_added_with_the_keys_the_cluster_lists_for_it(self):
+        record = self.record()
+        changes = self.refresh(record, _cluster_files())
+        self.assertEqual(changes, ["node node3 at pve3.example.com joined"])
+        nodes = record["metadata"]["pve"]["nodes"]
+        self.assertEqual(nodes[2], {"name": "node3", "address": "pve3.example.com", "host_keys": ["ssh-rsa BBBB3"]})
+        self.assertEqual(nodes[0]["host_keys"], ["ssh-ed25519 AAAA1"])
+        self.assertEqual(record["metadata"]["pve"]["token_id"], "abr@pve!altastor-x")
+
+    def test_a_cluster_that_did_not_change_leaves_the_record_as_it_is(self):
+        record = self.record()
+        before = json.loads(json.dumps(record))
+        two = {**MEMBERS, "nodelist": dict(list(MEMBERS["nodelist"].items())[:2])}
+        changes = self.refresh(record, _cluster_files(**{"/etc/pve/.members": json.dumps(two)}))
+        self.assertEqual((changes, record), ([], before))
+
+    def test_renewed_certificates_and_a_node_that_left_are_taken_in(self):
+        record = self.record()
+        one = {**MEMBERS, "nodelist": {"node1": MEMBERS["nodelist"]["node1"]}}
+        files = _cluster_files(
+            **{"/etc/pve/.members": json.dumps(one), "/etc/pve/nodes/node1/pveproxy-ssl.pem": "OWN"}
+        )
+        changes = self.refresh(record, files)
+        self.assertEqual(changes, ["node node2 left", "the API certificates changed"])
+        self.assertEqual(record["metadata"]["pve"]["certificates"], ["CA", "OWN"])
+        self.assertEqual([node["name"] for node in record["metadata"]["pve"]["nodes"]], ["node1"])
+
+    def test_the_next_pinned_node_answers_when_the_first_does_not(self):
+        record = self.record()
+        self.refresh(record, _cluster_files(), unreachable={"pve1.example.com"})
+        self.assertEqual(ClusterShell.reached, ["pve1.example.com", "pve2.example.com"])
+
+    def test_no_node_answering_says_so(self):
+        ClusterShell.files, ClusterShell.unreachable = _cluster_files(), {"pve1.example.com", "pve2.example.com"}
+        with patch.object(pve_inventory, "NodeShell", ClusterShell):
+            with self.assertRaisesRegex(Exception, "No node of the cluster could tell its nodes and certificates"):
+                pve_inventory.refresh_access(self.record())
+
+
 class FakeNode:
     cluster_name = "cluster1"
 
@@ -310,6 +414,25 @@ class DiscoveryTests(unittest.TestCase):
         found = self.resources(FakeNode(config_read=False))
         self.assertIn(("disk", "9002:scsi0"), found)
         self.assertNotIn(("disk", "9100:scsi0"), found)
+
+    def test_discovery_saves_nodes_and_certificates_the_cluster_changed_first(self):
+        def refresh(record):
+            record["metadata"] = {**record["metadata"], "pve": {"nodes": ["three"]}}
+            return ["node node3 at pve3.example.com joined"]
+
+        record = dict(self.RECORD)
+        with patch.object(pve_inventory, "refresh_access", refresh), patch.object(
+            mongo_db_wrapper, "update_hypervisor_fields"
+        ) as saved, patch.object(PveNode, "from_record", return_value=FakeNode()):
+            discovery.build_pve_resources(record)
+        saved.assert_called_once_with("inv-1", {"metadata": {"host": "pve1.example.com", "pve": {"nodes": ["three"]}}})
+
+    def test_discovery_goes_on_when_the_nodes_cannot_be_read_over_ssh(self):
+        with patch.object(pve_inventory, "refresh_access", side_effect=SshError("unreachable")):
+            with self.assertLogs("python.srv.services.discovery", "WARNING") as logged:
+                found = self.resources(FakeNode())
+        self.assertIn(("virtual_machine", "9002"), found)
+        self.assertIn("could not read its nodes and certificates over SSH: unreachable", logged.output[0])
 
     def test_the_inventory_provider_rescans_through_this_discovery(self):
         provider = inventory_management.InventoryProviderRegistry.resolve({"type": "proxmox-ve"})

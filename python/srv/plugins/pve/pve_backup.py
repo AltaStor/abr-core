@@ -251,6 +251,12 @@ def disk_bitmaps(disks: list[dict[str, Any]], previous: dict[str, Any] | None, i
 # ---- the run file --------------------------------------------------------------------------------------------------
 
 
+def disk_bandwidth(limit: int, parallel: int, disks: int) -> int:
+    """The provider limits each disk, so a backup's limit is split among the disks it reads at a time; at least
+    1 MiB/s each."""
+    return max(limit // max(min(parallel, disks), 1), 1)
+
+
 def build_run_file(
     *,
     run_id: str,
@@ -264,13 +270,14 @@ def build_run_file(
     compression: int,
     immutability: dict[str, Any] | None,
     now: datetime,
+    bandwidth_limit: int | None = None,
 ) -> dict[str, Any]:
-    options: dict[str, Any] = {
-        "compression": int(compression),
-        "parallel_disks": env_int("ALTASTOR_PVE_PARALLEL_DISKS"),
-    }
+    parallel = env_int("ALTASTOR_PVE_PARALLEL_DISKS")
+    options: dict[str, Any] = {"compression": int(compression), "parallel_disks": parallel}
     if immutability:
         options["immutability"] = immutability
+    if bandwidth_limit:
+        options["bwlimit"] = disk_bandwidth(int(bandwidth_limit), parallel, len(disks))
     stamp = "%Y-%m-%dT%H:%M:%SZ"
     return {
         "format": "abr-pve-run",
@@ -1197,6 +1204,7 @@ def _start(
         compression=compression_level,
         immutability=immutability_option(repository),
         now=datetime.now(timezone.utc),
+        bandwidth_limit=parameters.get("pve_bandwidth_limit"),
     )
     shell.make_directory(RUN_FOLDER, mode=0o700)
     _remove_run_files(shell, vmid)
@@ -1217,7 +1225,13 @@ def _start(
     _record_run(
         progress_callback, {"upid": upid, "node": node, "vmid": vmid, "run_id": task_id, "started_at": utc_now()}
     )
-    emit("transfer", 15, f"Started vzdump task {upid} on node {node}, with fleecing images on {fleecing}")
+    limit = run["options"].get("bwlimit")
+    emit(
+        "transfer",
+        15,
+        f"Started vzdump task {upid} on node {node}, with fleecing images on {fleecing}"
+        + (f", reading at most {limit} MiB/s per disk" if limit else ""),
+    )
     return upid, task_id
 
 

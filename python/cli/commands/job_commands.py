@@ -89,6 +89,16 @@ def _backup_copy_rows(view: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bandwidth_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a whole number of MiB/s") from None
+    if limit < 0:
+        raise argparse.ArgumentTypeError("the bandwidth limit cannot be negative")
+    return limit
+
+
 REPLICATION_HIDDEN_KEYS = frozenset(
     {
         "storage_layout",
@@ -525,6 +535,15 @@ class JobCommands:
                     "Proxmox VE only: a stopped VM that has not run since its previous backup. skip records a "
                     "restore point without changes instead of reading its disks (default); full backs it up with "
                     "vzdump every time, which reads a stopped VM's disks in full"
+                ),
+            )
+            parser.add_argument(
+                "--bandwidth-limit",
+                type=_bandwidth_limit,
+                metavar="MIB",
+                help=(
+                    "Proxmox VE only: the most a backup reads in MiB/s, split evenly among the disks backed up at a "
+                    "time; 0 removes the limit"
                 ),
             )
         if include_policy_flags:

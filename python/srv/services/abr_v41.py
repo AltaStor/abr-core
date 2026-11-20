@@ -4666,6 +4666,9 @@ def _record_encryption_key(keys: list[dict[str, Any]], key: str) -> tuple[list[d
     return [*keys, {"key_id": next_id, "key": key}], next_id
 
 
+# A Proxmox VE backup's bandwidth limit, in MiB/s: 0 is none, and 1 TiB/s is beyond any link.
+MAX_BANDWIDTH_LIMIT_MIB = 1 << 20
+
 TASK_PARAMETER_CHOICES = {
     "hyperv_consistency": ("application", "crash"),
     "pve_unchanged_stopped_vm": ("skip", "full"),
@@ -4694,6 +4697,16 @@ def _validate_task_parameters(params: dict[str, Any], previous: dict[str, Any] |
             "task_parameters.compression_level must be an integer between 0 and 9",
         )
         result["compression_level"] = level
+    if result.get("pve_bandwidth_limit") is not None:
+        limit = _whole_number(result["pve_bandwidth_limit"])
+        _ensure(
+            limit is not None and 0 <= limit <= MAX_BANDWIDTH_LIMIT_MIB,
+            422,
+            "invalid_job",
+            "task_parameters.pve_bandwidth_limit must be a whole number of MiB/s between 0 and "
+            f"{MAX_BANDWIDTH_LIMIT_MIB}",
+        )
+        result["pve_bandwidth_limit"] = limit or None
 
     if "vsphere_transport" in result:
         try:

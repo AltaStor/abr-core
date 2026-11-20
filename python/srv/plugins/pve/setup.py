@@ -322,6 +322,34 @@ def _ensure_storage(shell: NodeShell) -> list[str]:
     return changes
 
 
+def cluster_view(shell: NodeShell, known: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """The cluster's nodes, with their addresses and SSH host keys, and the API certificates to trust, as the node at
+    the other end tells them from /etc/pve.
+
+    /etc/pve is the cluster's shared file system, so a node AltaStor has pinned vouches for what it says of the others.
+    A node AltaStor knows keeps its pinned keys, with any the cluster lists for it added.
+    """
+    members = json.loads((shell.read_file("/etc/pve/.members") or b"{}").decode() or "{}")
+    nodelist = members.get("nodelist") if isinstance(members.get("nodelist"), dict) else {}
+    pinned = {str(node.get("name")): node for node in known}
+    nodes = []
+    for name in sorted(nodelist) or sorted(pinned):
+        entry = nodelist.get(name) if isinstance(nodelist.get(name), dict) else {}
+        keys = [str(key) for key in pinned.get(name, {}).get("host_keys") or []]
+        listed = known_host_keys((shell.read_file(f"/etc/pve/nodes/{name}/ssh_known_hosts") or b"").decode())
+        keys += [key for key in listed if key not in keys]
+        address = str(entry.get("ip") or pinned.get(name, {}).get("address") or name)
+        nodes.append({"name": name, "address": address, "host_keys": keys})
+    certificates = [(shell.read_file("/etc/pve/pve-root-ca.pem") or b"").decode()]
+    if not certificates[0].strip():
+        raise PveSetupError(f"{shell.address} has no cluster root CA in /etc/pve/pve-root-ca.pem")
+    for node in nodes:
+        own = (shell.read_file(f"/etc/pve/nodes/{node['name']}/pveproxy-ssl.pem") or b"").decode()
+        if own.strip():
+            certificates.append(own)
+    return nodes, certificates
+
+
 def _pinned_keys(shell: NodeShell, presented: str, extra: Sequence[str] = ()) -> list[str]:
     """Every host key the node has; the key it presented must be one of them."""
     keys = known_host_keys(shell.run("cat /etc/ssh/ssh_host_*_key.pub", check=False).text)

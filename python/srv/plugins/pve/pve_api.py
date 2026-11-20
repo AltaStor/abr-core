@@ -228,7 +228,8 @@ class PveApi:
         if refused:
             return PveCertificateError(
                 f"The TLS certificate of the PVE API at {', '.join(refused)} is not the one AltaStor trusts for this "
-                "cluster. If the node's certificate was renewed or replaced, AltaStor reads it again over SSH",
+                "cluster. If the node's certificate was renewed or replaced, run inventory rescan, which reads it "
+                "again over SSH",
                 path=path,
             )
         detail = "; ".join(f"{address}: {exc}" for address, exc in failures)

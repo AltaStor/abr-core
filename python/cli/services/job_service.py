@@ -115,6 +115,9 @@ class JobService:
         unchanged_stopped_vm = getattr(args, "unchanged_stopped_vm", None)
         if unchanged_stopped_vm is not None:
             updates["pve_unchanged_stopped_vm"] = str(unchanged_stopped_vm)
+        bandwidth_limit = getattr(args, "bandwidth_limit", None)
+        if bandwidth_limit is not None:
+            updates["pve_bandwidth_limit"] = int(bandwidth_limit)
         on_quiesce_failure = getattr(args, "on_quiesce_failure", None)
         if on_quiesce_failure is not None:
             updates["on_quiesce_failure"] = str(on_quiesce_failure).replace("-", "_")
@@ -511,6 +514,7 @@ class JobService:
         ("vsphere_transport", "--transport"),
         ("guest_consistency", "--guest-consistency"),
         ("unchanged_stopped_vm", "--unchanged-stopped-vm"),
+        ("bandwidth_limit", "--bandwidth-limit"),
     )
 
     @staticmethod

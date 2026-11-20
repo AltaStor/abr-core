@@ -953,6 +953,59 @@ class JobOptionTests(unittest.TestCase):
         self.assertIn("task_parameters.pve_unchanged_stopped_vm must be one of: skip, full", raised.exception.message)
 
 
+class BandwidthTests(unittest.TestCase):
+    def test_the_limit_is_split_among_the_disks_read_at_a_time(self):
+        self.assertEqual(pve_backup.disk_bandwidth(100, 4, 3), 33)
+        self.assertEqual(pve_backup.disk_bandwidth(100, 4, 8), 25)
+        self.assertEqual(pve_backup.disk_bandwidth(100, 4, 1), 100)
+        self.assertEqual(pve_backup.disk_bandwidth(2, 4, 8), 1)
+
+    def test_the_run_file_carries_each_disks_share_only_with_a_limit(self):
+        common = dict(
+            run_id="t",
+            task_user="abr@pve!a",
+            storage="abr",
+            vmid="9002",
+            repository={},
+            secrets={},
+            disks=_disks(),
+            bitmaps={disk["drive"]: "new" for disk in _disks()},
+            compression=3,
+            immutability=None,
+            now=datetime(2026, 11, 20, tzinfo=timezone.utc),
+        )
+        with patch.dict("os.environ", ENV):
+            limited = build_run_file(**common, bandwidth_limit=90)
+            free = build_run_file(**common)
+        self.assertEqual(limited["options"]["bwlimit"], 30)
+        self.assertNotIn("bwlimit", free["options"])
+
+    def test_the_job_option_takes_whole_mib_per_second_and_0_removes_it(self):
+        from python.srv.services import abr_v41
+
+        self.assertEqual(abr_v41._validate_task_parameters({"pve_bandwidth_limit": 200})["pve_bandwidth_limit"], 200)
+        self.assertIsNone(abr_v41._validate_task_parameters({"pve_bandwidth_limit": 0})["pve_bandwidth_limit"])
+        for wrong in (-1, "fast", 1.5):
+            with self.subTest(wrong=wrong), self.assertRaises(abr_v41.ApiError) as raised:
+                abr_v41._validate_task_parameters({"pve_bandwidth_limit": wrong})
+            self.assertIn("pve_bandwidth_limit must be a whole number of MiB/s", raised.exception.message)
+
+
+class BandwidthOptionCliTests(unittest.TestCase):
+    def test_job_edit_takes_the_limit_and_refuses_a_negative_one(self):
+        import contextlib
+        import io
+
+        from python.cli.parsing.parser_builder import build_parser
+        from python.cli.services.job_service import JobService
+
+        args = build_parser().parse_args(["job", "edit", "--name", "PVE-9002", "--bandwidth-limit", "120"])
+        self.assertEqual(JobService._build_task_parameter_updates(args)["pve_bandwidth_limit"], 120)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as error:
+            build_parser().parse_args(["job", "edit", "--name", "PVE-9002", "--bandwidth-limit", "-5"])
+        self.assertIn("the bandwidth limit cannot be negative", error.getvalue())
+
+
 class InterruptedSessionTests(unittest.TestCase):
     def test_a_session_following_a_vzdump_task_runs_again_and_others_fail(self):
         records = {

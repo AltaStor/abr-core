@@ -100,6 +100,8 @@ VDDK, or a vCenter or Hyper-V endpoint.
   after a server loss.
 - [Hyper-V backup and recovery](doc/HyperVBackup.md) - what Hyper-V backup and
   recovery need from the host, how they run, and what to check when they fail.
+- [Proxmox VE backup and recovery](doc/ProxmoxBackup.md) - what Proxmox VE backup
+  and recovery need from the cluster, how they run, and what to check when they fail.
 - [Roles, permissions and the audit log](doc/RBAC.md) - the built-in roles,
   the permission matrix, how requests are authorized, and the audit log.
 - [Notifications](doc/Notifications.md) - the notification service, its

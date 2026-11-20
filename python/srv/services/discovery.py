@@ -439,10 +439,20 @@ def build_hyperv_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def build_pve_resources(hv: dict[str, Any]) -> list[dict[str, Any]]:
+    from ..core.mongo_db_wrapper import update_hypervisor_fields
+    from ..plugins.pve.inventory import refresh_access
     from ..plugins.pve.pve import PveNode
 
     started = time.monotonic()
     discovery_logger.info("Proxmox VE discovery of inventory %s started", hv.get("name"))
+    # Nodes that joined and renewed API certificates, read over SSH before the API is used.
+    try:
+        if refresh_access(hv):
+            update_hypervisor_fields(str(hv["id"]), {"metadata": hv["metadata"]})
+    except Exception as exc:
+        discovery_logger.warning(
+            "Proxmox VE inventory %s: could not read its nodes and certificates over SSH: %s", hv.get("name"), exc
+        )
     try:
         with PveNode.from_record(hv) as node:
             hosts = node.list_hosts()

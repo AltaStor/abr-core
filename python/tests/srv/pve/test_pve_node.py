@@ -132,8 +132,8 @@ class AccessTests(unittest.TestCase):
         self.assertEqual(access.api_addresses, ["pve1.example.com", "pve2.example.com"])
         self.assertEqual(access.node("NODE2")["address"], "pve2.example.com")
 
-    def test_a_node_abr_core_has_not_set_up_is_named_in_the_error(self):
-        with self.assertRaisesRegex(PveError, "Node node3 is not one AltaStor has set up"):
+    def test_a_node_abr_core_does_not_know_is_named_with_the_rescan_that_adds_it(self):
+        with self.assertRaisesRegex(PveError, "Node node3 is not one AltaStor knows.*run inventory rescan"):
             access_from_record(_record()).node("node3")
 
     def test_an_inventory_without_token_or_key_has_to_be_set_up_again(self):

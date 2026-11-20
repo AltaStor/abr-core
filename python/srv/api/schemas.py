@@ -95,6 +95,11 @@ class TaskParametersDTO(_LenientModel):
         description="Proxmox VE backup jobs: skip (or omitted) records a restore point without changes for a stopped "
         "VM that has not run since its previous backup; full backs it up with vzdump every time",
     )
+    pve_bandwidth_limit: DocInt = Field(
+        default=None,
+        description="Proxmox VE backup jobs: the most a backup reads in MiB/s, split evenly among the disks backed up "
+        "at a time; omitted or 0 for no limit",
+    )
 
 
 class ExecutionChoiceDTO(_LenientModel):

@@ -254,8 +254,8 @@ class PveAccess:
             if str(node.get("name") or "").lower() == str(name or "").lower():
                 return node
         raise PveError(
-            f"Node {name} is not one AltaStor has set up in this cluster. If it joined the cluster since, run "
-            "inventory rescan; a node AltaStor has not seen yet needs inventory edit with the root password"
+            f"Node {name} is not one AltaStor knows in this cluster. If it joined the cluster since, run inventory "
+            "rescan, which reads its address and host keys from the cluster"
         )
 
 
