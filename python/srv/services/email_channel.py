@@ -260,7 +260,7 @@ def _oauth_endpoint(oauth: dict[str, Any]) -> tuple[str, str]:
     return _str(oauth.get("token_url")), _str(oauth.get("scope"))
 
 
-def validate(settings: dict[str, Any], *, require_complete: bool) -> dict[str, str]:
+def validate(settings: dict[str, Any], *, require_complete: bool, require_recipients: bool | None = None) -> dict[str, str]:
     """Problems with `settings`, by field. Values are always checked;
     `require_complete` (notifications switched on, or a test) also asks for
     every setting delivery needs."""
@@ -337,7 +337,7 @@ def validate(settings: dict[str, Any], *, require_complete: bool) -> dict[str, s
         problems["recipients"] = f"Not an e-mail address: {', '.join(bad)}"
     elif len(recipients) > MAX_RECIPIENTS:
         problems["recipients"] = f"At most {MAX_RECIPIENTS} recipients"
-    elif require_complete and not recipients:
+    elif (require_complete if require_recipients is None else require_recipients) and not recipients:
         problems["recipients"] = "Add at least one recipient"
 
     threshold = settings.get("repository_space_threshold_percent")
@@ -392,12 +392,12 @@ def update_settings(patch: dict[str, Any], *, updated_by: str | None) -> tuple[d
         return settings_dto(updated), changed
 
 
-def settings_for_test(patch: dict[str, Any] | None) -> dict[str, Any]:
+def settings_for_test(patch: dict[str, Any] | None, *, require_recipients: bool = True) -> dict[str, Any]:
     """The stored settings with unsaved changes from the form laid over them,
     complete enough to send, or 422 with what is missing."""
     problems: dict[str, str] = {}
     candidate = _apply_patch(load_settings(), patch or {}, problems)
-    problems.update(validate(candidate, require_complete=True))
+    problems.update(validate(candidate, require_complete=True, require_recipients=require_recipients))
     if problems:
         raise _refuse(problems)
     return candidate

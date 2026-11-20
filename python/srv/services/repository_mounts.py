@@ -316,6 +316,28 @@ def apply_change(before: dict[str, Any], after: dict[str, Any]) -> None:
         _note(str(after.get("id") or ""), None)
 
 
+def revert_change(before: dict[str, Any], after: dict[str, Any]) -> None:
+    if not is_managed(after) or _mount_fields(before) == _mount_fields(after):
+        return
+    record_id = str(before.get("id") or "")
+    with LOCK:
+        try:
+            if current_mount(after) is not None:
+                unmount(after)
+            mount(before)
+        except ApiError as exc:
+            _note(record_id, exc.message)
+            logger.warning(
+                "The edit of repository %s was refused, and its share could not be mounted again with its old settings: %s",
+                before.get("name"),
+                exc.message,
+            )
+            if exc.code != "repository_share_busy":
+                mount_in_background()
+            return
+        _note(record_id, None)
+
+
 def remove(record: dict[str, Any]) -> None:
     if not is_managed(record):
         return

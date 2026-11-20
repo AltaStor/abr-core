@@ -586,6 +586,42 @@ class CopyTriggerTests(_Catalog):
         backup_copy.on_session_finished(self._finished_backup())
         self.assertEqual([task["trigger"] for task in self._copy_sessions(job["id"])], ["after-job"])
 
+    def test_an_up_to_date_copy_still_runs_after_its_job_whatever_the_run_ended_with(self) -> None:
+        for status in ("stopped", "failed", "completed"):
+            with self.subTest(status=status):
+                TASKS.clear()
+                for point_id in [key for key in BACKUPS if key != "f1"]:
+                    del BACKUPS[point_id]
+                for job_id in [key for key in JOBS if key != "nightly"]:
+                    del JOBS[job_id]
+                self.copy = self._copy_job(run_after_job="Nightly")
+                self._copied("c1", "f1")
+
+                backup_copy.on_session_finished(self._finished_backup(status=status, result={}))
+
+                [session] = self._copy_sessions(self.copy["id"])
+                self.assertEqual((session["trigger"], session["resource_external_id"]), ("after-job", VM))
+                self.assertEqual(
+                    backup_copy.run_backup_copy(session)["message"],
+                    "Nothing new to copy for sql-01: the newest restore point of job Nightly is already in Offsite",
+                )
+                self.assertEqual(len([point for point in BACKUPS.values() if point["job_id"] == self.copy["id"]]), 1)
+
+    def test_a_disabled_copy_does_not_run_after_its_job(self) -> None:
+        job = self._copy_job(run_after_job="Nightly", enabled=False)
+
+        backup_copy.on_session_finished(self._finished_backup(status="stopped", result={}))
+
+        self.assertEqual(self._copy_sessions(job["id"]), [])
+
+    def test_a_copy_that_runs_after_another_job_does_not_start_on_its_sources_run(self) -> None:
+        JOBS["weekly"] = abr_v41.normalize_job_record({**JOBS["nightly"], "id": "weekly", "name": "Weekly"})
+        job = self._copy_job(run_after_job="Weekly")
+
+        backup_copy.on_session_finished(self._finished_backup(status="stopped", result={}))
+
+        self.assertEqual(self._copy_sessions(job["id"]), [])
+
     def test_a_failed_backup_starts_no_immediate_copy(self) -> None:
         job = self._copy_job(copy_mode="immediate")
 

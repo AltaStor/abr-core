@@ -332,9 +332,9 @@ def _removal(device: Any) -> Any:
     return spec
 
 
-def _addition(template: Any, controller_key: int, unit_number: int, path: str) -> Any:
+def _addition(template: Any, controller_key: int, unit_number: int, path: str, key: int) -> Any:
     disk = vim.vm.device.VirtualDisk()
-    disk.key = -100 - unit_number - controller_key
+    disk.key = key
     disk.controllerKey = controller_key
     disk.unitNumber = unit_number
     disk.capacityInKB = 0
@@ -367,7 +367,7 @@ def swap_disks(node: VCenterNode, replica: dict[str, Any], staging: dict[str, An
         return
     templates = {disk["slot"]: disk for disk in staging["disks"]}
     spec_changes = []
-    for change in changes:
+    for position, change in enumerate(changes, start=1):
         old = devices.get(change["slot"])
         if old is not None:
             spec_changes.append(_removal(old))
@@ -378,7 +378,7 @@ def swap_disks(node: VCenterNode, replica: dict[str, Any], staging: dict[str, An
             unit_number = int(old.unitNumber) if old is not None else int(source.get("unit_number") or 0)
             if template is None:
                 template = vim.vm.device.VirtualDisk(backing=vim.vm.device.VirtualDisk.FlatVer2BackingInfo(diskMode="persistent", thinProvisioned=True))
-            spec_changes.append(_addition(template, controller_key, unit_number, change["new_path"]))
+            spec_changes.append(_addition(template, controller_key, unit_number, change["new_path"], -100 - position))
     node._wait_for_task(vm.ReconfigVM_Task(spec=vim.vm.ConfigSpec(deviceChange=spec_changes)))
 
 

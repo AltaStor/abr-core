@@ -438,8 +438,8 @@ class SyntheticFullRunTests(unittest.TestCase):
         return task
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
-    def test_a_copy_jobs_scheduled_merge_of_a_lone_full_has_nothing_to_do(self, copy_mock) -> None:
-        for reason in ("SyntheticFullSchedule", "SyntheticFullWindow"):
+    def test_a_copy_jobs_merge_of_a_lone_full_has_nothing_to_do(self, copy_mock) -> None:
+        for reason in ("SyntheticFullSchedule", "SyntheticFullWindow", "ForceSynthetic"):
             with self.subTest(reason=reason):
                 self.setUp()
                 result = synthetic_full.run_synthetic_full(self._lone_full("backup-copy", reason))
@@ -452,14 +452,20 @@ class SyntheticFullRunTests(unittest.TestCase):
         copy_mock.assert_not_called()
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
-    def test_a_synthetic_full_asked_for_by_hand_still_refuses_a_lone_full(self, copy_mock) -> None:
-        for job_type in ("backup-copy", "backup"):
-            with self.subTest(job_type=job_type):
-                self.setUp()
-                with self.assertRaises(SyntheticFullValidationError) as ctx:
-                    synthetic_full.run_synthetic_full(self._lone_full(job_type, "ForceSynthetic"))
-                self.assertIn("only a full backup with no incrementals", str(ctx.exception))
+    def test_a_backup_jobs_synthetic_full_asked_for_by_hand_still_refuses_a_lone_full(self, copy_mock) -> None:
+        with self.assertRaises(SyntheticFullValidationError) as ctx:
+            synthetic_full.run_synthetic_full(self._lone_full("backup", "ForceSynthetic"))
+
+        self.assertIn("only a full backup with no incrementals", str(ctx.exception))
         copy_mock.assert_not_called()
+
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_copy_jobs_chain_with_increments_is_still_merged_by_hand(self, copy_mock) -> None:
+        JOBS[JOB_ID]["job_type"] = "backup-copy"
+        task = self._task()
+        task["parameters"]["resolved_backup_reason"] = "ForceSynthetic"
+
+        self.assertFalse(synthetic_full._nothing_to_merge(JOBS[JOB_ID], task["parameters"], synthetic_full.resolve_source_chain(JOB_ID, task["resource_external_id"], None)))
 
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_a_backup_jobs_scheduled_merge_of_a_lone_full_still_refuses(self, copy_mock) -> None:

@@ -49,6 +49,7 @@ from python.srv.core.mongo_db_wrapper import (
     persist_job,
     persist_repository,
     persist_task,
+    refuse_unstorable_repository_secrets,
     replace_resources_for_hypervisor,
     restore_catalog,
     snapshot_catalog,
@@ -2785,6 +2786,7 @@ def _create_managed_smb_repository(
     record_id = str(uuid4())
     repository_mounts.mount_arguments(record_id, str(server), str(share), str(username), str(password))
     probe = {"id": record_id, "name": name, "type": "smb", "metadata": {"server": server, "share": share, "username": username, "password": password}}
+    refuse_unstorable_repository_secrets(probe, None)
     repository_mounts.mount(probe)
     try:
         return create_repository_record(
@@ -3093,33 +3095,38 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
                     path=updated.get("path"),
                 )
     _ensure(changed, 422, "invalid_repository", "repo edit requires at least one editable option")
+    refuse_unstorable_repository_secrets(updated, record)
     repository_mounts.apply_change(record, updated)
-    registration_check = None
-    if _repository_connection_identity(updated) != _repository_connection_identity(record):
-        registration_check = _assert_repository_is_usable(
-            updated, create_bucket=bool(payload.get("create_bucket"))
-        )
-        if registration_check is not None:
-            updated["last_verify"] = registration_check
-    if next_s3_config is not None and immutability_is_enabled(next_immutability):
-        mode_changed = previous_immutability.get("mode") != next_immutability.get("mode")
-        connection_changed = registration_check is not None
-        # Only when the answer can have changed. The bucket probe reads the
-        # bucket's own Object Lock configuration -- whether it has one, how
-        # strong it is, what its default rule says -- and none of that depends
-        # on the retention period this repository asks for. Re-reading the
-        # bucket to change "lock for 1 day" into "lock for 5 days" put a
-        # round trip to the object store (and its timeouts) in front of an edit
-        # that only rewrites one integer in the catalog. Turning the lock on,
-        # changing its mode or repointing the repository still probe, and
-        # "Validate" re-runs the whole thing on demand.
-        if mode_changed or connection_changed:
-            _assert_immutability_is_usable(
-                next_s3_config,
-                write_probe=mode_changed or connection_changed,
+    try:
+        registration_check = None
+        if _repository_connection_identity(updated) != _repository_connection_identity(record):
+            registration_check = _assert_repository_is_usable(
+                updated, create_bucket=bool(payload.get("create_bucket"))
             )
-    updated["updated_at"] = utc_now()
-    persist_repository(updated)
+            if registration_check is not None:
+                updated["last_verify"] = registration_check
+        if next_s3_config is not None and immutability_is_enabled(next_immutability):
+            mode_changed = previous_immutability.get("mode") != next_immutability.get("mode")
+            connection_changed = registration_check is not None
+            # Only when the answer can have changed. The bucket probe reads the
+            # bucket's own Object Lock configuration -- whether it has one, how
+            # strong it is, what its default rule says -- and none of that depends
+            # on the retention period this repository asks for. Re-reading the
+            # bucket to change "lock for 1 day" into "lock for 5 days" put a
+            # round trip to the object store (and its timeouts) in front of an edit
+            # that only rewrites one integer in the catalog. Turning the lock on,
+            # changing its mode or repointing the repository still probe, and
+            # "Validate" re-runs the whole thing on demand.
+            if mode_changed or connection_changed:
+                _assert_immutability_is_usable(
+                    next_s3_config,
+                    write_probe=mode_changed or connection_changed,
+                )
+        updated["updated_at"] = utc_now()
+        persist_repository(updated)
+    except BaseException:
+        repository_mounts.revert_change(record, updated)
+        raise
     edited = normalize_repository_record(updated)
     edited["warnings"] = [*edited.get("warnings", []), *((registration_check or {}).get("warnings") or [])]
     if next_immutability is not None:
@@ -4165,7 +4172,11 @@ def _assert_repository_is_usable(
 
 def verify_repository(record_id: str) -> dict[str, Any]:
     repository = _find_by_id(catalog_records(REPOSITORIES), record_id, label="Repository")
-    result = _repository_verification_result(repository)
+    failure = mount_if_managed(repository)
+    if failure:
+        result = {"status": "error", "checks": [{"name": "mounted", "status": "failed"}], "message": failure}
+    else:
+        result = _repository_verification_result(repository)
     stored = _json_clone(repository)
     stored["last_verify"] = _verification_summary(result)
     persist_repository(stored)
@@ -5092,11 +5103,12 @@ def _ensure_full_backup_schedule(job: dict[str, Any]) -> None:
         _has_full_backup_schedule(job.get(schedule_key), job.get(days_key))
         for schedule_key, days_key, _next_run_key in EXECUTION_SCHEDULE_FIELDS
     )
+    kind = "backup copy" if job.get("job_type") == "backup-copy" else "backup"
     _ensure(
         enabled,
         422,
         "invalid_job",
-        "A backup job requires at least one full backup schedule so that retention can free the chain: "
+        f"A {kind} job requires at least one full backup schedule so that retention can free the chain: "
         "set an active full or a synthetic full schedule",
     )
 
@@ -5282,6 +5294,7 @@ def create_backup_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     )
     _ensure_full_backup_schedule(
         {
+            "job_type": "backup-copy",
             "active_full_schedule": active_full_schedule,
             "active_full_days": active_full_days,
             "synthetic_full_schedule": synthetic_full_schedule,

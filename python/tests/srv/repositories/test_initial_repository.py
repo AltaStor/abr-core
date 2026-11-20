@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from cryptography.fernet import Fernet
+
 from python.srv.core import broker_client, credential_encryption
 from python.srv.core.mongo_db_wrapper import REPOSITORIES
 from python.srv.plugins.hyperv import vhdx_tool
@@ -359,11 +361,10 @@ class HyperVHostTests(_InitialRepositoryCase):
         toward.assert_not_called()
 
     def test_a_password_this_appliance_cannot_decrypt_stops_the_run(self) -> None:
+        foreign = credential_encryption.ENCRYPTED_PREFIX + Fernet(Fernet.generate_key()).encrypt(b"other").decode()
+        self._stored()["metadata"]["password"] = foreign
         with patch.object(vhdx_tool, "appliance_address_toward", return_value="10.0.0.5"):
             repository = vhdx_tool.for_hyperv_host(self._stored(), "hv01.lab")
-        credential_encryption.reset_cipher()
-        (self.root / "credentials.key").write_bytes(b"A" * 43 + b"=")
-        credential_encryption.reset_cipher()
 
         with self.assertRaises(vhdx_tool.VhdxToolError) as caught:
             vhdx_tool.storage_invocation(repository, abr_path=str(self.path))

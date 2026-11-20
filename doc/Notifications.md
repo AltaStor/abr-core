@@ -182,7 +182,9 @@ one and an empty text removes it. The audit log masks them.
 Send test e-mail) sends a message now, synchronously, with the stored settings
 and any unsaved changes laid over them; nothing is saved. It goes to the
 configured recipients, or to `to`, a list of addresses (anything else is
-refused with `422 invalid_notification_settings` naming `to`). The answer is `200` with the recipients and
+refused with `422 invalid_notification_settings` naming `to`). With `to` no recipients need to be saved, so
+the server, sign-in and TLS can be tried before a recipient list exists; without it, at least one
+recipient must be configured. The answer is `200` with the recipients and
 how long it took, or `502` naming why it did not go:
 
 | Code | Stage | Meaning |

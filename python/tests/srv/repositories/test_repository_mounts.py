@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from python.srv.core import broker_client, credential_encryption
+from python.srv.core import broker_client, credential_encryption, mongo_db_wrapper
 from python.srv.core.mongo_db_wrapper import (
     BACKUPS,
     HYPERVISORS,
@@ -19,7 +19,7 @@ from python.srv.core.mongo_db_wrapper import (
     TASKS,
 )
 from python.srv.services import abr_v41, repository_mounts, share_mount
-from python.srv.services.api_errors import ApiError
+from python.srv.services.api_errors import ApiError, api_error
 
 PASSWORD = "Nas-Secret,with=odd chars"
 REAL_MOUNT_IN_BACKGROUND = repository_mounts.mount_in_background
@@ -171,6 +171,15 @@ class CreateTests(_MountsCase):
         self.assertEqual(self.refused(lambda: self.add(address="\\\\nas.example\\other")).code, "repository_name_exists")
         self.assertEqual(self.broker.calls, [])
 
+    def test_without_a_credential_key_nothing_is_mounted(self) -> None:
+        unusable = credential_encryption.CredentialKeyUnavailable("The credential key cannot be used")
+        with patch.object(mongo_db_wrapper, "encrypt_secret", side_effect=unusable):
+            error = self.refused(self.add)
+
+        self.assertEqual((error.status_code, error.code), (503, "credential_key_unavailable"))
+        self.assertEqual(self.broker.calls, [])
+        self.assertEqual(REPOSITORIES, {})
+
     def test_a_share_with_a_path_stays_mounted_by_hand(self) -> None:
         folder = self.broker.root.parent / "by-hand"
         folder.mkdir()
@@ -272,6 +281,69 @@ class EditTests(_MountsCase):
 
         self.assertEqual(error.code, "repository_share_busy")
         self.assertEqual(REPOSITORIES[self.repository["id"]]["metadata"]["password"], PASSWORD)
+
+
+    def test_a_new_password_that_cannot_be_stored_is_refused_before_the_share_is_touched(self) -> None:
+        unusable = credential_encryption.CredentialKeyUnavailable("The credential key cannot be used")
+        with patch.object(mongo_db_wrapper, "encrypt_secret", side_effect=unusable):
+            error = self.refused(lambda: self.edit(password="New-Secret"))
+
+        self.assertEqual(error.code, "credential_key_unavailable")
+        self.assertEqual(self.broker.calls, [])
+        self.assertEqual(REPOSITORIES[self.repository["id"]]["metadata"]["password"], PASSWORD)
+        self.assertTrue(repository_mounts.is_mounted(REPOSITORIES[self.repository["id"]]))
+
+    def test_without_a_credential_key_an_edit_that_keeps_the_secret_is_saved(self) -> None:
+        unusable = credential_encryption.CredentialKeyUnavailable("The credential key cannot be used")
+        with patch.object(mongo_db_wrapper, "encrypt_secret", side_effect=unusable):
+            self.edit(description="NAS in rack 2")
+
+        self.assertEqual(REPOSITORIES[self.repository["id"]]["metadata"]["description"], "NAS in rack 2")
+        self.assertEqual(self.broker.calls, [])
+
+    def test_an_edit_refused_after_the_swap_mounts_the_old_settings_again(self) -> None:
+        refusal = api_error(503, "credential_key_unavailable", "The credential key cannot be used")
+        with patch.object(abr_v41, "persist_repository", side_effect=refusal):
+            error = self.refused(lambda: self.edit(password="New-Secret"))
+
+        self.assertEqual(error.code, "credential_key_unavailable")
+        self.assertEqual(self.broker.operations(), ["mount.trial", "unmount.trial", "unmount", "mount", "unmount", "mount"])
+        self.assertEqual(self.mount_arguments()[-1]["password"], PASSWORD)
+        self.assertEqual(REPOSITORIES[self.repository["id"]]["metadata"]["password"], PASSWORD)
+        self.assertTrue(repository_mounts.is_mounted(REPOSITORIES[self.repository["id"]]))
+        self.assertNotIn(self.repository["id"], repository_mounts.STATE)
+
+    def test_a_check_that_refuses_the_new_share_leaves_the_old_one_mounted(self) -> None:
+        refusal = api_error(422, "invalid_repository", "The Hyper-V host refused the account")
+        with patch.object(abr_v41, "_assert_repository_is_usable", side_effect=refusal):
+            self.refused(lambda: self.edit(address="\\\\192.168.1.20\\backups\\vm"))
+
+        record = REPOSITORIES[self.repository["id"]]
+        self.assertEqual(record["metadata"]["server"], "nas.example")
+        self.assertEqual(repository_mounts.current_mount(record).source, "//nas.example/backups/vm")
+
+    def test_old_settings_that_no_longer_mount_are_named_and_retried(self) -> None:
+        original_call = self.broker.__call__
+        mounts = []
+
+        def old_password_rejected(socket_path, operation, arguments, *, timeout):
+            if operation == "mount" and not arguments.get("trial"):
+                mounts.append(arguments["password"])
+                if arguments["password"] == PASSWORD:
+                    raise broker_client.BrokerRefused("refused", "mount error 13 (Permission denied)")
+            return original_call(socket_path, operation, arguments, timeout=timeout)
+
+        refusal = api_error(503, "credential_key_unavailable", "The credential key cannot be used")
+        with (
+            patch.object(repository_mounts.broker_client, "call", side_effect=old_password_rejected),
+            patch.object(abr_v41, "persist_repository", side_effect=refusal),
+        ):
+            error = self.refused(lambda: self.edit(password="New-Secret"))
+
+        self.assertEqual(error.code, "credential_key_unavailable")
+        self.assertEqual(mounts, ["New-Secret", PASSWORD])
+        self.assertIn("Permission denied", repository_mounts.STATE[self.repository["id"]]["error"])
+        repository_mounts.mount_in_background.assert_called_once()
 
 
 class RemoveTests(_MountsCase):
@@ -420,6 +492,31 @@ class EnsureMountedTests(_MountsCase):
         abr_v41._ensure_share_mounted(REPOSITORIES[repository["id"]])
 
         self.assertTrue(repository_mounts.is_mounted(REPOSITORIES[repository["id"]]))
+
+
+    def test_a_repository_check_mounts_a_share_that_went_away(self) -> None:
+        repository = self.add()
+        self.broker.mounts.clear()
+        self.broker.write()
+        shutil.rmtree(repository["path"])
+
+        result = abr_v41.verify_repository(repository["id"])
+
+        self.assertNotIn("Path does not exist", str(result.get("message")))
+        self.assertTrue(repository_mounts.is_mounted(REPOSITORIES[repository["id"]]))
+
+    def test_a_repository_check_names_why_the_share_cannot_be_mounted(self) -> None:
+        repository = self.add()
+        self.broker.mounts.clear()
+        self.broker.write()
+        shutil.rmtree(repository["path"])
+        self.broker.refuse["mount"] = broker_client.BrokerRefused("refused", "mount error 112 (Host is down): the server is down")
+
+        result = abr_v41.verify_repository(repository["id"])
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["checks"], [{"name": "mounted", "status": "failed"}])
+        self.assertIn("the server is down", result["message"])
 
 
 class LostServerTests(unittest.TestCase):

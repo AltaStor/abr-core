@@ -26,6 +26,9 @@ from python.srv.core.mongo_db_wrapper import (
 )
 from python.srv.core.time_zones import RENAMED_ZONES
 from python.srv.core.storage_tool import (
+    DISK_TOOL_INTERRUPTED,
+    DISK_TOOL_NAME,
+    TOOL_ENDED_UNEXPECTEDLY,
     StorageToolError,
     chain_retention_till,
     copy_disk_tool_chain,
@@ -39,7 +42,7 @@ from python.srv.core.storage_tool import (
 from python.srv.core.subprocess_util import ProcessCancelled
 from python.srv.core.utils import utc_now
 from python.srv.services import audit_service
-from python.srv.services.api_errors import api_error
+from python.srv.services.api_errors import ApiError, api_error
 from python.srv.services.backup_mode import (
     object_lock_expiry,
     object_lock_generation_plan,
@@ -67,6 +70,17 @@ AVAILABLE_STATUSES = frozenset({"available", "completed", "healthy"})
 FINISHED_STATUSES = frozenset({"completed", "failed", "stopped", "canceled", "cancelled"})
 WINDOW_TIME = re.compile(r"^([01]\d|2[0-4]):([0-5]\d)$")
 WINDOW_STOP_REASON = "copy_window"
+
+
+COPY_ENDED_UNEXPECTEDLY = "the copy of the restore point ended unexpectedly"
+COPY_INTERRUPTED = (
+    f"{DISK_TOOL_NAME} was interrupted by a signal from outside the server (SIGTERM or SIGINT) and stopped copying "
+    "the restore point; what it had written is discarded"
+)
+
+
+def copy_tool_failure(text: str) -> str:
+    return text.replace(TOOL_ENDED_UNEXPECTEDLY, COPY_ENDED_UNEXPECTEDLY).replace(DISK_TOOL_INTERRUPTED, COPY_INTERRUPTED)
 
 
 class BackupCopyError(RuntimeError):
@@ -276,6 +290,12 @@ def plan_copy(job: dict[str, Any], vm_id: str, *, requested_type: str = "Increme
     }
 
 
+def _announced_phase(phase_type: str, phase_reason: str, plan: dict[str, Any] | None) -> tuple[str, str]:
+    if phase_type != "Incremental" or not plan or plan.get("kind") != "full":
+        return phase_type, phase_reason
+    return "ActiveFull", "DamagedChain" if plan.get("damaged") else "SourceNewChain"
+
+
 def copied_marker(destination: list[dict[str, Any]]) -> dict[str, Any] | None:
     return next((point for point in reversed(destination) if _copy_source(point)), None)
 
@@ -366,7 +386,8 @@ def create_copy_sessions(
             force_synthetic=force_synthetic,
             scheduled_type=scheduled_type,
         )
-        if not include_idle and execution_type == "Incremental" and plan_copy(normalized, vm_id) is None:
+        plan = plan_copy(normalized, vm_id) if execution_type == "Incremental" else None
+        if not include_idle and execution_type == "Incremental" and plan is None:
             continue
 
         requires_task_id = None
@@ -413,6 +434,8 @@ def create_copy_sessions(
                 task["warnings"] = [dict(missing_warning)]
                 _append_task_log(task, level="warn", message=missing_warning["message"], component="session")
 
+            announced_type, announced_reason = _announced_phase(phase_type, phase_reason, plan)
+            task["result"].update(resolved_backup_type=announced_type, resolved_backup_reason=announced_reason)
             what = "synthetic full of the copied chain" if synthetic else "backup copy"
             window = copy_window_state(normalized)
             if not window["open"]:
@@ -430,7 +453,7 @@ def create_copy_sessions(
                 level="info",
                 message=(
                     f"Job {normalized.get('name')}: {what} of {target['vm_name']} into repository "
-                    f"{destination.get('name') or normalized.get('repo_name')} ({phase_type}, {phase_reason})"
+                    f"{destination.get('name') or normalized.get('repo_name')} ({announced_type}, {announced_reason})"
                 ),
                 component="session",
             )
@@ -467,12 +490,14 @@ def _copy_jobs() -> list[dict[str, Any]]:
     return [job for job in jobs if job.get("job_type") == "backup-copy" and job.get("enabled")]
 
 
-def _start_and_record(job: dict[str, Any], *, trigger: str, vm_ids: list[str] | None = None) -> list[dict[str, Any]]:
+def _start_and_record(
+    job: dict[str, Any], *, trigger: str, vm_ids: list[str] | None = None, include_idle: bool = False
+) -> list[dict[str, Any]]:
     from python.srv.core.mongo_db_wrapper import persist_job
     from python.srv.services.abr_v41 import job_run_record
 
     run_id = str(uuid4())
-    sessions = create_copy_sessions(job, trigger=trigger, run_id=run_id, vm_ids=vm_ids)
+    sessions = create_copy_sessions(job, trigger=trigger, run_id=run_id, vm_ids=vm_ids, include_idle=include_idle)
 
     stored = JOBS.get(str(job.get("id") or ""))
     if sessions and isinstance(stored, dict):
@@ -534,7 +559,7 @@ def on_session_finished(task: dict[str, Any]) -> None:
             and str(copy_job.get("run_after_job_id") or "") == job_id
             and _run_finished(task)
         ):
-            _start_and_record(copy_job, trigger="after-job")
+            _start_and_record(copy_job, trigger="after-job", include_idle=True)
 
 
 def _source_encryption_key(points: list[dict[str, Any]]) -> str:
@@ -646,7 +671,7 @@ def _copy_once(
             {},
         )
 
-    _encryption_enabled, encryption_key = _resolve_encryption_settings(parameters)
+    encryption_algorithm, encryption_key = _resolve_encryption_settings(parameters)
     source_key = _source_encryption_key(points)
     if source_key and not encryption_key:
         raise BackupCopyValidationError(
@@ -700,7 +725,7 @@ def _copy_once(
             except OSError as exc:
                 if exc.errno != errno.ENOSPC:
                     raise
-                raise BackupCopyError(_out_of_space_message(repository, free_at_start)) from exc
+                raise BackupCopyError(_out_of_space_message(repository, free_at_start, copy=True)) from exc
 
         total = len(merges)
         disk_outputs: list[dict[str, Any]] = []
@@ -738,13 +763,13 @@ def _copy_once(
                     raise _stop_for_window(job, "while it copied; what it had written was discarded") from exc
                 raise TaskStopRequested("Backup copy cancelled; what it had written was discarded") from exc
             except StorageToolError as exc:
-                detail = _no_room_detail(repository, points, free_at_start)
-                raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {detail or exc}") from exc
+                detail = _no_room_detail(repository, points, free_at_start, copy=True)
+                raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {detail or copy_tool_failure(str(exc))}") from exc
             except OSError as exc:
                 if exc.errno == errno.ENOSPC:
                     raise BackupCopyError(
                         f"Copying disk {position + 1}/{total} failed: "
-                        + _out_of_space_message(repository, _free_bytes_at_start(repository))
+                        + _out_of_space_message(repository, _free_bytes_at_start(repository), copy=True)
                     ) from exc
                 raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {exc}") from exc
             written.append(backup_name)
@@ -812,6 +837,7 @@ def _copy_once(
                 "disks": disk_outputs,
                 "compression_level": compression_level,
                 "encryption_enabled": bool(encryption_key),
+                "encryption_algorithm": encryption_algorithm,
                 "repository_id": repository_id,
                 "repository_type": repository_type,
                 "storage_mode": "s3" if repository_type == "s3" else "local",
@@ -872,6 +898,7 @@ def _copy_once(
         "disks": disk_outputs,
         "compression_level": compression_level,
         "encryption_enabled": bool(encryption_key),
+        "encryption_algorithm": encryption_algorithm,
         "consistency": manifest_payload.get("consistency"),
         "consistency_reason": manifest_payload.get("consistency_reason"),
         "logical_bytes": logical_total,
@@ -999,6 +1026,15 @@ def _tokens(value: Any) -> list[str]:
     return [str(item).strip() for item in items if str(item or "").strip()]
 
 
+def _resolve_named(resolve: Any, label: str, *, name: str | None = None, record_id: str | None = None) -> dict[str, Any]:
+    try:
+        return resolve(name=name, record_id=record_id)
+    except ApiError as exc:
+        if exc.status_code != 404:
+            raise
+        raise api_error(404, exc.code, f"{label} not found: {name or record_id}", **exc.details) from exc
+
+
 def _resolve_sources(payload: dict[str, Any], current: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     from python.srv.services.abr_v41 import (
         normalize_job_record,
@@ -1009,14 +1045,14 @@ def _resolve_sources(payload: dict[str, Any], current: dict[str, Any]) -> tuple[
     jobs_given = any(key in payload for key in ("source_jobs", "source_job_ids"))
     repositories_given = any(key in payload for key in ("source_repositories", "source_repository_ids"))
     if jobs_given:
-        jobs = [resolve_job(name=token) for token in _tokens(payload.get("source_jobs"))]
-        jobs += [resolve_job(record_id=token) for token in _tokens(payload.get("source_job_ids"))]
+        jobs = [_resolve_named(resolve_job, "Job", name=token) for token in _tokens(payload.get("source_jobs"))]
+        jobs += [_resolve_named(resolve_job, "Job", record_id=token) for token in _tokens(payload.get("source_job_ids"))]
     else:
         jobs = [normalize_job_record(JOBS[job_id]) for job_id in source_job_ids(current) if job_id in JOBS]
 
     if repositories_given:
-        repositories = [resolve_repository(name=token) for token in _tokens(payload.get("source_repositories"))]
-        repositories += [resolve_repository(record_id=token) for token in _tokens(payload.get("source_repository_ids"))]
+        repositories = [_resolve_named(resolve_repository, "Repository", name=token) for token in _tokens(payload.get("source_repositories"))]
+        repositories += [_resolve_named(resolve_repository, "Repository", record_id=token) for token in _tokens(payload.get("source_repository_ids"))]
     else:
         repositories = [REPOSITORIES[repo_id] for repo_id in source_repository_ids(current) if repo_id in REPOSITORIES]
 
@@ -1196,7 +1232,7 @@ def apply_copy_settings(job: dict[str, Any], payload: dict[str, Any], *, creatin
         name = payload.get("run_after_job")
         record_id = payload.get("run_after_job_id")
         if name or record_id:
-            other = resolve_job(name=name, record_id=record_id)
+            other = _resolve_named(resolve_job, "Job", name=name, record_id=record_id)
             _ensure(
                 str(other.get("id") or "") != str(job.get("id") or ""),
                 422,
