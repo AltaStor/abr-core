@@ -14,6 +14,7 @@ from python.srv.core.mongo_db_wrapper import HYPERVISORS, RESOURCES_BY_HV, TASKS
 from python.srv.core.task_executor import TaskStopRequested
 from python.srv.plugins.pve import pve_backup
 from python.srv.plugins.pve.pve import PveAccess
+from python.srv.plugins.pve.pve_api import PveApiError
 from python.srv.plugins.pve.pve_backup import (
     PveBackupError,
     TaskLog,
@@ -415,7 +416,12 @@ class FakeApi:
         self.followed: list[dict] = []
 
     def get(self, path, **params):
-        return [{"storage": "local-lvm", "active": 1}]
+        if path.startswith("/storage/"):
+            # Reading one storage's config needs Datastore.Allocate, which abr-core's token does not have.
+            raise PveApiError("Permission check failed", status=403, path=path)
+        if path == "/storage":
+            return [item for item in self.cluster.storage_configs if item.get("type") == params.get("type")]
+        return list(self.cluster.storages)
 
     def tasks(self, node, **filters):
         self.cluster.task_queries.append(filters)
@@ -461,6 +467,8 @@ class FakeCluster:
         self.tasks: list[dict] = []
         self.task_queries: list[dict] = []
         self.task_logs: dict[str, list[str]] = {}
+        self.storages: list[dict] = [{"storage": "local-lvm", "active": 1}]
+        self.storage_configs: list[dict] = []
 
     def vm_state(self, node, vmid):
         return self.state
@@ -802,6 +810,13 @@ class SessionTests(unittest.TestCase):
         self.assertEqual((runs[0]["state"], runs[0]["run_id"]), ("starting", "task-1"))
         self.assertEqual(runs[1]["upid"], UPID)
 
+    def test_a_thick_fleecing_storage_without_room_refuses_the_backup_before_vzdump(self):
+        cluster = FakeCluster(_result({"scsi0": ("new", "new", "full")}))
+        cluster.storages = [{"storage": "local-lvm", "type": "lvm", "active": 1, "avail": 1 << 30}]
+        with self.assertRaisesRegex(PveBackupError, "Fleecing storage local-lvm has 1.0 GiB free"):
+            self.run_session(cluster)
+        self.assertEqual(cluster.api.started, [])
+
     def test_a_disk_level_backup_is_refused(self):
         task = {"id": "t", "hypervisor_id": "inv-1", "resource_type": "disk", "resource_external_id": "9002:scsi0"}
         with self.assertRaisesRegex(PveBackupError, "Proxmox VE backs up whole VMs"):
@@ -1025,6 +1040,42 @@ class JobOptionTests(unittest.TestCase):
         with self.assertRaises(abr_v41.ApiError) as raised:
             abr_v41._validate_task_parameters({"pve_unchanged_stopped_vm": "never"})
         self.assertIn("task_parameters.pve_unchanged_stopped_vm must be one of: skip, full", raised.exception.message)
+
+
+class FleecingRoomTests(unittest.TestCase):
+    GIB = 1 << 30
+
+    def room(self, avail, needed, thick):
+        return pve_backup.fleecing_room({"storage": "local-lvm", "avail": avail}, needed, thick, self.GIB)
+
+    def test_a_storage_with_room_for_every_disk_is_fine(self):
+        self.assertEqual(self.room(10 * self.GIB, 10 * self.GIB, True), (None, None))
+
+    def test_a_thick_storage_must_hold_every_disk(self):
+        refusal, _warning = self.room(5 * self.GIB, 10 * self.GIB, True)
+        self.assertIn("PVE reserves the full size of the VM's disks there, 10.0 GiB", refusal)
+
+    def test_a_thin_storage_warns_below_the_disks_and_refuses_below_the_floor(self):
+        refusal, warning = self.room(5 * self.GIB, 10 * self.GIB, False)
+        self.assertIsNone(refusal)
+        self.assertIn("if the guest overwrites more than that before the backup has read it", warning)
+        refusal, _warning = self.room(self.GIB // 2, 10 * self.GIB, False)
+        self.assertIn("has only 512.0 MiB free", refusal)
+
+    def test_a_storage_that_does_not_tell_its_room_is_not_checked(self):
+        self.assertEqual(pve_backup.fleecing_room({"storage": "x"}, 10 * self.GIB, True, self.GIB), (None, None))
+
+    def test_thick_lvm_and_zfs_without_sparse_reserve_the_full_size(self):
+        cluster = FakeCluster(None)
+        self.assertTrue(pve_backup.fleecing_thick(cluster, {"storage": "big", "type": "lvm"}))
+        self.assertFalse(pve_backup.fleecing_thick(cluster, {"storage": "thin", "type": "lvmthin"}))
+        self.assertTrue(pve_backup.fleecing_thick(cluster, {"storage": "tank", "type": "zfspool"}))
+        cluster.storage_configs = [
+            {"storage": "other", "type": "zfspool"},
+            {"storage": "tank", "type": "zfspool", "sparse": 1},
+        ]
+        self.assertFalse(pve_backup.fleecing_thick(cluster, {"storage": "tank", "type": "zfspool"}))
+        self.assertTrue(pve_backup.fleecing_thick(cluster, {"storage": "other", "type": "zfspool"}))
 
 
 class StartedTaskTests(unittest.TestCase):

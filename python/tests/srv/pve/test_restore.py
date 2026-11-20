@@ -15,6 +15,7 @@ from python.srv.core.task_executor import TaskStopRequested
 from python.srv.plugins.pve import pve_restore
 from python.srv.plugins.pve.pve import PveAccess, restore_metadata, vm_name_problem
 from python.srv.plugins.pve.pve_api import PveApiError
+from python.srv.plugins.pve.ssh import CommandResult
 from python.srv.plugins.pve.pve_restore import (
     PveRestoreError,
     RestoreLog,
@@ -346,12 +347,17 @@ class FakeShell:
         self.files: dict[str, bytes] = {}
         self.written: dict[str, dict] = {}
         self.removed: list[str] = []
+        self.nbd = "16\n0\n"
 
     def make_directory(self, path, mode):
         pass
 
     def write_file(self, path, data, mode=0o600):
         self.written[path] = json.loads(data)
+
+    def run(self, command, check=True):
+        """The node's NBD devices: how many there are, then how many are in use."""
+        return CommandResult(0, self.nbd.encode(), b"")
 
     def read_file(self, path):
         return self.files.get(path)
@@ -753,6 +759,18 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(cluster.api.started[0][0], f"/nodes/{NODE}/qemu")
         self.assertEqual(outcome["target_vm_id"], "120")
         self.assertTrue(any("never started" in m for m in self.messages()))
+
+    def test_a_node_whose_nbd_devices_are_all_in_use_is_refused_before_the_start(self):
+        for devices, message in (
+            ("16\n16\n", "All 16 kernel NBD devices of node node1 are in use"),
+            ("0\n0\n", "The nbd kernel module is not loaded on node node1"),
+        ):
+            with self.subTest(message=message):
+                cluster = FakeCluster()
+                cluster.shell_.nbd = devices
+                with self.assertRaisesRegex(PveRestoreError, message):
+                    self.run_session(cluster)
+                self.assertEqual(cluster.api.started, [])
 
     def test_an_in_place_restore_that_failed_says_whether_the_vm_kept_its_disks(self):
         cluster = FakeCluster({"status": "stopped", "exitstatus": "command failed"})

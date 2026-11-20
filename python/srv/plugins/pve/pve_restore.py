@@ -539,6 +539,31 @@ def _check_storages(cluster: PveNode, node: str, storages: dict[str, str]) -> No
             raise PveRestoreError(f"Storage {storage} for disk {drive} is not active on node {node}")
 
 
+def nbd_devices(shell: NodeShell) -> tuple[int, int]:
+    """The kernel NBD devices of a node and how many are in use; 0 devices when the nbd module is not loaded."""
+    text = shell.run(
+        "cat /sys/module/nbd/parameters/nbds_max 2>/dev/null || echo 0; ls -d /sys/block/nbd*/pid 2>/dev/null | wc -l",
+        check=False,
+    ).text.split()
+    numbers = [int(word) for word in text if word.isdigit()]
+    return (numbers[0], numbers[1]) if len(numbers) == 2 else (0, 0)
+
+
+def _check_nbd_devices(shell: NodeShell, node: str) -> None:
+    """A restore holds one kernel NBD device while PVE copies a disk, so it needs one free on its node."""
+    total, used = nbd_devices(shell)
+    if total == 0:
+        raise PveRestoreError(
+            f"The nbd kernel module is not loaded on node {node}; restores need it. The abr-pve-backup package loads "
+            "it at boot and when it is installed"
+        )
+    if used >= total:
+        raise PveRestoreError(
+            f"All {total} kernel NBD devices of node {node} are in use, by other restores or other NBD users; each "
+            "restore needs one while PVE copies a disk. Run the restore when one has ended"
+        )
+
+
 def _check_bridges(cluster: PveNode, node: str, adapters: list[dict[str, Any]]) -> None:
     bridges = set(cluster.bridges(node))
     for adapter in adapters:
@@ -786,6 +811,7 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
                 if resumed is None:
                     version = ensure_package(shell, node, package_path(), lambda message: emit("prepare", 10, message))
                     emit("prepare", 11, f"Node {node} has abr-pve-backup {version}")
+                    _check_nbd_devices(shell, node)
                     run_repository, secrets = node_repository(repository, common_path, node_address)
                     if encryption_key:
                         secrets["key"] = encryption_key

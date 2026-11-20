@@ -83,6 +83,11 @@ remove by hand.
    folder of the repository, and writes a result file abr-core reads at the end.
 4. abr-core writes the manifest and registers the restore point; a failed or stopped run is discarded.
 
+Before vzdump starts, abr-core checks the room on the fleecing storage. PVE reserves the full size of the VM's disks
+for the fleecing images on thick LVM, and on ZFS unless the storage is sparse, so a backup needs that much free there.
+On other storages the images grow only with what the guest overwrites during the backup: with less room than the VM's
+disks a backup starts with a warning, and below `ALTASTOR_PVE_FLEECING_MIN_FREE_MIB` it does not start.
+
 One vzdump runs at a time on a node: PVE holds a lock per node, so the backups of a job that land on one node wait for
 each other. The task runs in PVE and does not depend on the backup server. Its UPID is kept with the session, so a
 session the server lost by a restart follows the same task again when the server is back, and registers its backup.
@@ -140,7 +145,8 @@ and the bridge and link state of each network adapter.
 - `--network-map` moves the adapters of one source bridge to another, and `--nic-network "net1=<bridge>"` one adapter;
 - the name must suit PVE: letters, digits and hyphens, in parts separated by dots, up to 63 characters.
 
-Before anything is written the restore checks that the node is in the cluster and online, that every target storage
+Before anything is written the restore checks that the node is in the cluster and online, that it has a free kernel
+NBD device (the package gives each node 64, and a restore holds one while PVE copies a disk), that every target storage
 holds VM disks on that node and is active, and that every mapped bridge exists there. A restore that fails or is
 stopped removes the VM it had created.
 
@@ -162,6 +168,7 @@ restore limit to its own backups only.
 | `ALTASTOR_PVE_PACKAGE_PATH` | empty | The abr-pve-backup package the appliance installs on the nodes; empty takes the newest in `tools/abr-pve-backup/` |
 | `ALTASTOR_PVE_PARALLEL_DISKS` | 4 | How many disks of one VM the provider backs up at a time |
 | `ALTASTOR_PVE_RUN_FILE_MINUTES` | 60 | How long a run file is valid after abr-core writes it |
+| `ALTASTOR_PVE_FLEECING_MIN_FREE_MIB` | 1024 | The least free space a thin fleecing storage needs for a backup to start |
 
 ## Monitoring and logging
 
@@ -186,6 +193,8 @@ written to either; on the node they live only in the run file while the run last
 | `The PVE API refused AltaStor's API token` | The token was removed or replaced in PVE: set the cluster up again with `abr inventory edit --password` |
 | `presented SSH host key ..., which is not one of its own host keys` | The node's SSH host key changed outside the cluster's records; check the node, then set the cluster up again |
 | `PVE no longer had the dirty bitmap of ...` | Expected after the VM was restarted, stopped or migrated: those disks were backed up in full |
+| `Fleecing storage ... has ... free` | Free room on that storage, or give the job another one |
+| `All ... kernel NBD devices of node ... are in use` | Too many restores at once on that node, or other NBD users; run the restore when one has ended |
 | `cannot name a Proxmox VE VM` | Choose a name of letters, digits and hyphens, in parts separated by dots |
 | `Storage ... does not hold VM disks on node ...` | Restore to a storage that holds VM disks on that node and is enabled there |
 | `would land on bridge ..., which node ... does not have` | Map the adapter to a bridge of the target node with `--network-map` or `--nic-network` |

@@ -340,6 +340,52 @@ def fleecing_storage(images_storages: list[dict[str, Any]], disks: list[dict[str
     return active[0]
 
 
+def fleecing_thick(cluster: PveNode, storage: dict[str, Any]) -> bool:
+    """Whether PVE reserves a fleecing image's full size up front: on thick LVM, and on ZFS unless the storage is
+    sparse. Directory storage, LVM-thin and Ceph grow an image only as the guest overwrites what the backup has not
+    read yet. The storage index tells whether a ZFS storage is sparse: reading one storage's config needs
+    Datastore.Allocate, which abr-core's role does not have."""
+    kind = str(storage.get("type") or "")
+    if kind == "lvm":
+        return True
+    if kind != "zfspool":
+        return False
+    try:
+        configs = cluster.api.get("/storage", type=kind) or []
+    except PveApiError:
+        return True
+    name = str(storage.get("storage") or "")
+    config = next((item for item in configs if isinstance(item, dict) and str(item.get("storage")) == name), {})
+    return str(config.get("sparse") or "0") != "1"
+
+
+def fleecing_room(storage: dict[str, Any], needed: int, thick: bool, floor: int) -> tuple[str | None, str | None]:
+    """Whether the fleecing storage has room for a backup whose disks hold needed bytes: why the backup cannot start,
+    and a warning. A storage that does not report its free space is not checked."""
+    name = str(storage.get("storage") or "")
+    if storage.get("avail") is None or needed <= 0:
+        return None, None
+    avail = int(storage.get("avail") or 0)
+    if avail >= needed:
+        return None, None
+    if thick:
+        return (
+            f"Fleecing storage {name} has {_gib(avail)} free, and PVE reserves the full size of the VM's disks there, "
+            f"{_gib(needed)}: free room on it, or give the job another fleecing storage",
+            None,
+        )
+    if avail < min(floor, needed):
+        return (
+            f"Fleecing storage {name} has only {_gib(avail)} free, too little for the copies vzdump keeps there of "
+            "what the guest overwrites during the backup: free room on it, or give the job another fleecing storage",
+            None,
+        )
+    return None, (
+        f"Fleecing storage {name} has {_gib(avail)} free, less than the VM's disks, {_gib(needed)}: if the guest "
+        f"overwrites more than that before the backup has read it, the backup fails"
+    )
+
+
 # ---- following the task --------------------------------------------------------------------------------------------
 
 _PERCENT = re.compile(r"^INFO: (drive-[a-z]+[0-9]+(?:-backup)?): ([0-9]{1,3})%$")
@@ -1254,6 +1300,17 @@ def _start(
 
     images = [dict(item) for item in cluster.api.get(f"/nodes/{node}/storage", content="images", enabled=1) or []]
     fleecing = fleecing_storage(images, disks, str(parameters.get("pve_fleecing_storage") or ""))
+    fleecing_info = next((item for item in images if str(item.get("storage")) == fleecing), {})
+    refusal, warning = fleecing_room(
+        fleecing_info,
+        sum(int(disk.get("capacity_bytes") or 0) for disk in disks),
+        fleecing_thick(cluster, fleecing_info),
+        env_int("ALTASTOR_PVE_FLEECING_MIN_FREE_MIB") << 20,
+    )
+    if refusal:
+        raise PveBackupError(refusal)
+    if warning:
+        emit("prepare", 13, warning, log_level="warn")
     run = build_run_file(
         run_id=task_id,
         task_user=cluster.access.token_id,
