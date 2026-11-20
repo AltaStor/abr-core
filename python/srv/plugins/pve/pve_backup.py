@@ -40,11 +40,14 @@ from ...core.storage_tool import (
     apply_repository_immutability,
     describe_bytes,
     disk_tool_immutability_args,
+    chain_source_names,
     disk_tool_storage_args,
+    disk_tool_supports_retention_till,
     extract_s3_config,
     is_s3_repository,
     make_durable,
     run_disk_tool,
+    run_disk_tool_json,
     write_file_durably,
 )
 from ...core.task_executor import TaskStopRequested, cancel_requested
@@ -72,7 +75,7 @@ from ..vcenter.vcenter_backup import (
     _resolve_repository,
 )
 from .pve import PveError, PveNode, vm_disks
-from .pve_api import PveApiError, task_error, task_succeeded
+from .pve_api import PveApiError, Upid, task_error, task_succeeded
 from .setup import PveSetupError, ensure_package, package_path
 from .ssh import NodeShell, SshError
 
@@ -583,12 +586,41 @@ def run_pve_backup(task: dict[str, Any], progress_callback: ProgressCallback = N
         with PveNode.from_record(hypervisor) as cluster:
             located = cluster.locate_vm(vmid)
             node = str((resumed or {}).get("node") or located.get("node") or "")
+            located["status"] = cluster.vm_state(node, vmid) or located.get("status")
             config = cluster.vm_config(node, vmid)
             vm_name = str(config.get("name") or located.get("name") or vm_name)
             disks = [disk for disk in vm_disks(vmid, config) if disk["backup"]]
             if not disks:
                 raise PveBackupError(f"VM {vm_name} ({vmid}) has no disk vzdump backs up: each is marked backup=0")
             written = [backup_name(disk["drive"]) for disk in disks]
+            firewall_digest = cluster.firewall_digest(node, vmid)
+            if resumed is None:
+                unchanged = _unchanged_session(
+                    task=task,
+                    cluster=cluster,
+                    located=located,
+                    node=node,
+                    vmid=vmid,
+                    vm_name=vm_name,
+                    config=config,
+                    firewall_digest=firewall_digest,
+                    previous=previous,
+                    previous_path=previous_path,
+                    incremental=incremental,
+                    repository=repository,
+                    abr_path=abr_path,
+                    task_root=task_root,
+                    destination_root=destination_root,
+                    encryption_key=encryption_key,
+                    encryption_algorithm=encryption_algorithm,
+                    compression_level=compression_level,
+                    written=written,
+                    warnings=warnings,
+                    emit=emit,
+                    start_time=start_time,
+                )
+                if unchanged is not None:
+                    return unchanged
             node_address = str(cluster.access.node(node).get("address") or node)
             run_repository, secrets = node_repository(repository, abr_path, node_address)
             if encryption_key:
@@ -660,6 +692,7 @@ def run_pve_backup(task: dict[str, Any], progress_callback: ProgressCallback = N
                     disks=disks,
                     config=config,
                     located=located,
+                    firewall_digest=firewall_digest,
                     node=node,
                     vmid=vmid,
                     vm_name=vm_name,
@@ -741,6 +774,7 @@ def _register(
     disks: list[dict[str, Any]],
     config: dict[str, Any],
     located: dict[str, Any],
+    firewall_digest: str,
     node: str,
     vmid: str,
     vm_name: str,
@@ -803,11 +837,13 @@ def _register(
         "firewall_config": result.get("firewall_config"),
     }
     pve_details = {
+        "task_id": str(task.get("id") or ""),
         "upid": upid,
         "node": node,
         "archive": result.get("archive"),
         "provider_version": result.get("provider_version"),
         "config_digest": str(config.get("digest") or ""),
+        "firewall_digest": firewall_digest,
         "power_state": str(located.get("status") or ""),
     }
     backup_mode = "incremental" if incremental else "full"
@@ -866,6 +902,231 @@ def _register(
     return reported
 
 
+# ---- a stopped VM that has not run --------------------------------------------------------------------------------
+
+SKIP_PARAMETER = "pve_unchanged_stopped_vm"
+SKIP_CHOICES = ("skip", "full")
+
+
+def unchanged_reason(
+    previous: dict[str, Any],
+    located: dict[str, Any],
+    node: str,
+    vmid: str,
+    config_digest: str,
+    firewall_digest: str,
+    tasks: list[dict[str, Any]],
+) -> str | None:
+    """Why a stopped VM may have changed since the chain's last vzdump run, or None when it cannot have.
+
+    It cannot have when it was stopped for that run and is on the same node, its configuration and firewall settings
+    are as they were, and the node's task history since that run holds that run and no task of the VM other than
+    vzdump: starting, migrating, rolling back, restoring or moving a disk each leave a task, from the shell too.
+    """
+    pve = previous.get("pve") if isinstance(previous.get("pve"), dict) else {}
+    upid = str(pve.get("upid") or "")
+    if not upid:
+        return "its previous backup records no vzdump run to compare with"
+    if pve.get("power_state") != "stopped":
+        return "it was running when its previous backup was taken"
+    if str(pve.get("node") or "") != node:
+        return f"it moved from node {pve.get('node')} to node {node} since its previous backup"
+    if not pve.get("config_digest") or pve.get("firewall_digest") is None:
+        return "its previous backup recorded no digest of its configuration and firewall settings"
+    if pve.get("config_digest") != config_digest:
+        return "its configuration changed since its previous backup"
+    if pve.get("firewall_digest") != firewall_digest:
+        return "its firewall settings changed since its previous backup"
+    if upid not in {str(item.get("upid") or "") for item in tasks}:
+        return f"the task history of node {node} no longer reaches back to its previous backup"
+    others = sorted(
+        {str(item.get("type")) for item in tasks if str(item.get("id") or "") == vmid and item.get("type") != "vzdump"}
+    )
+    if others:
+        return f"the node's task history shows {', '.join(others)} since its previous backup"
+    return None
+
+
+def _unchanged_session(
+    *,
+    task: dict[str, Any],
+    cluster: PveNode,
+    located: dict[str, Any],
+    node: str,
+    vmid: str,
+    vm_name: str,
+    config: dict[str, Any],
+    firewall_digest: str,
+    previous: dict[str, Any] | None,
+    previous_path: Path | None,
+    incremental: bool,
+    repository: dict[str, Any],
+    abr_path: str,
+    task_root: Path,
+    destination_root: Path,
+    encryption_key: str,
+    encryption_algorithm: Any,
+    compression_level: int,
+    written: list[str],
+    warnings: list[str],
+    emit: Callable[..., None],
+    start_time: float,
+) -> dict[str, Any] | None:
+    """A stopped VM that has not run since the chain's last vzdump run gets a restore point with no changes, an
+    empty incremental of each disk, instead of a vzdump run, which reads a stopped VM's disks in full every time.
+
+    Returns the session's result, or None when vzdump has to run.
+    """
+    if not incremental or previous is None or located.get("status") != "stopped":
+        return None
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    if str(parameters.get(SKIP_PARAMETER) or "skip").strip().lower() != "skip":
+        emit("prepare", 9, f"VM {vm_name} is stopped, and this job backs up stopped VMs with vzdump every time")
+        return None
+    pve = previous.get("pve") if isinstance(previous.get("pve"), dict) else {}
+    try:
+        since = Upid.parse(str(pve.get("upid") or "")).starttime
+    except ValueError:
+        since = None
+    tasks = cluster.api.tasks(node, vmid=vmid, since=since, source="all", limit=1000) if since is not None else []
+    reason = unchanged_reason(previous, located, node, vmid, str(config.get("digest") or ""), firewall_digest, tasks)
+    if reason is not None:
+        emit(
+            "prepare",
+            9,
+            f"VM {vm_name} is stopped, but {reason}, so vzdump backs it up: in full, since PVE keeps no dirty bitmap "
+            "for a VM that is not running",
+        )
+        return None
+    previous_disks = [disk for disk in previous.get("disks") or [] if isinstance(disk, dict)]
+    emit(
+        "prepare",
+        10,
+        f"VM {vm_name} has not run since its backup in session {previous.get('task_id')}: node {node} has run only "
+        "backups of it since, and its configuration and firewall settings are unchanged. Recording a restore point "
+        f"without changes for its {len(previous_disks)} disk(s) instead of reading them again",
+    )
+    written[:] = []
+    outputs = []
+    for index, disk in enumerate(previous_disks, start=1):
+        name = str(disk.get("abr_backup_name") or "")
+        common, (parent, child) = chain_source_names([str(disk.get("abr_path") or ""), abr_path], [name, name])
+        args = [
+            "empty",
+            *disk_tool_storage_args(repository, abr_path=common),
+            "--name",
+            child,
+            "--parent",
+            parent,
+            *disk_tool_immutability_args(repository, takes_retention_till=disk_tool_supports_retention_till),
+        ]
+        if encryption_key:
+            args += ["--key", encryption_key]
+        written.append(name)
+        try:
+            outcome = run_disk_tool_json(args, timeout=300)
+        except StorageToolError as exc:
+            raise PveBackupError(
+                f"Recording disk {disk.get('drive') or name} of {vm_name} without changes failed: {exc}"
+            ) from exc
+        stored = int(outcome.get("stored_data_size") or 0)
+        outputs.append(
+            {
+                **disk,
+                "index": index,
+                "abr_path": abr_path,
+                "abr_backup_name": name,
+                "store_mode": "incremental",
+                "empty": True,
+                "bitmap_requested": None,
+                "bitmap_granted": None,
+                "previous_change_id": str(disk.get("change_id") or ""),
+                "logical_bytes": 0,
+                "stored_bytes": stored,
+                "compression_ratio": None,
+            }
+        )
+        emit(
+            "transfer",
+            15 + int(70 * index / max(len(previous_disks), 1)),
+            f"{disk.get('drive') or name}: no changes recorded",
+        )
+    storage_mode = "s3" if is_s3_repository(repository) else "local"
+    total_stored = sum(output["stored_bytes"] for output in outputs)
+    pve_details = {**pve, "unchanged_since": str(previous.get("task_id") or "")}
+    manifest_path = task_root / "manifest.json"
+    reported = {
+        "hypervisor_kind": HYPERVISOR_KIND,
+        "vm_name": vm_name,
+        "vm_external_id": vmid,
+        "backup_mode": "incremental",
+        "resolved_backup_type": "Incremental",
+        "resolved_backup_reason": "StandardIncremental",
+        "parent_point_id": str(parameters.get("parent_point_id") or "") or None,
+        "incremental": True,
+        "differential": False,
+        "unchanged": True,
+        "pve": pve_details,
+        "backup_root": str(task_root),
+        "manifest_path": str(manifest_path),
+        "repository_id": str(repository.get("id") or ""),
+        "repository_type": storage_mode,
+        "storage_mode": storage_mode,
+        "repository_storage_path": abr_path,
+        "vm_config": previous.get("vm_config"),
+        "disk_count": len(outputs),
+        "disks": outputs,
+        "compression_level": compression_level,
+        "encryption_enabled": bool(encryption_algorithm),
+        "encryption_algorithm": encryption_algorithm,
+        "service_type": f"Proxmox VE {cluster.get_service_type()}",
+        "processed_bytes": 0,
+        "transferred_bytes": total_stored,
+        "logical_bytes": 0,
+        "compression_ratio": None,
+    }
+    manifest = {
+        **reported,
+        "format_version": 1,
+        "operation": "vm-backup",
+        "task_id": str(task.get("id") or ""),
+        "hypervisor_id": str(task.get("hypervisor_id") or ""),
+        "job_id": str(task.get("job_id") or ""),
+        "cbt_enabled": True,
+        "parent_manifest_path": str(previous_path or ""),
+        "snapshot_name": "",
+        "snapshot_moref": "",
+        "warnings": warnings,
+        "created_at": utc_now(),
+    }
+    _write_manifest(
+        manifest_path, manifest, repository, abr_path, task_root, destination_root, written, str(task.get("id"))
+    )
+    duration = time.time() - start_time
+    summary = (
+        f"Proxmox VE backup of {vm_name} completed: VM not run since its previous backup, restore point without "
+        f"changes for {len(outputs)} disk(s) in {duration:.1f}s"
+    )
+    logger.info("Session %s: %s", task.get("id"), summary)
+    emit("finalize", 98, summary)
+    immutability_generation = (
+        _resolve_immutability_plan(task, REPOSITORIES[str(repository.get("id") or "")])
+        if str(repository.get("id") or "") in REPOSITORIES
+        else None
+    )
+    return {
+        **reported,
+        "operation": "backup",
+        "worker_mode": WORKER_MODE,
+        "snapshot_removed": True,
+        "stop_requested_after_completion": False,
+        "immutability_generation": immutability_generation,
+        "duration_seconds": round(duration, 3),
+        "warnings": warnings,
+        "finished_at": utc_now(),
+    }
+
+
 def _start(
     *,
     task: dict[str, Any],
@@ -895,8 +1156,12 @@ def _start(
         f"VM {vm_name} ({vmid}) is {located.get('status')} on node {node}, which has abr-pve-backup {version}",
     )
 
-    if incremental and previous is not None:
-        chained = str(previous.get("task_id") or "")
+    # PVE keeps no dirty bitmap for a VM that is not running: vzdump runs it only for the backup.
+    running = str(located.get("status") or "") != "stopped"
+    if incremental and previous is not None and running:
+        # The vzdump run the previous point rests on: a point without changes keeps the details of that run.
+        previous_pve = previous.get("pve") if isinstance(previous.get("pve"), dict) else {}
+        chained = str(previous_pve.get("task_id") or previous.get("task_id") or "")
         last = last_vzdump_task(str(task.get("hypervisor_id") or ""), vmid, task_id)
         if chained and last and last != chained:
             incremental = False
@@ -907,9 +1172,9 @@ def _start(
                 "every disk is backed up in full",
                 log_level="warn",
             )
-    elif incremental:
+    elif incremental and previous is None:
         emit("prepare", 11, f"No earlier backup of {vm_name} to chain onto; taking a full backup")
-    bitmaps = disk_bitmaps(disks, previous if incremental else None, incremental)
+    bitmaps = disk_bitmaps(disks, previous if incremental else None, incremental and running)
     emit(
         "prepare",
         12,

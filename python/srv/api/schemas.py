@@ -90,6 +90,11 @@ class TaskParametersDTO(_LenientModel):
     app_aware: DocBool = None
     dedup: DocBool = None
     hyperv_consistency: DocStr = None
+    pve_unchanged_stopped_vm: DocStr = Field(
+        default=None,
+        description="Proxmox VE backup jobs: skip (or omitted) records a restore point without changes for a stopped "
+        "VM that has not run since its previous backup; full backs it up with vzdump every time",
+    )
 
 
 class ExecutionChoiceDTO(_LenientModel):

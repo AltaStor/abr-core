@@ -669,6 +669,12 @@ Hyper-V jobs follow the same schedule rules: a full backup, then incrementals fr
 Example: 
 abr job create --name "HV nightly" --inventory "hv-cluster" --vms "sql-01,web-01" --repository "repo-01" --schedule daily --time "22:00" --retention-days 14 --guest-consistency application 
 
+Proxmox VE jobs follow the same schedule rules: a full backup, then incrementals from the dirty bitmaps PVE keeps for each disk of a running VM. A disk whose bitmap PVE lost, after the VM was restarted, stopped or migrated, and the TPM state are backed up in full within the incremental. PVE keeps no bitmap for a stopped VM, so vzdump reads its disks in full every time
+• --unchanged-stopped-vm <skip|full> sets what a backup does with a stopped VM that has not run since its previous backup: it was stopped then, is on the same node, its configuration and firewall settings are unchanged, and the node's task history shows only backups of it since. skip (the default) records a restore point without changes, an empty incremental of each disk, instead of reading the disks; full backs it up with vzdump every time. When any of these cannot be shown, the backup runs vzdump
+
+Example: 
+abr job create --name "PVE nightly" --inventory "pve-cluster" --vms "101,web-01" --repository "s3-repo" --schedule daily --time "22:00" --retention-days 14 --active-full-schedule monthly --active-full-day-of-month 1 --active-full-time 02:00 --unchanged-stopped-vm skip 
+
 abr job create-copy 
 
 Description: Clone an existing job configuration. The copied job receives a new ID and name while preserving inventory, selected VMs, repository, schedule configuration, schedule enabled/disabled state, and existing backup options. Optional repository, schedule, and retention overrides are still accepted for compatibility. 

@@ -4667,6 +4667,7 @@ def _record_encryption_key(keys: list[dict[str, Any]], key: str) -> tuple[list[d
 
 TASK_PARAMETER_CHOICES = {
     "hyperv_consistency": ("application", "crash"),
+    "pve_unchanged_stopped_vm": ("skip", "full"),
 }
 
 

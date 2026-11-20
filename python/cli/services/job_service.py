@@ -112,6 +112,9 @@ class JobService:
         guest_consistency = getattr(args, "guest_consistency", None)
         if guest_consistency is not None:
             updates["hyperv_consistency"] = str(guest_consistency)
+        unchanged_stopped_vm = getattr(args, "unchanged_stopped_vm", None)
+        if unchanged_stopped_vm is not None:
+            updates["pve_unchanged_stopped_vm"] = str(unchanged_stopped_vm)
         on_quiesce_failure = getattr(args, "on_quiesce_failure", None)
         if on_quiesce_failure is not None:
             updates["on_quiesce_failure"] = str(on_quiesce_failure).replace("-", "_")
@@ -507,6 +510,7 @@ class JobService:
         ("on_quiesce_failure", "--on-quiesce-failure"),
         ("vsphere_transport", "--transport"),
         ("guest_consistency", "--guest-consistency"),
+        ("unchanged_stopped_vm", "--unchanged-stopped-vm"),
     )
 
     @staticmethod

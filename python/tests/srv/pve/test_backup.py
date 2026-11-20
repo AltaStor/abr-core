@@ -417,6 +417,10 @@ class FakeApi:
     def get(self, path, **params):
         return [{"storage": "local-lvm", "active": 1}]
 
+    def tasks(self, node, **filters):
+        self.cluster.task_queries.append(filters)
+        return list(self.cluster.tasks)
+
     def start_task(self, path, **params):
         """The provider writes the result file once vzdump runs."""
         self.started.append((path, params))
@@ -449,6 +453,16 @@ class FakeCluster:
         self.status = status or {"status": "stopped", "exitstatus": "OK"}
         self.stop_during_task = False
         self.stopped_by_task = None
+        self.state = "running"
+        self.firewall = "fw-1"
+        self.tasks: list[dict] = []
+        self.task_queries: list[dict] = []
+
+    def vm_state(self, node, vmid):
+        return self.state
+
+    def firewall_digest(self, node, vmid):
+        return self.firewall
 
     def __enter__(self):
         return self
@@ -729,6 +743,214 @@ class SessionTests(unittest.TestCase):
             "vzdump of VM 9002 on node n1 failed: job errors; "
             "the task log says: cannot setup backup access without fleecing",
         )
+
+
+BASE_UPID = "UPID:node1:00275893:0512A6E8:6B002DCA:vzdump:9002:abr@pve!altastor-inv1:"
+
+
+def _stopped_previous(**changes) -> dict:
+    """The manifest of a vzdump run of the stopped VM, as the chain's previous point."""
+    pve = {
+        "task_id": "task-0",
+        "upid": BASE_UPID,
+        "node": "node1",
+        "power_state": "stopped",
+        "config_digest": "abc123",
+        "firewall_digest": "fw-1",
+    }
+    pve.update(changes)
+    return {
+        "task_id": "task-0",
+        "pve": pve,
+        "vm_config": {"guest_config": "name: web\n", "firewall_config": None},
+        "disks": [
+            {
+                "drive": "scsi0",
+                "abr_path": "pve/web/task-0",
+                "abr_backup_name": "scsi0",
+                "store_mode": "full",
+                "change_id": "snapshot-access:abr",
+                "capacity_bytes": 5 << 30,
+            },
+            {
+                "drive": "efidisk0",
+                "abr_path": "pve/web/task-0",
+                "abr_backup_name": "efidisk0",
+                "store_mode": "full",
+                "change_id": "snapshot-access:abr",
+                "capacity_bytes": 528 << 10,
+            },
+        ],
+    }
+
+
+class UnchangedReasonTests(unittest.TestCase):
+    VZDUMP = {"upid": BASE_UPID, "type": "vzdump", "id": "9002"}
+
+    def reason(
+        self,
+        previous: dict,
+        *,
+        node: str = "node1",
+        config: str = "abc123",
+        firewall: str = "fw-1",
+        tasks: list | None = None,
+    ):
+        return pve_backup.unchanged_reason(
+            previous, {}, node, "9002", config, firewall, [self.VZDUMP] if tasks is None else tasks
+        )
+
+    def test_a_vm_that_has_not_run_since_has_no_reason_to_be_read_again(self):
+        other_vm = {"upid": "UPID:x", "type": "qmstart", "id": "9003"}
+        later_backup = {"upid": "UPID:y", "type": "vzdump", "id": "9002"}
+        self.assertIsNone(self.reason(_stopped_previous(), tasks=[self.VZDUMP, other_vm, later_backup]))
+
+    def test_each_sign_of_a_change_is_named(self):
+        cases = [
+            (self.reason(_stopped_previous(upid="")), "its previous backup records no vzdump run to compare with"),
+            (
+                self.reason(_stopped_previous(power_state="running")),
+                "it was running when its previous backup was taken",
+            ),
+            (
+                self.reason(_stopped_previous(), node="node2"),
+                "it moved from node node1 to node node2 since its previous backup",
+            ),
+            (
+                self.reason(_stopped_previous(firewall_digest=None)),
+                "its previous backup recorded no digest of its configuration and firewall settings",
+            ),
+            (self.reason(_stopped_previous(), config="changed"), "its configuration changed since its previous backup"),
+            (
+                self.reason(_stopped_previous(), firewall="changed"),
+                "its firewall settings changed since its previous backup",
+            ),
+            (
+                self.reason(_stopped_previous(), tasks=[]),
+                "the task history of node node1 no longer reaches back to its previous backup",
+            ),
+            (
+                self.reason(
+                    _stopped_previous(),
+                    tasks=[self.VZDUMP, {"type": "qmstop", "id": "9002"}, {"type": "qmstart", "id": "9002"}],
+                ),
+                "the node's task history shows qmstart, qmstop since its previous backup",
+            ),
+        ]
+        for found, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(found, expected)
+
+
+class StoppedVmTests(SessionTests):
+    def setUp(self):
+        super().setUp()
+        self.empties: list[list[str]] = []
+        self.enterContext(
+            patch.object(
+                pve_backup,
+                "run_disk_tool_json",
+                lambda args, timeout: self.empties.append(args) or {"stored_data_size": 96},
+            )
+        )
+
+    def stopped_cluster(self) -> FakeCluster:
+        cluster = FakeCluster(
+            _result(
+                {
+                    "scsi0": ("new", "new", "full"),
+                    "efidisk0": ("new", "new", "full"),
+                    "tpmstate0": ("new", "new", "full"),
+                }
+            )
+        )
+        cluster.state = "stopped"
+        cluster.tasks = [{"upid": BASE_UPID, "type": "vzdump", "id": "9002"}]
+        return cluster
+
+    def test_a_stopped_vm_that_has_not_run_gets_a_point_without_changes_and_no_vzdump_run(self):
+        self.previous = _stopped_previous()
+        cluster = self.stopped_cluster()
+        outcome = self.run_session(cluster, {"resolved_backup_type": "Incremental"})
+        self.assertEqual(cluster.api.started, [])
+        self.assertEqual(cluster.task_queries, [{"vmid": "9002", "since": 0x6B002DCA, "source": "all", "limit": 1000}])
+        empty = self.empties[0]
+
+        def option(name: str) -> str:
+            return empty[empty.index(name) + 1]
+
+        self.assertEqual(empty[0], "empty")
+        self.assertEqual((option("--folder"), option("--path")), ("backups", "pve/web"))
+        self.assertEqual((option("--name"), option("--parent")), ("task-1/scsi0", "task-0/scsi0"))
+        self.assertNotIn("--key", empty)
+        self.assertEqual(
+            (outcome["resolved_backup_type"], outcome["backup_mode"], outcome["unchanged"]),
+            ("Incremental", "incremental", True),
+        )
+        self.assertEqual(
+            [(disk["abr_path"], disk["store_mode"], disk["empty"], disk["stored_bytes"]) for disk in outcome["disks"]],
+            [("pve/web/task-1", "incremental", True, 96)] * 2,
+        )
+        manifest = json.loads((self.task_root / "manifest.json").read_text())
+        self.assertEqual(
+            (manifest["pve"]["task_id"], manifest["pve"]["upid"], manifest["pve"]["unchanged_since"]),
+            ("task-0", BASE_UPID, "task-0"),
+        )
+        self.assertEqual(manifest["vm_config"]["guest_config"], "name: web\n")
+
+    def test_an_encrypted_chain_gets_its_key_for_the_empty_incrementals(self):
+        self.previous = _stopped_previous()
+        with patch.object(pve_backup, "_resolve_encryption_settings", return_value=(1, "the-key")):
+            self.run_session(self.stopped_cluster(), {"resolved_backup_type": "Incremental"})
+        self.assertEqual(self.empties[0][-2:], ["--key", "the-key"])
+
+    def test_a_job_set_to_full_runs_vzdump_for_a_stopped_vm(self):
+        self.previous = _stopped_previous()
+        cluster = self.stopped_cluster()
+        self.run_session(cluster, {"resolved_backup_type": "Incremental", "pve_unchanged_stopped_vm": "full"})
+        self.assertEqual(len(cluster.api.started), 1)
+        self.assertEqual(self.empties, [])
+
+    def test_a_stopped_vm_that_ran_is_read_with_new_bitmaps_and_no_warning(self):
+        self.previous = _stopped_previous()
+        cluster = self.stopped_cluster()
+        cluster.tasks.append({"upid": "UPID:z", "type": "qmstart", "id": "9002"})
+        outcome = self.run_session(cluster, {"resolved_backup_type": "Incremental"})
+        run = cluster.shell_.written["/run/abr/backup-9002.json"]
+        self.assertEqual({disk["bitmap"] for disk in run["disks"].values()}, {"new"})
+        self.assertEqual(
+            (outcome["resolved_backup_type"], outcome["resolved_backup_reason"], outcome["warnings"]),
+            ("ActiveFull", "IncrementalFallbackToFull", []),
+        )
+        self.assertTrue(any("task history shows qmstart" in str(update.get("message")) for update in self.progress))
+
+    def test_a_running_vm_after_a_point_without_changes_chains_onto_its_vzdump_run(self):
+        self.previous = {**_stopped_previous(), "task_id": "task-skipped"}
+        cluster = FakeCluster(
+            _result(
+                {
+                    "scsi0": ("use", "reuse", "incremental"),
+                    "efidisk0": ("use", "reuse", "incremental"),
+                    "tpmstate0": ("new", "new", "full"),
+                }
+            )
+        )
+        with patch.object(pve_backup, "last_vzdump_task", lambda *args: "task-0"):
+            outcome = self.run_session(cluster, {"resolved_backup_type": "Incremental"})
+        self.assertEqual(outcome["warnings"], [])
+        self.assertEqual(outcome["resolved_backup_type"], "Incremental")
+
+
+class JobOptionTests(unittest.TestCase):
+    def test_the_option_takes_skip_or_full(self):
+        from python.srv.services import abr_v41
+
+        self.assertEqual(
+            abr_v41._validate_task_parameters({"pve_unchanged_stopped_vm": "FULL"})["pve_unchanged_stopped_vm"], "full"
+        )
+        with self.assertRaises(abr_v41.ApiError) as raised:
+            abr_v41._validate_task_parameters({"pve_unchanged_stopped_vm": "never"})
+        self.assertIn("task_parameters.pve_unchanged_stopped_vm must be one of: skip, full", raised.exception.message)
 
 
 class InterruptedSessionTests(unittest.TestCase):

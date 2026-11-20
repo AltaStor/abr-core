@@ -394,6 +394,16 @@ class PveNode(Hypervisor):
             return []
         return sorted(str(row.get("iface")) for row in rows if row.get("iface"))
 
+    def vm_state(self, node: str, vm_id: str) -> str:
+        """running or stopped as the VM's node tells it now; the cluster's resource list lags by several seconds."""
+        current = self.api.get(f"/nodes/{quote(node, safe='')}/qemu/{quote(str(vm_id), safe='')}/status/current")
+        return str((current or {}).get("status") or "")
+
+    def firewall_digest(self, node: str, vm_id: str) -> str:
+        """The digest of the VM's firewall settings, which change without changing its configuration's digest."""
+        options = self.api.get(f"/nodes/{quote(node, safe='')}/qemu/{quote(str(vm_id), safe='')}/firewall/options")
+        return str((options or {}).get("digest") or "")
+
     def vm_config(self, node: str, vm_id: str) -> dict[str, Any]:
         return dict(self.api.get(f"/nodes/{quote(node, safe='')}/qemu/{quote(str(vm_id), safe='')}/config") or {})
 

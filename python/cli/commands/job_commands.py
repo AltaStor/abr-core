@@ -111,6 +111,7 @@ REPLICATION_HIDDEN_KEYS = frozenset(
         "effective_transport",
         "encryption",
         "guest_consistency",
+        "unchanged_stopped_vm",
         "backup_copy",
         "source_job",
     }
@@ -515,6 +516,15 @@ class JobCommands:
                     "Hyper-V only: recovery checkpoint consistency. application quiesces a running guest "
                     "through VSS and falls back to crash-consistent when it cannot (default); crash never "
                     "involves the guest"
+                ),
+            )
+            parser.add_argument(
+                "--unchanged-stopped-vm",
+                choices=("skip", "full"),
+                help=(
+                    "Proxmox VE only: a stopped VM that has not run since its previous backup. skip records a "
+                    "restore point without changes instead of reading its disks (default); full backs it up with "
+                    "vzdump every time, which reads a stopped VM's disks in full"
                 ),
             )
         if include_policy_flags:
