@@ -291,7 +291,7 @@ Shares are listed, added, checked and removed from the CLI (or the API), and wit
 the "Share over SMB" switch in a local repository's settings in the web console:
 
 ```bash
-abr repo share show                        # every local repository and its share: \\<host>\<share> or not shared
+abr repo share show                        # every local repository and its share: \\<server>\<share>, by the address Hyper-V hosts are given (or ABR_SHARES_SERVER_NAME), or not shared
 abr repo share add --name <repository>     # hidden share + own Samba account, stored encrypted   (repository.edit)
 abr repo share check --name <repository>   # write, read back and delete a test file through the share (repository.verify)
 abr repo share del --name <repository>     # remove the share and the account; the backups stay  (repository.edit)

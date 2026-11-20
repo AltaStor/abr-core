@@ -24,6 +24,7 @@ from python.srv.core.credential_encryption import (
     is_encrypted,
 )
 from python.srv.core.mongo_db_wrapper import (
+    HYPERVISORS,
     JOBS,
     REPOSITORIES,
     TASKS,
@@ -32,6 +33,11 @@ from python.srv.core.mongo_db_wrapper import (
 )
 from python.srv.core.server_defaults import env_int
 from python.srv.core.utils import utc_now
+from python.srv.plugins.hyperv.vhdx_tool import (
+    VhdxToolError,
+    appliance_address_toward,
+    configured_share_server,
+)
 from python.srv.services import abr_v41
 from python.srv.services.api_errors import ApiError, api_error
 
@@ -51,8 +57,11 @@ ACTIVE_STATUSES = frozenset({"queued", "pending", "running", "stopping"})
 CHECK_TIMEOUT_SECONDS = 60
 SOURCE_DEPTH = 2
 BROKER_UNIT = "altastor-backup-shares.socket"
+SERVER_CACHE_SECONDS = 60
+UNROUTED_PROBE = "192.0.2.1"
 
 LOCK = threading.RLock()
+_SERVER_CACHE: dict[str, Any] = {}
 
 
 def broker_socket() -> str:
@@ -67,11 +76,56 @@ def is_shared(record: dict[str, Any] | None) -> bool:
     return isinstance(record, dict) and bool(_metadata(record).get(SHARE_MARK))
 
 
+def _hyperv_hosts() -> list[str]:
+    hosts: list[str] = []
+    for record in sorted(catalog_records(HYPERVISORS), key=lambda item: str(item.get("name") or item.get("id") or "")):
+        if not abr_v41._inventory_is_hyperv(record.get("id")):
+            continue
+        host = str(_metadata(record).get("host") or "").strip()
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def _default_route_address() -> str | None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((UNROUTED_PROBE, 445))
+            return str(probe.getsockname()[0])
+    except OSError:
+        return None
+
+
+def _find_share_server() -> str:
+    for host in _hyperv_hosts():
+        try:
+            return appliance_address_toward(host)
+        except VhdxToolError:
+            continue
+    return _default_route_address() or socket.getfqdn()
+
+
+def share_server() -> str:
+    try:
+        configured = configured_share_server()
+    except VhdxToolError as exc:
+        raise api_error(409, "invalid_share_server_name", str(exc)) from exc
+    if configured:
+        return configured
+    now = time.monotonic()
+    cached = _SERVER_CACHE.get("server")
+    if cached and now - float(_SERVER_CACHE.get("at") or 0) < SERVER_CACHE_SECONDS:
+        return str(cached)
+    server = _find_share_server()
+    _SERVER_CACHE.update({"server": server, "at": now})
+    return server
+
+
 def network_path(record: dict[str, Any]) -> str | None:
     metadata = _metadata(record)
     if not is_shared(record) or not metadata.get("share"):
         return None
-    return f"\\\\{metadata.get('server') or socket.getfqdn()}\\{metadata.get('share')}"
+    return f"\\\\{share_server()}\\{metadata.get('share')}"
 
 
 def stored_repository(repository_id: str) -> dict[str, Any]:
@@ -241,6 +295,7 @@ def share_repository(record: dict[str, Any]) -> dict[str, Any]:
         if key_problem is not None:
             raise api_error(503, "credential_key_unavailable", f"{key_problem}. The share of {_name(record)} is not created.")
 
+        server = share_server()
         folder = _folder(record)
         what = f"The share of {_name(record)} could not be created"
         _remove_left_behind_share(folder, what=what)
@@ -248,7 +303,7 @@ def share_repository(record: dict[str, Any]) -> dict[str, Any]:
 
         updated = dict(record)
         metadata = _metadata(record)
-        metadata.update({"server": socket.getfqdn(), "share": share, "username": user, "password": password, SHARE_MARK: True})
+        metadata.update({"server": server, "share": share, "username": user, "password": password, SHARE_MARK: True})
         updated.update({"type": "smb", "metadata": metadata, "updated_at": utc_now()})
         try:
             persist_repository(updated)
@@ -454,7 +509,7 @@ def check_share(record: dict[str, Any]) -> dict[str, Any]:
         raise api_error(503, "credential_key_unavailable", f"{exc}. The share of {_name(record)} cannot be checked.") from exc
 
     folder = Path(_folder(record))
-    target = f"//{metadata.get('server') or socket.getfqdn()}/{metadata.get('share')}"
+    target = f"//{share_server()}/{metadata.get('share')}"
     name = f"abr-share-check-{int(time.time())}-{secrets.token_hex(4)}.txt"
     with tempfile.TemporaryDirectory(prefix="abr-share-check-") as work:
         auth, sent, received = Path(work, "auth"), Path(work, "sent"), Path(work, "received")

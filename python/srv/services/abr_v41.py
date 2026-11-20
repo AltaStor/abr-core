@@ -2253,6 +2253,13 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         item["address"] = metadata.get("address")
     if metadata.get("server") is not None:
         item["server"] = metadata.get("server")
+    if metadata.get("support_hyperv") and metadata.get("share"):
+        from python.srv.services.repository_shares import share_server
+
+        try:
+            item["server"] = share_server()
+        except ApiError:
+            pass
     if metadata.get("share") is not None:
         item["share"] = metadata.get("share")
     if metadata.get("username") is not None:
