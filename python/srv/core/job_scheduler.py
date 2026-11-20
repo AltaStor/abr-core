@@ -189,7 +189,7 @@ class JobScheduler:
                     )
                     continue
                 tasks = create_copy_sessions(
-                    normalized_job, trigger="schedule", run_id=run_id, scheduled_type=due_slots[0][1]
+                    normalized_job, trigger="schedule", run_id=run_id, scheduled_type=due_slots[0][1], include_idle=True
                 )
             else:
                 tasks = self._create_scheduled_tasks(normalized_job, scheduled_type=due_slots[0][1], run_id=run_id)
