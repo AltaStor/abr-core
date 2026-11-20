@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 from typing import Any
 
@@ -166,6 +167,32 @@ class VsphereConfigTests(unittest.TestCase):
             ],
         )
         self.assertEqual(vcenter_replica.unsynced(wanted, wanted), [])
+
+
+
+class SwapKeyTests(unittest.TestCase):
+    def test_disks_on_two_controllers_are_added_with_their_own_keys(self) -> None:
+        def disk(key: int, controller_key: int, unit: int, path: str) -> Any:
+            backing = vim.vm.device.VirtualDisk.FlatVer2BackingInfo(fileName=path, diskMode="persistent")
+            return vim.vm.device.VirtualDisk(key=key, controllerKey=controller_key, unitNumber=unit, backing=backing)
+
+        specs: list[Any] = []
+        vm = SimpleNamespace(
+            config=SimpleNamespace(hardware=SimpleNamespace(device=[disk(2001, 1000, 1, "[ds] r/a.vmdk"), disk(2016, 1001, 0, "[ds] r/b.vmdk")])),
+            ReconfigVM_Task=lambda spec: specs.append(spec) or "task",
+        )
+        node = SimpleNamespace(host="vc", _get_vm_by_moref=lambda vm_id: vm, _wait_for_task=lambda task: task)
+        changes = [
+            {"slot": "1000:1", "staging_slot": "1000:1", "new_path": "[ds] r/a-new.vmdk"},
+            {"slot": "1001:0", "staging_slot": "1001:0", "new_path": "[ds] r/b-new.vmdk"},
+        ]
+        with unittest.mock.patch.object(vcenter_replica, "find_replica", return_value={"disks": [{"path": "[ds] r/a.vmdk"}, {"path": "[ds] r/b.vmdk"}]}):
+            vcenter_replica.swap_disks(node, {"vm_id": "vm-1", "name": "r"}, {"disks": []}, changes)
+
+        [spec] = specs
+        added = [change.device.key for change in spec.deviceChange if change.operation == vim.vm.device.VirtualDeviceSpec.Operation.add]
+        self.assertEqual(len(added), 2)
+        self.assertEqual(len(set(added)), 2)
 
 
 if __name__ == "__main__":
