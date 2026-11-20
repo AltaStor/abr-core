@@ -1039,13 +1039,23 @@ class AbrV41EngineTests(unittest.TestCase):
 
         self.assertEqual(TASKS[session["id"]]["parameters"]["encryption_key"], "written-with-this")
 
-    def test_an_explicit_key_wins_over_every_stored_one(self) -> None:
+    def test_an_explicit_key_other_than_the_points_own_is_refused_before_the_session(self) -> None:
         inventory, job = self._encrypted_setup("192.0.2.37")
         self._encrypted_point(inventory, job, point_key="stored")
 
-        session = self._start_encrypted_restore(inventory, encryption_key="typed-by-hand")
+        with self.assertRaises(ApiError) as ctx:
+            self._start_encrypted_restore(inventory, encryption_key="typed-by-hand")
 
-        self.assertEqual(TASKS[session["id"]]["parameters"]["encryption_key"], "typed-by-hand")
+        self.assertEqual((ctx.exception.status_code, ctx.exception.code), (409, "encryption_key_mismatch"))
+        self.assertEqual(TASKS, {})
+
+    def test_the_points_own_key_given_by_hand_is_used(self) -> None:
+        inventory, job = self._encrypted_setup("192.0.2.37")
+        self._encrypted_point(inventory, job, point_key="stored")
+
+        session = self._start_encrypted_restore(inventory, encryption_key="stored")
+
+        self.assertEqual(TASKS[session["id"]]["parameters"]["encryption_key"], "stored")
 
     def test_an_encrypted_point_without_any_key_is_refused_with_a_clear_error(self) -> None:
         inventory, job = self._encrypted_setup("192.0.2.37")

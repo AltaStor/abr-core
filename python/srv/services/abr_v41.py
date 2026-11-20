@@ -10979,6 +10979,13 @@ def _job_current_key(job_id: str) -> str | None:
     return str(task_parameters.get("encryption_key") or "").strip() or None
 
 
+def _point_own_key(point: dict[str, Any]) -> str | None:
+    for key in (str(point.get("encryption_key") or "").strip(), _job_key_by_id(str(point.get("job_id") or ""), point.get("encryption_key_id"))):
+        if key and not is_encrypted(key):
+            return key
+    return None
+
+
 def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
     job_id = str(point.get("job_id") or "")
     found = []
@@ -11266,6 +11273,15 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
         "credential_key_unavailable",
         f"{key_problem}. The encryption key given for this restore is not stored. {KEY_REPAIR_HINT}, then repeat "
         "the restore.",
+        point_id=point_id,
+    )
+    own_key = _point_own_key(point) if given_key and _point_is_encrypted(point) else None
+    _ensure(
+        own_key is None or own_key == given_key,
+        409,
+        "encryption_key_mismatch",
+        f"The encryption key given does not decrypt restore point {point_id}: the point was written with another key. "
+        "Repeat the restore without an encryption key to use the stored one, or give the key the point was written with.",
         point_id=point_id,
     )
     encryption_key = given_key or _resolve_restore_encryption_key(point)

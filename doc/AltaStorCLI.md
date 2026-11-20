@@ -978,7 +978,7 @@ Tracking progress:
 - Use `abr session log --id <restore-session-id>`
  
 3. Restore from Backup Copy (From remote / disaster storage) 
-Description: The source backups are lost or their repository is unreachable, so the VM is restored from the restore points a backup copy job made in its own repository. A copy is a restore point of its own, with its own ID, and is restored in place or to a new VM exactly like any other: no --repo and no encryption key are needed (the copy job's key is used), and the source repository and the source backups are never read. 
+Description: The source backups are lost or their repository is unreachable, so the VM is restored from the restore points a backup copy job made in its own repository. A copy is a restore point of its own, with its own ID, and is restored in place or to a new VM exactly like any other: no --repo and no encryption key are needed (the copy job's key is used; a key given with --encryption-key that is not the one the copy was written with, such as the source job's, is refused before the restore starts with 409 encryption_key_mismatch), and the source repository and the source backups are never read. 
 Find the copies: abr restore list --vm <name> lists them next to the source points (the REPOSITORY column tells them apart); abr restore list --job <copy job> lists only the copies. 
 Syntax: abr restore start --restore-point <copy point id> (--in-place --force | --new-name <name> --target-inventory <name> --datastore <name>) [--power-on] 
 Example: abr restore start --restore-point 6b0f2c1e-8d4a-4c55-9a1e-3f7d2b9c8e10 --new-name sql-01-dr --target-inventory DR-Inventory --datastore DR-SSD --power-on 

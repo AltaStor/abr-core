@@ -131,8 +131,9 @@ class RestoreCommands:
             "--encryption-key",
             env_var=ENCRYPTION_KEY_ENV_VAR,
             help_text=(
-                "Decryption key for this restore. Overrides the key stored with the job and with the restore point; "
-                "needed when the job that held the key is gone"
+                "Decryption key for this restore, for a restore point whose key the server does not hold or cannot "
+                "read (for example when the job that held the key is gone). A key that is not the one the restore point "
+                "was written with is refused before the restore starts"
             ),
         )
         start.add_argument(
