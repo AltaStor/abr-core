@@ -920,7 +920,7 @@ class SystemCommandTests(unittest.TestCase):
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop(PASSWORD_ENV_VAR, None)
-            with patch("python.cli.commands.system_commands.getpass.getpass", side_effect=EOFError):
+            with patch("getpass.getpass", side_effect=EOFError):
                 with self.assertRaises(CliStructuredError) as ctx:
                     self._command().export(args)
 
@@ -932,7 +932,7 @@ class SystemCommandTests(unittest.TestCase):
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop(PASSWORD_ENV_VAR, None)
-            with patch("python.cli.commands.system_commands.getpass.getpass", side_effect=EOFError):
+            with patch("getpass.getpass", side_effect=EOFError):
                 with self.assertRaises(CliStructuredError) as ctx:
                     self._command().import_(args)
 

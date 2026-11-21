@@ -3,15 +3,17 @@
 
 from __future__ import annotations
 
+import getpass
 import io
 import unittest
-from contextlib import redirect_stdout
+import warnings
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from python.cli.errors import CliStructuredError
 from python.cli.parsing.parser_builder import AltaStorParserBuilder
-from python.cli.parsing.secret_arguments import ASK, resolve_secret
+from python.cli.parsing.secret_arguments import ASK, read_secret, resolve_secret
 from python.cli.services.job_service import JobService
 from python.cli.services.restore_service import RestoreService
 
@@ -73,6 +75,49 @@ class ResolveSecretTests(unittest.TestCase):
 class SecretFlagParsingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.parser = AltaStorParserBuilder().build()
+
+    def _without_terminal(self, piped: str):
+        def getpass_without_tty(prompt: str = "Password: ", stream=None) -> str:
+            return getpass.fallback_getpass(prompt, stream)
+
+        return (
+            patch("getpass.getpass", side_effect=getpass_without_tty),
+            patch("sys.stdin", io.StringIO(piped)),
+        )
+
+    def test_without_a_terminal_nothing_piped_refuses_with_only_the_error(self) -> None:
+        stderr = io.StringIO()
+        no_tty, stdin = self._without_terminal("")
+        with patch.dict("os.environ", {}, clear=True), no_tty, stdin, redirect_stderr(stderr), warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with self.assertRaises(CliStructuredError) as caught:
+                resolve_secret(ASK, env_var="ABR_X", prompt="Encryption key", needed=True, confirm=True)
+
+        self.assertIn("set ABR_X or run interactively", caught.exception.message)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_without_a_terminal_a_piped_secret_is_read_quietly_and_not_confirmed(self) -> None:
+        stderr = io.StringIO()
+        no_tty, stdin = self._without_terminal("piped-key\n")
+        with patch.dict("os.environ", {}, clear=True), no_tty, stdin, redirect_stderr(stderr), warnings.catch_warnings():
+            warnings.simplefilter("error")
+            secret = resolve_secret(ASK, env_var="ABR_X", prompt="Encryption key", needed=True, confirm=True)
+
+        self.assertEqual(secret, "piped-key")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_with_a_terminal_getpass_still_prompts_and_confirms(self) -> None:
+        with patch.dict("os.environ", {}, clear=True), patch("getpass.getpass", side_effect=["typed", "typed"]) as prompt:
+            secret = resolve_secret(ASK, env_var="ABR_X", prompt="Encryption key", needed=True, confirm=True)
+
+        self.assertEqual((secret, prompt.call_count), ("typed", 2))
+
+    def test_the_real_getpass_fallback_is_put_back_after_a_read(self) -> None:
+        original = getpass.fallback_getpass
+        with patch("getpass.getpass", return_value="x"):
+            read_secret("Key: ")
+
+        self.assertIs(getpass.fallback_getpass, original)
 
     def test_every_secret_flag_takes_a_value_or_nothing(self) -> None:
         cases = [
