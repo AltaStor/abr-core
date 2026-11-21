@@ -10,8 +10,10 @@ from unittest.mock import patch
 from python.srv.core.mongo_db_wrapper import HYPERVISORS, RESOURCES_BY_HV
 from python.srv.plugins import build_hypervisor_plugin
 from python.srv.services import abr_v41, inventory_management
+from python.srv.services.api_errors import ApiError
 from python.srv.services.inventory_management import (
     HyperVAuthError,
+    HyperVCertificateError,
     HyperVUnreachableError,
 )
 
@@ -358,3 +360,88 @@ class HyperVPluginPortTests(unittest.TestCase):
 
         self.assertEqual(node.port, 5985)
         self.assertEqual(node._candidate_ports(), [5985])
+
+
+class InventoryEditTlsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        HYPERVISORS.clear()
+        RESOURCES_BY_HV.clear()
+        self.addCleanup(HYPERVISORS.clear)
+        self.addCleanup(RESOURCES_BY_HV.clear)
+        reachable = patch.object(inventory_management, "_endpoint_reachable", return_value=True)
+        reachable.start()
+        self.addCleanup(reachable.stop)
+
+    def _vcenter(self, *, insecure: bool = True) -> dict:
+        with patch.object(inventory_management.VsphereInventoryProvider, "test_connection", return_value=None):
+            return abr_v41.create_inventory_record({**VSPHERE_PAYLOAD, "insecure": insecure})
+
+    def _untrusted(self):
+        return patch.object(
+            inventory_management.VsphereInventoryProvider,
+            "test_connection",
+            side_effect=OSError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate"),
+        )
+
+    def test_turning_verification_on_for_an_untrusted_certificate_is_refused_and_nothing_changes(self) -> None:
+        created = self._vcenter()
+        before = dict(HYPERVISORS[created["id"]])
+
+        with self._untrusted(), self.assertRaises(ApiError) as caught:
+            abr_v41.edit_inventory_record(created["id"], {"insecure": False})
+
+        self.assertEqual((caught.exception.status_code, caught.exception.code), (422, "inventory_unreachable"))
+        self.assertEqual(caught.exception.details["reason"], "certificate")
+        self.assertIn("is not trusted by this appliance", caught.exception.message)
+        self.assertIn("is left as it was", caught.exception.message)
+        self.assertNotIn("register", caught.exception.message)
+        self.assertEqual(HYPERVISORS[created["id"]], before)
+        self.assertFalse(HYPERVISORS[created["id"]]["metadata"]["verify_ssl"])
+
+    def test_turning_verification_on_for_a_trusted_certificate_is_saved(self) -> None:
+        created = self._vcenter()
+
+        with patch.object(inventory_management.VsphereInventoryProvider, "test_connection", return_value=None):
+            edited = abr_v41.edit_inventory_record(created["id"], {"insecure": False})
+
+        self.assertEqual(edited["status"], "available")
+        self.assertTrue(HYPERVISORS[created["id"]]["metadata"]["verify_ssl"])
+
+    def test_a_new_address_of_a_verifying_inventory_with_an_untrusted_certificate_is_refused(self) -> None:
+        created = self._vcenter(insecure=False)
+
+        with self._untrusted(), self.assertRaises(ApiError) as caught:
+            abr_v41.edit_inventory_record(created["id"], {"address": "192.0.2.21"})
+
+        self.assertEqual(caught.exception.details["reason"], "certificate")
+        self.assertEqual(HYPERVISORS[created["id"]]["metadata"]["host"], VCENTER_HOST)
+
+    def test_another_change_that_fails_on_the_certificate_is_saved_and_shown_unavailable_as_before(self) -> None:
+        created = self._vcenter(insecure=False)
+
+        with self._untrusted():
+            edited = abr_v41.edit_inventory_record(created["id"], {"password": "new-test-password"})
+
+        self.assertEqual(edited["status"], "unavailable")
+        self.assertIn("certificate", HYPERVISORS[created["id"]]["status_error"])
+
+    def test_turning_verification_off_is_saved_without_the_refusal(self) -> None:
+        created = self._vcenter(insecure=False)
+
+        with patch.object(inventory_management.VsphereInventoryProvider, "test_connection", return_value=None):
+            edited = abr_v41.edit_inventory_record(created["id"], {"insecure": True})
+
+        self.assertEqual(edited["status"], "available")
+        self.assertFalse(HYPERVISORS[created["id"]]["metadata"]["verify_ssl"])
+
+    def test_a_hyperv_host_whose_certificate_is_not_trusted_keeps_its_setting_with_its_own_reason(self) -> None:
+        with patch.object(inventory_management.HyperVInventoryProvider, "test_connection", return_value=None):
+            created = abr_v41.create_inventory_record(dict(HYPERV_PAYLOAD))
+        refused = HyperVCertificateError(HYPERV_HOST, 5986, "self-signed certificate")
+
+        with patch.object(inventory_management.HyperVInventoryProvider, "test_connection", side_effect=refused), self.assertRaises(ApiError) as caught:
+            abr_v41.edit_inventory_record(created["id"], {"insecure": False})
+
+        self.assertIn(f"The TLS certificate of Hyper-V host {HYPERV_HOST}:5986 was not trusted", caught.exception.message)
+        self.assertIn("is left as it was", caught.exception.message)
+        self.assertFalse(HYPERVISORS[created["id"]]["metadata"]["verify_ssl"])

@@ -1926,12 +1926,28 @@ def _apply_inventory_identity(record: dict[str, Any], identity: Any) -> dict[str
     return _record_inventory_identity(record, identity)
 
 
-def _recheck_inventory_connection(record: dict[str, Any]) -> dict[str, Any]:
+def _untrusted_certificate_error(record: dict[str, Any], exc: InventoryUnreachableError) -> ApiError:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    host = str(metadata.get("host") or "")
+    port = int(metadata.get("port", 443) or 443)
+    message = (
+        f"The TLS certificate of {host}:{port} is not trusted by this appliance, so certificate verification is not "
+        f"turned on, and inventory {record.get('name')} is left as it was. Keep it --insecure, or give {host} a "
+        "certificate this appliance trusts"
+        if inventory_type_from_record(record) == "vsphere"
+        else f"{exc}. Inventory {record.get('name')} is left as it was"
+    )
+    return api_error(422, "inventory_unreachable", message, address=host, port=port, reason=exc.reason)
+
+
+def _recheck_inventory_connection(record: dict[str, Any], *, refuse_untrusted_certificate: bool = False) -> dict[str, Any]:
     updated = dict(record)
     checked_at = utc_now()
     try:
         proof = _proof_of_connection(assert_inventory_registrable(updated))
     except (EsxHostInClusterError, InventoryUnreachableError) as exc:
+        if refuse_untrusted_certificate and getattr(exc, "reason", None) == "certificate":
+            raise _untrusted_certificate_error(updated, exc) from exc
         updated["status"] = "unavailable"
         updated["status_error"] = str(exc)
         updated["status_checked_at"] = checked_at
@@ -1984,8 +2000,12 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
         normalized = apply_inventory_updates(normalized, updates)
     _ensure(any(key in payload for key in ("name", "address", "port", "protocol", "username", "password", "description", "token", "insecure", "api", "transport", "vddk_library")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
     if connection_fields_changed(payload):
+        verifies = bool((normalized.get("metadata") or {}).get("verify_ssl", True))
+        endpoint_or_tls_changed = payload.get("insecure") is False or any(
+            payload.get(field) is not None for field in ("address", "port", "protocol")
+        )
         try:
-            normalized = _recheck_inventory_connection(normalized)
+            normalized = _recheck_inventory_connection(normalized, refuse_untrusted_certificate=verifies and endpoint_or_tls_changed)
         except HyperVAlreadyRegisteredError as exc:
             raise _already_registered_error(exc) from exc
     persist_hypervisor(normalized)

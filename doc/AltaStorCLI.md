@@ -601,7 +601,16 @@ abr inventory edit
 
 Description: Update server connection attributes or credentials. 
 
-abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--api <vddk|soap> | --reset-api] [--vddk-lib <path|ovddk> | --reset-vddk-lib] 
+abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure | --secure] [--api <vddk|soap> | --reset-api] [--vddk-lib <path|ovddk> | --reset-vddk-lib] 
+
+A change of the address, port, protocol, account or TLS verification is checked
+against the endpoint before it is saved. --secure, or a new address, port or
+protocol of an inventory that verifies certificates, is refused when this
+appliance does not trust the endpoint's certificate (422 inventory_unreachable,
+reason certificate, as inventory add refuses it), and the inventory is left as
+it was; keep it --insecure or give the endpoint a trusted certificate. Any other
+failure of the check saves the change and shows the inventory unavailable with
+the reason.
 
 Changing --protocol of a hyper-v inventory moves a standard port along with it
 (5986 for https, 5985 for http); a port of your own stays as it is.
