@@ -63,24 +63,27 @@ class ServeTests(_ServeCase):
     def test_a_client_that_is_neither_root_nor_the_service_user_is_refused_before_reading(self) -> None:
         code, reply, log = self.exchange(self.request("echo"), service_user="abr-nobody-here")
 
-        self.assertEqual((code, reply["ok"], reply["code"]), (1, False, broker_core.NOT_PERMITTED))
+        self.assertEqual((code, reply["ok"], reply["code"]), (0, False, broker_core.NOT_PERMITTED))
         self.assertIn(f"uid {os.getuid()} may not use this broker; only root and abr-nobody-here may", reply["message"])
         self.assertIn("- for uid", log)
 
-    def test_an_operation_refusal_is_answered_with_its_code(self) -> None:
-        code, reply, _log = self.exchange(self.request("refuse"))
+    def test_an_operation_refusal_is_answered_with_its_code_and_the_broker_ends_cleanly(self) -> None:
+        code, reply, log = self.exchange(self.request("refuse"))
 
-        self.assertEqual((code, reply), (1, {"ok": False, "code": "refused", "message": "smbd is not running"}))
+        self.assertEqual((code, reply), (0, {"ok": False, "code": "refused", "message": "smbd is not running"}))
+        self.assertIn("refuse for uid", log)
+        self.assertIn("refused: smbd is not running", log)
 
-    def test_an_unexpected_failure_is_answered_not_dropped(self) -> None:
-        _code, reply, _log = self.exchange(self.request("crash"))
+    def test_an_unexpected_failure_is_answered_not_dropped_and_ends_the_broker_as_failed(self) -> None:
+        code, reply, _log = self.exchange(self.request("crash"))
 
         self.assertEqual((reply["code"], reply["message"]), ("failed", "OSError: [Errno 5] Input/output error"))
+        self.assertEqual(code, 1)
 
     def test_an_operation_outside_the_list_is_refused_and_names_the_list(self) -> None:
-        _code, reply, _log = self.exchange(self.request("mount", {"path": "/"}))
+        code, reply, _log = self.exchange(self.request("mount", {"path": "/"}))
 
-        self.assertEqual(reply["code"], broker_core.INVALID_REQUEST)
+        self.assertEqual((code, reply["code"]), (0, broker_core.INVALID_REQUEST))
         self.assertIn("unknown operation 'mount'; this broker runs crash, echo, refuse", reply["message"])
 
     def test_requests_that_are_not_one_json_object_on_one_line_are_refused(self) -> None:

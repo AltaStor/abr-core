@@ -312,7 +312,10 @@ request on the socket `/run/altastor-backup-shares.sock`
 (`ABR_SHARES_BROKER_SOCKET`; the `altastor-backup-shares.socket` and
 `altastor-backup-shares@.service` units of the server package, with
 `Accept=yes`): one JSON request on stdin, one JSON answer on stdout, then it
-exits, and each call is a line in the journal. It answers only root and the
+exits, and each call is a line in the journal. A refusal is an answer like any
+other, so the instance ends successfully and leaves no failed unit; only a
+broker that breaks on an unexpected error, or cannot send its answer, ends
+failed. The mounts broker (`altastor-backup-mounts@.service`) works the same way. It answers only root and the
 service user (`SO_PEERCRED`), runs nothing but its two operations,
 `add-share` and `remove-share`, and checks every argument itself: the share and
 account names (`abr-xxxxxxxx$`, `abr-smb-xxxxxxxx`), the password, and a folder
