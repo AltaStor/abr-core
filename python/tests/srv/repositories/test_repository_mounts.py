@@ -105,6 +105,50 @@ class _MountsCase(unittest.TestCase):
         return [arguments for operation, arguments in self.broker.calls if operation == "mount"]
 
 
+class ShareCheckTests(_MountsCase):
+    def check_share(self, **changes) -> dict:
+        payload = {"type": "smb", "address": "\\\\nas.example\\backups\\vm", "username": "backup@corp.local", "password": PASSWORD}
+        payload.update(changes)
+        return abr_v41.test_smb_connection(payload)
+
+    def test_a_share_without_a_path_is_mounted_on_a_trial_point_checked_and_unmounted(self) -> None:
+        result = self.check_share()
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn("was mounted with this account, written to and unmounted again", result["message"])
+        self.assertEqual(self.broker.operations(), ["mount.trial", "unmount.trial"])
+        [arguments] = self.mount_arguments()
+        self.assertEqual((arguments["server"], arguments["share"], arguments["subfolder"]), ("nas.example", "backups", "vm"))
+        self.assertEqual(self.broker.mounts, {})
+        self.assertEqual(REPOSITORIES, {})
+
+    def test_a_share_that_does_not_mount_is_refused_as_the_create_call_refuses_it(self) -> None:
+        self.broker.refuse["mount.trial"] = broker_client.BrokerRefused("refused", "mount error(13): Permission denied")
+        self.broker.refuse["mount"] = broker_client.BrokerRefused("refused", "mount error(13): Permission denied")
+
+        tested = self.refused(self.check_share)
+        created = self.refused(self.add)
+
+        self.assertEqual((tested.status_code, tested.code), (created.status_code, created.code))
+        self.assertEqual(tested.code, "share_mount_failed")
+        self.assertIn("mount error(13): Permission denied", tested.message)
+        self.assertEqual(REPOSITORIES, {})
+
+    def test_an_account_is_required_and_nothing_is_mounted_without_one(self) -> None:
+        for changes in ({"username": None}, {"password": None}):
+            with self.subTest(changes=changes):
+                error = self.refused(lambda changes=changes: self.check_share(**changes))
+                self.assertIn("needs --username and --password", error.message)
+        self.assertEqual(self.broker.calls, [])
+
+    def test_the_trial_mount_is_unmounted_when_the_check_breaks(self) -> None:
+        with patch.object(abr_v41, "_verify_local_repository", side_effect=RuntimeError("check broke")), self.assertRaises(RuntimeError):
+            self.check_share()
+
+        self.assertEqual(self.broker.operations(), ["mount.trial", "unmount.trial"])
+        self.assertEqual(self.broker.mounts, {})
+
+
 class CreateTests(_MountsCase):
     def test_a_share_without_a_path_is_mounted_by_the_server_at_its_own_point(self) -> None:
         created = self.add()

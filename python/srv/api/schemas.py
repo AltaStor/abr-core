@@ -904,15 +904,29 @@ class UpdateInventoryRequest(_LenientModel):
     vddk_library: LaxStr | None = Field(default=None, description=f"vSphere only: the full path of a VDDK library file on the backup server, or inherit (or empty) to use the server-wide one; {OMITTED_KEEPS}")
 
 
+REPOSITORY_PATH = (
+    "local: the folder on this server. smb: leave it out to have this server mount the share itself, at "
+    "/run/altastor-backup-mounts/<repository id> (metadata.managed_mount is then true; address or server and share, "
+    "username and password are needed); give it only for a share mounted by hand, as the folder it is mounted at"
+)
+REPOSITORY_ADDRESS = "smb: the share as //server/share or \\\\server\\share, optionally with a folder in it. nfs: host:/export"
+REPOSITORY_SERVER = "smb or nfs: the server of the share or export, instead of address"
+REPOSITORY_SHARE = "smb: the share (and a folder in it); nfs: the export, instead of address"
+REPOSITORY_USERNAME = (
+    "smb: the account the share is opened with, user or DOMAIN\\user; required when this server mounts the share (no path)"
+)
+REPOSITORY_PASSWORD = "smb: the password of that account; required with it. It is stored encrypted and never returned"
+
+
 class CreateRepositoryRequest(_LenientModel):
     name: LaxStr | None = None
     type: LaxStr | None = None
-    path: LaxStr | None = None
-    address: LaxStr | None = None
-    server: LaxStr | None = None
-    share: LaxStr | None = None
-    username: LaxStr | None = None
-    password: LaxStr | None = None
+    path: LaxStr | None = Field(default=None, description=REPOSITORY_PATH)
+    address: LaxStr | None = Field(default=None, description=REPOSITORY_ADDRESS)
+    server: LaxStr | None = Field(default=None, description=REPOSITORY_SERVER)
+    share: LaxStr | None = Field(default=None, description=REPOSITORY_SHARE)
+    username: LaxStr | None = Field(default=None, description=REPOSITORY_USERNAME)
+    password: LaxStr | None = Field(default=None, description=REPOSITORY_PASSWORD)
     description: LaxStr | None = None
     s3: Annotated[SkipValidation[S3Request] | None, _checked_booleans(S3Request)] = None
     bucket: LaxStr | None = None
@@ -937,12 +951,12 @@ class CreateRepositoryRequest(_LenientModel):
 
 class UpdateRepositoryRequest(_LenientModel):
     name: LaxStr | None = None
-    path: LaxStr | None = None
-    address: LaxStr | None = None
-    server: LaxStr | None = None
-    share: LaxStr | None = None
-    username: LaxStr | None = None
-    password: LaxStr | None = None
+    path: LaxStr | None = Field(default=None, description=REPOSITORY_PATH)
+    address: LaxStr | None = Field(default=None, description=REPOSITORY_ADDRESS)
+    server: LaxStr | None = Field(default=None, description=REPOSITORY_SERVER)
+    share: LaxStr | None = Field(default=None, description=REPOSITORY_SHARE)
+    username: LaxStr | None = Field(default=None, description=REPOSITORY_USERNAME)
+    password: LaxStr | None = Field(default=None, description=REPOSITORY_PASSWORD)
     description: LaxStr | None = None
     s3: Annotated[SkipValidation[S3Request] | None, _checked_booleans(S3Request)] = None
     bucket: LaxStr | None = None

@@ -2835,11 +2835,7 @@ def _ensure_appliance_folder(repo_type: str, path: str) -> None:
     )
 
 
-def _create_managed_smb_repository(
-    payload: dict[str, Any], *, name: str, server: str | None, share: str | None, username: str | None, password: str | None
-) -> dict[str, Any]:
-    from python.srv.services import repository_mounts
-
+def _ensure_mountable_share(server: str | None, share: str | None, username: str | None, password: str | None) -> None:
     _ensure(
         bool(server) and bool(share),
         422,
@@ -2853,6 +2849,14 @@ def _create_managed_smb_repository(
         "A share this server mounts needs --username and --password: its traffic is encrypted, which needs an account. "
         "Give --path for a share mounted by hand",
     )
+
+
+def _create_managed_smb_repository(
+    payload: dict[str, Any], *, name: str, server: str | None, share: str | None, username: str | None, password: str | None
+) -> dict[str, Any]:
+    from python.srv.services import repository_mounts
+
+    _ensure_mountable_share(server, share, username, password)
     for existing in catalog_records(REPOSITORIES):
         if str(existing.get("name") or "").lower() == name.lower():
             raise api_error(409, "repository_name_exists", "Repository name already exists", name=name)
@@ -4109,6 +4113,8 @@ def test_smb_connection(payload: dict[str, Any]) -> dict[str, Any]:
         parsed_server, parsed_share = _split_repository_address("smb", address)
         server = server or parsed_server
         share = share or parsed_share
+    if not path:
+        return _test_mounted_smb_share(str(payload.get("name") or "").strip(), server, share, payload.get("username"), payload.get("password"))
     _ensure_appliance_folder("smb", path)
     _ensure_smb_repository_share(server, share, payload.get("username"), payload.get("password"))
     record = {
@@ -4124,6 +4130,39 @@ def test_smb_connection(payload: dict[str, Any]) -> dict[str, Any]:
         "status": "success",
         "checks": result.get("checks") or [],
         "message": str(result.get("message") or "").replace("Repository is available", "SMB folder and share match", 1),
+    }
+
+
+def _test_mounted_smb_share(name: str, server: str, share: str, username: Any, password: Any) -> dict[str, Any]:
+    from python.srv.services import repository_mounts
+
+    _ensure_mountable_share(server, share, username, password)
+    probe_id = str(uuid4())
+    repository_mounts.mount_arguments(probe_id, server, share, str(username), str(password))
+    unc = "\\\\" + server + "\\" + share.replace("/", "\\")
+    probe = {
+        "id": probe_id,
+        "name": name or unc,
+        "type": "smb",
+        "metadata": {"server": server, "share": share, "username": username, "password": password, "managed_mount": True},
+    }
+    mounted = repository_mounts.mount(probe, trial=True)
+    try:
+        checked = {**probe, "path": str(mounted.get("mount_point") or repository_mounts.mount_point(probe_id, trial=True))}
+        result = _with_share_account(_verify_local_repository(checked, check_backups=False), checked)
+    finally:
+        try:
+            repository_mounts.unmount(probe, trial=True)
+        except ApiError as exc:
+            LOGGER.warning("The share %s mounted to test it could not be unmounted: %s", unc, exc.message)
+    if result.get("status") != "success":
+        return {"status": "error", "checks": result.get("checks") or [], "message": result.get("message")}
+    return {
+        "status": "success",
+        "checks": result.get("checks") or [],
+        "message": str(result.get("message") or "").replace(
+            "Repository is available", f"{unc} was mounted with this account, written to and unmounted again", 1
+        ),
     }
 
 
