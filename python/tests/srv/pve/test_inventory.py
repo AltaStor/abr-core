@@ -243,6 +243,35 @@ class ClusterShell:
         text = self.files.get(path)
         return None if text is None else text.encode()
 
+    @property
+    def helper(self) -> "ClusterHelper":
+        return ClusterHelper(self.files)
+
+
+class ClusterHelper:
+    """abr-node-helper on a node whose key runs it already, answering from the cluster's files."""
+
+    def __init__(self, files: dict[str, str]) -> None:
+        self.files = files
+
+    def version(self) -> dict:
+        return {"helper": "0.1.5", "package": "0.1.5", "restricted": True}
+
+    def cluster_info(self) -> dict:
+        members = json.loads(self.files.get("/etc/pve/.members") or "{}")
+        return {
+            "members": self.files.get("/etc/pve/.members"),
+            "root_ca": self.files.get("/etc/pve/pve-root-ca.pem"),
+            "nodes": {
+                name: {
+                    "ssh_known_hosts": self.files.get(f"/etc/pve/nodes/{name}/ssh_known_hosts"),
+                    "pveproxy_ssl_pem": self.files.get(f"/etc/pve/nodes/{name}/pveproxy-ssl.pem"),
+                }
+                for name in sorted(members.get("nodelist") or {})
+            },
+            "host_keys": "",
+        }
+
 
 def _cluster_files(**changes) -> dict[str, str]:
     files = {

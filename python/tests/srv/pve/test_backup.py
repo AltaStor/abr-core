@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from python.srv.core.mongo_db_wrapper import HYPERVISORS, RESOURCES_BY_HV, TASKS
 from python.srv.core.task_executor import TaskStopRequested
+from python.tests.srv.pve.fake_helper import FakeHelper
 from python.srv.plugins.pve import pve_backup
 from python.srv.plugins.pve.pve import PveAccess
 from python.srv.plugins.pve.pve_api import PveApiError
@@ -394,6 +395,9 @@ class FakeShell:
         self.files: dict[str, bytes] = {}
         self.written: dict[str, dict] = {}
         self.removed: list[str] = []
+        self.offered: dict[str, dict] = {}
+        self.offers: list = []
+        self.helper = FakeHelper(self)
 
     def make_directory(self, path, mode):
         self.files.setdefault(path + "/", b"")
@@ -554,10 +558,10 @@ class SessionTests(unittest.TestCase):
         outcome = self.run_session(cluster)
         run = cluster.shell_.written["/run/abr/backup-9002.json"]
         self.assertEqual(sorted(run["disks"]), ["drive-efidisk0", "drive-scsi0", "drive-tpmstate0-backup"])
-        self.assertEqual(
-            (run["task_user"], run["repository"]["path"], run["secrets"]),
-            ("abr@pve!altastor-inv1", "pve/web/task-1", {"secret_key": "s3-secret"}),
-        )
+        self.assertEqual((run["task_user"], run["repository"]["path"]), ("abr@pve!altastor-inv1", "pve/web/task-1"))
+        self.assertNotIn("secrets", run)
+        self.assertEqual(cluster.shell_.offered, {"backup-9002": {"secret_key": "s3-secret"}})
+        self.assertTrue(cluster.shell_.offers[0].closed)
         path, params = cluster.api.started[0]
         self.assertEqual(path, "/nodes/node1/vzdump")
         self.assertEqual(

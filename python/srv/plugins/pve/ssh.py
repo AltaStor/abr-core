@@ -168,6 +168,7 @@ class NodeShell:
         self._timeout = timeout
         self._transport: paramiko.Transport | None = None
         self._sftp: paramiko.SFTPClient | None = None
+        self._helper: Any = None
         self.host_key = ""
 
     def __enter__(self) -> "NodeShell":
@@ -300,6 +301,25 @@ class NodeShell:
         if check and status != 0:
             raise SshCommandError(text, status, result.error_text)
         return result
+
+    def start(self, command: str) -> paramiko.Channel:
+        """Starts a command and returns its channel, for a command that runs as long as the caller keeps it open."""
+        channel = self._open(lambda transport: transport.open_session(timeout=self._timeout), "a session")
+        try:
+            channel.exec_command(command)
+        except (paramiko.SSHException, OSError, EOFError) as exc:
+            channel.close()
+            raise SshUnreachableError(f"The SSH connection to {self.address} broke while starting {command}: {exc}") from exc
+        return channel
+
+    @property
+    def helper(self) -> Any:
+        """abr-node-helper on this node, which is all the key of an inventory may run."""
+        if self._helper is None:
+            from .node_helper import NodeHelper
+
+            self._helper = NodeHelper(self)
+        return self._helper
 
     def _transport_active(self) -> bool:
         return self._transport is not None and self._transport.is_active()

@@ -16,7 +16,7 @@ from typing import Any, Mapping
 from ...core.mongo_db_wrapper import HYPERVISORS, catalog_records
 from .pve import PLATFORM, PveError, PveNode, access_from_record
 from .pve_api import PveApiError, PveAuthError, PveCertificateError, PvePermissionError, PveUnreachableError
-from .setup import PveSetupError, cluster_view, package_path, set_up_cluster, tear_down, token_name
+from .setup import PveSetupError, cluster_view, package_path, restrict_key, set_up_cluster, tear_down, token_name
 from .ssh import NodeShell, SshAuthError, SshError, SshHostKeyError, SshUnreachableError
 
 logger = logging.getLogger(__name__)
@@ -173,7 +173,7 @@ def test_connection(record: Mapping[str, Any]) -> dict[str, Any]:
                 if item.get("type") == "node" and item.get("online")
             }
             for name in sorted(online):
-                node.shell(name).run(["true"])
+                node.shell(name).helper.version()
     except (SshError, PveApiError, PveError) as exc:
         raise _registration_error(exc, address) from exc
     return identity
@@ -195,6 +195,14 @@ def refresh_access(record: dict[str, Any]) -> list[str]:
                 private_key=access.ssh_key,
                 host_keys=[str(key) for key in node.get("host_keys") or []],
             ) as shell:
+                pve = _metadata(record).get("pve") or {}
+                restricted = restrict_key(
+                    shell,
+                    ssh_key=access.ssh_key,
+                    source=str(pve.get("key_source") or ""),
+                    inventory_id=str(record.get("id") or ""),
+                    package=package_path(),
+                )
                 nodes, certificates = cluster_view(shell, access.nodes)
             break
         except (SshError, PveSetupError, ValueError) as exc:
@@ -204,7 +212,8 @@ def refresh_access(record: dict[str, Any]) -> list[str]:
 
     known = {str(node.get("name")): node for node in access.nodes}
     current = {node["name"]: node for node in nodes}
-    changes = [f"node {name} at {node['address']} joined" for name, node in current.items() if name not in known]
+    changes = ["the SSH key now runs only AltaStor's node helper"] if restricted else []
+    changes += [f"node {name} at {node['address']} joined" for name, node in current.items() if name not in known]
     changes += [f"node {name} left" for name in known if name not in current]
     changes += [
         f"node {name} has a new address, {node['address']}"

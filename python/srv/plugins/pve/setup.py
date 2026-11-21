@@ -6,13 +6,14 @@
 The admin gives the address of one node and its root password. abr-core logs in with the password once and:
 
 1. checks that the node runs PVE 9 and that its cluster is not registered already;
-2. installs the inventory's SSH key in root's authorized_keys, which PVE shares across the cluster through /etc/pve,
-   limited to abr-core's address and to commands and file transfers;
+2. writes abr-node-helper to /etc/pve/priv, and installs the inventory's SSH key in root's authorized_keys, which PVE
+   shares across the cluster through /etc/pve, limited to abr-core's address and to the helper as its forced command
+   (see node_helper.py);
 3. pins what the cluster tells about itself over that connection: every node's SSH host keys and the certificates of
    the REST API, the cluster's root CA and any certificate a node has in place of the one the CA issued;
 4. creates the PVE user abr@pve with its own role, granted on /, and an API token for this inventory;
-5. installs the abr-pve-backup package on every node with SSH and the new key, then adds the "abr" storage, in this
-   order, since a node without the package complains about an unknown storage type on every command;
+5. installs the abr-pve-backup package on every node with SSH, the new key and the helper, then adds the "abr"
+   storage, in this order, since a node without the package complains about an unknown storage type on every command;
 6. checks the token through the API.
 
 The password is not kept. Setting up again, with inventory edit and the root password, keeps the key and the pinned
@@ -30,6 +31,15 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ...core.storage_tool import APP_ROOT, REPO_ROOT
 from ...core.utils import utc_now
+from .node_helper import (
+    FORCED_COMMAND,
+    HELPER_PATH,
+    NodeHelperError,
+    NodeHelperMissing,
+    helper_from_package,
+    helper_version,
+    version_key,
+)
 from .pve_api import DEFAULT_PORT, PveApi, PveApiError
 from .ssh import DEFAULT_PORT as SSH_PORT
 from .ssh import (
@@ -64,8 +74,8 @@ PRIVILEGES = (
 )
 KEY_MARK = "altastor-inventory"
 AUTHORIZED_KEYS = "/root/.ssh/authorized_keys"
-REMOTE_PACKAGE_FOLDER = "/var/tmp"
-INSTALL_TIMEOUT_SECONDS = 900
+# Where the package puts its copy of the helper, for a setup on an appliance without the package.
+INSTALLED_HELPER = "/usr/lib/abr/abr-node-helper"
 PACKAGE_NAME = re.compile(r"^abr-pve-backup_([0-9][A-Za-z0-9.+~-]*)_([a-z0-9]+)\.deb$")
 
 
@@ -95,8 +105,9 @@ def key_comment(inventory_id: str) -> str:
 
 
 def authorized_key_line(private_key: str, source: str, inventory_id: str) -> str:
-    """The key, usable only from abr-core's address and without forwarding or a terminal; commands and SFTP work."""
-    options = f'from="{source}",restrict ' if source else "restrict "
+    """The key, usable only from abr-core's address, without forwarding or a terminal, and only for the node helper,
+    which sshd runs whatever the client asks for."""
+    options = (f'from="{source}",' if source else "") + f'restrict,command="{FORCED_COMMAND}" '
     return options + public_key_line(private_key, key_comment(inventory_id))
 
 
@@ -160,49 +171,46 @@ def package_path() -> Path | None:
     return max(found, key=lambda path: path.stat().st_mtime).resolve()
 
 
-def installed_version(shell: NodeShell) -> str | None:
-    result = shell.run(["dpkg-query", "-W", "-f", "${Status} ${Version}", PACKAGE], check=False)
-    words = result.text.split()
-    return words[-1] if result.status == 0 and words[:3] == ["install", "ok", "installed"] and len(words) == 4 else None
+def ensure_helper(shell: NodeShell, package: Path | None) -> dict[str, Any]:
+    """The helper's answer to version, after the helper in /etc/pve was replaced by the package's when that one is
+    newer. One copy serves the whole cluster, so the first node to see a newer package brings it to every node."""
+    helper = shell.helper
+    state = helper.version()
+    if package is not None:
+        text = helper_from_package(package)
+        if version_key(helper_version(text)) > version_key(str(state.get("helper") or "0")):
+            helper.update(text)
+            state = helper.version()
+    return state
 
 
 def ensure_package(shell: NodeShell, node: str, package: Path | None, progress: Progress | None = None) -> str:
-    """Installs the package on a node that lacks it or has an older one, with apt so that its dependencies come from
-    the node's Debian repositories; returns the version the node has."""
-    installed = installed_version(shell)
+    """Installs the package through the node helper on a node that lacks it or has an older one, with apt so that its
+    dependencies come from the node's Debian repositories; returns the version the node has."""
+    state = ensure_helper(shell, package)
     if package is None:
-        if installed:
-            return installed
+        if state.get("package"):
+            return str(state["package"])
         raise PveSetupError(
             f"Node {node} does not have the {PACKAGE} package, and this appliance has none to install. Install "
             f"{PACKAGE} on every node, or put it on this appliance in tools/abr-pve-backup/ or at "
             "ALTASTOR_PVE_PACKAGE_PATH"
         )
     version = package_version(package)
-    if installed and shell.run(["dpkg", "--compare-versions", installed, "ge", version], check=False).status == 0:
+    installed, current = shell.helper.package_status(version)
+    if current and installed:
         return installed
-    remote = f"{REMOTE_PACKAGE_FOLDER}/{package.name}"
     _say(
         progress, f"Installing {PACKAGE} {version} on node {node}" + (f" in place of {installed}" if installed else "")
     )
-    shell.upload_file(str(package), remote, mode=0o644)
     try:
-        result = shell.run(
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y -q -o DPkg::Lock::Timeout=300 "
-            f"--no-install-recommends {remote}",
-            timeout=INSTALL_TIMEOUT_SECONDS,
-            check=False,
-        )
-    finally:
-        shell.remove_file(remote)
-    if result.status != 0:
-        lines = [line for line in result.error_text.splitlines() if line.strip() and not line.startswith("W:")]
+        now = shell.helper.install_package(package)
+    except NodeHelperError as exc:
         raise PveSetupError(
-            f"apt could not install {PACKAGE} {version} on node {node}: {lines[-1] if lines else 'no error output'}. "
+            f"apt could not install {PACKAGE} {version} on node {node}: {exc}. "
             "Its dependencies (nbdkit, nbd-client, cifs-utils) come from the node's Debian repositories, which the "
             "node must reach"
-        )
-    now = installed_version(shell)
+        ) from exc
     if now != version:
         raise PveSetupError(f"Node {node} has {PACKAGE} {now or 'not installed'} after installing {version}")
     return now
@@ -327,41 +335,68 @@ def cluster_view(shell: NodeShell, known: Sequence[Mapping[str, Any]]) -> tuple[
     the other end tells them from /etc/pve.
 
     /etc/pve is the cluster's shared file system, so a node AltaStor has pinned vouches for what it says of the others.
-    A node AltaStor knows keeps its pinned keys, with any the cluster lists for it added.
+    A node AltaStor knows keeps its pinned keys, with any the cluster lists for it added. The node helper reads it all.
     """
-    members = json.loads((shell.read_file("/etc/pve/.members") or b"{}").decode() or "{}")
+    info = shell.helper.cluster_info()
+    try:
+        members = json.loads(str(info.get("members") or "{}"))
+    except ValueError as exc:
+        raise PveSetupError(f"{shell.address} has an /etc/pve/.members that is not JSON") from exc
     nodelist = members.get("nodelist") if isinstance(members.get("nodelist"), dict) else {}
+    listed_nodes = info.get("nodes") if isinstance(info.get("nodes"), dict) else {}
     pinned = {str(node.get("name")): node for node in known}
     nodes = []
     for name in sorted(nodelist) or sorted(pinned):
         entry = nodelist.get(name) if isinstance(nodelist.get(name), dict) else {}
+        files = listed_nodes.get(name) if isinstance(listed_nodes.get(name), dict) else {}
         keys = [str(key) for key in pinned.get(name, {}).get("host_keys") or []]
-        listed = known_host_keys((shell.read_file(f"/etc/pve/nodes/{name}/ssh_known_hosts") or b"").decode())
+        listed = known_host_keys(str(files.get("ssh_known_hosts") or ""))
         keys += [key for key in listed if key not in keys]
         address = str(entry.get("ip") or pinned.get(name, {}).get("address") or name)
         nodes.append({"name": name, "address": address, "host_keys": keys})
-    certificates = [(shell.read_file("/etc/pve/pve-root-ca.pem") or b"").decode()]
+    certificates = [str(info.get("root_ca") or "")]
     if not certificates[0].strip():
         raise PveSetupError(f"{shell.address} has no cluster root CA in /etc/pve/pve-root-ca.pem")
     for node in nodes:
-        own = (shell.read_file(f"/etc/pve/nodes/{node['name']}/pveproxy-ssl.pem") or b"").decode()
+        files = listed_nodes.get(node["name"]) if isinstance(listed_nodes.get(node["name"]), dict) else {}
+        own = str(files.get("pveproxy_ssl_pem") or "")
         if own.strip():
             certificates.append(own)
     return nodes, certificates
 
 
-def _pinned_keys(shell: NodeShell, presented: str, extra: Sequence[str] = ()) -> list[str]:
-    """Every host key the node has; the key it presented must be one of them."""
-    keys = known_host_keys(shell.run("cat /etc/ssh/ssh_host_*_key.pub", check=False).text)
+def _pinned_keys(address: str, host_keys: str, presented: str, extra: Sequence[str] = ()) -> list[str]:
+    """Every host key the node has, from the text of its .pub files; the key it presented must be one of them."""
+    keys = known_host_keys(host_keys)
     for key in extra:
         if key not in keys:
             keys.append(key)
     if normalized_key(presented) not in keys:
         raise PveSetupError(
-            f"{shell.address} presented SSH host key {key_fingerprint(presented)}, "
-            "which is not one of its own host keys"
+            f"{address} presented SSH host key {key_fingerprint(presented)}, which is not one of its own host keys"
         )
     return keys
+
+
+def _install_helper(shell: NodeShell, package: Path | None) -> str:
+    """Writes the node helper to /etc/pve/priv through the root password's session, from this appliance's package or
+    else from the one installed on the node; a newer helper there, which another appliance may have put, stays.
+    Returns the version /etc/pve has."""
+    if package is not None:
+        text = helper_from_package(package)
+    else:
+        text = shell.read_file(INSTALLED_HELPER) or b""
+        if not text:
+            raise PveSetupError(
+                f"{shell.address} has no {PACKAGE} package, and this appliance has none either: AltaStor needs it for "
+                "its node helper. Put the package on this appliance in tools/abr-pve-backup/ or at "
+                "ALTASTOR_PVE_PACKAGE_PATH"
+            )
+    current = shell.read_file(HELPER_PATH)
+    if current and version_key(helper_version(current)) >= version_key(helper_version(text)):
+        return helper_version(current)
+    shell.write_file(HELPER_PATH, text, mode=None)
+    return helper_version(text)
 
 
 def set_up_cluster(
@@ -441,6 +476,8 @@ def _set_up(
     warnings: list[str] = []
     ssh_key = str(previous.get("ssh_key") or "") or generate_key_pair("")[0]
     source = (first.run('printf %s "$SSH_CLIENT"').text.split() or [""])[0]
+    helper = _install_helper(first, package)
+    _say(progress, f"Wrote AltaStor's node helper {helper} to {HELPER_PATH}")
     path = _install_key(first, authorized_key_line(ssh_key, source, inventory_id), inventory_id)
     _say(progress, f"Installed AltaStor's SSH key for root in {path}, usable from {source or 'any address'}")
 
@@ -455,7 +492,8 @@ def _set_up(
                 node["host_keys"].append(key)
     if not certificates[0].strip():
         raise PveSetupError(f"{address} has no cluster root CA in /etc/pve/pve-root-ca.pem")
-    nodes[0]["host_keys"] = _pinned_keys(first, first.host_key, nodes[0]["host_keys"])
+    own_keys = first.run("cat /etc/ssh/ssh_host_*_key.pub", check=False).text
+    nodes[0]["host_keys"] = _pinned_keys(address, own_keys, first.host_key, nodes[0]["host_keys"])
 
     token_id, token_secret = _ensure_access(first, inventory_id, inventory_name)
     _say(progress, f"Created API token {token_id} with role {ROLE} on /")
@@ -468,7 +506,8 @@ def _set_up(
         try:
             with NodeShell(node["address"], port=ssh_port, private_key=ssh_key, host_keys=node["host_keys"]) as shell:
                 if not node["local"]:
-                    node["host_keys"] = _pinned_keys(shell, shell.host_key, node["host_keys"])
+                    own_keys = str(shell.helper.cluster_info().get("host_keys") or "")
+                    node["host_keys"] = _pinned_keys(node["address"], own_keys, shell.host_key, node["host_keys"])
                 versions[node["name"]] = ensure_package(shell, node["name"], package, progress)
         except SshError as exc:
             raise PveSetupError(f"Node {node['name']} at {node['address']}: {exc}") from exc
@@ -504,20 +543,27 @@ def _set_up(
     }
 
 
+def restrict_key(shell: NodeShell, *, ssh_key: str, source: str, inventory_id: str, package: Path | None) -> bool:
+    """Moves an inventory that was set up before the node helper onto it, through its own key, which still runs any
+    command: writes the helper to /etc/pve/priv and gives the key the helper as its forced command. Returns whether it
+    did; a key the helper runs as its forced command already is left as it is."""
+    try:
+        if shell.helper.version().get("restricted"):
+            return False
+    except NodeHelperMissing:
+        pass
+    _install_helper(shell, package)
+    _install_key(shell, authorized_key_line(ssh_key, source, inventory_id), inventory_id)
+    return True
+
+
 def tear_down(shell: NodeShell, inventory_id: str) -> list[str]:
-    """Removes what one inventory alone used: its API token and its SSH key. The user, the role, the package and the
-    storage stay for other inventories and servers; returns what was removed."""
+    """Removes what one inventory alone used, through the node helper: its API token and its SSH key. The user, the
+    role, the package, the helper and the storage stay for other inventories and servers; returns what was removed."""
     removed = []
-    name = token_name(inventory_id)
-    tokens = _json(shell, ["pveum", "user", "token", "list", USER, "--output-format", "json"]) or []
-    if any(str(item.get("tokenid")) == name for item in tokens):
-        shell.run(["pveum", "user", "token", "remove", USER, name])
-        removed.append(f"API token {USER}!{name}")
-    path = shell.run(["readlink", "-f", AUTHORIZED_KEYS]).text.strip() or AUTHORIZED_KEYS
-    current = (shell.read_file(path) or b"").decode()
-    updated = without_authorized_key(current, inventory_id)
+    if shell.helper.remove_token(inventory_id):
+        removed.append(f"API token {USER}!{token_name(inventory_id)}")
     # The key is removed last: the connection that removes it uses it.
-    if updated != current:
-        shell.write_file(path, updated, mode=None if path.startswith("/etc/pve/") else 0o600)
-        removed.append(f"SSH key in {path}")
+    if shell.helper.remove_key(inventory_id):
+        removed.append("SSH key in /etc/pve/priv/authorized_keys")
     return removed

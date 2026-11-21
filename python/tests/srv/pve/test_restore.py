@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES, RESOURCES_BY_HV
 from python.srv.core.task_executor import TaskStopRequested
+from python.tests.srv.pve.fake_helper import FakeHelper
 from python.srv.plugins.pve import pve_restore
 from python.srv.plugins.pve.pve import PveAccess, restore_metadata, vm_name_problem
 from python.srv.plugins.pve.pve_api import PveApiError
@@ -347,6 +348,9 @@ class FakeShell:
         self.files: dict[str, bytes] = {}
         self.written: dict[str, dict] = {}
         self.removed: list[str] = []
+        self.offered: dict[str, dict] = {}
+        self.offers: list = []
+        self.helper = FakeHelper(self)
         self.nbd = "16\n0\n"
 
     def make_directory(self, path, mode):
@@ -564,7 +568,12 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(run["repository"]["path"], "pve/web")
         self.assertEqual(run["disks"]["drive-scsi0"]["chain"], ["task-a/scsi0", "task-b/scsi0", "task-c/scsi0"])
         self.assertEqual(run["disks"]["drive-tpmstate0-backup"]["chain"], ["task-c/tpmstate0"])
-        self.assertEqual(run["secrets"], {"secret_key": "s3-secret", "key": "secret-key"})
+        self.assertNotIn("secrets", run)
+        self.assertEqual(
+            cluster.shell_.offered,
+            {f"restore-9002-{point_ctime(BACKUPS['point-c'])}": {"secret_key": "s3-secret", "key": "secret-key"}},
+        )
+        self.assertTrue(cluster.shell_.offers[0].closed)
         self.assertIn("name: web-restored", run["guest_config"].splitlines())
         self.assertEqual(run["firewall_config"], "[OPTIONS]\nenable: 1\n")
         self.assertEqual(

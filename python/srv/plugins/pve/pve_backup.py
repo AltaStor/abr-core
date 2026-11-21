@@ -77,6 +77,7 @@ from ..vcenter.vcenter_backup import (
 from .pve import PveError, PveNode, restore_metadata, vm_disks
 from .pve_api import PveApiError, Upid, task_error, task_succeeded
 from .setup import PveSetupError, ensure_package, package_path
+from .node_helper import SecretsOffer
 from .ssh import NodeShell, SshError
 
 logger = logging.getLogger(__name__)
@@ -124,8 +125,13 @@ def backup_name(key: str) -> str:
     return key
 
 
+def run_base(vmid: str) -> str:
+    """The name of a backup's run on its node: its files are <base>.json, .result.json and .log in /run/abr."""
+    return f"backup-{vmid}"
+
+
 def run_file_path(vmid: str, suffix: str = "json") -> str:
-    return f"{RUN_FOLDER}/backup-{vmid}.{suffix}"
+    return f"{RUN_FOLDER}/{run_base(vmid)}.{suffix}"
 
 
 # ---- the repository as a node reaches it ---------------------------------------------------------------------------
@@ -579,15 +585,14 @@ def find_started_task(
 
 
 def _remove_run_files(shell: NodeShell, vmid: str) -> None:
-    for suffix in ("json", "result.json", "log"):
-        try:
-            shell.remove_file(run_file_path(vmid, suffix))
-        except (SshError, OSError) as exc:
-            logger.warning("Could not remove %s on %s: %s", run_file_path(vmid, suffix), shell.address, exc)
+    try:
+        shell.helper.remove_run(run_base(vmid))
+    except (SshError, OSError) as exc:
+        logger.warning("Could not remove the run files of %s on %s: %s", run_base(vmid), shell.address, exc)
 
 
 def _read_result(shell: NodeShell, vmid: str, run_id: str) -> dict[str, Any] | None:
-    data = shell.read_file(run_file_path(vmid, "result.json"))
+    data = shell.helper.get_result(f"{run_base(vmid)}.result.json")
     if not data:
         return None
     try:
@@ -746,8 +751,9 @@ def run_pve_backup(task: dict[str, Any], progress_callback: ProgressCallback = N
             if not _acquire_node(lock, stopped, lambda: emit("prepare", 8, waiting)):
                 raise TaskStopRequested("Session stop requested")
             try:
+                offer: SecretsOffer | None = None
                 if resumed is None:
-                    upid, run_id = _start(
+                    upid, run_id, offer = _start(
                         task=task,
                         cluster=cluster,
                         shell=shell,
@@ -794,6 +800,8 @@ def run_pve_backup(task: dict[str, Any], progress_callback: ProgressCallback = N
                 )
                 _record_run(progress_callback, run_state)
             finally:
+                if offer is not None:
+                    offer.close()
                 lock.release()
             # The result file stays on the node until the session is registered or discarded: a server that stops
             # in between reads it again when it follows the task once more.
@@ -1257,8 +1265,9 @@ def _start(
     located: dict[str, Any],
     emit: Callable[..., None],
     progress_callback: ProgressCallback,
-) -> tuple[str, str]:
-    """Writes the run file and starts vzdump; returns the task's UPID and the run ID."""
+) -> tuple[str, str, SecretsOffer | None]:
+    """Writes the run file, has the node helper offer the secrets, and starts vzdump; returns the task's UPID, the run
+    ID and the offer, which the caller closes when the task has ended."""
     task_id = str(task.get("id") or "")
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
     version = ensure_package(shell, node, package_path(), lambda message: emit("prepare", 9, message))
@@ -1325,9 +1334,15 @@ def _start(
         now=datetime.now(timezone.utc),
         bandwidth_limit=parameters.get("pve_bandwidth_limit"),
     )
-    shell.make_directory(RUN_FOLDER, mode=0o700)
+    # The secrets stay out of the run file: the node helper keeps them in memory and hands them to the task alone. A
+    # run without any says so with an empty set.
+    offered = run.pop("secrets", None) or {}
+    if not offered:
+        run["secrets"] = {}
+    base = run_base(vmid)
     _remove_run_files(shell, vmid)
-    shell.write_file(run_file_path(vmid), json.dumps(run, indent=2), mode=0o600)
+    shell.helper.put_run(f"{base}.json", json.dumps(run, indent=2))
+    offer = shell.helper.offer_secrets(base, offered) if offered else None
     _record_run(
         progress_callback,
         {"state": STARTING, "node": node, "vmid": vmid, "run_id": task_id, "prepared_at": time.time()},
@@ -1343,7 +1358,9 @@ def _start(
             **{"notification-mode": "legacy-sendmail"},
         )
     except BaseException:
-        shell.remove_file(run_file_path(vmid))
+        if offer is not None:
+            offer.close()
+        shell.helper.remove_run(base)
         raise
     _record_run(
         progress_callback, {"upid": upid, "node": node, "vmid": vmid, "run_id": task_id, "started_at": utc_now()}
@@ -1355,7 +1372,7 @@ def _start(
         f"Started vzdump task {upid} on node {node}, with fleecing images on {fleecing}"
         + (f", reading at most {limit} MiB/s per disk" if limit else ""),
     )
-    return upid, task_id
+    return upid, task_id, offer
 
 
 def _write_manifest(

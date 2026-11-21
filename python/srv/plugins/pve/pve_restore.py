@@ -48,6 +48,7 @@ from .pve import (
 from .pve_api import PveApiError, Upid, task_error, task_succeeded
 from .pve_backup import RUN_FOLDER, STARTING, WORKER_MODE, drive_device, find_started_task, node_repository
 from .setup import PveSetupError, ensure_package, package_path
+from .node_helper import SecretsOffer
 from .ssh import NodeShell, SshError
 
 logger = logging.getLogger(__name__)
@@ -83,8 +84,14 @@ def archive_name(vmid: str, ctime: int) -> str:
     return f"backup/{vmid}/qemu-{ctime}"
 
 
+def run_base(vmid: str, ctime: int) -> str:
+    """The name of a restore's run on its node, after the restore point: its files are <base>.json and .result.json in
+    /run/abr."""
+    return f"restore-{vmid}-{ctime}"
+
+
 def run_file_path(vmid: str, ctime: int, suffix: str = "json") -> str:
-    return f"{RUN_FOLDER}/restore-{vmid}-{ctime}.{suffix}"
+    return f"{RUN_FOLDER}/{run_base(vmid, ctime)}.{suffix}"
 
 
 def point_ctime(point: Mapping[str, Any]) -> int:
@@ -447,16 +454,15 @@ def _record_run(progress_callback: ProgressCallback, run: dict[str, Any]) -> Non
 
 
 def _remove_run_files(shell: NodeShell, vmid: str, ctime: int) -> None:
-    for suffix in ("json", "result.json"):
-        try:
-            shell.remove_file(run_file_path(vmid, ctime, suffix))
-        except (SshError, OSError) as exc:
-            logger.warning("Could not remove %s on %s: %s", run_file_path(vmid, ctime, suffix), shell.address, exc)
+    try:
+        shell.helper.remove_run(run_base(vmid, ctime))
+    except (SshError, OSError) as exc:
+        logger.warning("Could not remove the run files of %s on %s: %s", run_base(vmid, ctime), shell.address, exc)
 
 
 def _read_result(shell: NodeShell, vmid: str, ctime: int, run_id: str) -> dict[str, Any] | None:
     try:
-        data = shell.read_file(run_file_path(vmid, ctime, "result.json"))
+        data = shell.helper.get_result(f"{run_base(vmid, ctime)}.result.json")
     except (SshError, OSError) as exc:
         logger.warning("Could not read the result file of the restore on %s: %s", shell.address, exc)
         return None
@@ -541,12 +547,7 @@ def _check_storages(cluster: PveNode, node: str, storages: dict[str, str]) -> No
 
 def nbd_devices(shell: NodeShell) -> tuple[int, int]:
     """The kernel NBD devices of a node and how many are in use; 0 devices when the nbd module is not loaded."""
-    text = shell.run(
-        "cat /sys/module/nbd/parameters/nbds_max 2>/dev/null || echo 0; ls -d /sys/block/nbd*/pid 2>/dev/null | wc -l",
-        check=False,
-    ).text.split()
-    numbers = [int(word) for word in text if word.isdigit()]
-    return (numbers[0], numbers[1]) if len(numbers) == 2 else (0, 0)
+    return shell.helper.nbd_devices()
 
 
 def _check_nbd_devices(shell: NodeShell, node: str) -> None:
@@ -807,6 +808,7 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
             waiting = f"Waiting for another restore of this restore point on node {node} to end"
             if not _acquire(lock, stopped, lambda: emit("prepare", 9, waiting)):
                 raise TaskStopRequested("Session stop requested")
+            offer: SecretsOffer | None = None
             try:
                 if resumed is None:
                     version = ensure_package(shell, node, package_path(), lambda message: emit("prepare", 10, message))
@@ -833,7 +835,6 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
                         )
                     if stopped():
                         raise TaskStopRequested("Session stop requested")
-                    shell.make_directory(RUN_FOLDER, mode=0o700)
                     for attempt in range(1, NEW_VM_ATTEMPTS + 1):
                         if mode == "new_vm":
                             target_vmid = cluster.next_vm_id()
@@ -851,8 +852,14 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
                             chains=qualified,
                             now=datetime.now(timezone.utc),
                         )
+                        # The secrets stay out of the run file: the node helper keeps them for the task of this target
+                        # VM alone, so each attempt offers them anew.
+                        offered = run.pop("secrets", None) or {}
+                        if not offered:
+                            run["secrets"] = {}
                         _remove_run_files(shell, source_vmid, ctime)
-                        shell.write_file(run_file_path(source_vmid, ctime), json.dumps(run, indent=2), mode=0o600)
+                        shell.helper.put_run(f"{run_base(source_vmid, ctime)}.json", json.dumps(run, indent=2))
+                        offer = shell.helper.offer_secrets(run_base(source_vmid, ctime), offered) if offered else None
                         options = {"force": 1} if mode == "in_place" else {"unique": 1}
                         _record_run(
                             progress_callback,
@@ -875,8 +882,13 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
                                 archive=f"{cluster.access.storage}:{archive}",
                                 **options,
                             )
-                        except PveApiError as exc:
+                        except BaseException as exc:
+                            if offer is not None:
+                                offer.close()
+                                offer = None
                             _remove_run_files(shell, source_vmid, ctime)
+                            if not isinstance(exc, PveApiError):
+                                raise
                             # Another VM took the ID between the question and the start.
                             if mode == "new_vm" and "already exists" in str(exc) and attempt < NEW_VM_ATTEMPTS:
                                 continue
@@ -919,6 +931,8 @@ def run_pve_restore(task: dict[str, Any], progress_callback: ProgressCallback = 
                 result = _read_result(shell, source_vmid, ctime, str(run_state.get("run_id") or task_id))
                 _remove_run_files(shell, source_vmid, ctime)
             finally:
+                if offer is not None:
+                    offer.close()
                 lock.release()
 
             if not task_succeeded(status):

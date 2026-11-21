@@ -15,7 +15,9 @@ it with the **abr-pve-backup** package (the `abr-pve-backup` repository), which 
 
 The backup server never touches the disks. It starts each backup and restore as a PVE task through the PVE API, with
 an API token of its own, and hands the provider what the task needs in a run file it writes to `/run/abr` on the node
-over SSH: the repository, the backups to write or read, and the secrets. The provider runs only tasks abr-core started:
+through AltaStor's node helper over SSH: the repository and the backups to write or read. The secrets never go into a
+file: the helper keeps them in memory and hands them once to the task, see [The node helper](#the-node-helper). The
+provider runs only tasks abr-core started:
 a backup or restore on the `abr` storage started from the PVE web interface, a PVE backup job or the shell is refused.
 The backup server keeps the catalog, the manifests and the keys, merges chains, applies retention and verifies, as for
 the other platforms.
@@ -30,7 +32,7 @@ it installed already.
 
 | From | What | Why |
 | --- | --- | --- |
-| Every node | PVE 9, the PVE API on TCP 8006 and SSH on TCP 22 from the backup server | Inventory and tasks through the API; run files, package installs and the one-time setup over SSH |
+| Every node | PVE 9, the PVE API on TCP 8006 and SSH on TCP 22 from the backup server | Inventory and tasks through the API; run files, secrets, package installs and the one-time setup over SSH, through the node helper |
 | The cluster | Root's password, once, when the inventory is added or set up again | The setup creates AltaStor's own credentials; the password is not kept |
 | Every node | Its Debian repositories, or a mirror | `apt` installs the package's dependencies: nbdkit, nbd-client, cifs-utils, libnbd0 |
 | The repository | **S3** with an access key of its own, or an **SMB** repository, reachable from every node and from the backup server; a local repository the appliance shares over SMB works too | The nodes write and read the backups; the backup server keeps manifests, merges chains and applies retention. Both reach the same storage |
@@ -50,8 +52,10 @@ An inventory is the cluster of the node at `--address`, or that node alone when 
 added once: adding it again under another name, or adding one of its nodes, is refused. The setup runs over SSH with
 root's password, on the node given, and:
 
-1. installs AltaStor's own SSH key for root in `/etc/pve/priv/authorized_keys`, which PVE shares with every node, as
-   `from="<backup server address>",restrict` and marked `altastor-inventory:<inventory id>`;
+1. writes AltaStor's node helper to `/etc/pve/priv/abr-node-helper`, from the package, and installs AltaStor's own SSH
+   key for root in `/etc/pve/priv/authorized_keys`, which PVE shares with every node, as
+   `from="<backup server address>",restrict,command="/usr/bin/perl -T /etc/pve/priv/abr-node-helper"` and marked
+   `altastor-inventory:<inventory id>`: the key runs the helper and nothing else;
 2. pins every node's SSH host keys and the API certificates the cluster trusts, read from `/etc/pve`: its root CA and any
    node certificate of its own;
 3. creates the role `AltaStorBackup`, the PVE user `abr@pve` with that role on `/`, and an API token
@@ -66,7 +70,45 @@ changed. A first setup that fails takes back what it made.
 `abr inventory rescan` reads the cluster's nodes and certificates over SSH from a node the inventory has pinned before
 it lists the VMs: a node that joined the cluster gets its address and host keys, a node that left is dropped, and a
 renewed API certificate replaces the old one. No password is needed for that, since `/etc/pve` is the cluster's own
-file system. A node that joined is given the package before its first backup or restore.
+file system. A node that joined is given the package before its first backup or restore. An inventory set up before
+the node helper is moved onto it by the rescan: its key, which can still run any command, writes the helper and gives
+itself the helper as its forced command.
+
+## The node helper
+
+AltaStor's SSH key runs one program on the nodes, `abr-node-helper` (from the abr-pve-backup package), as the key's
+forced command: whatever the backup server asks for, sshd runs the helper, which does only what it knows and refuses
+the rest. There is no shell, no SFTP and no forwarding with the key. The helper lives in `/etc/pve/priv`, next to the
+shared `authorized_keys`, so every node has it, also before the package is installed and on nodes that join later.
+
+| Command | What it does |
+| --- | --- |
+| `version`, `package-status` | The helper's version, the installed package's, and whether the package is current |
+| `install-package` | Installs the abr-pve-backup package that comes on its input, with `apt`; any other package is refused |
+| `put-run`, `get-result`, `remove-run` | Writes a run file to `/run/abr`, reads a result file, removes a run's files; only names of runs |
+| `hand-secrets` | Keeps a run's secrets in memory and hands them once to the PVE task the run file names |
+| `nbd-devices` | How many kernel NBD devices the node has and how many are in use |
+| `cluster-info` | The cluster's members, SSH host keys and API certificates from `/etc/pve`, and the node's public host keys |
+| `remove-token`, `remove-key` | Removes the inventory's API token and its own `authorized_keys` line |
+| `update-helper` | Replaces the helper with a newer one, which must start and answer before it takes the old one's place |
+
+**Secrets.** The S3 secret key, the share's password and the encryption key never go into the run file. The backup
+server streams them over its SSH connection to `hand-secrets`, which keeps them in locked memory and offers them on a
+socket in `/run/abr`, root only. It gives them to a process only when it is the run's PVE task: root, on this node,
+named after a task of the run's kind, VM and API token, and asking for the run's ID. It hands them over once, and
+withdraws the offer when the backup server closes its connection or the run file expires.
+
+**Updates.** One copy serves the whole cluster. Before each run the backup server compares its package's helper with
+the one in `/etc/pve` and replaces an older one; a command already running keeps its old code. Replacing it needs the
+cluster's quorum, like every write to `/etc/pve`. The previous helper stays as `abr-node-helper.previous`. If the
+helper cannot be used, setting the cluster up again with `abr inventory edit --password` writes it anew.
+
+**Logging.** Every request the helper grants or refuses is logged on the node: `journalctl -t abr-node-helper`.
+
+**Limits.** Root on a node can read anything there, the secrets of a running backup included, since the tools need
+them. Installing a package runs its scripts as root, and the helper checks only that a package is abr-pve-backup for
+the node's architecture, not who built it: whoever holds the backup server's key can still have code run as root
+through a crafted package. The key stays limited to the backup server's address.
 
 `abr inventory remove` takes the API token and the SSH key back from the first node that answers. The user, the role,
 the package and the storage stay, for other inventories and appliances. When no node answers, the result names what to
@@ -76,9 +118,9 @@ remove by hand.
 
 1. abr-core finds the VM's node and configuration through the API, checks the node has the package, and decides for
    each disk whether PVE should keep its dirty bitmap (an incremental) or start a new one (a full).
-2. It writes the run file `/run/abr/backup-<vmid>.json` over SSH, readable by root only and valid for
-   `ALTASTOR_PVE_RUN_FILE_MINUTES`, and starts `vzdump` on the `abr` storage in snapshot mode with fleecing, on a
-   storage for VM disks of the VM's own.
+2. It writes the run file `/run/abr/backup-<vmid>.json` through the node helper, readable by root only and valid for
+   `ALTASTOR_PVE_RUN_FILE_MINUTES`, has the helper offer the run's secrets to its task, and starts `vzdump` on the `abr`
+   storage in snapshot mode with fleecing, on a storage for VM disks of the VM's own.
 3. The provider backs up `ALTASTOR_PVE_PARALLEL_DISKS` disks at a time, each with `abr-nbd-tool` into the session's
    folder of the repository, and writes a result file abr-core reads at the end.
 4. abr-core writes the manifest and registers the restore point; a failed or stopped run is discarded.
@@ -176,7 +218,8 @@ Every backup and restore is a session in *Activity* (and `abr session list` / `a
 log: the node and the package version, each disk with its bitmap and whether it was backed up in full or incrementally
 and why, the PVE task's UPID and the lines of its log that matter, warnings and the cause of a failure. The PVE task log
 on the node holds the provider's own lines, starting with one that names the run's ID. Credentials and encryption keys are never
-written to either; on the node they live only in the run file while the run lasts.
+written to either; on the node they never reach a file, and live only in the node helper's memory until the task takes
+them, and then in the processes that use them.
 
 ## Troubleshooting
 
@@ -191,6 +234,8 @@ written to either; on the node they live only in the run file while the run last
 | `Node ... is not one AltaStor knows in this cluster` | Run `abr inventory rescan`, which reads the nodes that joined from the cluster |
 | `The TLS certificate of the PVE API ... is not the one AltaStor trusts` | Run `abr inventory rescan`, which reads renewed certificates over SSH |
 | `The PVE API refused AltaStor's API token` | The token was removed or replaced in PVE: set the cluster up again with `abr inventory edit --password` |
+| `... has no AltaStor node helper in /etc/pve/priv/abr-node-helper` | The cluster was set up before the backup server used the helper: run `abr inventory rescan`, or set the cluster up again with `abr inventory edit --password` |
+| `The node helper on ... could not keep the secrets of ...` | See `journalctl -t abr-node-helper` on that node; `/run/abr` must be writable, and the run file must be there |
 | `presented SSH host key ..., which is not one of its own host keys` | The node's SSH host key changed outside the cluster's records; check the node, then set the cluster up again |
 | `PVE no longer had the dirty bitmap of ...` | Expected after the VM was restarted, stopped or migrated: those disks were backed up in full |
 | `Fleecing storage ... has ... free` | Free room on that storage, or give the job another one |

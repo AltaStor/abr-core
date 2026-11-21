@@ -18,13 +18,16 @@ from python.srv.plugins.pve.setup import (
     known_host_keys,
     package_version,
     pve_major_version,
+    restrict_key,
     set_up_cluster,
     tear_down,
     token_name,
     with_authorized_key,
     without_authorized_key,
 )
+from python.srv.plugins.pve.node_helper import FORCED_COMMAND, HELPER_COMMAND, helper_from_package, helper_version, version_key
 from python.srv.plugins.pve.ssh import NodeShell, generate_key_pair
+from python.tests.srv.pve.fake_helper import helper_text, make_package
 from python.tests.srv.pve.fake_ssh import FakeSshNode, key_line
 
 ROOT_KEYS = "ssh-rsa AAAAnode1 root@node1\nssh-rsa AAAAnode2 root@node2\n"
@@ -44,6 +47,7 @@ class FakeCluster:
         self.installed: str | None = None
         self.apt_fails = False
         self.created_tokens = 0
+        self.helper_calls: list[list[str]] = []
         root = node.root
         for folder in ("etc/pve/priv", "etc/pve/nodes/node1", "etc/pve/nodes/node2", "root/.ssh", "var/tmp"):
             (root / folder).mkdir(parents=True, exist_ok=True)
@@ -57,6 +61,8 @@ class FakeCluster:
     def answer(self, command: str, stdin: bytes):
         words = shlex.split(command)
         text = None
+        if words[:3] == HELPER_COMMAND:
+            return self.helper(words[3:], stdin)
         if words == ["pveversion"]:
             text = self.version
         elif words[:3] == ["pvesh", "get", "/cluster/status"]:
@@ -127,6 +133,64 @@ class FakeCluster:
     def authorized_keys(self) -> str:
         return (self.node.root / "etc/pve/priv/authorized_keys").read_text()
 
+    def helper(self, words: list[str], stdin: bytes):
+        """abr-node-helper as the fake node runs it, over the fake cluster's state."""
+        path = self.node.root / "etc/pve/priv/abr-node-helper"
+        if not path.exists():
+            return 2, b"", b'Can\'t open perl script "/etc/pve/priv/abr-node-helper": No such file or directory\n'
+        self.helper_calls.append(words)
+        command, arguments = words[0], words[1:]
+
+        def read(name: str) -> str | None:
+            file = self.node.root / name
+            return file.read_text() if file.exists() else None
+
+        if command == "version":
+            answer = {
+                "helper": helper_version(path.read_bytes()),
+                "package": self.installed,
+                "restricted": 'command="' in self.authorized_keys(),
+            }
+        elif command == "update-helper":
+            path.write_bytes(stdin)
+            answer = {"helper": helper_version(stdin)}
+        elif command == "package-status":
+            current = self.installed is not None and version_key(self.installed) >= version_key(arguments[0])
+            answer = {"installed": self.installed, "current": current}
+        elif command == "install-package":
+            if self.apt_fails:
+                return 1, b"", b"W: some warning\nE: Unable to locate package nbdkit\n"
+            package = self.node.root / "var/tmp/received.deb"
+            package.write_bytes(stdin)
+            self.installed = helper_version(helper_from_package(package))
+            package.unlink()
+            answer = {"installed": self.installed}
+        elif command == "cluster-info":
+            answer = {
+                "members": read("etc/pve/.members")
+                or json.dumps({"nodelist": {"node1": {"ip": "127.0.0.1"}, "node2": {"ip": "127.0.0.1"}}}),
+                "root_ca": read("etc/pve/pve-root-ca.pem"),
+                "nodes": {
+                    name: {
+                        "ssh_known_hosts": read(f"etc/pve/nodes/{name}/ssh_known_hosts"),
+                        "pveproxy_ssl_pem": read(f"etc/pve/nodes/{name}/pveproxy-ssl.pem"),
+                    }
+                    for name in ("node1", "node2")
+                },
+                "host_keys": key_line(self.node.host_keys[0]) + " root@node1\n",
+            }
+        elif command == "remove-token":
+            name = token_name(arguments[0])
+            answer = {"removed": self.tokens.pop(name, None) is not None}
+        elif command == "remove-key":
+            current = self.authorized_keys()
+            updated = without_authorized_key(current, arguments[0])
+            (self.node.root / "etc/pve/priv/authorized_keys").write_text(updated)
+            answer = {"removed": updated != current}
+        else:
+            return 2, b"", f"abr-node-helper: unknown command {command}\n".encode()
+        return 0, (json.dumps(answer) + "\n").encode(), b""
+
 
 class FakeApi:
     calls: list[tuple] = []
@@ -154,7 +218,7 @@ class SetupTests(unittest.TestCase):
         self.addCleanup(self.node.close)
         self.cluster = FakeCluster(self.node)
         self.package = folder / "abr-pve-backup_0.2.0_amd64.deb"
-        self.package.write_bytes(b"package")
+        make_package(self.package, "0.2.0")
         FakeApi.calls = []
         self.enterContext(patch.object(setup, "PveApi", FakeApi))
 
@@ -183,7 +247,12 @@ class SetupTests(unittest.TestCase):
         self.assertEqual((pve["token_id"], result["token"]), ("abr@pve!altastor-inv12345678", "secret-1"))
         lines = self.cluster.authorized_keys().splitlines()
         self.assertEqual(lines[:2], ROOT_KEYS.splitlines())
-        self.assertRegex(lines[2], r'^from="127\.0\.0\.1",restrict ssh-ed25519 \S+ altastor-inventory:inv-1234-5678$')
+        self.assertEqual(
+            lines[2].split(" ssh-ed25519 ")[0], f'from="127.0.0.1",restrict,command="{FORCED_COMMAND}"'
+        )
+        self.assertTrue(lines[2].endswith(" altastor-inventory:inv-1234-5678"))
+        self.assertEqual((self.root / "etc/pve/priv/abr-node-helper").read_bytes(), helper_text("0.2.0"))
+        self.assertIn("Wrote AltaStor's node helper 0.2.0 to /etc/pve/priv/abr-node-helper", messages)
         self.assertEqual(self.cluster.roles["AltaStorBackup"], ",".join(setup.PRIVILEGES))
         self.assertEqual(self.cluster.acl, [("/", "abr@pve", "AltaStorBackup")])
         self.assertEqual(self.cluster.installed, "0.2.0")
@@ -198,11 +267,11 @@ class SetupTests(unittest.TestCase):
         )
         self.assertEqual(list((self.root / "var/tmp").iterdir()), [])
         self.assertIn("Installing abr-pve-backup 0.2.0 on node node1", messages)
-        # The key from the setup opens the node, which must present the pinned host key.
+        # The key from the setup opens the node, which must present the pinned host key, and reaches the helper.
         with NodeShell(
             "127.0.0.1", port=self.node.port, private_key=pve["ssh_key"], host_keys=pve["nodes"][0]["host_keys"]
         ) as shell:
-            self.assertEqual(shell.run("echo key").text, "key\n")
+            self.assertEqual(shell.helper.version()["helper"], "0.2.0")
 
     def test_setting_up_again_keeps_the_key_and_pins_and_replaces_the_token(self):
         first, _ = self.set_up()
@@ -263,14 +332,18 @@ class SetupTests(unittest.TestCase):
 
     def test_a_node_with_the_package_and_no_package_here_is_enough(self):
         self.cluster.installed = "0.3.0"
+        (self.root / "usr/lib/abr").mkdir(parents=True)
+        (self.root / "usr/lib/abr/abr-node-helper").write_bytes(helper_text("0.3.0"))
         result, messages = self.set_up(package=None)
         self.assertEqual(result["pve"]["package_versions"], {"node1": "0.3.0", "node2": "0.3.0"})
+        self.assertIn("Wrote AltaStor's node helper 0.3.0 to /etc/pve/priv/abr-node-helper", messages)
 
     def test_a_node_without_the_package_and_no_package_here_fails(self):
         with self.assertRaisesRegex(
-            PveSetupError, "Node node1 does not have the abr-pve-backup package, and this appliance has none"
+            PveSetupError, "127.0.0.1 has no abr-pve-backup package, and this appliance has none either"
         ):
             self.set_up(package=None)
+        self.assertEqual(self.cluster.authorized_keys(), ROOT_KEYS)
 
     def test_tearing_down_removes_the_inventorys_token_and_key_only(self):
         result, _ = self.set_up()
@@ -290,17 +363,46 @@ class SetupTests(unittest.TestCase):
 
     def test_a_newer_package_on_a_node_stays(self):
         self.cluster.installed = "0.3.0"
+        (self.root / "etc/pve/priv/abr-node-helper").write_bytes(helper_text("0.3.0"))
         with NodeShell("127.0.0.1", port=self.node.port, password="root-password") as shell:
             self.assertEqual(ensure_package(shell, "node1", self.package), "0.3.0")
-        self.assertFalse([command for command in self.node.commands if "apt-get" in command])
+        self.assertFalse([words for words in self.cluster.helper_calls if words[0] in ("install-package", "update-helper")])
+        self.assertEqual((self.root / "etc/pve/priv/abr-node-helper").read_bytes(), helper_text("0.3.0"))
+
+    def test_a_newer_package_brings_its_helper_to_the_cluster(self):
+        self.cluster.installed = "0.1.0"
+        (self.root / "etc/pve/priv/abr-node-helper").write_bytes(helper_text("0.1.0"))
+        with NodeShell("127.0.0.1", port=self.node.port, password="root-password") as shell:
+            self.assertEqual(ensure_package(shell, "node1", self.package), "0.2.0")
+        self.assertEqual([words[0] for words in self.cluster.helper_calls if words[0] != "version"],
+                         ["update-helper", "package-status", "install-package"])
+        self.assertEqual((self.root / "etc/pve/priv/abr-node-helper").read_bytes(), helper_text("0.2.0"))
+
+    def test_a_key_from_before_the_helper_is_moved_onto_it(self):
+        private, public = generate_key_pair("")
+        old = f'from="127.0.0.1",restrict {public} altastor-inventory:inv-1234-5678\n'
+        (self.root / "etc/pve/priv/authorized_keys").write_text(ROOT_KEYS + old)
+        with NodeShell("127.0.0.1", port=self.node.port, private_key=private) as shell:
+            moved = restrict_key(
+                shell, ssh_key=private, source="127.0.0.1", inventory_id="inv-1234-5678", package=self.package
+            )
+            again = restrict_key(
+                shell, ssh_key=private, source="127.0.0.1", inventory_id="inv-1234-5678", package=self.package
+            )
+        self.assertEqual((moved, again), (True, False))
+        lines = self.cluster.authorized_keys().splitlines()
+        self.assertEqual(lines[:2], ROOT_KEYS.splitlines())
+        self.assertEqual(lines[2], authorized_key_line(private, "127.0.0.1", "inv-1234-5678"))
+        self.assertEqual((self.root / "etc/pve/priv/abr-node-helper").read_bytes(), helper_text("0.2.0"))
 
 
 class LineTests(unittest.TestCase):
     def test_the_key_line_limits_the_key_to_abr_cores_address(self):
         private, public = generate_key_pair("")
         line = authorized_key_line(private, "backup.example.com", "inv-1")
-        self.assertEqual(line, f'from="backup.example.com",restrict {public} altastor-inventory:inv-1')
-        self.assertTrue(authorized_key_line(private, "", "inv-1").startswith("restrict ssh-ed25519 "))
+        command = 'command="/usr/bin/perl -T /etc/pve/priv/abr-node-helper"'
+        self.assertEqual(line, f'from="backup.example.com",restrict,{command} {public} altastor-inventory:inv-1')
+        self.assertTrue(authorized_key_line(private, "", "inv-1").startswith(f"restrict,{command} ssh-ed25519 "))
 
     def test_an_inventorys_line_replaces_its_earlier_one_and_leaves_the_rest(self):
         text = (
