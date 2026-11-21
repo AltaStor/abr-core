@@ -159,7 +159,11 @@ class FakeCluster:
             answer = {"installed": self.installed, "current": current}
         elif command == "install-package":
             if self.apt_fails:
-                return 1, b"", b"W: some warning\nE: Unable to locate package nbdkit\n"
+                # The helper passes apt's output on to standard error and adds its own line last.
+                return 1, b"", (
+                    b"W: some warning\nE: Unable to locate package nbdkit\n"
+                    b"abr-node-helper: apt-get could not install abr-pve-backup 0.2.0 (exit code 100)\n"
+                )
             package = self.node.root / "var/tmp/received.deb"
             package.write_bytes(stdin)
             self.installed = helper_version(helper_from_package(package))

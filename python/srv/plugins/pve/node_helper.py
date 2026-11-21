@@ -28,7 +28,7 @@ from typing import Any
 
 import paramiko
 
-from .ssh import CommandResult, NodeShell, SshCommandError, SshError, SshUnreachableError, quote_command
+from .ssh import CommandResult, NodeShell, SshError, SshUnreachableError, quote_command
 
 HELPER_PATH = "/etc/pve/priv/abr-node-helper"
 HELPER_COMMAND = ["/usr/bin/perl", "-T", HELPER_PATH]
@@ -172,12 +172,19 @@ class NodeHelper:
         result = self.shell.run([*HELPER_COMMAND, command, *arguments], **options)
         if result.status == 2 and "Can't open perl script" in result.error_text:
             raise NodeHelperMissing(
-                f"{self.address} has no AltaStor node helper in {HELPER_PATH}: the cluster was set up before abr-core "
+                f"{self.address} has no AltaStor node helper in {HELPER_PATH}: the cluster was set up before AltaStor "
                 "used one. Run inventory rescan, or set the cluster up again with inventory edit and the root password"
             )
         if check and result.status != 0:
-            raise SshCommandError(f"abr-node-helper {command}", result.status, result.error_text)
+            raise self.failure(command, result)
         return result
+
+    def failure(self, command: str, result: CommandResult) -> NodeHelperError:
+        """The helper's own reason for a request it refused, with exit code 2, or could not carry out."""
+        lines = [line.removeprefix("abr-node-helper: ") for line in result.error_text.splitlines() if line.strip()]
+        reason = lines[-1] if lines else f"exit code {result.status}"
+        verb = "refused" if result.status == 2 else "could not carry out"
+        return NodeHelperError(f"The node helper on {self.address} {verb} {command}: {reason}")
 
     def answer(self, command: str, *arguments: str, **options: Any) -> dict[str, Any]:
         result = self.call(command, *arguments, **options)
@@ -211,8 +218,12 @@ class NodeHelper:
         """Installs the package with apt on the node, which takes its dependencies from the node's repositories."""
         result = self.call("install-package", input=package.read_bytes(), timeout=INSTALL_TIMEOUT_SECONDS, check=False)
         if result.status != 0:
+            # apt's own error says more than the helper's last line, which only gives apt's exit code.
             lines = [line for line in result.error_text.splitlines() if line.strip() and not line.startswith("W:")]
-            raise NodeHelperError(lines[-1] if lines else f"the node helper ended with exit code {result.status}")
+            errors = [line for line in lines if line.startswith("E:")]
+            if errors:
+                raise NodeHelperError(errors[-1])
+            raise self.failure("install-package", result)
         try:
             return str(json.loads(result.text).get("installed") or "")
         except (ValueError, AttributeError) as exc:
@@ -229,7 +240,7 @@ class NodeHelper:
         if result.status == 3:
             return None
         if result.status != 0:
-            raise SshCommandError("abr-node-helper get-result", result.status, result.error_text)
+            raise self.failure("get-result", result)
         return result.stdout
 
     def remove_run(self, base: str) -> list[str]:
