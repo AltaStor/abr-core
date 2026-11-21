@@ -17,8 +17,8 @@ The backup server never touches the disks. It starts each backup and restore as 
 an API token of its own, and hands the provider what the task needs in a run file it writes to `/run/abr` on the node
 through AltaStor's node helper over SSH: the repository and the backups to write or read. The secrets never go into a
 file: the helper keeps them in memory and hands them once to the task, see [The node helper](#the-node-helper). The
-provider runs only tasks abr-core started:
-a backup or restore on the `abr` storage started from the PVE web interface, a PVE backup job or the shell is refused.
+provider runs only tasks the backup server started: a backup or restore on the `abr` storage started from the PVE
+web interface, a PVE backup job or the shell is refused.
 The backup server keeps the catalog, the manifests and the keys, merges chains, applies retention and verifies, as for
 the other platforms.
 
@@ -37,10 +37,14 @@ it installed already.
 | Every node | Its Debian repositories, or a mirror | `apt` installs the package's dependencies: nbdkit, nbd-client, cifs-utils, libnbd0 |
 | The repository | **S3** with an access key of its own, or an **SMB** repository, reachable from every node and from the backup server; a local repository the appliance shares over SMB works too | The nodes write and read the backups; the backup server keeps manifests, merges chains and applies retention. Both reach the same storage |
 | The VM | A storage for VM disks on its node | vzdump keeps its fleecing images there while a backup runs |
+| The nodes and the backup server | DNS for the names of nodes, repositories and S3 endpoints, where names are used | Both sides reach each other and the repository by name |
+| The nodes and the backup server | A common time source (NTP) | A run file expires by the node's clock, `ALTASTOR_PVE_RUN_FILE_MINUTES` after the backup server wrote it; clocks far apart make runs fail as expired |
+
+The nodes never connect to the backup server, and nothing new listens on them. Each node reaches the repository itself:
+the S3 endpoint, or the SMB share on TCP 445.
 
 An S3 repository needs an access key and secret key of its own: the nodes cannot use the appliance's AWS profile. An SMB
-repository is mounted by the provider for each process, in a private mount namespace the host never sees, read-only
-for restores, with the repository's account and the password passed through a pipe.
+repository is mounted by the provider for each process, see [SMB repositories](#smb-repositories).
 
 ## Adding a cluster
 
@@ -56,8 +60,8 @@ root's password, on the node given, and:
    key for root in `/etc/pve/priv/authorized_keys`, which PVE shares with every node, as
    `from="<backup server address>",restrict,command="/usr/bin/perl -T /etc/pve/priv/abr-node-helper"` and marked
    `altastor-inventory:<inventory id>`: the key runs the helper and nothing else;
-2. pins every node's SSH host keys and the API certificates the cluster trusts, read from `/etc/pve`: its root CA and any
-   node certificate of its own;
+2. pins every node's SSH host keys and the API certificates the cluster trusts, read from `/etc/pve`: its root CA and
+   any node certificate of its own;
 3. creates the role `AltaStorBackup`, the PVE user `abr@pve` with that role on `/`, and an API token
    `abr@pve!altastor-<id>` for this inventory;
 4. installs the package on every node that is up, and adds the storage `abr` of type `abr` for backups.
@@ -116,26 +120,26 @@ remove by hand.
 
 ## How a backup runs
 
-1. abr-core finds the VM's node and configuration through the API, checks the node has the package, and decides for
-   each disk whether PVE should keep its dirty bitmap (an incremental) or start a new one (a full).
+1. The backup server finds the VM's node and configuration through the API, checks the node has the package, and decides
+   for each disk whether PVE should keep its dirty bitmap (an incremental) or start a new one (a full).
 2. It writes the run file `/run/abr/backup-<vmid>.json` through the node helper, readable by root only and valid for
    `ALTASTOR_PVE_RUN_FILE_MINUTES`, has the helper offer the run's secrets to its task, and starts `vzdump` on the `abr`
    storage in snapshot mode with fleecing, on a storage for VM disks of the VM's own.
 3. The provider backs up `ALTASTOR_PVE_PARALLEL_DISKS` disks at a time, each with `abr-nbd-tool` into the session's
-   folder of the repository, and writes a result file abr-core reads at the end.
-4. abr-core writes the manifest and registers the restore point; a failed or stopped run is discarded.
+   folder of the repository, and writes a result file the backup server reads at the end.
+4. The backup server writes the manifest and registers the restore point; a failed or stopped run is discarded.
 
-Before vzdump starts, abr-core checks the room on the fleecing storage. PVE reserves the full size of the VM's disks
-for the fleecing images on thick LVM, and on ZFS unless the storage is sparse, so a backup needs that much free there.
-On other storages the images grow only with what the guest overwrites during the backup: with less room than the VM's
-disks a backup starts with a warning, and below `ALTASTOR_PVE_FLEECING_MIN_FREE_MIB` it does not start.
+Before vzdump starts, the backup server checks the room on the fleecing storage. PVE reserves the full size of the VM's
+disks for the fleecing images on thick LVM, and on ZFS unless the storage is sparse, so a backup needs that much free
+there. On other storages the images grow only with what the guest overwrites during the backup: with less room than the
+VM's disks a backup starts with a warning, and below `ALTASTOR_PVE_FLEECING_MIN_FREE_MIB` it does not start.
 
 One vzdump runs at a time on a node: PVE holds a lock per node, so the backups of a job that land on one node wait for
 each other. The task runs in PVE and does not depend on the backup server. Its UPID is kept with the session, so a
 session the server lost by a restart follows the same task again when the server is back, and registers its backup.
 
-Every disk of the VM is backed up except CD-ROM drives, empty drives and disks marked `backup=0`. A backup is of the
-whole VM; disk-level backups are refused.
+A backup is of the whole VM, with the disks [What a backup takes](#what-a-backup-takes) lists; disk-level backups are
+refused.
 
 **Full and incremental.** The first backup is a full, the following ones incrementals, with active and synthetic full
 backups on their own schedules, as for the other platforms. PVE keeps a disk's dirty bitmap only while the VM runs, so
@@ -151,15 +155,37 @@ reads each disk from there.
 
 **Stopped VMs.** vzdump reads a stopped VM's disks in full every time. A stopped VM that has not run since its previous
 backup gets a restore point without changes instead: an empty incremental of each disk, written by the backup server,
-with no vzdump run. abr-core judges that the VM has not run when it was stopped at the previous backup and still is,
-is on the same node, its configuration and firewall settings are unchanged, and the node's task history shows only
-backups of it since. When any of these cannot be shown, the backup runs vzdump. `abr job edit --unchanged-stopped-vm full` turns
-this off for a job.
+with no vzdump run. The backup server judges that the VM has not run when it was stopped at the previous backup and
+still is, is on the same node, its configuration and firewall settings are unchanged, and the node's task history shows
+only backups of it since. When any of these cannot be shown, the backup runs vzdump.
+`abr job edit --unchanged-stopped-vm full` turns this off for a job.
 
 **Bandwidth.** `abr job edit --bandwidth-limit <MiB/s>` caps how fast a backup reads, split evenly among the disks it
 backs up at a time; 0 removes the limit.
 
 A stop from AltaStor stops the PVE task, and the provider lets the running tools discard what they wrote before it ends.
+
+## What a backup takes
+
+**Consistency.** vzdump backs up in snapshot mode: the guest goes on running while the backup reads a frozen view of
+its disks, and fleecing images keep what the guest overwrites meanwhile. When the VM runs and the QEMU guest agent is
+enabled in its options, PVE freezes the guest's file systems while it takes that view, so the backup is file-system
+consistent, and application consistent where the guest's freeze hooks or VSS writers take part. PVE thaws the guest
+also after a failed freeze. Without the agent the backup is crash consistent, as after a power loss; the backup of a
+stopped VM is consistent as it is.
+
+Only the current state of the disks is backed up: no PVE snapshots of the VM and no memory state.
+
+| Device | Backup | Restore |
+| --- | --- | --- |
+| A disk on a PVE storage (`scsi`, `virtio`, `sata`, `ide`) | Full or incremental | To the storage chosen for it |
+| EFI disk (`efidisk0`) | Like a disk | Like a disk |
+| TPM state (`tpmstate0`) | In full every time, since PVE attaches it only for the backup | Like a disk |
+| A physical disk passed through by its path | Like a disk | A new VM gets it as a volume on the storage chosen, with a warning; an in-place restore leaves the VM's physical disk as it is |
+| A disk marked `backup=0` | Left out | PVE comments its line out in the restored configuration |
+| CD-ROM drive or empty drive | Left out | The drive comes back as configured; its ISO must be on a storage of the target node |
+| Unused volumes (`unused0`, ...) | Left out | PVE drops them from the restored configuration |
+| PCI and USB devices (`hostpci`, `usb`) | Kept in the configuration | A VM on another node needs the same devices or mappings there to start |
 
 ## What a restore point holds
 
@@ -176,8 +202,8 @@ the one PVE granted, full or incremental, and where its backup is in the reposit
 A Proxmox VE restore point is restored to a Proxmox VE inventory only. PVE restores the VM from the guest configuration
 the backup recorded, through the provider: for each disk, `nbdkit-abr-plugin` serves the chain of backups that makes up
 the disk at the restore point on `/dev/nbdN`, and PVE copies it to a new volume with `qemu-img`, on any storage type.
-abr-core changes the guest configuration in the run file for the restore: the name of a new VM, the storage of each disk,
-and the bridge and link state of each network adapter.
+The backup server changes the guest configuration in the run file for the restore: the name of a new VM, the storage of
+each disk, and the bridge and link state of each network adapter.
 
 **As a new VM** (`abr restore start --new-name ... --target-host <node> --datastore <storage>`):
 
@@ -203,13 +229,60 @@ restore's task is followed by its UPID too, so a restore survives a restart of t
 restore point on one node run one after the other. A restore is not limited in bandwidth: PVE applies its datacenter
 restore limit to its own backups only.
 
+## SMB repositories
+
+The nodes reach an SMB repository with the kernel's SMB client; the tools see an ordinary folder and have no SMB code
+of their own.
+
+- **One mount per process.** The provider mounts the share for each `abr-nbd-tool` and `nbdkit` process, in a private
+  mount namespace of that process. The node, PVE and other runs never see the mount, and the kernel drops it when the
+  process ends, also after a crash or a stopped task, so no mount is left behind.
+- **Own connection.** Each process opens its own SMB connection and session (`nosharesock`): a VM with four disks uses
+  four connections while it is backed up.
+- **Encrypted.** Every mount asks for SMB 3.1.1 with `seal`, SMB encryption.
+- **Read-only for restores.** A restore only reads, but the mount covers the whole share, other VMs' backups included,
+  so nbdkit gets it read-only.
+- **Account and password.** The nodes use the repository's account. The password reaches `mount.cifs` through a pipe,
+  never on a command line or in a file.
+- **Access control.** The client's own permission checks are off (`noperm`), and every file shows as the node's root
+  with modes 0700 and 0600 only to satisfy the tools' folder checks. Who may read or change the backups is decided by
+  the share's ACLs for the repository's account, and by the private namespace on the node.
+
+## Encryption keys
+
+A job's encryption key is set with `abr job create` or `abr job edit --set-encryption`, from `ABR_ENCRYPTION_KEY` or a
+prompt. The backup server keeps it with the job, encrypted at rest with the appliance's credential key, together with
+every earlier key of the job, and each restore point records which key it was written with.
+
+- **Backup.** For each run the key goes to the node helper over SSH and from there to the run's task, which hands it
+  to `abr-nbd-tool` on standard input. It never reaches a file or a command line on the node, and leaves the node's
+  memory when the run ends.
+- **Changing the key.** A new key applies to the backups that follow. The next backup is an active full, with the
+  reason `EncryptionKeyChanged`, so each chain is written with one key; earlier restore points keep theirs.
+- **Restore.** A restore takes the key the restore point was written with from the job, and hands it to `nbdkit` the
+  same way. `abr restore start --encryption-key` gives it by hand, for a point whose job is gone.
+- **Losing the key.** Backups cannot be read without their key, and PVE has no copy. Keep the appliance's database and
+  credential key backed up, or keep the job's keys elsewhere.
+
+## Tested releases and storages
+
+| What | Tested | Expected, not yet tested |
+| --- | --- | --- |
+| Proxmox VE | 9.2 | Later 9.x releases, once tested; PVE 8 is not supported |
+| VM storages backed up and restored to | LVM-thin, directory storage with raw and qcow2 disks, ZFS | Ceph RBD, iSCSI, ZFS over iSCSI |
+| Fleecing storages | LVM-thin, ZFS sparse and not sparse | Thick LVM, directory storage |
+| Repositories | S3 (MinIO) through the backup server; SMB 3.1.1 through the provider with runs written by hand | SMB through the backup server; AWS S3 and other S3 services with Object Lock |
+
+A storage type counts as supported once a restore to it has been tested. Restores write through PVE's own `qemu-img`,
+so every storage that holds VM disk images is expected to work.
+
 ## Settings
 
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `ALTASTOR_PVE_PACKAGE_PATH` | empty | The abr-pve-backup package the appliance installs on the nodes; empty takes the newest in `tools/abr-pve-backup/` |
 | `ALTASTOR_PVE_PARALLEL_DISKS` | 4 | How many disks of one VM the provider backs up at a time |
-| `ALTASTOR_PVE_RUN_FILE_MINUTES` | 60 | How long a run file is valid after abr-core writes it |
+| `ALTASTOR_PVE_RUN_FILE_MINUTES` | 60 | How long a run file is valid after the backup server writes it |
 | `ALTASTOR_PVE_FLEECING_MIN_FREE_MIB` | 1024 | The least free space a thin fleecing storage needs for a backup to start |
 
 ## Monitoring and logging
@@ -217,9 +290,9 @@ restore limit to its own backups only.
 Every backup and restore is a session in *Activity* (and `abr session list` / `abr session log`), with its progress and
 log: the node and the package version, each disk with its bitmap and whether it was backed up in full or incrementally
 and why, the PVE task's UPID and the lines of its log that matter, warnings and the cause of a failure. The PVE task log
-on the node holds the provider's own lines, starting with one that names the run's ID. Credentials and encryption keys are never
-written to either; on the node they never reach a file, and live only in the node helper's memory until the task takes
-them, and then in the processes that use them.
+on the node holds the provider's own lines, starting with one that names the run's ID. Credentials and encryption keys
+are never written to either; on the node they never reach a file, and live only in the node helper's memory until the
+task takes them, and then in the processes that use them.
 
 ## Troubleshooting
 
