@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import ClassVar
 
 from .errors import CliError, cli_error_from_parse_message
 from .exit_codes import INVALID_USAGE
@@ -16,6 +17,9 @@ GLOBAL_HELP_SECTION = """Global options:
   --log-level {debug,info,warn,error}
                                  Console log verbosity (default: info)
 """
+
+
+GLOBAL_OPTIONS = frozenset({"--output", "--base-url", "--log-level", "--help", "-h"})
 
 
 def normalize_global_cli_options(argv: list[str] | None) -> list[str] | None:
@@ -40,6 +44,21 @@ def normalize_global_cli_options(argv: list[str] | None) -> list[str] | None:
 
 
 class AltaStorArgumentParser(argparse.ArgumentParser):
+    parsed_argv: ClassVar[list[str]] = []
+    parse_depth: ClassVar[int] = 0
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+    def _unknown_options(self) -> list[str]:
+        known = set(self._option_string_actions) | GLOBAL_OPTIONS
+        return [
+            token.split("=", 1)[0]
+            for token in AltaStorArgumentParser.parsed_argv
+            if token.startswith("--") and len(token) > 2 and token.split("=", 1)[0] not in known
+        ]
+
     def _raw_args(self, args: list[str] | None = None) -> list[str]:
         return list(sys.argv[1:] if args is None else args)
 
@@ -51,7 +70,7 @@ class AltaStorArgumentParser(argparse.ArgumentParser):
         return "table"
 
     def emit_cli_error(self, cli_error: CliError, args: list[str] | None = None) -> None:
-        if self._requested_output(args) == "json":
+        if self._requested_output(args if args is not None else AltaStorArgumentParser.parsed_argv or None) == "json":
             self._print_message(f"{cli_error.to_json()}\n", sys.stderr)
         else:
             self._print_message(f"{cli_error.to_text()}\n", sys.stderr)
@@ -69,9 +88,18 @@ class AltaStorArgumentParser(argparse.ArgumentParser):
         args: list[str] | None = None,
         namespace: argparse.Namespace | None = None,
     ) -> tuple[argparse.Namespace, list[str]]:
-        return super().parse_known_args(normalize_global_cli_options(args), namespace)
+        if AltaStorArgumentParser.parse_depth == 0:
+            AltaStorArgumentParser.parsed_argv = self._raw_args(args)
+        AltaStorArgumentParser.parse_depth += 1
+        try:
+            return super().parse_known_args(normalize_global_cli_options(args), namespace)
+        finally:
+            AltaStorArgumentParser.parse_depth -= 1
 
     def error(self, message: str) -> None:
+        unknown = self._unknown_options() if message.startswith("the following arguments are required") else []
+        if unknown:
+            message = f"unrecognized arguments: {' '.join(unknown)}; {message}"
         self.emit_cli_error(cli_error_from_parse_message(message))
 
     def exit(self, status: int = 0, message: str | None = None) -> None:
