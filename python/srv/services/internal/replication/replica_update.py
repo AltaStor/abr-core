@@ -717,6 +717,12 @@ def _update_replica(
     job_id = str(job["id"])
     session_id = str(task["id"])
     replica = replica_of(job)
+    found_change = replica.get("changed") if isinstance(replica.get("changed"), dict) else None
+    if found_change:
+        raise ReplicationValidationError(
+            f"Replica was changed: {found_change.get('reason')} (found by the run of {found_change.get('at')}; the job does "
+            "not update the replica after that, even once the change is undone). Create a new Replication Job"
+        )
     state = platform.find_replica(node, replica["vm_id"])
     if state is None:
         raise ReplicationError(
@@ -743,6 +749,7 @@ def _update_replica(
     )
     reason = _changed(job_id, state, replica, node, platform, trust_fingerprint=not (found or interrupted))
     if reason:
+        save_replica(job_id, {**replica_of(load_job(job_id)), "changed": {"reason": reason, "at": utc_now()}})
         raise ReplicationValidationError(f"Replica was changed: {reason}. Create a new Replication Job")
 
     target = points[-1]

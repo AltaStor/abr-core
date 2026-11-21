@@ -383,10 +383,31 @@ class UpdateTests(_UpdateCase):
         )
         for field, value, text in cases:
             with self.subTest(field=field, text=text):
+                self.setUp()
                 self.platform = FakePlatform()
                 self.platform.state[field] = value
                 with self.assertRaisesRegex(ReplicationValidationError, f"Replica was changed: .*{text}"):
                     self._run()
+
+    def test_a_refused_replica_stays_refused_once_the_snapshot_is_removed(self) -> None:
+        self.platform.state["snapshots"] = ["before-patch"]
+        with self.assertRaisesRegex(ReplicationValidationError, "before-patch that this job did not take"):
+            self._run()
+        recorded = self._replica()["changed"]
+
+        self.platform.state["snapshots"] = []
+        self.platform.calls.clear()
+        for _ in range(2):
+            with self.assertRaisesRegex(ReplicationValidationError, "Replica was changed: .*before-patch .*found by the run of .*even once the change is undone"):
+                self._run()
+
+        self.assertIn("before-patch", recorded["reason"])
+        self.assertEqual(self.platform.calls, [])
+        self.assertEqual(self._replica()["changed"], recorded)
+
+    def test_a_replica_that_was_never_refused_is_updated_as_before(self) -> None:
+        self.assertEqual(self._run()["mode"], "incremental")
+        self.assertNotIn("changed", self._replica())
 
     def test_a_power_on_between_runs_is_a_changed_replica(self) -> None:
         self.platform.powered_on_since_result = True
