@@ -704,14 +704,14 @@ def _find_by_id(items: Iterable[dict[str, Any]], record_id: str, *, label: str) 
     for item in items:
         if str(item.get("id") or "") == str(record_id):
             return item
-    raise api_error(404, f"{label.lower()}_not_found", f"{label} not found", record_id=record_id)
+    raise api_error(404, f"{label.lower()}_not_found", f"{label} not found: {record_id}", record_id=record_id)
 
 
 def _find_by_name(items: Iterable[dict[str, Any]], name: str, *, label: str) -> dict[str, Any]:
     lowered = str(name).lower()
     matches = [item for item in items if str(item.get("name") or "").lower() == lowered]
     if not matches:
-        raise api_error(404, f"{label.lower()}_not_found", f"{label} not found", name=name)
+        raise api_error(404, f"{label.lower()}_not_found", f"{label} not found: {name}", name=name)
     if len(matches) > 1:
         raise api_error(409, f"ambiguous_{label.lower()}", f"Multiple {label.lower()} records matched the provided name", name=name)
     return matches[0]
@@ -9111,6 +9111,11 @@ def _host_selector_aliases(value: Any) -> set[str]:
     return aliases
 
 
+def _inventory_label(inventory_id: Any) -> str:
+    record = HYPERVISORS.get(str(inventory_id or ""))
+    return str((record or {}).get("name") or inventory_id or "")
+
+
 def _inventory_selector_aliases(inventory_id: str) -> set[str]:
     record = HYPERVISORS.get(inventory_id, {})
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
@@ -9152,7 +9157,7 @@ def _resolve_host(inventory_id: str, identifier: str) -> dict[str, Any]:
                     host=identifier,
                     available_hosts=[str(resource.get("name") or "") for resource in host_records],
                 )
-        raise api_error(404, "host_not_found", "Target host not found in inventory", inventory_id=inventory_id, host=identifier)
+        raise api_error(404, "host_not_found", f"Target host not found in inventory {_inventory_label(inventory_id)}: {identifier}", inventory_id=inventory_id, host=identifier)
     if len(matches) > 1:
         raise api_error(409, "ambiguous_host", "Multiple hosts matched the provided selector", inventory_id=inventory_id, host=identifier)
     return matches[0]
@@ -10038,7 +10043,7 @@ def _resolve_restore_target_datastore(inventory_id: str, datastore_identifier: s
     raise api_error(
         404,
         "datastore_not_found",
-        "Target datastore not found in inventory",
+        f"Target datastore not found in inventory {_inventory_label(inventory_id)}: {identifier}",
         inventory_id=inventory_id,
         datastore=identifier,
     )
@@ -10393,7 +10398,7 @@ def _resolve_restore_target_network(
     raise api_error(
         404,
         "network_not_found",
-        "Target network not found in inventory",
+        f"Target network not found in inventory {_inventory_label(inventory_id)}: {identifier}",
         inventory_id=inventory_id,
         network=identifier,
     )
@@ -10572,7 +10577,14 @@ def _resolve_restore_network_selection(
                 host=(host or {}).get("name"),
                 inventory_id=target_inventory_id,
             )
-            _ensure(target_network is not None, 404, "network_not_found", "Target network not found in inventory", target_network_id=target_network_id, inventory_id=target_inventory_id)
+            _ensure(
+                target_network is not None,
+                404,
+                "network_not_found",
+                f"Target network not found in inventory {_inventory_label(target_inventory_id)}: {target_network_id}",
+                target_network_id=target_network_id,
+                inventory_id=target_inventory_id,
+            )
             target_network_name = str(target_network.get("name") or "")
             resolved[source_network] = target_network_name
             adapter_targets[position] = {
@@ -10653,7 +10665,7 @@ def _ensure_restore_network_map_targets(
                 (
                     "Target network is not available on the selected host"
                     if target_network_name in off_host_names
-                    else "Target network not found in inventory"
+                    else f"Target network not found in inventory {_inventory_label(target_inventory_id)}: {target_network_name}"
                 ),
                 inventory_id=target_inventory_id,
                 host=(host or {}).get("name"),
