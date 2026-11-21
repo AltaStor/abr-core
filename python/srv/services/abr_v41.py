@@ -5372,6 +5372,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "last_session_id": None,
     }
     _ensure_job_transport(job)
+    _ensure_job_guest_consistency(job, task_parameters)
     return job_to_dto(_persist_canonical_job(job))
 
 
@@ -5838,6 +5839,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         changed = apply_copy_settings(updated, payload, creating=False) or changed
     if _touches_full_backup_policy(payload):
         _ensure_full_backup_schedule(updated)
+    _ensure_job_guest_consistency(updated, payload.get("task_parameters"), current.get("task_parameters"))
     return _finish_job_edit(updated, payload, changed, was_enabled)
 
 
@@ -5869,6 +5871,21 @@ def _ensure_job_transport(job: dict[str, Any]) -> None:
     library = disk_transport.explicit_library(access["vddk_library"], access["vddk_library_source"])
     problem = disk_transport.transport_problem(override, library=library)
     _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=override)
+
+
+def _ensure_job_guest_consistency(job: dict[str, Any], requested: Any, stored: dict[str, Any] | None = None) -> None:
+    asked = requested.get("hyperv_consistency") if isinstance(requested, dict) else None
+    if asked is None or _inventory_is_hyperv(job.get("inventory_id")):
+        return
+    kept = (stored or {}).get("hyperv_consistency")
+    if kept is not None and str(asked).strip().lower() == str(kept).strip().lower():
+        return
+    _ensure(
+        False,
+        422,
+        "invalid_job",
+        f"guest consistency applies to jobs of a Hyper-V inventory, and {job.get('inventory_name') or job.get('name')} is not one",
+    )
 
 
 def _finish_job_edit(updated: dict[str, Any], payload: dict[str, Any], changed: bool, was_enabled: bool) -> dict[str, Any]:
