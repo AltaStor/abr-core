@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import stat
 import tempfile
 import unittest
 
@@ -549,6 +550,62 @@ class CliUnauthorizedExitCodeTests(_IsolatedConfigDirCase):
                     main(["repo", "list"])
         self.assertEqual(exc.exception.code, UNAUTHORIZED)
 
+
+
+
+
+class PrivateConfigFileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        base = tempfile.TemporaryDirectory(prefix="abr-config-")
+        self.addCleanup(base.cleanup)
+        self.config = Path(base.name) / "cfg"
+        environment = patch.dict(os.environ, {token_store.CONFIG_DIR_ENV_VAR: str(self.config)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_the_token_file_is_0600_from_its_first_byte_in_a_0700_directory(self) -> None:
+        seen: list[int] = []
+        create = tempfile.mkstemp
+
+        def watched(*args, **kwargs):
+            descriptor, name = create(*args, **kwargs)
+            seen.append(stat.S_IMODE(os.fstat(descriptor).st_mode))
+            return descriptor, name
+
+        with patch("python.cli.token_store.tempfile.mkstemp", side_effect=watched):
+            token_store.save_token("http://a.test", "tok-1", "2099-01-01T00:00:00+00:00")
+
+        self.assertEqual(seen, [0o600])
+        self.assertEqual(stat.S_IMODE((self.config / "credentials.json").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o700)
+        self.assertEqual(token_store.load_token("http://a.test"), "tok-1")
+
+    def test_an_existing_looser_file_is_replaced_by_a_0600_one(self) -> None:
+        self.config.mkdir(mode=0o755)
+        (self.config / "credentials.json").write_text("{}")
+        os.chmod(self.config / "credentials.json", 0o644)
+
+        token_store.save_token("http://a.test", "tok-2", "2099-01-01T00:00:00+00:00")
+
+        self.assertEqual(stat.S_IMODE((self.config / "credentials.json").stat().st_mode), 0o600)
+        self.assertEqual(token_store.load_token("http://a.test"), "tok-2")
+
+    def test_a_failed_write_leaves_the_old_file_and_no_temporary_one(self) -> None:
+        token_store.save_token("http://a.test", "tok-old", "2099-01-01T00:00:00+00:00")
+
+        with patch("python.cli.token_store.json.dumps", side_effect=ValueError("boom")), self.assertRaises(ValueError):
+            token_store.save_token("http://a.test", "tok-new", "2099-01-01T00:00:00+00:00")
+
+        self.assertEqual(sorted(path.name for path in self.config.iterdir()), ["credentials.json"])
+        self.assertEqual(token_store.load_token("http://a.test"), "tok-old")
+
+    def test_the_trusted_certificates_file_is_written_the_same_way(self) -> None:
+        from python.cli import tls_trust
+
+        tls_trust._save_all({"https://a.test": "sha256:00"})
+
+        self.assertEqual(stat.S_IMODE((self.config / "trusted_certs.json").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o700)
 
 
 if __name__ == "__main__":

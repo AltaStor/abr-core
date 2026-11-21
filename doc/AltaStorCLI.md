@@ -120,7 +120,7 @@ abr
 
 AUTHENTICATION COMMANDS 
 
-Every REST API call requires a session token. The token is cached locally per --base-url and used automatically; ABR_TOKEN, if set, always wins over the cache. 
+Every REST API call requires a session token. The token is cached locally per --base-url and used automatically; ABR_TOKEN, if set, always wins over the cache. The cache and the trusted certificates are kept in files readable only by their owner (0600) from the moment they are created, in a configuration directory the CLI creates 0700 (an existing directory keeps its mode). 
 
 abr auth login 
 
