@@ -896,6 +896,27 @@ class JobPayloadBuilderTests(unittest.TestCase):
 
         self.assertEqual(payload["schedule"], {"type": "daily", "time": "22:00", "enabled": True})
 
+    def test_edit_payload_details_without_a_type_keep_the_stored_type(self) -> None:
+        daily = {"id": "job-1", "schedule": {"type": "daily", "time": "22:00", "enabled": False}}
+        weekly = {"id": "job-1", "schedule": {"type": "weekly", "days": ["Mon"], "time": "22:00", "enabled": True}}
+
+        timed = self.service.build_edit_payload(daily, self._base_edit_args(time="23:00"))
+        moved = self.service.build_edit_payload(weekly, self._base_edit_args(days=["Tue", "Wed"]))
+
+        self.assertEqual(timed["schedule"], {"type": "daily", "time": "23:00", "enabled": False})
+        self.assertEqual(moved["schedule"], {"type": "weekly", "days": ["Tue", "Wed"], "time": "22:00", "enabled": True})
+
+    def test_edit_payload_detail_the_stored_type_does_not_take_is_refused(self) -> None:
+        daily = {"id": "job-1", "schedule": {"type": "daily", "time": "22:00", "enabled": True}}
+
+        with self.assertRaisesRegex(ValueError, "^Daily schedules do not accept --days$"):
+            self.service.build_edit_payload(daily, self._base_edit_args(days=["Tue"]))
+
+    def test_edit_payload_details_without_a_stored_schedule_still_need_the_type(self) -> None:
+        for job in ({"id": "job-1"}, {"id": "job-1", "schedule": {"type": "cron", "expression": "0 1 * * *"}}):
+            with self.subTest(job=job), self.assertRaisesRegex(ValueError, "^Schedule details require --schedule$"):
+                self.service.build_edit_payload(job, self._base_edit_args(time="23:00"))
+
     def test_edit_payload_supports_compression_level_update(self) -> None:
         args = self._base_edit_args(compression_level=9)
 
