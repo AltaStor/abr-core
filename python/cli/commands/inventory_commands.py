@@ -75,9 +75,9 @@ class InventoryCommands:
         add_api.add_argument("--transport", choices=("vddk", "soap"), help="The same as --api, its earlier name")
         add.add_argument(
             "--vddk-lib",
-            metavar="PATH",
-            help="vSphere only: the full path of the VDDK library file on the backup server; without it the "
-            "inventory uses the server-wide one",
+            metavar="PATH|ovddk",
+            help="vSphere only: the full path of the VDDK library file on the backup server, or ovddk for the oVDDK "
+            "library installed on it; without it the inventory uses the server-wide one",
         )
         add.set_defaults(handler=self.add)
 
@@ -164,7 +164,10 @@ class InventoryCommands:
         )
         edit_library = edit.add_mutually_exclusive_group()
         edit_library.add_argument(
-            "--vddk-lib", metavar="PATH", help="vSphere only: the full path of the VDDK library file on the backup server"
+            "--vddk-lib",
+            metavar="PATH|ovddk",
+            help="vSphere only: the full path of the VDDK library file on the backup server, or ovddk for the oVDDK library "
+            "installed on it",
         )
         edit_library.add_argument(
             "--reset-vddk-lib", action="store_true", help="vSphere only: use the server-wide VDDK library"

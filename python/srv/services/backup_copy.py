@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import errno
 import logging
+import os
+import pwd
 import re
 import time
 from collections.abc import Callable
@@ -55,6 +57,7 @@ from python.srv.services.synthetic_full import (
     _hypervisor_kind,
     _no_room_detail,
     _out_of_space_message,
+    _repository_label,
     _source_manifest,
     _write_synthetic_manifest,
     build_disk_merges,
@@ -81,6 +84,46 @@ COPY_INTERRUPTED = (
 
 def copy_tool_failure(text: str) -> str:
     return text.replace(TOOL_ENDED_UNEXPECTEDLY, COPY_ENDED_UNEXPECTEDLY).replace(DISK_TOOL_INTERRUPTED, COPY_INTERRUPTED)
+
+
+
+UNWRITABLE = (errno.EACCES, errno.EPERM, errno.EROFS)
+
+
+def _service_user() -> str:
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        return f"uid {os.geteuid()}"
+
+
+def _cannot_write(repository: dict[str, Any], code: int | None, detail: str, reason: str) -> str:
+    where = f" ({detail})" if detail else ""
+    label = _repository_label(repository)
+    if code == errno.EROFS:
+        return f"The {label} cannot be written to: its filesystem is read-only{where}. Make it writable, or copy into another repository"
+    if code in UNWRITABLE:
+        return (
+            f"The {label} cannot be written to: the server's user '{_service_user()}' has no write permission "
+            f"there{where}. Give it write access, or copy into another repository"
+        )
+    return f"The {label} cannot be written to: {reason}{where}"
+
+
+def cannot_write_message(repository: dict[str, Any], exc: OSError) -> str:
+    return _cannot_write(repository, exc.errno, str(exc.filename or ""), str(exc.strerror or exc))
+
+
+TOOL_DENIALS = {"permission denied": errno.EACCES, "read-only file system": errno.EROFS}
+
+
+def tool_cannot_write_message(repository: dict[str, Any], text: str) -> str | None:
+    lowered = text.lower()
+    code = next((value for marker, value in TOOL_DENIALS.items() if marker in lowered), None)
+    root = str(repository.get("path") or "").rstrip("/")
+    if code is None or not root or root not in text:
+        return None
+    return _cannot_write(repository, code, text.strip(), "")
 
 
 class BackupCopyError(RuntimeError):
@@ -723,9 +766,9 @@ def _copy_once(
             try:
                 ensure_private_directory(task_root.parent)
             except OSError as exc:
-                if exc.errno != errno.ENOSPC:
-                    raise
-                raise BackupCopyError(_out_of_space_message(repository, free_at_start, copy=True)) from exc
+                if exc.errno == errno.ENOSPC:
+                    raise BackupCopyError(_out_of_space_message(repository, free_at_start, copy=True)) from exc
+                raise BackupCopyError(cannot_write_message(repository, exc)) from exc
 
         total = len(merges)
         disk_outputs: list[dict[str, Any]] = []
@@ -763,7 +806,7 @@ def _copy_once(
                     raise _stop_for_window(job, "while it copied; what it had written was discarded") from exc
                 raise TaskStopRequested("Backup copy cancelled; what it had written was discarded") from exc
             except StorageToolError as exc:
-                detail = _no_room_detail(repository, points, free_at_start, copy=True)
+                detail = _no_room_detail(repository, points, free_at_start, copy=True) or tool_cannot_write_message(repository, str(exc))
                 raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {detail or copy_tool_failure(str(exc))}") from exc
             except OSError as exc:
                 if exc.errno == errno.ENOSPC:
@@ -771,7 +814,7 @@ def _copy_once(
                         f"Copying disk {position + 1}/{total} failed: "
                         + _out_of_space_message(repository, _free_bytes_at_start(repository), copy=True)
                     ) from exc
-                raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {exc}") from exc
+                raise BackupCopyError(f"Copying disk {position + 1}/{total} failed: {cannot_write_message(repository, exc)}") from exc
             written.append(backup_name)
             in_flight = None
 

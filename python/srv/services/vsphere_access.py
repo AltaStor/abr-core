@@ -40,6 +40,11 @@ def _has_own_settings(record: dict[str, Any]) -> bool:
 
 def vddk_library_or_error(text: str) -> str:
     """A library file this server can hand to abr-vmdk-tool, or a 422 naming what is wrong with it."""
+    if text.strip().lower() == disk_transport.OVDDK:
+        text = str(disk_transport.ovddk_library())
+        if disk_transport.library_problem(text):
+            message = f"oVDDK is not installed on the backup server: there is no usable {text}"
+            raise api_error(422, "invalid_vddk_library", message, fields={"vddk_library": message})
     problem = disk_transport.library_problem(text)
     if problem:
         raise api_error(422, "invalid_vddk_library", problem, fields={"vddk_library": problem})

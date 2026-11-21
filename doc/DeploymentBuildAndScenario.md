@@ -291,7 +291,7 @@ Shares are listed, added, checked and removed from the CLI (or the API), and wit
 the "Share over SMB" switch in a local repository's settings in the web console:
 
 ```bash
-abr repo share show                        # every local repository and its share: \\<host>\<share> or not shared
+abr repo share show                        # every local repository and its share: \\<server>\<share>, by the address Hyper-V hosts are given (or ABR_SHARES_SERVER_NAME), or not shared
 abr repo share add --name <repository>     # hidden share + own Samba account, stored encrypted   (repository.edit)
 abr repo share check --name <repository>   # write, read back and delete a test file through the share (repository.verify)
 abr repo share del --name <repository>     # remove the share and the account; the backups stay  (repository.edit)
@@ -312,7 +312,10 @@ request on the socket `/run/altastor-backup-shares.sock`
 (`ABR_SHARES_BROKER_SOCKET`; the `altastor-backup-shares.socket` and
 `altastor-backup-shares@.service` units of the server package, with
 `Accept=yes`): one JSON request on stdin, one JSON answer on stdout, then it
-exits, and each call is a line in the journal. It answers only root and the
+exits, and each call is a line in the journal. A refusal is an answer like any
+other, so the instance ends successfully and leaves no failed unit; only a
+broker that breaks on an unexpected error, or cannot send its answer, ends
+failed. The mounts broker (`altastor-backup-mounts@.service`) works the same way. It answers only root and the
 service user (`SO_PEERCRED`), runs nothing but its two operations,
 `add-share` and `remove-share`, and checks every argument itself: the share and
 account names (`abr-xxxxxxxx$`, `abr-smb-xxxxxxxx`), the password, and a folder

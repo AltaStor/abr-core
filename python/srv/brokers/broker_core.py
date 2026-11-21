@@ -87,9 +87,10 @@ def send_reply(connection: socket.socket, reply: dict[str, Any]) -> None:
 
 def handle(
     connection: socket.socket, operations: Mapping[str, Operation], *, service_user: str
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, dict[str, Any], bool]:
     peer = peer_of(connection)
     operation = "-"
+    crashed = False
     try:
         if peer.uid not in allowed_uids(service_user):
             raise BrokerError(NOT_PERMITTED, f"uid {peer.uid} may not use this broker; only root and {service_user} may")
@@ -101,23 +102,24 @@ def handle(
         reply = {"ok": False, "code": exc.code, "message": exc.message}
     except UNEXPECTED_ERRORS as exc:
         reply = {"ok": False, "code": FAILED, "message": f"{type(exc).__name__}: {exc}"}
+        crashed = True
 
     outcome = "ok" if reply["ok"] else f"{reply['code']}: {reply['message']}"
     print(f"{operation} for uid {peer.uid} (pid {peer.pid}): {outcome}", file=sys.stderr, flush=True)
-    return operation, reply
+    return operation, reply, crashed
 
 
 def serve(
     operations: Mapping[str, Operation], *, service_user: str, connection: socket.socket | None = None
 ) -> int:
     connection = connection or socket.socket(fileno=sys.stdin.fileno())
-    _operation, reply = handle(connection, operations, service_user=service_user)
+    _operation, reply, crashed = handle(connection, operations, service_user=service_user)
     try:
         send_reply(connection, reply)
     except OSError as exc:
         print(f"the reply could not be sent: {exc}", file=sys.stderr, flush=True)
         return 1
-    return 0 if reply["ok"] else 1
+    return 1 if crashed else 0
 
 
 def argument_parser(description: str) -> argparse.ArgumentParser:

@@ -439,8 +439,6 @@ class JobService:
 
         repository_name = self._coalesce_string(getattr(args, "repository", None), getattr(args, "repo", None))
         repository_id = self._coalesce_string(getattr(args, "repository_id", None), getattr(args, "repo_id", None))
-        if not repository_name and not repository_id:
-            raise ValueError("job create requires --repository/--repo or --repository-id/--repo-id")
 
         schedule_fields = self.schedule_fields_for_create(args)
         payload: dict[str, Any] = {
@@ -448,8 +446,8 @@ class JobService:
             "vms": vm_tokens,
             "inventory": self._coalesce_string(getattr(args, "inventory", None)),
             "inventory_id": self._coalesce_string(getattr(args, "inventory_id", None)),
-            "repo": repository_name,
-            "repo_id": repository_id,
+            **({"repo": repository_name} if repository_name else {}),
+            **({"repo_id": repository_id} if repository_id else {}),
             "retention_days": int(getattr(args, "retention_days", 14)),
             "gfs": {
                 "weekly": int(getattr(args, "gfs_weekly", 0) or 0),

@@ -687,16 +687,34 @@ class CopyScheduleTests(_Catalog):
         self.assertTrue(sessions[0]["parameters"]["copy_job"])
         self.assertGreater(datetime.fromisoformat(JOBS[job["id"]]["next_incremental_run_at"]), datetime.now(timezone.utc))
 
-    def test_a_scheduled_run_with_nothing_new_queues_nothing_and_moves_on(self) -> None:
+    def test_a_scheduled_run_with_nothing_new_queues_a_session_and_moves_last_run_at(self) -> None:
         job = self._copy_job(schedule={"type": "daily", "time": "03:00"})
         self.copy = job
         self._copied("c1", "f1")
         self._due(job)
+        before = JOBS[job["id"]].get("last_run_at")
 
         self.scheduler._dispatch_due_jobs()
 
-        self.assertEqual([task for task in TASKS.values() if task.get("job_id") == job["id"]], [])
+        sessions = [task for task in TASKS.values() if task.get("job_id") == job["id"]]
+        self.assertEqual([(task["trigger"], task["resource_external_id"]) for task in sessions], [("schedule", VM)])
+        self.assertIsNone(backup_copy.plan_copy(abr_v41.normalize_job_record(JOBS[job["id"]]), VM))
+        self.assertEqual(JOBS[job["id"]]["last_run_at"], sessions[0]["created_at"])
+        self.assertNotEqual(JOBS[job["id"]]["last_run_at"], before)
+        self.assertEqual(JOBS[job["id"]]["last_run"]["trigger"], "schedule")
         self.assertGreater(datetime.fromisoformat(JOBS[job["id"]]["next_incremental_run_at"]), datetime.now(timezone.utc))
+
+    def test_a_scheduled_tick_while_the_last_one_is_still_queued_adds_no_second_session(self) -> None:
+        job = self._copy_job(schedule={"type": "daily", "time": "03:00"})
+        self.copy = job
+        self._copied("c1", "f1")
+        self._due(job)
+        self.scheduler._dispatch_due_jobs()
+        self._due(job)
+
+        self.scheduler._dispatch_due_jobs()
+
+        self.assertEqual(len([task for task in TASKS.values() if task.get("job_id") == job["id"]]), 1)
 
     def test_a_disabled_copy_job_is_not_run_by_the_schedule(self) -> None:
         job = self._copy_job(schedule={"type": "daily", "time": "03:00", "enabled": False})

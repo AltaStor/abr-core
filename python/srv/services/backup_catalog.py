@@ -1012,6 +1012,33 @@ def _remove_interrupted_task_snapshot(task: dict[str, Any]) -> None:
     )
 
 
+def _settle_interrupted_in_place(task: dict[str, Any]) -> None:
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    if str(task.get("task_type") or "") != "restore" or str(parameters.get("restore_mode") or "") != "in_place":
+        return
+    hypervisor = HYPERVISORS.get(str(task.get("hypervisor_id") or ""))
+    if not isinstance(hypervisor, dict) or hypervisor.get("kind") != "vcenter":
+        return
+    from python.srv.plugins.vcenter.vcenter_restore import recover_interrupted_in_place
+
+    stored = TASKS.get(str(task.get("id") or ""))
+    outcome = recover_interrupted_in_place(dict(stored) if isinstance(stored, dict) else task)
+    if outcome:
+        logger.info("In-place restore %s was interrupted by the server stop: %s", task.get("id"), outcome)
+
+
+def _note_in_place_unsettled(task_id: str, exc: Exception) -> None:
+    message = (
+        f"What this interrupted in-place restore left could not be settled after the server restart "
+        f"({str(exc).rstrip('. ') or type(exc).__name__}); the next in-place restore of this VM settles it first"
+    )
+
+    def change(record: dict[str, Any]) -> None:
+        _append_task_log(record, level="warn", message=message, component="engine")
+
+    _update_finished_task(task_id, change)
+
+
 def _note_snapshot_left(task_id: str, vm_name: str, snapshot_name: str, reason: str) -> None:
     message = f"Backup snapshot {snapshot_name} of VM {vm_name} could not be removed after the server restart: {reason}"
 
@@ -1144,6 +1171,11 @@ def _sweep_interrupted_tasks(tasks: list[dict[str, Any]]) -> None:
             logger.exception(
                 "Could not remove the snapshot interrupted task %s left behind", task.get("id")
             )
+        try:
+            _settle_interrupted_in_place(task)
+        except Exception as exc:
+            logger.exception("Could not settle the in-place restore interrupted task %s left behind", task.get("id"))
+            _note_in_place_unsettled(str(task.get("id") or ""), exc)
         try:
             discard_unregistered_output(task)
         except Exception:

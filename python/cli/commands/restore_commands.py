@@ -76,9 +76,10 @@ class RestoreCommands:
                 "A restore point goes back to the platform it came from. For Hyper-V, --datastore and\n"
                 "--datastore-map name a volume or Cluster Shared Volume of the target host (D:,\n"
                 "C:\\ClusterStorage\\Volume1) and --network-map maps the source adapters' virtual switches\n"
-                "to switches on the target host; the VM's files go under <volume>\\Hyper-V\\<new name>.\n"
-                "An in-place Hyper-V restore keeps the VM and replaces its disks; it is refused while the\n"
-                "VM has checkpoints.\n\n"
+                "to switches on the target host; the VM's files go under <volume>\\Hyper-V\\<new name>, its\n"
+                "configuration on the --datastore volume even when --disk-datastore moves a disk elsewhere.\n"
+                "An in-place restore keeps the VM and replaces its disks; a Hyper-V VM with checkpoints is\n"
+                "refused, a VMware VM keeps its snapshots.\n\n"
                 "Examples:\n"
                 '  abr restore start --restore-point <point-id> --new-name "sql-01-restored"\n'
                 '  abr restore start --backup <backup-id> --vm "sql-01" --target-inventory "vCenter-Prod" '
@@ -130,8 +131,9 @@ class RestoreCommands:
             "--encryption-key",
             env_var=ENCRYPTION_KEY_ENV_VAR,
             help_text=(
-                "Decryption key for this restore. Overrides the key stored with the job and with the restore point; "
-                "needed when the job that held the key is gone"
+                "Decryption key for this restore, for a restore point whose key the server does not hold or cannot "
+                "read (for example when the job that held the key is gone). A key that is not the one the restore point "
+                "was written with is refused before the restore starts"
             ),
         )
         start.add_argument(
@@ -139,8 +141,8 @@ class RestoreCommands:
             dest="in_place",
             action="store_true",
             help=(
-                "Restore in place: replace the running source VM at its original host, datastore, "
-                "and name. Requires --force. Cannot be combined with --target-inventory/--target-host/"
+                "Restore in place: keep the source VM and replace its disks with the restore point's, "
+                "at its own host, datastore and name. Requires --force. Cannot be combined with --target-inventory/--target-host/"
                 "--datastore/--new-name -- in-place restore always uses the source VM's own placement."
             ),
         )

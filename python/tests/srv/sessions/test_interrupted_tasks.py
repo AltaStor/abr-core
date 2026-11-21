@@ -817,3 +817,52 @@ class ChainDeleteLeftoverTests(SweepTestCase):
             abr_v41.delete_backup_chain("backup::job-1::vm-1::repo-s3")
 
         self.assertEqual([call.args[0]["id"] for call in discard.call_args_list], ["task-crashed"])
+
+
+class InterruptedInPlaceRestoreTests(SweepTestCase):
+    def in_place(self, task_id: str, **extra) -> dict:
+        task = {
+            **_task(task_id, "running", restore_mode="in_place", target_vm_name="web01"),
+            "task_type": "restore",
+            "result": {"in_place_vm_id": "vm-1", "staging_vm_id": "vm-9"},
+            "logs": [],
+            **extra,
+        }
+        TASKS[task_id] = task
+        return task
+
+    def test_an_interrupted_in_place_restore_is_settled_after_the_restart(self) -> None:
+        self.in_place("restore-ip")
+
+        with patch(
+            "python.srv.plugins.vcenter.vcenter_restore.recover_interrupted_in_place", return_value="Removed the temporary VM web01-restoring-restore-"
+        ) as recover:
+            backup_catalog.fail_interrupted_tasks()
+
+        recover.assert_called_once()
+        self.assertEqual(recover.call_args.args[0]["id"], "restore-ip")
+        self.assertEqual(TASKS["restore-ip"]["status"], "failed")
+
+    def test_other_restores_and_backups_are_left_to_their_own_sweep(self) -> None:
+        TASKS["backup-1"] = _task("backup-1", "running")
+        self.in_place("restore-new", parameters={"restore_mode": "new_vm", "target_vm_name": "web01-copy"})
+        self.in_place("restore-hv", hypervisor_id="hv-hyperv")
+        HYPERVISORS["hv-hyperv"] = {"id": "hv-hyperv", "kind": "hyperv", "metadata": {}}
+
+        with patch("python.srv.plugins.vcenter.vcenter_restore.recover_interrupted_in_place") as recover:
+            backup_catalog.fail_interrupted_tasks()
+
+        recover.assert_not_called()
+
+    def test_a_settling_that_fails_is_written_into_the_session_and_left_to_the_next_restore(self) -> None:
+        self.in_place("restore-down")
+
+        with (
+            patch("python.srv.plugins.vcenter.vcenter_restore.recover_interrupted_in_place", side_effect=RuntimeError("vCenter is not reachable")),
+            self.assertLogs(backup_catalog.logger, "ERROR"),
+        ):
+            backup_catalog.fail_interrupted_tasks()
+
+        messages = [line["message"] for line in TASKS["restore-down"]["logs"]]
+        self.assertTrue(any("could not be settled after the server restart (vCenter is not reachable)" in message for message in messages), messages)
+        self.assertTrue(any("the next in-place restore of this VM settles it first" in message for message in messages))

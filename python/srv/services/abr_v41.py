@@ -139,7 +139,14 @@ from python.srv.services.backup_copy import (
 )
 from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
 from python.srv.services import clock_guard
-from python.srv.services.share_mount import mount_if_managed, share_mount_check, unmounted_share_message
+from python.srv.services.share_mount import (
+    SMB_FILESYSTEMS,
+    mount_holding,
+    mount_if_managed,
+    read_mounts,
+    share_mount_check,
+    unmounted_share_message,
+)
 from python.srv.plugins.hyperv.hyperv import WINRM_PORTS, log_detected_protocol, with_protocol
 from python.srv.plugins.hyperv.vhdx_tool import VhdxToolError, ensure_hyperv_repository
 from python.srv.plugins.vcenter import disk_transport
@@ -264,6 +271,7 @@ def is_initial_repository_metadata(metadata: dict[str, Any]) -> bool:
     return bool(metadata.get(DEFAULT_REPOSITORY_MARK))
 
 PRODUCT_STORAGE_MODE = 0o750
+BACKUP_READER_FOLDER_MODE = 0o750
 
 EXECUTION_TYPES = ("Incremental", "ActiveFull", "SyntheticFull")
 EXECUTION_REASONS = (
@@ -2253,6 +2261,13 @@ def normalize_repository_record(record: dict[str, Any]) -> dict[str, Any]:
         item["address"] = metadata.get("address")
     if metadata.get("server") is not None:
         item["server"] = metadata.get("server")
+    if metadata.get("support_hyperv") and metadata.get("share"):
+        from python.srv.services.repository_shares import share_server
+
+        try:
+            item["server"] = share_server()
+        except ApiError:
+            pass
     if metadata.get("share") is not None:
         item["share"] = metadata.get("share")
     if metadata.get("username") is not None:
@@ -2647,7 +2662,65 @@ def _local_repository_permission_warnings(path: Path, permissions: dict[str, Any
     return warnings
 
 
-def _reject_insecure_local_repository_path(path: Path) -> None:
+def _reader_refuses_folder_mode(mode: int) -> bool:
+    return bool(mode & 0o777 & ~BACKUP_READER_FOLDER_MODE)
+
+
+def _share_folder_mode_problem(path: Path) -> str | None:
+    try:
+        mount = mount_holding(path.resolve(), read_mounts())
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return None
+    if mount is None or mount.fstype not in SMB_FILESYSTEMS or not _reader_refuses_folder_mode(mode):
+        return None
+    return (
+        f"{path} is on the SMB share {mount.source} mounted at {mount.point}, where every folder gets mode "
+        f"{mode & 0o777:04o} from the mount (dir_mode). abr-vmdk-tool reads a backup only from a folder of mode "
+        f"{BACKUP_READER_FOLDER_MODE:04o} or stricter, so backups written there could not be verified or restored by this server. "
+        f"Mount the share with dir_mode=0{BACKUP_READER_FOLDER_MODE:o}"
+    )
+
+
+def _repository_backup_folders(repository: dict[str, Any], path: Path) -> list[Path]:
+    repository_id = str(repository.get("id") or "")
+    root = path.resolve()
+    folders: set[Path] = set()
+    for point in catalog_records(BACKUPS):
+        if str(point.get("repository_id") or "") != repository_id:
+            continue
+        artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+        for disk in artifact.get("disks") or []:
+            folder = Path(str((disk or {}).get("abr_path") or "")) if isinstance(disk, dict) else None
+            if folder is not None and folder.is_absolute() and (folder == root or root in folder.parents):
+                folders.add(folder)
+    return sorted(folders)
+
+
+def _backup_folder_mode_problem(repository: dict[str, Any], path: Path) -> str | None:
+    refused: list[tuple[Path, int]] = []
+    for folder in _repository_backup_folders(repository, path):
+        try:
+            mode = stat.S_IMODE(folder.stat().st_mode)
+        except OSError:
+            continue
+        if _reader_refuses_folder_mode(mode):
+            refused.append((folder, mode))
+    if not refused:
+        return None
+    shown = ", ".join(f"{folder} ({mode & 0o777:04o})" for folder, mode in refused[:3])
+    more = f" and {len(refused) - 3} more" if len(refused) > 3 else ""
+    return (
+        f"{len(refused)} backup folder(s) of this repository have a mode abr-vmdk-tool refuses: {shown}{more}. It reads "
+        f"a backup only from a folder of mode {BACKUP_READER_FOLDER_MODE:04o} or stricter, so verify and restore of those "
+        f"backups by this server fail. Run: find {path} -type d -exec chmod {BACKUP_READER_FOLDER_MODE:o} {{}} +"
+    )
+
+
+def _reject_insecure_local_repository_path(path: Path, *, mounted_by_server: bool = False) -> None:
+    share_problem = None if mounted_by_server else _share_folder_mode_problem(path)
+    if share_problem:
+        raise api_error(422, "repository_folder_mode", share_problem, path=str(path))
     permissions = _local_path_permissions(path)
     if permissions is None or not permissions["world_writable"]:
         return
@@ -2762,11 +2835,7 @@ def _ensure_appliance_folder(repo_type: str, path: str) -> None:
     )
 
 
-def _create_managed_smb_repository(
-    payload: dict[str, Any], *, name: str, server: str | None, share: str | None, username: str | None, password: str | None
-) -> dict[str, Any]:
-    from python.srv.services import repository_mounts
-
+def _ensure_mountable_share(server: str | None, share: str | None, username: str | None, password: str | None) -> None:
     _ensure(
         bool(server) and bool(share),
         422,
@@ -2780,6 +2849,14 @@ def _create_managed_smb_repository(
         "A share this server mounts needs --username and --password: its traffic is encrypted, which needs an account. "
         "Give --path for a share mounted by hand",
     )
+
+
+def _create_managed_smb_repository(
+    payload: dict[str, Any], *, name: str, server: str | None, share: str | None, username: str | None, password: str | None
+) -> dict[str, Any]:
+    from python.srv.services import repository_mounts
+
+    _ensure_mountable_share(server, share, username, password)
     for existing in catalog_records(REPOSITORIES):
         if str(existing.get("name") or "").lower() == name.lower():
             raise api_error(409, "repository_name_exists", "Repository name already exists", name=name)
@@ -2835,7 +2912,7 @@ def create_repository_record(
             raise api_error(422, "invalid_repository", f"Path is not accessible: {local_path} ({access_error})", path=path)
         _ensure(exists, 422, "invalid_repository", f"Path does not exist: {local_path}", path=path)
         _ensure(is_dir, 422, "invalid_repository", f"Path is not a directory: {local_path}", path=path)
-        _reject_insecure_local_repository_path(local_path)
+        _reject_insecure_local_repository_path(local_path, mounted_by_server=bool((metadata_flags or {}).get("managed_mount")))
         if repo_type == "smb":
             _ensure_smb_repository_share(server, share, username, password)
             password = password if username else None
@@ -3185,11 +3262,14 @@ def _verify_local_repository(
         return {"status": "error", "checks": checks, "message": f"Path is not readable and writable: {path}"}
     permissions = _local_path_permissions(path)
     permission_warnings = _local_repository_permission_warnings(path, permissions)
+    mounted_by_server = bool((repository.get("metadata") or {}).get("managed_mount"))
+    mode_problem = (None if mounted_by_server else _share_folder_mode_problem(path)) or _backup_folder_mode_problem(repository, path)
     checks.append(
         {
             "name": "permissions",
-            "status": "warning" if permission_warnings else "ok",
-            "message": " ".join(permission_warnings)
+            "status": "failed" if mode_problem else "warning" if permission_warnings else "ok",
+            "message": mode_problem
+            or " ".join(permission_warnings)
             or (
                 f"mode {permissions['mode']} {permissions['owner']}:{permissions['group']}"
                 if permissions
@@ -3234,9 +3314,11 @@ def _verify_local_repository(
                 **({"errors": backup_health["errors"]} if backup_health["errors"] else {}),
             }
         )
-        if backup_health["status"] == "failed":
+        if backup_health["status"] == "failed" and not mode_problem:
             return {"status": "error", "checks": checks, "message": f"Backup integrity check failed: {backup_health['message']}"}
 
+    if mode_problem:
+        return {"status": "error", "checks": checks, "message": mode_problem}
     message = "Repository is available"
     if permission_warnings:
         message = f"{message}. Warning: {' '.join(permission_warnings)}"
@@ -4031,6 +4113,8 @@ def test_smb_connection(payload: dict[str, Any]) -> dict[str, Any]:
         parsed_server, parsed_share = _split_repository_address("smb", address)
         server = server or parsed_server
         share = share or parsed_share
+    if not path:
+        return _test_mounted_smb_share(str(payload.get("name") or "").strip(), server, share, payload.get("username"), payload.get("password"))
     _ensure_appliance_folder("smb", path)
     _ensure_smb_repository_share(server, share, payload.get("username"), payload.get("password"))
     record = {
@@ -4046,6 +4130,39 @@ def test_smb_connection(payload: dict[str, Any]) -> dict[str, Any]:
         "status": "success",
         "checks": result.get("checks") or [],
         "message": str(result.get("message") or "").replace("Repository is available", "SMB folder and share match", 1),
+    }
+
+
+def _test_mounted_smb_share(name: str, server: str, share: str, username: Any, password: Any) -> dict[str, Any]:
+    from python.srv.services import repository_mounts
+
+    _ensure_mountable_share(server, share, username, password)
+    probe_id = str(uuid4())
+    repository_mounts.mount_arguments(probe_id, server, share, str(username), str(password))
+    unc = "\\\\" + server + "\\" + share.replace("/", "\\")
+    probe = {
+        "id": probe_id,
+        "name": name or unc,
+        "type": "smb",
+        "metadata": {"server": server, "share": share, "username": username, "password": password, "managed_mount": True},
+    }
+    mounted = repository_mounts.mount(probe, trial=True)
+    try:
+        checked = {**probe, "path": str(mounted.get("mount_point") or repository_mounts.mount_point(probe_id, trial=True))}
+        result = _with_share_account(_verify_local_repository(checked, check_backups=False), checked)
+    finally:
+        try:
+            repository_mounts.unmount(probe, trial=True)
+        except ApiError as exc:
+            LOGGER.warning("The share %s mounted to test it could not be unmounted: %s", unc, exc.message)
+    if result.get("status") != "success":
+        return {"status": "error", "checks": result.get("checks") or [], "message": result.get("message")}
+    return {
+        "status": "success",
+        "checks": result.get("checks") or [],
+        "message": str(result.get("message") or "").replace(
+            "Repository is available", f"{unc} was mounted with this account, written to and unmounted again", 1
+        ),
     }
 
 
@@ -9465,6 +9582,7 @@ def _build_restore_source_vm(point: dict[str, Any], manifest: dict[str, Any]) ->
                 break
         discovered_payload = discovered.get("payload") if isinstance(discovered, dict) and isinstance(discovered.get("payload"), dict) else {}
         effective_path = datastore_path or str(discovered_payload.get("datastore_path") or "").strip() or None
+        host_bytes = _restore_disk_host_bytes(artifact_disks, disk_entry)
         datastore_name, folder_name, _filename = _parse_datastore_path_parts(effective_path)
         if original_datastore is None and datastore_name:
             original_datastore = datastore_name
@@ -9475,7 +9593,8 @@ def _build_restore_source_vm(point: dict[str, Any], manifest: dict[str, Any]) ->
                 "id": _source_disk_id(vm_id, index, disk_entry, discovered),
                 "label": str(disk_entry.get("disk_label") or (discovered or {}).get("name") or f"Hard disk {index}"),
                 "capacity_bytes": _capacity_bytes_from_disk_entry(disk_entry) or _capacity_bytes_from_disk_entry(discovered_payload),
-                "used_bytes": _restore_disk_used_bytes(manifest, disk_entry),
+                "used_bytes": host_bytes or _restore_disk_used_bytes(manifest, disk_entry),
+                "used_bytes_on_host": bool(host_bytes),
                 "provisioning": str(disk_entry.get("source_disk_type_name") or discovered_payload.get("source_disk_type_name") or "").strip() or None,
                 "controller_type": str(disk_entry.get("controller_type") or discovered_payload.get("bus") or "scsi").strip() or None,
                 "datastore_path": effective_path,
@@ -9897,6 +10016,20 @@ _THIN_SOURCE_DISK_TYPES = {"vmfs_thin", "vmfs_sparse", "monolithic_sparse", "spl
 _WHOLE_DISK_BACKUP_MODES = {"full", "incremental-full-fallback"}
 
 
+def _restore_disk_host_bytes(artifact_disks: list[Any], disk_entry: dict[str, Any]) -> int | None:
+    slot = str(disk_entry.get("slot") or disk_entry.get("disk_label") or "").strip()
+    recorded = [
+        disk
+        for disk in artifact_disks
+        if isinstance(disk, dict) and slot and str(disk.get("slot") or disk.get("disk_label") or "").strip() == slot
+    ]
+    for disk in (*recorded, disk_entry):
+        allocated = _safe_int(disk.get("allocated_bytes"))
+        if allocated:
+            return allocated
+    return None
+
+
 def _restore_disk_used_bytes(manifest: dict[str, Any], disk_entry: dict[str, Any]) -> int | None:
     store_mode = str(disk_entry.get("store_mode") or "").strip().lower()
     backup_mode = str(manifest.get("backup_mode") or "").strip().lower()
@@ -9941,11 +10074,13 @@ def _ensure_restore_target_capacity(
     """
     requirements: list[int | None] = []
     thin_target = False
+    host_measured = False
     for disk in disks:
         if not isinstance(disk, dict):
             continue
         if _restore_disk_target_is_thin(disk, disk_provisioning):
             thin_target = True
+            host_measured = host_measured or bool(disk.get("used_bytes_on_host"))
             requirements.append(_safe_int(disk.get("used_bytes")))
         else:
             requirements.append(_safe_int(disk.get("capacity_bytes")))
@@ -9961,7 +10096,10 @@ def _ensure_restore_target_capacity(
         f"Datastore '{datastore.get('name')}' does not have enough free space for the disks that land on it: "
         f"{_gib(required_total)} required, {_gib(free_bytes)} free"
         + (
-            " — thin-provisioned disks are measured by the data the backup holds, "
+            " — a dynamic disk is measured by what it took on the host when the backup was made, "
+            "not by its provisioned size"
+            if host_measured
+            else " — thin-provisioned disks are measured by the data the backup holds, "
             "not by their provisioned size"
             if thin_target
             else ""
@@ -10979,6 +11117,13 @@ def _job_current_key(job_id: str) -> str | None:
     return str(task_parameters.get("encryption_key") or "").strip() or None
 
 
+def _point_own_key(point: dict[str, Any]) -> str | None:
+    for key in (str(point.get("encryption_key") or "").strip(), _job_key_by_id(str(point.get("job_id") or ""), point.get("encryption_key_id"))):
+        if key and not is_encrypted(key):
+            return key
+    return None
+
+
 def _resolve_restore_encryption_key(point: dict[str, Any]) -> str | None:
     job_id = str(point.get("job_id") or "")
     found = []
@@ -11266,6 +11411,15 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
         "credential_key_unavailable",
         f"{key_problem}. The encryption key given for this restore is not stored. {KEY_REPAIR_HINT}, then repeat "
         "the restore.",
+        point_id=point_id,
+    )
+    own_key = _point_own_key(point) if given_key and _point_is_encrypted(point) else None
+    _ensure(
+        own_key is None or own_key == given_key,
+        409,
+        "encryption_key_mismatch",
+        f"The encryption key given does not decrypt restore point {point_id}: the point was written with another key. "
+        "Repeat the restore without an encryption key to use the stored one, or give the key the point was written with.",
         point_id=point_id,
     )
     encryption_key = given_key or _resolve_restore_encryption_key(point)

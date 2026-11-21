@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ...core.subprocess_util import ProcessCancelled, run_capped
-from ...core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES, catalog_records
+from ...core.mongo_db_wrapper import BACKUPS, HYPERVISORS, REPOSITORIES, TASKS, catalog_records
 from ...core.task_executor import TaskStopRequested, cancel_requested
 from .disk_transport import (
     SOAP,
@@ -48,6 +48,7 @@ from .vcenter_backup import (
     _sanitize_name,
     _unexpected_data_mover_end,
 )
+from . import vcenter_inplace
 from .vcenter_disk_types import (
     DISK_PLACEMENT_FIELDS,
     VddkDiskType,
@@ -110,44 +111,6 @@ def _build_disk_file_name(index: int, source_name: str) -> str:
     return _name_with_suffix(f"{index:02d}-{source.stem}", extension, RESTORED_DISK_FILE_NAME_LIMIT)
 
 
-def _read_original_identity(node: Any, vm_name: str) -> dict[str, str]:
-    try:
-        identity = node.read_vm_identity(vm_name)
-    except Exception:
-        logger.warning(
-            "Could not read the vSphere identifiers of '%s' before replacing it; the restored VM will carry "
-            "new ones and anything keyed on the old identity will stop matching.",
-            vm_name,
-            exc_info=True,
-        )
-        return {}
-    return {key: value for key, value in identity.items() if value}
-
-
-def _restore_original_identity(
-    node: Any, vm_name: str, identity: dict[str, str], *, vm_moref: str = ""
-) -> bool:
-    if not identity:
-        return False
-    try:
-        node.set_vm_identity(
-            vm_name,
-            uuid=identity.get("uuid", ""),
-            instance_uuid=identity.get("instance_uuid", ""),
-            vm_moref=vm_moref or None,
-        )
-    except Exception:
-        logger.warning(
-            "In-place restore of '%s' finished, but the original vSphere identifiers could not be applied to it. "
-            "The data is intact; guest licensing, vCenter tags, monitoring and backup jobs keyed on the old "
-            "identity will not recognise this VM until it is corrected.",
-            vm_name,
-            exc_info=True,
-        )
-        return False
-    return True
-
-
 def _note_after_swap(progress_callback: ProgressCallback, *args: Any, **extra: Any) -> None:
     try:
         _emit_progress(progress_callback, *args, **extra)
@@ -155,82 +118,127 @@ def _note_after_swap(progress_callback: ProgressCallback, *args: Any, **extra: A
         pass
 
 
-def _read_original_placement(node: Any, vm_name: str) -> dict[str, Any]:
-    try:
-        return node.read_vm_placement(vm_name)
-    except Exception:
-        logger.warning(
-            "Could not read the VM folder, MAC addresses, notes, tags, custom attributes, permissions and alarms "
-            "of '%s' before replacing it; the restored VM goes without them.",
-            vm_name,
-            exc_info=True,
-        )
-        return {}
-
-
-def _kept_summary(applied: dict[str, Any]) -> str:
-    adapters = ", ".join(f"{item['label']} {item['mac']}" for item in applied.get("network_adapters") or [])
-    parts = [f"VM folder {applied.get('folder') or '(root)'}", f"MAC addresses ({adapters or 'none'})"]
-    if applied.get("notes"):
-        parts.append("notes")
-    for key, label in (("tags", "tags"), ("custom_attributes", "custom attributes"), ("permissions", "permissions"), ("alarms", "alarms")):
-        names = applied.get(key) or []
-        if names:
-            parts.append(f"{label} ({', '.join(names)})")
-    return ", ".join(parts)
-
-
-def _restore_original_placement(
-    node: Any,
+def _finish_in_place(
     progress_callback: ProgressCallback,
     vm_name: str,
-    placement: dict[str, Any],
-    *,
-    vm_moref: str = "",
-) -> bool:
-    if not placement:
-        message = (
-            f"VM {vm_name} was restored, but could not be given back its original VM folder, MAC addresses, notes, "
-            "tags, custom attributes, permissions and alarms: they could not be read from the VM it replaced"
-        )
-        _note_after_swap(
-            progress_callback,
-            "finalize",
-            88,
-            message,
-            worker_mode="vcenter-abr-vmdk-tool",
-            warning={"code": "placement_not_restored", "message": message, "vm_name": vm_name},
-        )
-        return False
-    try:
-        applied = node.apply_vm_placement(vm_name, placement, vm_moref=vm_moref or None)
-    except Exception as exc:
-        applied = {"failed": {"VM folder, MAC addresses, notes, tags, custom attributes, permissions and alarms": str(exc).rstrip(". ") or type(exc).__name__}}
-        logger.warning("Could not give VM '%s' back what the VM it replaced had", vm_name, exc_info=True)
-    failed = applied.get("failed") or {}
-    if "network_adapters" in applied:
-        _note_after_swap(
-            progress_callback,
-            "finalize",
-            88,
-            f"VM {vm_name} kept its {_kept_summary(applied)}",
-            worker_mode="vcenter-abr-vmdk-tool",
-        )
-    if failed:
-        message = f"VM {vm_name} was restored, but could not be given back its original " + "; ".join(
-            f"{part}: {reason}" for part, reason in failed.items()
-        )
+    kept_disks: list[dict[str, Any]],
+    point_id: str,
+    outcome: dict[str, Any],
+) -> None:
+    def warn(progress: int, message: str, code: str) -> None:
         logger.warning("%s", message)
         _note_after_swap(
-            progress_callback,
-            "finalize",
-            88,
-            message,
-            worker_mode="vcenter-abr-vmdk-tool",
-            warning={"code": "placement_not_restored", "message": message, "vm_name": vm_name, "parts": sorted(failed)},
+            progress_callback, "finalize", progress, message, worker_mode="vcenter-abr-vmdk-tool", warning={"code": code, "message": message, "vm_name": vm_name}
         )
-        return False
-    return True
+
+    for problem in outcome["problems"]:
+        warn(87, f"In-place restore of {vm_name}: {problem}", "in_place_cleanup_incomplete")
+    if outcome["changes"]:
+        _note_after_swap(
+            progress_callback, "finalize", 88, f"{vm_name} set back to restore point {point_id}: {'; '.join(outcome['changes'])}", worker_mode="vcenter-abr-vmdk-tool"
+        )
+    for note in outcome["notes"]:
+        warn(89, note, "in_place_config_kept")
+    if outcome["held"]:
+        warn(89, outcome["held"], "in_place_snapshot_disks")
+    for disk in kept_disks:
+        warn(89, f"{disk['label']} of {vm_name} ({disk['path']}) is not in restore point {point_id}; it stays attached as it is", "in_place_disk_kept")
+
+
+def _in_place_leftover(record: dict[str, Any], current_id: str, vm_id: str, vm_name: str) -> bool:
+    parameters = record.get("parameters") if isinstance(record.get("parameters"), dict) else {}
+    result = record.get("result") if isinstance(record.get("result"), dict) else {}
+    return (
+        str(record.get("id") or "") != current_id
+        and str(record.get("task_type") or "") == "restore"
+        and str(parameters.get("restore_mode") or "") == "in_place"
+        and str(record.get("status") or "") not in ("queued", "running")
+        and bool(result.get("swap_plan") or result.get("staging_vm_id"))
+        and (str(result.get("in_place_vm_id") or "") == vm_id or str(parameters.get("target_vm_name") or "") == vm_name)
+    )
+
+
+def _settle_leftover(node: Any, record: dict[str, Any]) -> str | None:
+    from ...services.backup_catalog import _update_finished_task
+
+    parameters = record.get("parameters") if isinstance(record.get("parameters"), dict) else {}
+    result = record.get("result") if isinstance(record.get("result"), dict) else {}
+    staging_name = _build_staging_vm_name(str(parameters.get("target_vm_name") or ""), str(record.get("id") or ""))
+    outcome, settled, completed = vcenter_inplace.recover(node, result, staging_name)
+    if completed:
+        outcome = f"{outcome}. {_complete_after_interruption(node, parameters, result)}"
+
+    def change(stored: dict[str, Any]) -> None:
+        if settled:
+            stored_result = dict(stored.get("result") or {})
+            stored_result["swap_plan"] = {}
+            stored_result["staging_vm_id"] = ""
+            stored["result"] = stored_result
+        if outcome:
+            from ...services.abr_v41 import _append_task_log
+
+            _append_task_log(stored, level="info", message=f"After the interruption: {outcome}", component="engine")
+
+    _update_finished_task(str(record.get("id") or ""), change)
+    return outcome
+
+
+def _complete_after_interruption(node: Any, parameters: dict[str, Any], result: dict[str, Any]) -> str:
+    plan = result.get("swap_plan") if isinstance(result.get("swap_plan"), dict) else {}
+    vm_id, vm_name = str(plan.get("vm_id") or ""), str(plan.get("name") or parameters.get("target_vm_name") or "")
+    point_id = str(parameters.get("point_id") or "")
+    parts = []
+    try:
+        vm_config = _load_manifest(str(parameters.get("manifest_path") or "")).get("vm_config") or {}
+        changes, notes = vcenter_inplace.settle_config(node, vm_id, vm_name, dict(vm_config), point_id)
+        parts.append(f"{vm_name} set back to restore point {point_id}: {'; '.join(changes)}" if changes else f"{vm_name} already matched restore point {point_id}")
+        parts.extend(notes)
+    except Exception as exc:
+        logger.exception("Setting the configuration of %s back after the interruption failed", vm_name)
+        parts.append(f"its configuration could not be set back to restore point {point_id}: {exc}")
+    if parameters.get("power_on"):
+        try:
+            node.power_on_vm(vm_name, vm_moref=vm_id)
+            parts.append(f"{vm_name} was powered on")
+        except vcenter_inplace.VSPHERE_FAILURES as exc:
+            parts.append(f"{vm_name} could not be powered on: {exc}")
+    else:
+        parts.append(f"{vm_name} stays powered off")
+    return "; ".join(parts)
+
+
+def _recover_earlier_in_place(node: Any, task: dict[str, Any], progress_callback: ProgressCallback) -> None:
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    vm_id = str(task.get("resource_external_id") or "")
+    vm_name = str(parameters.get("target_vm_name") or "")
+    for record in catalog_records(TASKS):
+        if not isinstance(record, dict) or not _in_place_leftover(record, str(task.get("id") or ""), vm_id, vm_name):
+            continue
+        outcome = _settle_leftover(node, record)
+        if outcome:
+            _emit_progress(
+                progress_callback,
+                "prepare",
+                5,
+                f"An earlier in-place restore of {vm_name} (session {record.get('id')}) was interrupted: {outcome}",
+                worker_mode="vcenter-abr-vmdk-tool",
+            )
+
+
+def recover_interrupted_in_place(task: dict[str, Any]) -> str | None:
+    from .vcenter import VCenterNode
+
+    hypervisor = _get_hypervisor(task)
+    metadata = hypervisor.get("metadata") if isinstance(hypervisor.get("metadata"), dict) else {}
+    credentials = metadata.get("credentials") if isinstance(metadata.get("credentials"), dict) else {}
+    with VCenterNode(
+        str(metadata.get("host") or ""),
+        str(credentials.get("username") or ""),
+        str(credentials.get("password") or ""),
+        port=int(metadata.get("port") or 443),
+        verify_ssl=bool(metadata.get("verify_ssl", False)),
+    ) as node:
+        return _settle_leftover(node, task)
 
 
 def _build_staging_vm_name(target_vm_name: str, task_id: str) -> str:
@@ -1038,18 +1046,7 @@ def run_vcenter_restore(
                 f"{recovery_label} requires target_vm_name, target_host_name, and target_datastore_name"
             )
 
-        # In-place restore builds a fully separate, fully verified VM under a
-        # staging name first — target_vm_name is the ORIGINAL VM's own name
-        # (abr_v41 resolves/forces it that way for in-place), so the shell and
-        # every disk write must land under a different name, in its own
-        # datastore folder, never touching the still-live original until the
-        # swap below. For every other restore mode create_vm_name is simply
-        # target_vm_name — zero behavior change.
-        create_vm_name = (
-            _build_staging_vm_name(target_vm_name, str(task.get("id") or ""))
-            if is_in_place
-            else target_vm_name
-        )
+        create_vm_name = _build_staging_vm_name(target_vm_name, task_id) if is_in_place else target_vm_name
 
         _emit_progress(
             progress_callback,
@@ -1066,6 +1063,49 @@ def run_vcenter_restore(
         with VCenterNode(host, username, password, port=port, verify_ssl=verify_ssl) as node, node.session_keepalive():
             service_type = node.get_service_type()
             is_virtual_center = service_type == "VirtualCenter"
+            original: dict[str, Any] = {}
+            in_place_disks: list[dict[str, Any]] = []
+            kept_disks: list[dict[str, Any]] = []
+            swapping = False
+            swap_plan: dict[str, Any] = {}
+            if is_in_place:
+                _recover_earlier_in_place(node, task, progress_callback)
+                original = vcenter_inplace.describe_vm(
+                    vcenter_inplace.find_original(
+                        node,
+                        vm_id=str(task.get("resource_external_id") or ""),
+                        instance_uuid=str(vm_config.get("instance_uuid") or ""),
+                        name=target_vm_name,
+                    )
+                )
+                refused = vcenter_inplace.refusal(original)
+                if refused:
+                    raise VCenterBackupError(refused)
+                in_place_disks, kept_disks = vcenter_inplace.plan_disks(original, disk_entries, task_id)
+                target_vm_name = original["name"]
+                target_host_name = original["host"] or target_host_name
+                target_datastore_name = original["home_datastore"]
+                create_vm_name = _build_staging_vm_name(target_vm_name, task_id)
+                _emit_progress(
+                    progress_callback,
+                    "prepare",
+                    6,
+                    f"VM {target_vm_name} ({original['vm_id']}) on {target_host_name} is restored in place: its "
+                    f"{len(in_place_disks)} disk(s) are written next to the current ones through a temporary VM "
+                    f"{create_vm_name}, and the VM keeps running until they are complete",
+                    worker_mode="vcenter-abr-vmdk-tool",
+                    in_place_vm_id=original["vm_id"],
+                    in_place_new_paths=[disk["new_path"] for disk in in_place_disks],
+                )
+                if original["snapshots"]:
+                    _emit_progress(
+                        progress_callback,
+                        "prepare",
+                        6,
+                        f"VM {target_vm_name} has snapshot(s) {', '.join(original['snapshots'])}; they are kept, with the disks the "
+                        "VM has now",
+                        worker_mode="vcenter-abr-vmdk-tool",
+                    )
             disk_provisioning: list[dict[str, Any]] = []
             for index, disk in enumerate(disk_entries, start=1):
                 if not isinstance(disk, dict):
@@ -1096,37 +1136,41 @@ def run_vcenter_restore(
                     provisioning=disk_provisioning,
                     disk_targets=disk_targets,
                 )
-                if is_virtual_center or over_soap
+                if (is_virtual_center and not is_in_place) or over_soap
                 else None
             )
+            if is_in_place and disk_layout is not None:
+                for layout_entry, planned_disk in zip(disk_layout, in_place_disks, strict=True):
+                    layout_entry["path"] = planned_disk["new_path"]
+                    layout_entry["datastore_name"] = planned_disk["datastore"]
             disk_placements = _disk_placements(disk_entries)
-            original_destroyed = False
-            original_identity: dict[str, str] = {}
-            identity_preserved = False
-            original_placement: dict[str, Any] = {}
-            placement_preserved = False
             replica_marker = str(parameters.get("replica_marker") or "")
             created_vm: dict[str, Any] = node.create_vm_shell(
                 vm_name=create_vm_name,
                 host_name=target_host_name,
                 datastore_name=target_datastore_name,
-                config_metadata={**vm_config, "annotation": replica_marker} if replica_marker else vm_config,
+                config_metadata=(
+                    {**vm_config, "network_adapters": []}
+                    if is_in_place
+                    else {**vm_config, "annotation": replica_marker} if replica_marker else vm_config
+                ),
                 disk_layout=disk_layout,
                 disk_placements=disk_placements,
                 **({"create_disks": False} if over_soap else {}),
             )
             soap_cluster = node.compute_resource_name(target_host_name) if over_soap else None
             thick_kept_thin: list[int] = []
-            if replica_marker:
-                _emit_progress(
-                    progress_callback,
-                    "prepare",
-                    7,
-                    f"Created VM {create_vm_name} on {target_host_name}",
-                    worker_mode="vcenter-abr-vmdk-tool",
-                    created_vm_id=str(created_vm.get("vm_moref") or ""),
-                )
             try:
+                if replica_marker or is_in_place:
+                    _emit_progress(
+                        progress_callback,
+                        "prepare",
+                        7,
+                        f"Created {'the temporary ' if is_in_place else ''}VM {create_vm_name} on {target_host_name}",
+                        worker_mode="vcenter-abr-vmdk-tool",
+                        created_vm_id=str(created_vm.get("vm_moref") or ""),
+                        **({"staging_vm_id": str(created_vm.get("vm_moref") or "")} if is_in_place else {}),
+                    )
                 logger.info(
                     "Created VM shell %s on host %s datastore %s with resulting firmware %s, "
                     "disk controllers %s, Secure Boot requested=%s",
@@ -1209,6 +1253,9 @@ def run_vcenter_restore(
                             index,
                         )
                     )
+                    if is_in_place and not over_soap:
+                        restore_target = in_place_disks[index - 1]["new_path"]
+                        disk_datastore_name = in_place_disks[index - 1]["datastore"]
                     logger.info(
                         "Restoring VM disk %d/%d from %s to %s",
                         index,
@@ -1223,7 +1270,7 @@ def run_vcenter_restore(
                     attachment: dict[str, Any] | None = None
                     if over_soap and not provisioning["thin_provisioned"]:
                         thick_kept_thin.append(index)
-                    if not is_virtual_center and not over_soap:
+                    if (not is_virtual_center or is_in_place) and not over_soap:
                         node.create_managed_disk(
                             datastore_name=disk_datastore_name,
                             disk_path=restore_target,
@@ -1231,6 +1278,8 @@ def run_vcenter_restore(
                             disk_type_code=resolved_disk_type_code,
                             eager_zeroed=provisioning["eager_zeroed"],
                         )
+                        if is_in_place:
+                            node.set_disk_uuid(restore_target, disk.get("uuid"), vm_name=create_vm_name)
                         attachment = node.attach_existing_disk(
                             create_vm_name,
                             restore_target,
@@ -1395,7 +1444,7 @@ def run_vcenter_restore(
                         warning={"code": "soap_thin_disks", "message": message, "disks": thick_kept_thin},
                     )
                 source_boot_order = vm_config.get("boot_order")
-                if isinstance(source_boot_order, list) and source_boot_order:
+                if isinstance(source_boot_order, list) and source_boot_order and not is_in_place:
                     boot_order_report = node.apply_boot_order(
                         create_vm_name,
                         source_boot_order,
@@ -1405,54 +1454,47 @@ def run_vcenter_restore(
                     _report_boot_order(progress_callback, boot_order_report)
 
                 if is_in_place:
-                    # Every disk is now fully written and verified on the
-                    # staging VM — only now is it safe to touch the original.
-                    # The original is never powered off or destroyed before
-                    # this point, no matter what fails above.
-                    _emit_progress(
-                        progress_callback,
-                        "finalize",
-                        85,
-                        f"Retiring original VM {target_vm_name} to complete in-place restore",
-                        worker_mode="vcenter-abr-vmdk-tool",
-                        target_vm_name=target_vm_name,
-                    )
-                    logger.info(
-                        "In-place restore: all disks verified written to staging VM '%s'; retiring original VM '%s'.",
-                        create_vm_name,
-                        target_vm_name,
-                    )
-                    original_identity = _read_original_identity(node, target_vm_name)
-                    original_placement = _read_original_placement(node, target_vm_name)
-                    node.power_off_vm(target_vm_name)
-                    node.destroy_vm(target_vm_name)
-                    original_destroyed = True  # point of no return: the original is gone
-                    node.rename_vm(create_vm_name, target_vm_name, vm_moref=str(created_vm.get("vm_moref") or ""))
-                    identity_preserved = _restore_original_identity(
+                    swap_plan = {
+                        "vm_id": original["vm_id"],
+                        "name": target_vm_name,
+                        "was_powered_on": original["powered_on"],
+                        "staging_vm_id": str(created_vm.get("vm_moref") or ""),
+                        "staging_name": create_vm_name,
+                        "guard_snapshot": f"{vcenter_inplace.GUARD_PREFIX}{task_id[:8]}",
+                        "old_bases": [disk["old_base"] for disk in in_place_disks if disk.get("old_base")],
+                        "disks": in_place_disks,
+                    }
+                    try:
+                        _emit_progress(
+                            progress_callback,
+                            "finalize",
+                            84,
+                            f"All {len(in_place_disks)} disk(s) of {target_vm_name} are written; replacing its disks with them",
+                            worker_mode="vcenter-abr-vmdk-tool",
+                            swap_plan=swap_plan,
+                        )
+                    except TaskStopRequested:
+                        _note_after_swap(progress_callback, "finalize", 84, "", swap_plan={}, log_entry=False)
+                        raise
+                    swapping = True
+                    outcome = vcenter_inplace.switch(
                         node,
-                        target_vm_name,
-                        original_identity,
-                        vm_moref=str(created_vm.get("vm_moref") or ""),
+                        swap_plan,
+                        vm_config,
+                        selected_point_id,
+                        lambda progress, message, level: _note_after_swap(
+                            progress_callback, "finalize", progress, message, worker_mode="vcenter-abr-vmdk-tool", log_level=level
+                        ),
+                        lambda plan: _note_after_swap(progress_callback, "finalize", 86, "", swap_plan=dict(plan), log_entry=False),
                     )
-                    placement_preserved = _restore_original_placement(
-                        node,
-                        progress_callback,
-                        target_vm_name,
-                        original_placement,
-                        vm_moref=str(created_vm.get("vm_moref") or ""),
-                    )
+                    _note_after_swap(progress_callback, "finalize", 87, "", swap_plan={}, staging_vm_id="", log_entry=False)
+                    _finish_in_place(progress_callback, target_vm_name, kept_disks, selected_point_id, outcome)
                     try:
                         from ...services.abr_v41 import schedule_inventory_discovery
 
                         schedule_inventory_discovery(str(task["hypervisor_id"]), force=True)
                     except Exception:
-                        logger.warning(
-                            "Failed to schedule post-restore inventory rescan for hypervisor %s; "
-                            "run `inventory rescan` manually so jobs pick up %s's new id.",
-                            task.get("hypervisor_id"),
-                            target_vm_name,
-                            exc_info=True,
-                        )
+                        logger.warning("Failed to schedule post-restore inventory rescan for hypervisor %s", task.get("hypervisor_id"), exc_info=True)
 
                 power_state: dict[str, Any] | None = None
                 if bool(parameters.get("power_on")):
@@ -1466,30 +1508,12 @@ def run_vcenter_restore(
                     )
                     power_state = node.power_on_vm(
                         target_vm_name,
-                        vm_moref=str(created_vm.get("vm_moref") or ""),
+                        vm_moref=original["vm_id"] if is_in_place else str(created_vm.get("vm_moref") or ""),
                     )
             except Exception as exc:
-                if is_in_place and original_destroyed:
-                    # Every disk was confirmed written and the original was
-                    # already retired — only the rename (or the power-on
-                    # after it) failed. The fully-restored VM survives intact
-                    # under the staging name; nothing is lost, but it is NOT
-                    # automatically renamed. Do not guess at remediation here
-                    # (retrying blind against an unknown failure mode risks
-                    # compounding it) — fail loudly and leave it for a human.
-                    logger.critical(
-                        "In-place restore for '%s' failed AFTER the original VM was destroyed but BEFORE "
-                        "the rename completed. The fully-restored VM survives under the staging name '%s' "
-                        "on host '%s' datastore '%s' with all data intact — it is NOT automatically renamed. "
-                        "The original VM has already been destroyed and is not recoverable. "
-                        "Manual intervention required: rename '%s' to '%s' in vCenter to restore normal operation.",
-                        target_vm_name,
-                        create_vm_name,
-                        target_host_name,
-                        target_datastore_name,
-                        create_vm_name,
-                        target_vm_name,
-                    )
+                if is_in_place and swapping:
+                    if swap_plan.get("undone"):
+                        _note_after_swap(progress_callback, "finalize", 86, "", swap_plan={}, staging_vm_id="", log_entry=False)
                     raise
                 outcome = "stopped" if isinstance(exc, TaskStopRequested) else "failed"
                 created_moref = str(created_vm.get("vm_moref") or "")
@@ -1511,6 +1535,10 @@ def run_vcenter_restore(
                     node.destroy_vm(create_vm_name, vm_moref=created_moref)
                 except Exception:
                     logger.exception("Failed to destroy VM %s during restore cleanup.", create_vm_name)
+                if is_in_place:
+                    left = vcenter_inplace.delete_disks(node, [disk["new_path"] for disk in in_place_disks])
+                    if left:
+                        logger.warning("Restore %s left the disk file(s) %s; delete them by hand", outcome, ", ".join(left))
                 raise
 
         total_duration = time.time() - start_time
@@ -1526,10 +1554,8 @@ def run_vcenter_restore(
             "worker_mode": "vcenter-abr-vmdk-tool",
             "hypervisor_kind": "vcenter",
             "restore_mode": restore_mode,
-            "identity_preserved": identity_preserved,
-            "original_identity": original_identity or None,
-            "placement_preserved": placement_preserved if is_in_place else None,
-            "original_placement": original_placement or None,
+            "identity_preserved": is_in_place,
+            "placement_preserved": True if is_in_place else None,
             "source_vm_name": source_vm_name,
             "target_vm_name": target_vm_name,
             "target_host_name": target_host_name,
@@ -1560,6 +1586,7 @@ def run_vcenter_restore(
             "transferred_bytes": total_sent_bytes,
             "finished_at": utc_now(),
             **({"target_vm_id": str(created_vm.get("vm_moref") or "")} if parameters.get("replica_marker") else {}),
+            **({"target_vm_id": original["vm_id"], "kept_disks": [disk["path"] for disk in kept_disks]} if is_in_place else {}),
         }
 
     if resource_type != "disk":

@@ -21,6 +21,7 @@ folder of the appliance alone, which the hosts cannot reach.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -172,6 +173,27 @@ def windows_share(repository: dict[str, Any] | None) -> str | None:
     return f"\\\\{server}\\{share}"
 
 
+SHARES_SERVER_NAME_ENV = "ABR_SHARES_SERVER_NAME"
+SHARE_SERVER_NAME_PATTERN = re.compile(r"(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*")
+
+
+def configured_share_server() -> str | None:
+    value = os.environ.get(SHARES_SERVER_NAME_ENV, "").strip()
+    if not value:
+        return None
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+    if SHARE_SERVER_NAME_PATTERN.fullmatch(value):
+        return value
+    raise VhdxToolError(
+        f"{SHARES_SERVER_NAME_ENV} is set to {value!r}, which is not a host name or an address. Set it to a name every "
+        "Hyper-V host and this server resolve, or leave it empty to give the hosts this server's address"
+    )
+
+
 def appliance_address_toward(host: str) -> str:
     try:
         family, kind, proto, _name, address = socket.getaddrinfo(host, 445, type=socket.SOCK_DGRAM)[0]
@@ -188,7 +210,7 @@ def for_hyperv_host(repository: dict[str, Any] | None, host: str) -> dict[str, A
     metadata = repository.get("metadata") if isinstance(repository, dict) and isinstance(repository.get("metadata"), dict) else {}
     if not metadata.get("support_hyperv"):
         return repository
-    address = appliance_address_toward(host)
+    address = configured_share_server() or appliance_address_toward(host)
     return {**repository, "server": address, "metadata": {**metadata, "server": address}}
 
 

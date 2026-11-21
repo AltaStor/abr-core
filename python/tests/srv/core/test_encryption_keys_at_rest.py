@@ -396,6 +396,42 @@ class RestoreKeyTests(_KeyFileTestCase):
 
         self.assertEqual(TASKS[task["id"]]["parameters"]["encryption_key"], KEY_1)
 
+    def test_a_given_key_that_is_not_the_points_own_is_refused_before_the_session(self) -> None:
+        self._seed_point(KEY_1)
+
+        error = self._refused(encryption_key=KEY_2)
+
+        self.assertEqual((error.status_code, error.code), (409, "encryption_key_mismatch"))
+        self.assertIn("does not decrypt restore point rp-1", error.message)
+        self.assertEqual(TASKS, {})
+
+    def test_the_points_own_key_given_by_hand_starts(self) -> None:
+        self._seed_point(KEY_1)
+
+        task = self._start(encryption_key=KEY_1)
+
+        self.assertEqual(TASKS[task["id"]]["parameters"]["encryption_key"], KEY_1)
+
+    def test_the_key_the_point_was_written_under_is_found_by_its_id(self) -> None:
+        self._seed_point("")
+        parameters = abr_v41._validate_task_parameters({"encryption_enabled": True, "encryption_key": KEY_1})
+        parameters = abr_v41._validate_task_parameters({"encryption_enabled": True, "encryption_key": KEY_2}, previous=parameters)
+        JOBS["job-1"] = {"id": "job-1", "name": "rotated", "job_type": "backup", "task_parameters": parameters}
+        BACKUPS["rp-1"] = {**BACKUPS["rp-1"], "job_id": "job-1", "encryption_key_id": 0, "encryption_key": None}
+
+        error = self._refused(encryption_key=KEY_2)
+
+        self.assertEqual(error.code, "encryption_key_mismatch")
+        self.assertEqual(TASKS, {})
+        self.assertIn(self._start(encryption_key=KEY_1)["id"], TASKS)
+
+    def test_a_given_key_is_taken_when_the_points_own_cannot_be_read(self) -> None:
+        self._seed_point(_foreign(KEY_1))
+
+        task = self._start(encryption_key=KEY_2)
+
+        self.assertEqual(TASKS[task["id"]]["parameters"]["encryption_key"], KEY_2)
+
 
 if __name__ == "__main__":
     unittest.main()

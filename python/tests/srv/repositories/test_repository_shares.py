@@ -20,6 +20,7 @@ from unittest.mock import patch
 from python.srv.brokers import broker_core, shares_broker
 from python.srv.core import broker_client, credential_encryption, mongo_db_wrapper
 from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, TASKS
+from python.srv.plugins.hyperv import vhdx_tool
 from python.srv.services import abr_v41, rbac, repository_shares
 from python.srv.services.api_errors import ApiError
 from python.tests.srv.brokers.fake_samba import SMB_CONF_TEXT, current_user, make_system
@@ -58,6 +59,8 @@ class _Catalog(unittest.TestCase):
         self.addCleanup(environment.stop)
         credential_encryption.reset_cipher()
         self.addCleanup(credential_encryption.reset_cipher)
+        repository_shares._SERVER_CACHE.clear()
+        self.addCleanup(repository_shares._SERVER_CACHE.clear)
         self.folder = self.root / "repo1"
         self.folder.mkdir()
         self.repository = abr_v41.create_repository_record({"name": "Local-Repo-1", "type": "local", "path": str(self.folder)})
@@ -501,6 +504,117 @@ class ListTests(_SharesCase):
         self.assertNotIn("password", json.dumps(items))
 
 
+class ServerAddressTests(_SharesCase):
+    def setUp(self) -> None:
+        super().setUp()
+        HYPERVISORS["hv"]["metadata"] = {"host": "hv-01.example"}
+        HYPERVISORS["hv2"] = {"id": "hv2", "name": "Hyper-V 2", "kind": "hyperv", "type": "hyper-v", "metadata": {"host": "hv-02.example"}}
+        HYPERVISORS["vc"]["metadata"] = {"host": "vcenter.example"}
+        self.routes = {"hv-01.example": "192.0.2.5", "hv-02.example": "192.0.2.6"}
+        toward = patch.object(repository_shares, "appliance_address_toward", side_effect=self.toward)
+        self.asked = toward.start()
+        self.addCleanup(toward.stop)
+        default = patch.object(repository_shares, "_default_route_address", return_value="198.51.100.9")
+        self.default = default.start()
+        self.addCleanup(default.stop)
+
+    def toward(self, host: str) -> str:
+        if host not in self.routes:
+            raise repository_shares.VhdxToolError(f"This appliance has no route to Hyper-V host {host}")
+        return self.routes[host]
+
+    def test_the_share_is_shown_stored_and_checked_by_the_address_the_hosts_are_given(self) -> None:
+        shared = self.share()
+        share = shared["metadata"]["share"]
+
+        self.assertEqual(self.stored()["metadata"]["server"], "192.0.2.5")
+        self.assertEqual(repository_shares.network_path(self.stored()), f"\\\\192.0.2.5\\{share}")
+        self.assertEqual(repository_shares.share_view(self.stored())["network_path"], f"\\\\192.0.2.5\\{share}")
+        self.assertEqual(abr_v41.resolve_repository(record_id=self.repository["id"])["server"], "192.0.2.5")
+        self.assertEqual([call.args[0] for call in self.asked.call_args_list], ["hv-01.example"])
+
+    def test_a_repository_shared_by_the_host_name_before_is_shown_by_the_address(self) -> None:
+        self.share()
+        self.stored()["metadata"]["server"] = "appliance"
+        share = self.stored()["metadata"]["share"]
+
+        self.assertEqual(repository_shares.network_path(self.stored()), f"\\\\192.0.2.5\\{share}")
+        self.assertEqual(abr_v41.resolve_repository(record_id=self.repository["id"])["server"], "192.0.2.5")
+
+    def test_a_host_without_a_route_is_passed_over_for_the_next_one(self) -> None:
+        del self.routes["hv-01.example"]
+
+        self.assertEqual(repository_shares.share_server(), "192.0.2.6")
+
+    def test_without_a_reachable_hyperv_host_the_default_route_address_is_used(self) -> None:
+        self.routes.clear()
+
+        self.assertEqual(repository_shares.share_server(), "198.51.100.9")
+        self.assertNotIn("vcenter.example", [call.args[0] for call in self.asked.call_args_list])
+
+    def test_without_any_route_the_host_name_is_left(self) -> None:
+        self.routes.clear()
+        self.default.return_value = None
+
+        with patch.object(repository_shares.socket, "getfqdn", return_value="appliance.example"):
+            self.assertEqual(repository_shares.share_server(), "appliance.example")
+
+    def test_the_address_is_worked_out_again_only_after_a_minute(self) -> None:
+        with patch.object(repository_shares.time, "monotonic", side_effect=[100.0, 130.0, 161.0]):
+            self.assertEqual(repository_shares.share_server(), "192.0.2.5")
+            self.routes["hv-01.example"] = "192.0.2.7"
+            self.assertEqual(repository_shares.share_server(), "192.0.2.5")
+            self.assertEqual(repository_shares.share_server(), "192.0.2.7")
+
+    def test_the_name_the_administrator_set_is_shown_stored_and_checked_without_working_out_an_address(self) -> None:
+        with patch.dict("os.environ", {vhdx_tool.SHARES_SERVER_NAME_ENV: "backup.example.test"}):
+            self.share()
+            share = self.stored()["metadata"]["share"]
+
+            self.assertEqual(self.stored()["metadata"]["server"], "backup.example.test")
+            self.assertEqual(repository_shares.network_path(self.stored()), f"\\\\backup.example.test\\{share}")
+            self.assertEqual(abr_v41.resolve_repository(record_id=self.repository["id"])["server"], "backup.example.test")
+        self.asked.assert_not_called()
+
+    def test_a_name_set_later_wins_over_an_address_worked_out_before(self) -> None:
+        self.assertEqual(repository_shares.share_server(), "192.0.2.5")
+
+        with patch.dict("os.environ", {vhdx_tool.SHARES_SERVER_NAME_ENV: "backup.example.test"}):
+            self.assertEqual(repository_shares.share_server(), "backup.example.test")
+
+    def test_a_setting_that_is_not_a_name_is_refused_but_the_repository_is_still_shown(self) -> None:
+        self.share()
+        stored_server = self.stored()["metadata"]["server"]
+
+        with patch.dict("os.environ", {vhdx_tool.SHARES_SERVER_NAME_ENV: "backup server"}):
+            error = self.refused(repository_shares.list_shares)
+            info = abr_v41.resolve_repository(record_id=self.repository["id"])
+
+        self.assertEqual((error.status_code, error.code), (409, "invalid_share_server_name"))
+        self.assertIn(vhdx_tool.SHARES_SERVER_NAME_ENV, error.message)
+        self.assertEqual(info["server"], stored_server)
+
+    def test_a_setting_that_is_not_a_name_makes_no_share_in_samba(self) -> None:
+        with patch.dict("os.environ", {vhdx_tool.SHARES_SERVER_NAME_ENV: "backup server"}):
+            error = self.refused(self.share)
+
+        self.assertEqual(error.code, "invalid_share_server_name")
+        self.assertEqual(self.broker.calls, [])
+        self.assertFalse(repository_shares.is_shared(self.stored()))
+
+    def test_an_smb_repository_added_by_hand_keeps_its_own_server(self) -> None:
+        REPOSITORIES["nas"] = {
+            "id": "nas",
+            "name": "NAS",
+            "type": "smb",
+            "path": str(self.root / "nas"),
+            "metadata": {"server": "nas.example", "share": "backups", "username": "svc"},
+        }
+
+        self.assertEqual(abr_v41.normalize_repository_record(REPOSITORIES["nas"])["server"], "nas.example")
+        self.asked.assert_not_called()
+
+
 class _SmbClient:
     def __init__(self, folder: Path) -> None:
         self.folder = folder
@@ -549,7 +663,7 @@ class CheckTests(_SharesCase):
         metadata = self.stored()["metadata"]
         self.assertTrue(result["checked"])
         self.assertIn("write, read back and delete passed", result["message"])
-        self.assertEqual(self.smbclient.commands[0][1], f"//{metadata['server']}/{metadata['share']}")
+        self.assertEqual(self.smbclient.commands[0][1], f"//{repository_shares.share_server()}/{metadata['share']}")
         password = credential_encryption.decrypt_secret(metadata["password"])
         self.assertEqual(self.smbclient.auth[0], (f"username={metadata['username']}\npassword={password}\n", 0o600))
         self.assertNotIn(password, " ".join(self.smbclient.commands[0]))

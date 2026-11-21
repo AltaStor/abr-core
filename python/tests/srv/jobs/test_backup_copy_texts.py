@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import errno
 import json
+import unittest.mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -170,6 +171,68 @@ class CopyToolEndTests(_CopyRun):
 
     def test_a_backup_keeps_its_own_words(self) -> None:
         self.assertTrue(storage_tool.disk_tool_failure_text(-9, "", "").startswith("the backup tool ended unexpectedly"))
+
+
+
+class CopyUnwritableTests(_CopyRun):
+    def refused(self, **patches) -> str:
+        task = self.start()
+        with self.assertRaises(BackupCopyError) as caught, patch.multiple(backup_copy, **patches):
+            backup_copy.run_backup_copy(task)
+        return str(caught.exception)
+
+    def test_a_destination_the_server_cannot_write_is_named(self) -> None:
+        denied = PermissionError(errno.EACCES, "Permission denied", "/srv/dst/job-1")
+
+        message = self.refused(ensure_private_directory=unittest.mock.Mock(side_effect=denied))
+
+        self.assertTrue(message.startswith("The repository 'Offsite' at "), message)
+        self.assertIn("cannot be written to: the server's user '", message)
+        self.assertIn("has no write permission there (/srv/dst/job-1). Give it write access, or copy into another repository", message)
+        self.assertNotIn("[Errno", message)
+
+    def test_a_read_only_filesystem_is_said(self) -> None:
+        read_only = OSError(errno.EROFS, "Read-only file system", "/srv/dst/job-1")
+
+        message = self.refused(ensure_private_directory=unittest.mock.Mock(side_effect=read_only))
+
+        self.assertIn("cannot be written to: its filesystem is read-only (/srv/dst/job-1)", message)
+
+    def test_a_disk_that_cannot_be_written_names_the_destination_too(self) -> None:
+        denied = PermissionError(errno.EACCES, "Permission denied", "/srv/dst/job-1/task/01-disk.vmdk")
+
+        message = self.refused(copy_disk_tool_chain=unittest.mock.Mock(side_effect=denied))
+
+        self.assertTrue(message.startswith("Copying disk 1/1 failed: The repository 'Offsite' at "), message)
+        self.assertNotIn("[Errno", message)
+
+    def test_the_tools_own_permission_refusal_names_the_destination(self) -> None:
+        root = REPOSITORIES["dst"]["path"]
+        refusal = StorageToolError(f"Failed to create directory '{root}/job-1/vm/task' with 750 permissions: Permission denied")
+
+        message = self.refused(copy_disk_tool_chain=unittest.mock.Mock(side_effect=refusal), _free_bytes_at_start=unittest.mock.Mock(return_value=None))
+
+        self.assertTrue(message.startswith("Copying disk 1/1 failed: The repository 'Offsite' at "), message)
+        self.assertIn(f"has no write permission there (Failed to create directory '{root}/job-1/vm/task' with 750 permissions: Permission denied)", message)
+
+    def test_a_permission_refusal_on_the_source_is_not_blamed_on_the_destination(self) -> None:
+        refusal = StorageToolError("Failed to open '/srv/source/job-9/vm/task/01-disk.vmdk.abrd': Permission denied")
+
+        message = self.refused(copy_disk_tool_chain=unittest.mock.Mock(side_effect=refusal), _free_bytes_at_start=unittest.mock.Mock(return_value=None))
+
+        self.assertEqual(message, "Copying disk 1/1 failed: Failed to open '/srv/source/job-9/vm/task/01-disk.vmdk.abrd': Permission denied")
+
+    def test_another_tool_error_is_passed_on_as_it_is(self) -> None:
+        message = self.refused(copy_disk_tool_chain=unittest.mock.Mock(side_effect=StorageToolError("lost the source backup")), _free_bytes_at_start=unittest.mock.Mock(return_value=None))
+
+        self.assertEqual(message, "Copying disk 1/1 failed: lost the source backup")
+
+    def test_a_full_destination_keeps_its_own_words(self) -> None:
+        full = OSError(errno.ENOSPC, "No space left on device", "/srv/dst/job-1")
+
+        message = self.refused(ensure_private_directory=unittest.mock.Mock(side_effect=full), _free_bytes_at_start=unittest.mock.Mock(return_value=0))
+
+        self.assertIn("ran out of space", message)
 
 
 class CopyManifestAlgorithmTests(_CopyRun):

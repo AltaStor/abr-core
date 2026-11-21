@@ -371,6 +371,36 @@ class HyperVHostTests(_InitialRepositoryCase):
 
         self.assertIn("cannot be decrypted", str(caught.exception))
 
+    def test_hosts_get_the_name_the_administrator_set_instead_of_an_address(self) -> None:
+        for value, server in (("backup.example.test", "backup.example.test"), (" 192.0.2.10 ", "192.0.2.10")):
+            with self.subTest(value=value), patch.dict("os.environ", {vhdx_tool.SHARES_SERVER_NAME_ENV: value}):
+                with patch.object(vhdx_tool, "appliance_address_toward") as toward:
+                    repository = vhdx_tool.for_hyperv_host(self._stored(), "hv01.lab")
+                _args, env = vhdx_tool.storage_invocation(repository, abr_path=str(self.path / "job" / "vm"))
+
+                toward.assert_not_called()
+                self.assertEqual(env["ABR_SMB_SHARE"], f"\\\\{server}\\{self._stored()['metadata']['share']}")
+
+    def test_an_empty_setting_leaves_the_address(self) -> None:
+        with patch.dict("os.environ", {vhdx_tool.SHARES_SERVER_NAME_ENV: "  "}), patch.object(vhdx_tool, "appliance_address_toward", return_value="192.0.2.5"):
+            repository = vhdx_tool.for_hyperv_host(self._stored(), "hv01.lab")
+
+        self.assertEqual(repository["metadata"]["server"], "192.0.2.5")
+
+    def test_a_setting_that_is_not_a_name_or_an_address_stops_the_run_with_its_name(self) -> None:
+        for value in ("backup server", "\\\\backup\\share", "-backup"):
+            with self.subTest(value=value), patch.dict("os.environ", {vhdx_tool.SHARES_SERVER_NAME_ENV: value}):
+                with self.assertRaises(vhdx_tool.VhdxToolError) as caught:
+                    vhdx_tool.for_hyperv_host(self._stored(), "hv01.lab")
+
+                self.assertIn(vhdx_tool.SHARES_SERVER_NAME_ENV, str(caught.exception))
+
+    def test_the_setting_does_not_touch_other_repositories(self) -> None:
+        other = REPOSITORIES[abr_v41.create_repository_record({"name": "Lab", "type": "local", "path": self._folder("lab")})["id"]]
+
+        with patch.dict("os.environ", {vhdx_tool.SHARES_SERVER_NAME_ENV: "backup.example.test"}):
+            self.assertIs(vhdx_tool.for_hyperv_host(other, "hv01.lab"), other)
+
     def test_the_address_toward_a_host_is_a_local_one(self) -> None:
         self.assertEqual(vhdx_tool.appliance_address_toward("127.0.0.1"), "127.0.0.1")
 

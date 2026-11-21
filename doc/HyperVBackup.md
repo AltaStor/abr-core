@@ -214,9 +214,10 @@ host: the disks go under `<volume>\Hyper-V\<new name>\Virtual Hard Disks`
 (at the root of a Cluster Shared Volume or share), the VM gets the backup's
 generation, processors, memory, Secure Boot settings and adapters, each adapter
 on the virtual switch the network mapping names, and boots from the disk it
-booted from. `--datastore-map` places the disks of each source storage location,
+booted from. The VM's configuration goes to the `--datastore` volume, under
+`<volume>\Hyper-V\<new name>`. `--datastore-map` places the disks of each source storage location,
 and `--disk-datastore "SCSI0:1=E:"` one disk by its slot, which wins over the
-mapping of its location; `--network-map` connects the adapters of each source
+mapping of its location; both move only disks, never the configuration; `--network-map` connects the adapters of each source
 switch, and `--nic-network "nic2=Isolated"` one adapter by its name, so two
 adapters on one switch can land on different ones. The source VM is not touched. Before anything is written the
 restore checks, on the host itself, that every target storage location exists
@@ -227,7 +228,10 @@ at a later backup of it, else what the source VM's disk takes now (asked of the
 source VM's own inventory when the restore goes to another one, for up to
 `ALTASTOR_HYPERV_SOURCE_SIZE_SECONDS`), and only without any of these the data
 of the chain's backups, at most the disk's capacity. The session log names, per
-disk, how much it needs and where that figure comes from. A VM that had a virtual TPM gets a new one, so secrets sealed to the
+disk, how much it needs and where that figure comes from. For a backup that
+recorded what its disks took on the host, `abr restore context` gives that figure
+as the disk's `used_bytes`, and `abr restore start` refuses a target storage
+location with less free space at its last scan before the session starts. A VM that had a virtual TPM gets a new one, so secrets sealed to the
 old TPM (BitLocker keys, for one) need their recovery keys; the session warns
 about it.
 
