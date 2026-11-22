@@ -4,12 +4,14 @@
 """The notification service: one place every component hands a notification
 to, whatever it is about and however it goes out.
 
-A component calls ``notify(event_id, subject, body)``. Each channel (e-mail)
-says whether it wants the notification; for those that do, the service queues
-it, and a background worker per channel delivers it, retrying what the channel
-calls retryable and recording every outcome in that channel's history and the
-server log. A component is never held up by a slow mail server, and a failed
-delivery never fails the operation it reports on.
+A component calls ``notify(event_id, subject, body)``. Each channel (e-mail,
+and the messaging platforms: Telegram, Slack, Discord and ntfy) says
+whether it wants the notification; for those
+that do, the service queues it, and a background worker per channel delivers
+it, retrying what the channel calls retryable and recording every outcome in
+that channel's history and the server log. A component is never held up by a
+slow mail server or chat service, and a failed delivery never fails the
+operation it reports on. One channel's delays do not hold up another.
 
 A channel is a module offering ``ID``, ``LABEL``, ``RETRY_DELAYS_SECONDS``,
 ``wants(notification)``, ``describe(notification)`` for the history entry, and
@@ -35,6 +37,7 @@ from python.srv.core.utils import utc_now
 
 from . import email_channel
 from .api_errors import api_error
+from .chat_channels import PLATFORMS
 from .notification_events import EVENTS_BY_ID, TEST_EVENT, DeliveryError, Notification
 
 LOGGER = logging.getLogger(__name__)
@@ -309,7 +312,10 @@ class _Channel:
 
 
 EMAIL = _Channel(email_channel, "email_notification_deliveries")
-CHANNELS = (EMAIL,)
+# The messaging platforms by ID, each with its own queue, worker and history.
+MESSAGING = {platform_id: _Channel(module, f"{platform_id}_notification_deliveries") for platform_id, module in PLATFORMS.items()}
+TELEGRAM, SLACK, DISCORD, NTFY = (MESSAGING[platform_id] for platform_id in ("telegram", "slack", "discord", "ntfy"))
+CHANNELS = (EMAIL, *MESSAGING.values())
 
 
 def resume_waiting() -> None:
@@ -385,3 +391,31 @@ def send_test(patch: dict[str, Any] | None, to: list[str] | None) -> dict[str, A
         "duration_ms": round((time.monotonic() - started) * 1000),
     }
 
+
+def send_chat_test(channel: _Channel, patch: dict[str, Any] | None) -> dict[str, Any]:
+    """Send a test message through a messaging platform now, with the
+    stored settings and any unsaved changes in `patch` (not saved). Answers
+    where it went; a delivery that failed is a 502 naming why
+    (connection_failed, tls_failed, delivery_refused, delivery_failed,
+    timed_out, apprise_missing, apprise_not_started, apprise_url_refused,
+    apprise_failed) and the stage it reached, with `delivered_to` for the
+    targets that did get it."""
+    module = channel.module
+    settings = module.settings_for_test(patch)
+    subject, body = module.test_message()
+    notification = Notification(TEST_EVENT, subject, body)
+    entry = new_entry(notification, module.describe(notification, settings), attempts=1)
+    started = time.monotonic()
+    try:
+        delivered = module.deliver(settings, entry["subject"], body, "info")
+    except DeliveryError as exc:
+        entry.update(status="failed", error=exc.to_dict(), **exc.extra)
+        channel.history.record(entry)
+        LOGGER.warning("Test %s notification was not sent (%s): %s", module.LABEL, exc.code, exc)
+        raise api_error(
+            502, exc.code, str(exc), stage=exc.stage, retryable=exc.retryable, delivered_to=exc.extra.get("delivered_to", [])
+        ) from exc
+    entry.update(status="sent", sent_at=utc_now(), delivered_to=delivered)
+    channel.history.record(entry)
+    LOGGER.info("Test %s notification sent%s.", module.LABEL, _addressees(entry))
+    return {"status": "sent", "delivered_to": delivered, "duration_ms": round((time.monotonic() - started) * 1000)}

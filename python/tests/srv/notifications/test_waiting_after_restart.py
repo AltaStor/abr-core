@@ -6,6 +6,7 @@ from __future__ import annotations
 import queue
 import time
 import unittest
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -273,17 +274,26 @@ class InterruptedAttemptTests(_RestartCase):
         self.drain(after)
         self.assertEqual(self.only_entry(after)["status"], "sent")
 
-    def test_the_real_channel_says_whether_it_repeats(self) -> None:
-        from python.srv.services import email_channel
+    def test_the_real_channels_say_whether_they_repeat(self) -> None:
+        from python.srv.services import chat_channels, email_channel
 
         self.assertIs(email_channel.REPEAT_AFTER_RESTART, True)
+        for platform in chat_channels.PLATFORMS.values():
+            self.assertIs(platform.REPEAT_AFTER_RESTART, True)
 
 
 class StartupTests(unittest.TestCase):
-    def test_every_channel_is_taken_up_and_a_failure_does_not_stop_the_start(self) -> None:
-        with patch.object(notification_service.EMAIL, "resume", side_effect=RuntimeError("catalog")) as email:
+    def test_every_channel_is_taken_up_and_one_failure_does_not_stop_the_others(self) -> None:
+        with ExitStack() as stack:
+            email = stack.enter_context(patch.object(notification_service.EMAIL, "resume", side_effect=RuntimeError("catalog")))
+            others = [
+                stack.enter_context(patch.object(channel, "resume", return_value=0))
+                for channel in notification_service.MESSAGING.values()
+            ]
             notification_service.resume_waiting()
         email.assert_called_once()
+        for other in others:
+            other.assert_called_once()
 
 
 class SecondsUntilTests(unittest.TestCase):

@@ -1962,6 +1962,74 @@ class EmailTestResult(_LenientModel):
     duration_ms: DocInt = None
 
 
+# ------------------------------------------------ messaging notifications --
+
+class MessagingSettingsRequest(_LenientModel):
+    enabled: SkipValidation[bool] | None = Field(default=None, description="Send notifications; true requires every setting the platform needs and Apprise on the appliance, and is refused when Apprise cannot read them")
+    bot_token: SkipValidation[str] | None = Field(default=None, description=f"Telegram: the bot's token from @BotFather, 123456789:AAE.... {SECRET_KEPT}")
+    chat_ids: SkipValidation[list[str]] | None = Field(default=None, description="Telegram: the whole list of chats to post to (at most 10): a number such as -1001234567890, or a public channel's @name; a forum topic after a colon. The bot must be a member")
+    webhook_url: SkipValidation[str] | None = Field(default=None, description=f"Slack: an incoming webhook URL, https://hooks.slack.com/services/.... Discord: a channel's webhook URL, https://discord.com/api/webhooks/.... ntfy: the topic's URL, https://ntfy.sh/<topic> or https://<your server>/<topic>. {SECRET_KEPT}")
+    access_token: SkipValidation[str] | None = Field(default=None, description=f"ntfy only: an access token (tk_...) for a server with access control. {SECRET_KEPT}")
+    events: SkipValidation[dict[str, bool]] | None = Field(default=None, description="Event ID to true or false; events left out keep their setting. Chosen apart from the events that send e-mail")
+
+
+class MessagingTestRequest(_LenientModel):
+    settings: SkipValidation[MessagingSettingsRequest] | None = Field(default=None, description="Unsaved changes to test with, over the stored settings; nothing is saved")
+
+
+class AppriseDTO(_LenientModel):
+    available: DocBool = Field(default=None, description="false: Apprise (/usr/bin/apprise, the apprise package) is not installed, so nothing can be sent")
+    version: DocStrOrNull = Field(default=None, description="Its version, such as 1.9.3")
+
+
+class ChatDeliveryDTO(_LenientModel):
+    id: DocStr = None
+    event: DocStr = Field(default=None, description="The event ID, or test")
+    subject: DocStr = None
+    severity: DocStr = None
+    recipients: DocStrArray = Field(default=None, description="Telegram: the chats it goes to")
+    delivered_to: DocStrArray = Field(default=None, description="The chats (Telegram) or webhook that got it; a retry goes to the others only")
+    queued_at: DocStr = None
+    sent_at: DocStrOrNull = None
+    status: DocStr = Field(default=None, description="queued, retrying, sent, failed or cancelled")
+    attempts: DocInt = None
+    next_attempt_at: DocStrOrNull = None
+    error: DocObject = Field(default=None, description="code, message, stage (start, connect, tls, send, queue) and retryable")
+
+
+class MessagingPlatformDTO(_LenientModel):
+    id: DocStr = Field(default=None, description="telegram, slack, discord or ntfy")
+    name: DocStr = None
+    added: DocBool = Field(default=None, description="true once its settings were saved, until it is removed")
+    enabled: DocBool = None
+    bot_token_set: DocBool = Field(default=None, description="Telegram only")
+    bot_id: DocStrOrNull = Field(default=None, description="Telegram only: the number before the colon of the bot token, which names the bot")
+    chat_ids: DocStrArray = Field(default=None, description="Telegram only")
+    webhook_url_set: DocBool = Field(default=None, description="Slack, Discord and ntfy (its topic URL)")
+    webhook_host: DocStrOrNull = Field(default=None, description="Slack, Discord and ntfy: the host of the stored URL")
+    access_token_set: DocBool = Field(default=None, description="ntfy only")
+    updated_at: DocStrOrNull = None
+    updated_by: DocStrOrNull = None
+    apprise: AppriseDTO | DocObject = None
+    events: list[NotificationEventDTO] | DocObjectArray = None
+    deliveries: list[ChatDeliveryDTO] | DocObjectArray = Field(default=None, description="The latest deliveries, newest first")
+
+
+class MessagingList(_LenientModel):
+    apprise: AppriseDTO | DocObject = None
+    items: list[MessagingPlatformDTO] | DocObjectArray = None
+
+
+class ChatDeliveryList(_LenientModel):
+    items: list[ChatDeliveryDTO] | DocObjectArray = None
+
+
+class ChatTestResult(_LenientModel):
+    status: DocStr = None
+    delivered_to: DocStrArray = None
+    duration_ms: DocInt = None
+
+
 class VsphereTransportAvailabilityDTO(_LenientModel):
     available: DocBool = None
     problem: DocStrOrNull = Field(default=None, description="Why this server cannot use the transport now, or null")
