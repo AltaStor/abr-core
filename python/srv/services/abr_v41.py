@@ -17,6 +17,7 @@ import shutil
 import socket
 import stat
 import threading
+import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time, timedelta, timezone
@@ -650,6 +651,29 @@ def _ensure_ascii_text(
             f"(no Cyrillic or other non-Latin characters)",
             **details,
         )
+
+
+LINE_BREAKING_CATEGORIES = frozenset({"Cc", "Zl", "Zp"})
+
+
+def _ensure_description_text(value: str | None, *, field: str, code: str) -> None:
+    if not value:
+        return
+    details: dict[str, Any] = {"field": field, "max_length": MAX_LONG_TEXT_LENGTH, "value": value}
+    _ensure(
+        len(value) <= MAX_LONG_TEXT_LENGTH,
+        400,
+        code,
+        f"{field} must be at most {MAX_LONG_TEXT_LENGTH} characters",
+        **details,
+    )
+    _ensure(
+        not any(unicodedata.category(character) in LINE_BREAKING_CATEGORIES for character in value),
+        400,
+        code,
+        f"{field} must be one line without control characters",
+        **details,
+    )
 
 
 def _validate_text_fields(
@@ -5304,7 +5328,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     task_parameters = _validate_task_parameters(task_parameters)
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
-    _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+    _ensure_description_text(description, field="Job description", code="invalid_job")
     _ensure(retention_days > 0, 422, "invalid_job", "retention-days must be greater than 0")
     _ensure_full_backup_schedule(
         {
@@ -5422,7 +5446,7 @@ def create_backup_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     task_parameters = _validate_task_parameters(task_parameters)
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
-    _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+    _ensure_description_text(description, field="Job description", code="invalid_job")
     _ensure(
         not any(str(existing.get("name") or "").lower() == name.lower() for existing in catalog_records(JOBS)),
         409,
@@ -5482,7 +5506,7 @@ def create_replication_job(payload: dict[str, Any]) -> dict[str, Any]:
     description = str(payload.get("description") or "").strip()
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
-    _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+    _ensure_description_text(description, field="Job description", code="invalid_job")
     _ensure(
         not any(str(existing.get("name") or "").lower() == name.lower() for existing in catalog_records(JOBS)),
         409,
@@ -5544,7 +5568,7 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     description = str(payload.get("description") or source_job.get("description") or "").strip()
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
-    _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+    _ensure_description_text(description, field="Job description", code="invalid_job")
     _ensure(retention_days > 0, 422, "invalid_job", "retention-days must be greater than 0")
     _ensure(not any(str(existing.get("name") or "").lower() == name.lower() for existing in catalog_records(JOBS)), 409, "job_name_exists", "Job name already exists", name=name)
     source_gfs = source_job.get("gfs") if isinstance(source_job.get("gfs"), dict) else {"weekly": 0, "monthly": 0, "yearly": 0, "enabled": True}
@@ -5761,7 +5785,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         updated[next_run_key] = _execution_schedule_next_run(schedule_value)
     if "description" in payload:
         description = str(payload.get("description") or "").strip()
-        _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+        _ensure_description_text(description, field="Job description", code="invalid_job")
         updated["description"] = description
         changed = True
     if any(key in payload and (key == "verify_schedule" or payload[key] is not None) for key in VERIFY_SETTING_KEYS):

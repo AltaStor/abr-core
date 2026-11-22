@@ -125,22 +125,42 @@ class UnicodeJobNameServiceLayerTests(unittest.TestCase):
         names = {item["name"] for item in abr_v41.list_jobs()}
         self.assertIn(LATIN_NAME, names)
 
-    def test_non_latin_job_description_is_rejected(self) -> None:
-        """Validation is not limited to the name field: a Cyrillic description
-        on an otherwise-valid job is rejected with a 400."""
+    def _create_described(self, name: str, description: str) -> dict[str, object]:
+        return abr_v41.create_backup_job(
+            {
+                "name": name,
+                "vms": ["web-01"],
+                "inventory_id": self.inventory["id"],
+                "repo_id": "repo-1",
+                "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
+                "description": description,
+            }
+        )
+
+    def test_a_job_description_in_any_script_is_kept(self) -> None:
+        for number, (label, text) in enumerate(UNICODE_NAMES.items()):
+            with self.subTest(label=label):
+                job = self._create_described(f"described-{number}", text)
+
+                self.assertEqual(job["description"], text)
+
+        edited = abr_v41.edit_job_record(job["id"], {"description": "Резервне копіювання"})
+
+        self.assertEqual(edited["description"], "Резервне копіювання")
+
+    def test_a_job_description_with_a_line_break_or_control_character_is_refused(self) -> None:
+        for text in ("line one\nline two", "tab\there", "bell\x07", "c1\x85here", "separator\u2028here"):
+            with self.subTest(text=text):
+                with self.assertRaises(ApiError) as ctx:
+                    self._create_described("nightly-with-bad-desc", text)
+                self.assertEqual((ctx.exception.code, ctx.exception.status_code), ("invalid_job", 400))
+                self.assertIn("must be one line without control characters", ctx.exception.message)
+
+    def test_an_overlong_job_description_is_still_refused(self) -> None:
         with self.assertRaises(ApiError) as ctx:
-            abr_v41.create_backup_job(
-                {
-                    "name": "nightly-with-bad-desc",
-                    "vms": ["web-01"],
-                    "inventory_id": self.inventory["id"],
-                    "repo_id": "repo-1",
-                    "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
-                    "description": "Резервная копия",
-                }
-            )
-        self.assertEqual(ctx.exception.code, "invalid_job")
-        self.assertEqual(ctx.exception.status_code, 400)
+            self._create_described("nightly-long-desc", "ж" * (abr_v41.MAX_LONG_TEXT_LENGTH + 1))
+
+        self.assertIn("must be at most", ctx.exception.message)
 
     def test_latin_punctuation_job_description_accepted(self) -> None:
         """Free-text descriptions keep accepting ordinary punctuation/symbols
