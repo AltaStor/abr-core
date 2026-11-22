@@ -58,7 +58,7 @@ _PYTHON_LEVELS = {
 #   %(asctime)s | %(levelname)-8s | PID:%(process)d | %(name)s:%(funcName)s:%(lineno)d | %(message)s
 # `levelname` is space-padded to 8, so every separator is matched loosely.
 _LINE_RE = re.compile(
-    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*"
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2}|Z)?)\s*\|\s*"
     r"(?P<level>[A-Z]+)\s*\|\s*"
     r"PID:(?P<pid>\d+)\s*\|\s*"
     r"(?P<origin>[^|]*?)\s*\|\s*"
@@ -139,14 +139,14 @@ def _read_tail(path: Path) -> tuple[str, bool]:
 
 
 def _iso_timestamp(stamp: str) -> str:
-    """`logger_conf` formats with no timezone, so the file's wall-clock time is
-    local time. Stamping the appliance's own offset onto it is what lets the
-    console render it in the reader's zone instead of guessing UTC."""
+    """Lines written before the offset was logged carry local wall-clock time;
+    stamping the appliance's own offset onto them is what lets the console
+    render them in the reader's zone instead of guessing UTC."""
     try:
-        naive = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+        moment = datetime.fromisoformat(stamp)
     except ValueError:
         return stamp
-    return naive.astimezone().isoformat()
+    return moment.isoformat() if moment.tzinfo else moment.astimezone().isoformat()
 
 
 def _source_of(logger: str) -> str:
