@@ -4628,7 +4628,7 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
         task_parameters = metadata.get("task_parameters") if isinstance(metadata.get("task_parameters"), dict) else {}
     item["task_parameters"] = dict(task_parameters)
     item["enabled"] = _job_is_enabled(item)
-    item["schedule_state"] = "enabled" if item["schedule"] and item["enabled"] else "disabled" if item["schedule"] else "manual"
+    item["schedule_state"] = "disabled" if not item["enabled"] else "enabled" if item["schedule"] else "manual"
     item["vm_count"] = len(item["vm_ids"]) or len(item["vm_names"])
     if not item["enabled"]:
         item["status"] = "disabled"

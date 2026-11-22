@@ -114,6 +114,31 @@ class ScheduleRemovalTests(unittest.TestCase):
         self.assertIsNone(job["schedule"])
         self.assertEqual((job["enabled"], job["status"]), (False, "disabled"))
 
+    def test_a_disabled_job_reads_disabled_whatever_schedules_it_has(self) -> None:
+        full_next = (datetime.now(timezone.utc) + timedelta(days=3650)).isoformat()
+        cases = (
+            ({}, True, "enabled"),
+            ({}, False, "disabled"),
+            ({"schedule": None, "schedule_summary": None, "next_incremental_run_at": None, "active_full_schedule": dict(LONG_FULL), "active_full_next_run_at": full_next}, True, "manual"),
+            ({"schedule": None, "schedule_summary": None, "next_incremental_run_at": None, "active_full_schedule": dict(LONG_FULL), "active_full_next_run_at": full_next}, False, "disabled"),
+            ({"schedule": None, "schedule_summary": None, "next_incremental_run_at": None}, False, "disabled"),
+        )
+        for overrides, enabled, state in cases:
+            with self.subTest(overrides=sorted(overrides), enabled=enabled):
+                self.register(**overrides, enabled=enabled)
+
+                listed = next(job for job in abr_v41.list_jobs() if job["id"] == "job-1")
+
+                self.assertEqual(listed["schedule_state"], state)
+
+    def test_switching_a_full_only_job_off_and_on_moves_its_state(self) -> None:
+        self.register(schedule=None, schedule_summary=None, next_incremental_run_at=None, active_full_schedule=dict(LONG_FULL))
+
+        off = abr_v41.edit_job_record("job-1", {"enabled": False})
+        on = abr_v41.edit_job_record("job-1", {"enabled": True})
+
+        self.assertEqual((off["schedule_state"], on["schedule_state"]), ("disabled", "manual"))
+
     def test_a_schedule_set_again_gets_its_next_run(self) -> None:
         self.register()
         abr_v41.edit_job_record("job-1", {"schedule": None})

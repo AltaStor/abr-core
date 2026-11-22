@@ -746,7 +746,7 @@ abr job create-replication --name "App-DR" --source-job "App-HV" --target-invent
 
 abr job list 
 
-Description: Show all configured jobs, including inventory, repository, VM count, schedule summary, schedule state, and run timestamps when available. LAST RESULT is how the job's last run went over all of its VMs: Success, Warning, Stopped or Failed, with the number of VMs affected, or Running while any VM is still being backed up. It is empty for a job that has not run since the server was upgraded to report it. TYPE is backup, backup-copy or replication; a backup copy job has no inventory of its own, and a replication job shows its target environment. 
+Description: Show all configured jobs, including inventory, repository, VM count, schedule summary, schedule state, and run timestamps when available. STATE is disabled for a disabled job, whatever schedules it has; for an enabled one it is enabled when it has a regular schedule and manual when it has none (a full schedule still starts it when due). LAST RESULT is how the job's last run went over all of its VMs: Success, Warning, Stopped or Failed, with the number of VMs affected, or Running while any VM is still being backed up. It is empty for a job that has not run since the server was upgraded to report it. TYPE is backup, backup-copy or replication; a backup copy job has no inventory of its own, and a replication job shows its target environment. 
 
 abr job list [--output json] 
 
