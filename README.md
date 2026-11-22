@@ -103,7 +103,8 @@ VDDK, or a vCenter or Hyper-V endpoint.
 - [Roles, permissions and the audit log](doc/RBAC.md) - the built-in roles,
   the permission matrix, how requests are authorized, and the audit log.
 - [Notifications](doc/Notifications.md) - the notification service, its
-  events, e-mail (SMTP with TLS, password sign-in, failures and retries), API
+  events, e-mail (SMTP with TLS, password sign-in, failures and retries),
+  messaging platforms (Telegram, Slack, Discord, ntfy) through Apprise, API
   and CLI.
 
 Note: the environment and service setup in the deployment runbook and the ESXi

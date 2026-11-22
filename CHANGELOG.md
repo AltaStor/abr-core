@@ -106,6 +106,27 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   /api/v1/notifications/email/deliveries`, `GET /api/v1/notifications/events`,
   functions `notification.view`, `notification.edit`, `notification.test`. See
   `doc/Notifications.md`.
+- Messaging platforms: Telegram, Slack, Discord and ntfy notifications, sent
+  through Apprise (`/usr/bin/apprise` from the Debian package `apprise`, run as
+  a program of its own; the server package needs `apprise (>= 1.9)`). Each is
+  added when its settings are first saved and can be removed again (its
+  history stays). Telegram: a bot token and up to ten chats, each sent to on
+  its own, so a retry repeats none. Slack: an incoming webhook URL, posting as
+  AltaStor. Discord: a channel webhook URL, long messages split. ntfy: a
+  topic URL on ntfy.sh or a server of one's own, and an access token for a
+  server with access control; failures go at high priority. Each has its own
+  switch, events, test message and delivery history, with the e-mail's retries
+  and restart handling. Secrets are stored encrypted and never returned; they
+  reach Apprise in a private file, never on its command line, and Apprise
+  loads no plugins, configuration or cache of its own. Apprise is asked
+  whether it can read the settings before a platform is switched on.
+  Microsoft Teams is not offered: Debian 13's Apprise 1.9.3 cannot read the
+  workflow URLs Teams gives now. `abr notification platforms` and `abr
+  notification telegram|slack|discord|ntfy show|set|test|history|remove`;
+  `GET /api/v1/notifications/messaging`, `GET|PUT|DELETE
+  /api/v1/notifications/{platform}`, `POST .../test`, `GET .../deliveries`,
+  under `notification.view`, `notification.edit` and `notification.test`.
+  `ABR_APPRISE` names another Apprise program.
 - `GET /api/v1/auth/me` reports the session's `expires_at` and
   `absolute_expires_at`; sent with `X-ABR-Refresh` it renews nothing, so the
   Web UI reads the expiry without moving it.

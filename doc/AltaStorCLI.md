@@ -18,7 +18,7 @@ role = built-in roles and the functions each allows
 
 audit = the record of every command and user or role change 
 
-notification = e-mail notifications (SMTP server, sign-in, recipients, events, deliveries) 
+notification = e-mail notifications (SMTP server, sign-in, recipients, events, deliveries), and the messaging platforms (Telegram, Slack, Discord, ntfy) through Apprise 
 
 repo = backup storage targets 
 
@@ -258,7 +258,7 @@ abr --output json audit list --function job. --limit 500
 
 NOTIFICATION COMMANDS 
 
-E-mail notifications: the SMTP server, how the appliance signs in to it (user name and password, or none), the sender and recipients, and the events that send e-mail. The Web UI's Settings > Notifications changes the same settings. See doc/Notifications.md. 
+E-mail notifications: the SMTP server, how the appliance signs in to it (user name and password, or none), the sender and recipients, and the events that send e-mail; and the messaging platforms, Telegram, Slack, Discord and ntfy, sent through Apprise (/usr/bin/apprise, the apprise package), each added on its own with its own events. The Web UI's Settings > Notifications changes the same settings. See doc/Notifications.md. 
 
 abr notification show 
 
@@ -294,6 +294,46 @@ abr notification events set --enable <ids> --disable <ids>
 
 Examples: 
 abr notification events set --enable job.succeeded,restore.succeeded --disable repository.low_space 
+
+abr notification platforms 
+
+Description: List the messaging platforms (telegram, slack, discord, ntfy), whether each is set up and on, and its last delivery, and say when Apprise, which sends them, is not installed. 
+
+abr notification platforms [--output json] 
+
+abr notification <platform> show 
+
+Description: Show a platform's settings (the secret only as set or not set: Telegram's bot token with the bot's number, or the webhook or topic URL with its host, and ntfy's access token), whether Apprise is installed and its version, every event with whether it sends a message, and the last delivery. <platform> is telegram, slack, discord or ntfy. 
+
+abr notification <platform> set 
+
+Description: Set the platform up, or change it; options left out keep their value. Telegram takes --bot-token and --chats, the whole list of chats (at most 10): a number such as -1001234567890, or a public channel's @name, with a forum topic after a colon; the bot must be in each chat. Slack and Discord take --webhook-url: a Slack incoming webhook (https://hooks.slack.com/services/...) or a Discord channel webhook (https://discord.com/api/webhooks/...). ntfy takes --topic-url, https://ntfy.sh/<topic> or https://<your server>/<topic> (on ntfy.sh anyone who knows the topic can read it: make it long and hard to guess), and --access-token (tk_...) for a server with access control. A secret flag without a value reads ABR_TELEGRAM_BOT_TOKEN, ABR_SLACK_WEBHOOK_URL, ABR_DISCORD_WEBHOOK_URL, ABR_NTFY_TOPIC_URL or ABR_NTFY_ACCESS_TOKEN, or prompts; an empty value removes it. The server refuses the whole change, naming every problem by field, when a value is invalid, or when the platform is on and a setting or Apprise is missing, or Apprise cannot read the settings (exit 2). Its events are chosen apart from those that send e-mail. 
+
+abr notification telegram set [--enable | --disable] [--bot-token [<token>]] [--chats <ids>] [--event-on <ids>] [--event-off <ids>] 
+abr notification slack|discord set [--enable | --disable] [--webhook-url [<url>]] [--event-on <ids>] [--event-off <ids>] 
+abr notification ntfy set [--enable | --disable] [--topic-url [<url>]] [--access-token [<token>]] [--event-on <ids>] [--event-off <ids>] 
+
+Examples: 
+abr notification telegram set --bot-token --chats -1001234567890 --enable 
+abr notification slack set --webhook-url --enable 
+abr notification discord set --event-on job.succeeded --event-off repository.low_space 
+abr notification ntfy set --topic-url https://ntfy.sh/abr-alerts-7f3k9q2m --enable 
+
+abr notification <platform> test 
+
+Description: Send a test message now and report whether the platform took it, or why not: connection_failed, tls_failed, delivery_refused, delivery_failed, timed_out, apprise_missing, apprise_not_started, apprise_url_refused or apprise_failed, with the stage it reached (exit 1). --bot-token and --chats (Telegram), --webhook-url, or --topic-url and --access-token (ntfy) test a change without saving it. 
+
+abr notification telegram test [--bot-token [<token>]] [--chats <ids>] 
+abr notification slack|discord test [--webhook-url [<url>]] 
+abr notification ntfy test [--topic-url [<url>]] [--access-token [<token>]] 
+
+abr notification <platform> history 
+
+Description: The platform's latest 50 deliveries, newest first: event, status, attempts, where it went (Telegram: the chats that got it; a retry goes only to the others) and the error. Times are UTC. 
+
+abr notification <platform> remove 
+
+Description: Remove the platform: its settings and secret are deleted and it sends nothing until it is set up again. Its delivery history stays. 
 
 REPOSITORY COMMANDS 
 
