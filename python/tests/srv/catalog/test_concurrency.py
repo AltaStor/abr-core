@@ -17,10 +17,12 @@ from python.srv.core.mongo_db_wrapper import (
     BACKUPS,
     JOBS,
     REPOSITORIES,
+    SYSTEM_STATE,
     TASKS,
     catalog_entries,
     catalog_records,
     delete_repository,
+    load_system_state,
     persist_repository,
 )
 from python.srv.services import abr_v41
@@ -300,6 +302,53 @@ class UnhandledErrorReportingTests(unittest.TestCase):
         self.assertIsNotNone(record.exc_info, "the traceback was not attached to the log record")
         self.assertIn("/api/v1/repositories", record.getMessage())
         self.assertIn("dictionary changed size during iteration", "".join(captured.output))
+
+    def test_a_catalog_outage_answers_with_the_catalog_refusal_and_no_traceback(self) -> None:
+        from fastapi.testclient import TestClient
+
+        with mock.patch.object(abr_v41, "list_repository_records", side_effect=PyMongoError("connection refused")):
+            with self.assertLogs("python.srv.backup_server", level="ERROR") as captured:
+                with TestClient(self.app, raise_server_exceptions=False) as client:
+                    response = client.get("/api/v1/repositories")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "catalog_unavailable")
+        self.assertEqual([record.exc_info for record in captured.records], [None])
+
+
+class SystemStateOutageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        SYSTEM_STATE.clear()
+        self.addCleanup(SYSTEM_STATE.clear)
+
+    def _db(self, record: dict | None = None, *, fails: bool = False) -> mock.Mock:
+        db = mock.Mock()
+        if fails:
+            db.get.side_effect = PyMongoError("connection refused")
+        else:
+            db.get.return_value = record
+        return db
+
+    def test_the_last_state_read_is_used_while_the_catalog_is_down(self) -> None:
+        with mock.patch("python.srv.core.mongo_db_wrapper.get_database", return_value=self._db({"id": "s", "api": "soap"})):
+            self.assertEqual(load_system_state("s")["api"], "soap")
+
+        with mock.patch("python.srv.core.mongo_db_wrapper.get_database", return_value=self._db(fails=True)):
+            self.assertEqual(load_system_state("s")["api"], "soap")
+
+    def test_a_state_never_read_is_refused_as_a_catalog_outage(self) -> None:
+        with mock.patch("python.srv.core.mongo_db_wrapper.get_database", return_value=self._db(fails=True)), self.assertRaises(ApiError) as ctx:
+            load_system_state("s")
+
+        self.assertEqual((ctx.exception.status_code, ctx.exception.code), (503, "catalog_unavailable"))
+
+    def test_a_state_removed_from_the_catalog_is_not_used_later(self) -> None:
+        with mock.patch("python.srv.core.mongo_db_wrapper.get_database", return_value=self._db({"id": "s", "api": "soap"})):
+            load_system_state("s")
+        with mock.patch("python.srv.core.mongo_db_wrapper.get_database", return_value=self._db(None)):
+            self.assertIsNone(load_system_state("s"))
+        with mock.patch("python.srv.core.mongo_db_wrapper.get_database", return_value=self._db(fails=True)), self.assertRaises(ApiError):
+            load_system_state("s")
 
 
 if __name__ == "__main__":

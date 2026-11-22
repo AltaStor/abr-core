@@ -16,6 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pymongo.errors import PyMongoError
 
 from python.srv.core.logger_conf import close_crash_reporting, setup_logging
 
@@ -56,6 +57,7 @@ from .core import tls_renewal
 from .core.job_scheduler import JobScheduler
 from .core.mongo_db_wrapper import (
     BACKUPS,
+    CATALOG_UNAVAILABLE_MESSAGE,
     CUSTOM_ROLES,
     HYPERVISORS,
     JOBS,
@@ -509,6 +511,15 @@ async def validation_error_handler(
     _: Request, exc: RequestValidationError
 ) -> JSONResponse:
     return JSONResponse(status_code=422, content=validation_error_payload(exc))
+
+
+@app.exception_handler(PyMongoError)
+async def catalog_error_handler(request: Request, exc: PyMongoError) -> JSONResponse:
+    logger.error("The catalog database did not answer while serving %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"code": "catalog_unavailable", "message": CATALOG_UNAVAILABLE_MESSAGE}},
+    )
 
 
 @app.exception_handler(Exception)
