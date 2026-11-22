@@ -138,8 +138,21 @@ class ShareCheckTests(_MountsCase):
         for changes in ({"username": None}, {"password": None}):
             with self.subTest(changes=changes):
                 error = self.refused(lambda changes=changes: self.check_share(**changes))
-                self.assertIn("needs --username and --password", error.message)
+                self.assertIn("needs username and password", error.message)
         self.assertEqual(self.broker.calls, [])
+
+    def test_the_refusals_name_request_fields_not_cli_flags(self) -> None:
+        messages = [
+            self.refused(lambda: self.add(username=None, password=None)).message,
+            self.refused(lambda: self.check_share(username=None)).message,
+            self.refused(lambda: self.check_share(address="nas-only")).message,
+            self.refused(lambda: self.add(name="NAS-2", address=None)).message,
+        ]
+
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertNotIn("--", message)
+        self.assertIn("needs username and password", messages[0])
 
     def test_the_trial_mount_is_unmounted_when_the_check_breaks(self) -> None:
         with patch.object(abr_v41, "_verify_local_repository", side_effect=RuntimeError("check broke")), self.assertRaises(RuntimeError):
@@ -168,7 +181,7 @@ class CreateTests(_MountsCase):
         for changes in ({"username": None}, {"password": None}):
             with self.subTest(changes=changes):
                 error = self.refused(lambda changes=changes: self.add(**changes))
-                self.assertIn("needs --username and --password", error.message)
+                self.assertIn("needs username and password", error.message)
         self.assertEqual(self.broker.calls, [])
 
     def test_a_bad_account_or_folder_is_refused_before_the_broker(self) -> None:
@@ -316,7 +329,7 @@ class EditTests(_MountsCase):
     def test_a_path_cannot_be_given_to_a_share_the_server_mounts(self) -> None:
         error = self.refused(lambda: self.edit(path="/mnt/elsewhere"))
 
-        self.assertIn("takes no --path", error.message)
+        self.assertIn("takes no path", error.message)
 
     def test_a_share_in_use_is_not_swapped(self) -> None:
         self.broker.busy.add(self.repository["path"])

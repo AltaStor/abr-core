@@ -2805,7 +2805,7 @@ def _ensure_smb_repository_share(
         bool(str(server or "").strip()) and bool(str(share or "").strip()),
         422,
         "invalid_repository",
-        "smb repositories require --server and --share, or --address \\\\server\\share",
+        "smb repositories require server and share, or address \\\\server\\share",
     )
     account = str(username or "").strip()
     previous = str(previous_username or "").strip()
@@ -2814,7 +2814,7 @@ def _ensure_smb_repository_share(
         bool(account) or not given,
         422,
         "invalid_repository",
-        "An SMB repository's password needs the account it belongs to: give --username with --password, or "
+        "An SMB repository's password needs the account it belongs to: give username with password, or "
         "leave both out so the hosts open the share with the inventory's account",
     )
     keeps_stored = bool(previous) and account == previous and bool(str(stored_password or ""))
@@ -2822,10 +2822,10 @@ def _ensure_smb_repository_share(
         not account or given or keeps_stored,
         422,
         "invalid_repository",
-        f"The account {account} needs its own password: give --password with --username; the password of "
+        f"The account {account} needs its own password: give password with username; the password of "
         f"{previous} is not used for another account"
         if previous and account != previous
-        else "An SMB repository's account needs --password with --username",
+        else "An SMB repository's account needs password with username",
     )
 
 
@@ -2837,20 +2837,20 @@ def _refuse_local_repository_share(server: Any, share: Any) -> None:
         422,
         "invalid_repository",
         "A local repository has no SMB share: add the folder as an SMB repository "
-        "(--type smb --path --server --share) for Hyper-V hosts to reach it",
+        "(type smb, with path, server and share) for Hyper-V hosts to reach it",
     )
 
 
 def _ensure_appliance_folder(repo_type: str, path: str) -> None:
     """A file repository's path is a folder of this appliance; for an SMB one,
     where the appliance mounts the share, never the share itself."""
-    _ensure(bool(path), 422, "invalid_repository", f"{repo_type} repositories require --path")
+    _ensure(bool(path), 422, "invalid_repository", f"{repo_type} repositories require path")
     _ensure(
         repo_type != "smb" or not SMB_PATTERN.fullmatch(path.replace("\\", "/")),
         422,
         "invalid_repository",
-        "An SMB repository's --path is the folder this appliance mounts the share at; "
-        "give the share itself with --address or --server and --share",
+        "An SMB repository's path is the folder this appliance mounts the share at; "
+        "give the share itself as address, or as server and share",
         path=path,
     )
 
@@ -2860,14 +2860,14 @@ def _ensure_mountable_share(server: str | None, share: str | None, username: str
         bool(server) and bool(share),
         422,
         "invalid_repository",
-        "smb repositories require --address \\\\server\\share, or --server and --share",
+        "smb repositories require address \\\\server\\share, or server and share",
     )
     _ensure(
         bool(username) and bool(password),
         422,
         "invalid_repository",
-        "A share this server mounts needs --username and --password: its traffic is encrypted, which needs an account. "
-        "Give --path for a share mounted by hand",
+        "A share this server mounts needs username and password: its traffic is encrypted, which needs an account. "
+        "Give path for a share mounted by hand",
     )
 
 
@@ -2951,8 +2951,8 @@ def create_repository_record(
             parsed_server, parsed_share = _split_repository_address(repo_type, raw_address)
             server = server or parsed_server
             share = share or parsed_share
-        _ensure(bool(server), 422, "invalid_repository", f"{repo_type} repositories require --server")
-        _ensure(bool(share), 422, "invalid_repository", f"{repo_type} repositories require --share")
+        _ensure(bool(server), 422, "invalid_repository", f"{repo_type} repositories require server")
+        _ensure(bool(share), 422, "invalid_repository", f"{repo_type} repositories require share")
         path = _build_repository_path(repo_type, server, share)
     for existing in catalog_records(REPOSITORIES):
         if str(existing.get("name") or "").lower() == name.lower():
@@ -3159,8 +3159,8 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
             changed = True
         server = str(metadata.get("server") or "").strip()
         share = str(metadata.get("share") or "").strip()
-        _ensure(bool(server), 422, "invalid_repository", f"{repo_type} repositories require --server")
-        _ensure(bool(share), 422, "invalid_repository", f"{repo_type} repositories require --share")
+        _ensure(bool(server), 422, "invalid_repository", f"{repo_type} repositories require server")
+        _ensure(bool(share), 422, "invalid_repository", f"{repo_type} repositories require share")
         updated["path"] = _build_repository_path(repo_type, server, share)
     for field_name in ("username", "password", "description"):
         if repo_type == "s3":

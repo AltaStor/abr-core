@@ -428,7 +428,7 @@ class SmbRegistrationValidationTests(_FolderCase):
         with self.assertRaises(ApiError) as caught:
             abr_v41.edit_repository_record(repository["id"], {"password": ""})
 
-        self.assertIn("needs --password with --username", caught.exception.message)
+        self.assertIn("needs password with username", caught.exception.message)
 
     def test_a_password_without_an_account_is_refused_on_create_and_on_edit(self) -> None:
         with self.assertRaises(ApiError) as created:
