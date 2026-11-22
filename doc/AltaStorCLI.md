@@ -1084,6 +1084,8 @@ abr system import --file <path>
 Example: 
 abr system import --file /tmp/test.adrx
 
+The server configuration in the archive is not applied: it is written next to the archive as <archive>-default.env, readable only by its owner (when that name is taken, <archive>-default-2.env and so on; an existing file is never overwritten), to review and merge into /etc/altastor-backup/server.conf by hand. Secret settings, such as the bootstrap admin password, are not exported and are left there as comments.
+
 abr system get-support-bundle 
 
 Description: Collect logs, sanitized configuration, and system info into a local ZIP for troubleshooting. Passwords/secrets are redacted.

@@ -247,7 +247,8 @@ class SystemCommands:
                 f"Recovered server configuration written to {recovered_configuration_file}. "
                 "This is NOT applied automatically: review it (storage paths and ports may "
                 "differ on this host) and merge what's appropriate into "
-                "/etc/default/altastor-backup-server, then restart the service"
+                "/etc/altastor-backup/server.conf, then restart the service. Secret settings were not "
+                "exported and are left as comments"
             )
 
         print(

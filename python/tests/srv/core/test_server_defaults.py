@@ -128,14 +128,24 @@ class RenderRecoveredServerDefaultsTests(unittest.TestCase):
             {"ABR_BOOTSTRAP_ADMIN_PASSWORD": "TotallySecretPW123"}
         )
         self.assertNotIn("TotallySecretPW123", rendered)
-        self.assertIn("ABR_BOOTSTRAP_ADMIN_PASSWORD=********", rendered)
+        self.assertIn("# ABR_BOOTSTRAP_ADMIN_PASSWORD was not exported: its value is secret.", rendered)
+        self.assertNotIn("\nABR_BOOTSTRAP_ADMIN_PASSWORD=", rendered)
 
     def test_mongodb_uri_credentials_are_redacted(self) -> None:
         rendered = render_recovered_server_defaults(
             {"MONGODB_URI": "mongodb://dbuser:dbpass@127.0.0.1:27018/abr"}
         )
         self.assertNotIn("dbuser:dbpass", rendered)
-        self.assertIn("mongodb://********:********@127.0.0.1:27018/abr", rendered)
+        self.assertIn("# MONGODB_URI was not exported: its value is secret.", rendered)
+
+    def test_no_setting_is_written_with_the_mask_as_its_value(self) -> None:
+        rendered = render_recovered_server_defaults(
+            {"ABR_BOOTSTRAP_ADMIN_PASSWORD": "********", "MONGODB_URI": "mongodb://********@127.0.0.1:27018/abr", "BACKUP_WORKER_COUNT": "8"}
+        )
+        settings = [line for line in rendered.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+        self.assertEqual([line for line in settings if "********" in line], [])
+        self.assertIn("BACKUP_WORKER_COUNT=8", settings)
 
 
 if __name__ == "__main__":
