@@ -1882,27 +1882,15 @@ class ExtendSessionResult(_LenientModel):
 SECRET_KEPT = "Write-only: omitted or null keeps the stored one, an empty text clears it"
 
 
-class EmailOAuth2Request(_LenientModel):
-    provider: SkipValidation[str] | None = Field(default=None, description="microsoft (Microsoft 365 / Exchange Online), google (Google Workspace) or custom")
-    tenant_id: SkipValidation[str] | None = Field(default=None, description="Microsoft only: the directory (tenant) ID or domain")
-    client_id: SkipValidation[str] | None = Field(default=None, description="The application (client) ID registered with the provider")
-    client_secret: SkipValidation[str] | None = Field(default=None, description=f"The client secret. {SECRET_KEPT}")
-    grant: SkipValidation[str] | None = Field(default=None, description="client_credentials (an app sends as the mailbox; Microsoft) or refresh_token (a user consented once; Microsoft, Google, custom)")
-    refresh_token: SkipValidation[str] | None = Field(default=None, description=f"refresh_token grant: the token from the user's consent. {SECRET_KEPT}")
-    token_url: SkipValidation[str] | None = Field(default=None, description="custom only: the token endpoint, https://")
-    scope: SkipValidation[str] | None = Field(default=None, description="Overrides the provider's scope for SMTP; required for custom when the provider needs one")
-
-
 class EmailSmtpRequest(_LenientModel):
     host: SkipValidation[str] | None = Field(default=None, description="SMTP server host name (at most 253 characters) or IP address")
     port: SkipValidation[int] | None = Field(default=None, description="1-65535; usually 587 for starttls, 465 for ssl, 25 for none")
     security: SkipValidation[str] | None = Field(default=None, description="starttls (upgrade to TLS after connecting), ssl (TLS from the start) or none (no encryption)")
     verify_tls: SkipValidation[bool] | None = Field(default=None, description="Check the server certificate against the system trust store (default true)")
-    auth: SkipValidation[str] | None = Field(default=None, description="password (user name and password), oauth2 (OAuth 2.0, SASL XOAUTH2) or none")
-    username: SkipValidation[str] | None = Field(default=None, description="password: the account to sign in as; oauth2: the mailbox the token sends as")
+    auth: SkipValidation[str] | None = Field(default=None, description="password (user name and password) or none")
+    username: SkipValidation[str] | None = Field(default=None, description="password: the account to sign in as")
     password: SkipValidation[str] | None = Field(default=None, description=f"password: the account's password. {SECRET_KEPT}")
     timeout_seconds: SkipValidation[int] | None = Field(default=None, description="5-300 (default 30)")
-    oauth2: SkipValidation[EmailOAuth2Request] | None = None
 
 
 class EmailSenderRequest(_LenientModel):
@@ -1944,12 +1932,12 @@ class EmailDeliveryDTO(_LenientModel):
     attempts: DocInt = None
     next_attempt_at: DocStrOrNull = None
     refused: DocStrArray = Field(default=None, description="Recipients the server refused while taking the message for the others")
-    error: DocObject = Field(default=None, description="code, message, stage (connect, tls, auth, oauth, send, queue) and retryable")
+    error: DocObject = Field(default=None, description="code, message, stage (connect, tls, auth, send, queue) and retryable")
 
 
 class EmailNotificationSettingsDTO(_LenientModel):
     enabled: DocBool = None
-    smtp: DocObject = Field(default=None, description="As in the request, with password_set, oauth2.client_secret_set and oauth2.refresh_token_set in place of the secrets, and the token URL and scope the provider resolves to")
+    smtp: DocObject = Field(default=None, description="As in the request, with password_set in place of the password")
     sender: DocObject = None
     recipients: DocStrArray = None
     repository_space_threshold_percent: DocInt = None
@@ -1972,57 +1960,6 @@ class EmailTestResult(_LenientModel):
     recipients: DocStrArray = None
     refused: DocStrArray = None
     duration_ms: DocInt = None
-
-
-class NotificationScriptSettingsRequest(_LenientModel):
-    enabled: SkipValidation[bool] | None = Field(default=None, description="Run the script on the chosen events; needs an uploaded script")
-    events: SkipValidation[dict[str, bool]] | None = Field(default=None, description="Event ID to true or false; events left out keep their setting. Separate from the events that send e-mail")
-    timeout_seconds: SkipValidation[int] | None = Field(default=None, description="Stop a run after this long, with whatever it started, 5-600 (default 60)")
-
-
-class NotificationScriptUploadRequest(_LenientModel):
-    name: SkipValidation[str] | None = Field(default=None, description="The file name, to tell scripts apart")
-    script_content: SkipValidation[str] | None = Field(default=None, description="The script as text, at most 256 KiB, starting with a #! line. Windows line ends are converted. Not stored in the audit log")
-
-
-class NotificationScriptFileDTO(_LenientModel):
-    name: DocStr = None
-    size: DocInt = None
-    sha256: DocStr = Field(default=None, description="Of the script as stored and run")
-    uploaded_at: DocStr = None
-    uploaded_by: DocStrOrNull = None
-
-
-class NotificationScriptRunDTO(_LenientModel):
-    id: DocStr = None
-    event: DocStr = Field(default=None, description="The event ID, or test")
-    subject: DocStr = None
-    severity: DocStr = None
-    script: DocStrOrNull = None
-    sha256: DocStrOrNull = None
-    queued_at: DocStr = None
-    sent_at: DocStrOrNull = None
-    status: DocStr = Field(default=None, description="queued, sent (it exited 0), failed or cancelled")
-    attempts: DocInt = None
-    exit_code: DocIntOrNull = None
-    duration_ms: DocInt = None
-    output: DocStrOrNull = Field(default=None, description="The end of what it printed, with credentials masked; for those allowed notification.script")
-    error: DocObject = Field(default=None, description="code (script_failed, script_timed_out, script_not_started, script_unreadable), message, stage and retryable")
-
-
-class NotificationScriptDTO(_LenientModel):
-    available: DocBool = Field(default=None, description="false: switched off on this appliance with ABR_NOTIFICATION_SCRIPTS=0")
-    enabled: DocBool = None
-    timeout_seconds: DocInt = None
-    file: NotificationScriptFileDTO | DocObject = Field(default=None, description="The uploaded script, without its content; null when there is none")
-    updated_at: DocStrOrNull = None
-    updated_by: DocStrOrNull = None
-    events: list[NotificationEventDTO] | DocObjectArray = None
-    runs: list[NotificationScriptRunDTO] | DocObjectArray = Field(default=None, description="The latest runs, newest first")
-
-
-class NotificationScriptContentDTO(NotificationScriptFileDTO):
-    script_content: DocStr = None
 
 
 class VsphereTransportAvailabilityDTO(_LenientModel):

@@ -3,20 +3,13 @@
 
 from __future__ import annotations
 
-import socket
-import ssl
 import unittest
 from unittest.mock import patch
-
-import requests
-from urllib3.exceptions import MaxRetryError, NewConnectionError
-from urllib3.exceptions import SSLError as Urllib3SSLError
 
 from python.srv.core.mongo_db_wrapper import SYSTEM_STATE
 from python.srv.services import email_channel, notification_service
 from python.srv.services.api_errors import ApiError
-from python.srv.services.notification_events import DeliveryError
-from python.tests.srv.notifications.test_script_channel import in_memory
+from python.tests.srv.notifications.memory import in_memory
 
 INJECTED = "x\r\nBcc: evil@example.test"
 SMTP = {"host": "smtp.example.test", "port": 2525, "security": "none", "auth": "none"}
@@ -200,77 +193,6 @@ class TestRecipientsTests(_EmailCase):
         self.store_raw(recipients=[])
         fields = self.refused_fields({"enabled": True})
         self.assertEqual(fields.get("recipients"), "Add at least one recipient")
-
-
-TOKEN_URL = "https://login.example.test:8443/token"
-OAUTH = {**SMTP, "auth": "oauth2", "username": "abr@example.test", "oauth2": {"provider": "custom", "client_id": "client", "client_secret": "secret", "token_url": TOKEN_URL, "grant": "client_credentials"}}
-
-
-def pool_error(kind: type, reason: BaseException) -> requests.RequestException:
-    return kind(MaxRetryError(None, "/token", reason=reason))
-
-
-class TokenEndpointFailureTests(_EmailCase):
-    def failure(self, exc: BaseException) -> DeliveryError:
-        settings = email_channel.load_settings()
-        settings["smtp"].update(OAUTH)
-        email_channel._TOKENS.clear()
-        with patch.object(email_channel.requests, "post", side_effect=exc), self.assertRaises(DeliveryError) as raised:
-            email_channel._access_token(settings)
-        error = raised.exception
-        self.assertEqual((error.code, error.stage), ("oauth_token_failed", "oauth"))
-        for internal in ("HTTPSConnectionPool", "Max retries", "object at 0x", "Caused by"):
-            self.assertNotIn(internal, str(error))
-        return error
-
-    def test_an_untrusted_certificate_is_named_and_not_retried(self) -> None:
-        untrusted = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate")
-        untrusted.verify_message = "self-signed certificate"
-
-        error = self.failure(pool_error(requests.exceptions.SSLError, Urllib3SSLError(untrusted)))
-
-        self.assertFalse(error.retryable)
-        self.assertEqual(
-            str(error),
-            "The certificate of the OAuth 2.0 token endpoint login.example.test:8443 is not trusted: self-signed certificate. "
-            "The client secret is sent there, so the endpoint needs a certificate the appliance trusts; certificate "
-            "verification is not switched off for it",
-        )
-
-    def test_another_tls_failure_is_not_retried(self) -> None:
-        error = self.failure(pool_error(requests.exceptions.SSLError, Urllib3SSLError(ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number"))))
-
-        self.assertFalse(error.retryable)
-        self.assertIn("The TLS handshake with the OAuth 2.0 token endpoint login.example.test:8443 failed", str(error))
-
-    def test_a_refused_connection_is_named_and_retried(self) -> None:
-        refused = NewConnectionError(None, "Failed to establish a new connection: [Errno 111] Connection refused")
-        refused.__cause__ = ConnectionRefusedError(111, "Connection refused")
-
-        error = self.failure(pool_error(requests.exceptions.ConnectionError, refused))
-
-        self.assertTrue(error.retryable)
-        self.assertEqual(
-            str(error),
-            "The OAuth 2.0 token endpoint login.example.test:8443 refused the connection: nothing answers on that port. Check the token endpoint URL",
-        )
-
-    def test_a_timeout_and_an_unknown_name_are_said_and_retried(self) -> None:
-        timed_out = self.failure(requests.exceptions.ConnectTimeout("timed out"))
-        unknown = self.failure(pool_error(requests.exceptions.ConnectionError, socket.gaierror(-2, "Name or service not known")))
-
-        self.assertEqual((timed_out.retryable, unknown.retryable), (True, True))
-        self.assertIn("did not answer within", str(timed_out))
-        self.assertIn("The name login.example.test of the OAuth 2.0 token endpoint does not resolve", str(unknown))
-
-    def test_any_other_failure_keeps_only_its_own_words(self) -> None:
-        broken = NewConnectionError(None, "Failed to establish a new connection: [Errno 101] Network is unreachable")
-        broken.__cause__ = OSError(101, "Network is unreachable")
-
-        error = self.failure(pool_error(requests.exceptions.ConnectionError, broken))
-
-        self.assertTrue(error.retryable)
-        self.assertEqual(str(error), "Could not reach the OAuth 2.0 token endpoint login.example.test:8443: Network is unreachable")
 
 
 if __name__ == "__main__":

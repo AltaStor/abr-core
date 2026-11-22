@@ -35,7 +35,6 @@ EXPECTED_MATRIX = {
     "notification.view": "AU",
     "notification.edit": "A",
     "notification.test": "A",
-    "notification.script": "A",
     "user.view": "AU",
     "user.create": "A",
     "user.edit": "A",

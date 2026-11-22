@@ -5,14 +5,12 @@
 sending one message through the configured server.
 
 The settings are one record in the catalog's ``system_state`` collection (id
-``email_notifications``); the SMTP password, the OAuth 2.0 client secret and
-refresh token are kept encrypted with the server's credential key, and never
-leave the server: the DTO says only whether each one is set.
+``email_notifications``); the SMTP password is kept encrypted with the server's
+credential key, and never leaves the server: the DTO says only whether it is
+set.
 
 Authentication is a username and password (SMTP AUTH LOGIN/PLAIN, whichever the
-server offers), OAuth 2.0 (SASL XOAUTH2 with an access token from the
-provider's token endpoint, by the client-credentials or the refresh-token
-grant), or none for a relay that trusts the appliance. The connection is
+server offers), or none for a relay that trusts the appliance. The connection is
 STARTTLS, implicit TLS ("ssl"), or plain; certificates are verified against the
 system trust store unless verification is switched off.
 
@@ -21,7 +19,7 @@ stage they happened at, so the test e-mail, the delivery history and the
 server log all say the same thing.
 
 As a channel of the notification service this module offers ``wants``,
-``describe`` and ``send``; ``script_channel`` offers the same three.
+``describe`` and ``send``.
 """
 
 from __future__ import annotations
@@ -33,14 +31,9 @@ import smtplib
 import socket
 import ssl
 import threading
-import time
-from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 from typing import Any
-from urllib.parse import urlsplit
-
-import requests
 
 from python.srv.core.credential_encryption import decrypt_secret, encrypt_secret, is_encrypted
 from python.srv.core.mongo_db_wrapper import load_system_state, persist_system_state
@@ -60,21 +53,11 @@ PRODUCT_NAME = "AltaStor Backup & Replication"
 STATE_ID = "email_notifications"
 
 SECURITY_MODES = ("starttls", "ssl", "none")
-AUTH_METHODS = ("password", "oauth2", "none")
-OAUTH_PROVIDERS = ("microsoft", "google", "custom")
-OAUTH_GRANTS = ("client_credentials", "refresh_token")
+AUTH_METHODS = ("password", "none")
 DEFAULT_PORTS = {"starttls": 587, "ssl": 465, "none": 25}
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_RECIPIENTS = 50
 DEFAULT_SPACE_THRESHOLD = 85
-
-# Where each provider issues tokens, and the scope that lets the token send
-# mail over SMTP. Microsoft's endpoint names the tenant.
-MICROSOFT_TOKEN_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
-MICROSOFT_SCOPE_CLIENT_CREDENTIALS = "https://outlook.office365.com/.default"
-MICROSOFT_SCOPE_REFRESH = "https://outlook.office365.com/SMTP.Send offline_access"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_SCOPE = "https://mail.google.com/"
 
 # An address as people write them: something@domain.tld, no spaces, no display name.
 ADDRESS_PATTERN = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$")
@@ -100,16 +83,6 @@ def _default_settings() -> dict[str, Any]:
             "username": "",
             "password": "",
             "timeout_seconds": DEFAULT_TIMEOUT_SECONDS,
-            "oauth2": {
-                "provider": "microsoft",
-                "tenant_id": "",
-                "client_id": "",
-                "client_secret": "",
-                "token_url": "",
-                "scope": "",
-                "grant": "client_credentials",
-                "refresh_token": "",
-            },
         },
         "sender": {"address": "", "name": "AltaStor Backup & Replication"},
         "recipients": [],
@@ -138,6 +111,14 @@ def load_settings() -> dict[str, Any]:
         LOGGER.warning("Could not read the e-mail notification settings from the catalog: %s", exc)
         stored = {}
     stored.pop("_id", None)
+    smtp = stored.get("smtp")
+    if isinstance(smtp, dict):
+        # An earlier version signed in with OAuth 2.0. That is gone: such a
+        # record reads as password sign-in with no password, and its OAuth
+        # secrets leave the catalog with the next change.
+        smtp.pop("oauth2", None)
+        if smtp.get("auth") == "oauth2":
+            smtp["auth"] = "password"
     return _merged(_default_settings(), stored)
 
 
@@ -151,14 +132,8 @@ def settings_dto(settings: dict[str, Any] | None = None) -> dict[str, Any]:
     """The settings as the API shows them: every secret replaced by whether it is set."""
     current = settings or load_settings()
     smtp = dict(current["smtp"])
-    oauth = dict(smtp.pop("oauth2"))
     password = smtp.pop("password", "")
-    client_secret = oauth.pop("client_secret", "")
-    refresh_token = oauth.pop("refresh_token", "")
-    oauth.update({"client_secret_set": bool(client_secret), "refresh_token_set": bool(refresh_token)})
-    if oauth.get("provider") != "custom":
-        oauth["effective_token_url"], oauth["effective_scope"] = _oauth_endpoint(current["smtp"]["oauth2"])
-    smtp.update({"password_set": bool(password), "oauth2": oauth})
+    smtp["password_set"] = bool(password)
     return {
         "enabled": bool(current.get("enabled")),
         "smtp": smtp,
@@ -208,15 +183,6 @@ def _apply_patch(current: dict[str, Any], patch: dict[str, Any], problems: dict[
     if smtp_patch.get("password") is not None:
         smtp["password"] = encrypt_secret(str(smtp_patch["password"])) if smtp_patch["password"] != "" else ""
 
-    oauth_patch = smtp_patch.get("oauth2") if isinstance(smtp_patch.get("oauth2"), dict) else {}
-    oauth = smtp["oauth2"]
-    for key in ("provider", "tenant_id", "client_id", "token_url", "scope", "grant"):
-        if oauth_patch.get(key) is not None:
-            oauth[key] = _str(oauth_patch[key])
-    for key in ("client_secret", "refresh_token"):
-        if oauth_patch.get(key) is not None:
-            oauth[key] = encrypt_secret(str(oauth_patch[key])) if oauth_patch[key] != "" else ""
-
     sender_patch = patch.get("sender") if isinstance(patch.get("sender"), dict) else {}
     for key in ("address", "name"):
         if sender_patch.get(key) is not None:
@@ -248,26 +214,12 @@ def _apply_patch(current: dict[str, Any], patch: dict[str, Any], problems: dict[
     return out
 
 
-def _oauth_endpoint(oauth: dict[str, Any]) -> tuple[str, str]:
-    """The token URL and scope the OAuth settings resolve to."""
-    provider = oauth.get("provider") or "custom"
-    grant = oauth.get("grant") or "client_credentials"
-    if provider == "microsoft":
-        tenant = _str(oauth.get("tenant_id")) or "organizations"
-        scope = MICROSOFT_SCOPE_CLIENT_CREDENTIALS if grant == "client_credentials" else MICROSOFT_SCOPE_REFRESH
-        return MICROSOFT_TOKEN_URL.format(tenant=tenant), _str(oauth.get("scope")) or scope
-    if provider == "google":
-        return GOOGLE_TOKEN_URL, _str(oauth.get("scope")) or GOOGLE_SCOPE
-    return _str(oauth.get("token_url")), _str(oauth.get("scope"))
-
-
 def validate(settings: dict[str, Any], *, require_complete: bool, require_recipients: bool | None = None) -> dict[str, str]:
     """Problems with `settings`, by field. Values are always checked;
     `require_complete` (notifications switched on, or a test) also asks for
     every setting delivery needs."""
     problems: dict[str, str] = {}
     smtp = settings["smtp"]
-    oauth = smtp["oauth2"]
 
     host = smtp.get("host") or ""
     if host and not is_host(host):
@@ -291,36 +243,6 @@ def validate(settings: dict[str, Any], *, require_complete: bool, require_recipi
             problems["smtp.username"] = "Enter the user name the SMTP server signs in"
         if not smtp.get("password"):
             problems["smtp.password"] = "Enter the password for that user"
-    elif auth == "oauth2":
-        provider = oauth.get("provider")
-        grant = oauth.get("grant")
-        if provider not in OAUTH_PROVIDERS:
-            problems["smtp.oauth2.provider"] = f"Must be one of: {', '.join(OAUTH_PROVIDERS)}"
-        if grant not in OAUTH_GRANTS:
-            problems["smtp.oauth2.grant"] = f"Must be one of: {', '.join(OAUTH_GRANTS)}"
-        if provider == "google" and grant == "client_credentials":
-            problems["smtp.oauth2.grant"] = (
-                "Google issues no client-credentials tokens for mail: use the refresh_token grant"
-            )
-        token_url = _oauth_endpoint(oauth)[0]
-        if token_url and not re.match(r"^https://[^\s/]+", token_url):
-            problems["smtp.oauth2.token_url"] = "Must be an https:// URL"
-        if oauth.get("tenant_id") and not re.match(r"^[A-Za-z0-9.-]+$", oauth["tenant_id"]):
-            problems["smtp.oauth2.tenant_id"] = "Must be a tenant ID (a GUID) or a domain name"
-        if require_complete:
-            if not smtp.get("username"):
-                problems["smtp.username"] = "Enter the mailbox the token sends as"
-            if not oauth.get("client_id"):
-                problems["smtp.oauth2.client_id"] = "Enter the application (client) ID"
-            if provider == "microsoft" and grant == "client_credentials" and not oauth.get("tenant_id"):
-                problems["smtp.oauth2.tenant_id"] = "Enter the directory (tenant) ID"
-            if provider == "custom" and not token_url:
-                problems["smtp.oauth2.token_url"] = "Enter the token endpoint URL"
-            if grant == "client_credentials" and not oauth.get("client_secret"):
-                problems["smtp.oauth2.client_secret"] = "Enter the client secret"
-            if grant == "refresh_token" and not oauth.get("refresh_token"):
-                problems["smtp.oauth2.refresh_token"] = "Enter the refresh token"
-
     address = settings["sender"].get("address") or ""
     if address and not ADDRESS_PATTERN.match(address):
         problems["sender.address"] = "Not an e-mail address"
@@ -388,8 +310,6 @@ def update_settings(patch: dict[str, Any], *, updated_by: str | None) -> tuple[d
         updated["updated_at"] = utc_now()
         updated["updated_by"] = updated_by
         persist_system_state(updated)
-        if updated["smtp"] != current["smtp"]:
-            _TOKENS.clear()
         return settings_dto(updated), changed
 
 
@@ -405,121 +325,6 @@ def settings_for_test(patch: dict[str, Any] | None, *, require_recipients: bool 
 
 
 # --------------------------------------------------------------- delivery --
-
-@dataclass
-class _Token:
-    value: str
-    expires_at: float
-
-
-_TOKENS: dict[tuple[str, str, str, str], _Token] = {}
-
-
-def _access_token(settings: dict[str, Any]) -> str:
-    """An OAuth 2.0 access token for SMTP, from the cache or the provider."""
-    oauth = settings["smtp"]["oauth2"]
-    token_url, scope = _oauth_endpoint(oauth)
-    grant = oauth.get("grant") or "client_credentials"
-    key = (token_url, oauth.get("client_id") or "", scope, grant)
-    cached = _TOKENS.get(key)
-    if cached and cached.expires_at - 60 > time.time():
-        return cached.value
-
-    form = {"grant_type": grant, "client_id": oauth.get("client_id") or "", "scope": scope}
-    client_secret = _secret(oauth.get("client_secret"))
-    if client_secret:
-        form["client_secret"] = client_secret
-    if grant == "refresh_token":
-        form["refresh_token"] = _secret(oauth.get("refresh_token"))
-    timeout = settings["smtp"].get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS
-    try:
-        response = requests.post(token_url, data=form, timeout=timeout)
-    except requests.RequestException as exc:
-        raise token_endpoint_failure(token_url, exc, timeout) from exc
-    try:
-        body = response.json()
-    except ValueError:
-        body = {}
-    if response.status_code != 200 or not body.get("access_token"):
-        reason = body.get("error_description") or body.get("error") or response.text[:300] or f"HTTP {response.status_code}"
-        raise DeliveryError(
-            "oauth_token_failed",
-            f"The OAuth 2.0 token endpoint refused the request (HTTP {response.status_code}): {reason}",
-            stage="oauth",
-            retryable=response.status_code >= 500,
-        )
-    token = _Token(str(body["access_token"]), time.time() + float(body.get("expires_in") or 3600))
-    _TOKENS[key] = token
-    rotated = body.get("refresh_token")
-    if grant == "refresh_token" and rotated and rotated != form.get("refresh_token"):
-        _store_rotated_refresh_token(str(rotated))
-    return token.value
-
-
-def _causes(exc: BaseException) -> list[BaseException]:
-    found: list[BaseException] = []
-    stack: list[Any] = [exc]
-    while stack:
-        item = stack.pop(0)
-        if not isinstance(item, BaseException) or any(item is seen for seen in found):
-            continue
-        found.append(item)
-        stack.extend([getattr(item, "reason", None), item.__cause__, item.__context__, *item.args])
-    return found
-
-
-def _innermost_text(causes: list[BaseException]) -> str:
-    for cause in reversed(causes):
-        text = str(cause.strerror if isinstance(cause, OSError) and cause.strerror else cause).strip()
-        if text and "object at 0x" not in text and "Max retries" not in text:
-            return text
-    return type(causes[-1]).__name__
-
-
-def token_endpoint_failure(token_url: str, exc: BaseException, timeout: float) -> DeliveryError:
-    parts = urlsplit(token_url)
-    host = parts.hostname or token_url
-    where = f"{host}:{parts.port or (443 if parts.scheme == 'https' else 80)}"
-    causes = _causes(exc)
-
-    def fail(message: str, *, retryable: bool) -> DeliveryError:
-        return DeliveryError("oauth_token_failed", message, stage="oauth", retryable=retryable)
-
-    untrusted = next((cause for cause in causes if isinstance(cause, ssl.SSLCertVerificationError)), None)
-    if untrusted is not None:
-        return fail(
-            f"The certificate of the OAuth 2.0 token endpoint {where} is not trusted: {getattr(untrusted, 'verify_message', None) or untrusted}. "
-            "The client secret is sent there, so the endpoint needs a certificate the appliance trusts; certificate "
-            "verification is not switched off for it",
-            retryable=False,
-        )
-    if any(isinstance(cause, ssl.SSLError) for cause in causes):
-        return fail(f"The TLS handshake with the OAuth 2.0 token endpoint {where} failed: {_innermost_text(causes)}", retryable=False)
-    if isinstance(exc, (requests.exceptions.InvalidURL, requests.exceptions.MissingSchema, requests.exceptions.InvalidSchema)):
-        return fail(f"The OAuth 2.0 token endpoint URL {token_url} is not valid: {_innermost_text(causes)}", retryable=False)
-    if isinstance(exc, requests.Timeout) or any(isinstance(cause, (TimeoutError, socket.timeout)) for cause in causes):
-        return fail(f"The OAuth 2.0 token endpoint {where} did not answer within {timeout} seconds", retryable=True)
-    if any(isinstance(cause, socket.gaierror) or type(cause).__name__ == "NameResolutionError" for cause in causes):
-        return fail(f"The name {host} of the OAuth 2.0 token endpoint does not resolve; check the token endpoint URL", retryable=True)
-    if any(isinstance(cause, ConnectionRefusedError) for cause in causes):
-        return fail(
-            f"The OAuth 2.0 token endpoint {where} refused the connection: nothing answers on that port. Check the token endpoint URL",
-            retryable=True,
-        )
-    return fail(f"Could not reach the OAuth 2.0 token endpoint {where}: {_innermost_text(causes)}", retryable=True)
-
-
-def _store_rotated_refresh_token(token: str) -> None:
-    """Keep the refresh token a provider issued in place of the one it just
-    accepted (Microsoft rotates them), so the next refresh still works."""
-    with _lock:
-        stored = load_settings()
-        stored["smtp"]["oauth2"]["refresh_token"] = encrypt_secret(token)
-        try:
-            persist_system_state(stored)
-        except Exception as exc:
-            LOGGER.warning("Could not store the OAuth 2.0 refresh token the provider rotated: %s", exc)
-
 
 def _tls_context(settings: dict[str, Any]) -> ssl.SSLContext:
     context = ssl.create_default_context()
@@ -622,32 +427,29 @@ def _authenticate(client: smtplib.SMTP, settings: dict[str, Any]) -> None:
     where = f"{smtp['host']}:{smtp['port']}"
     if smtp.get("security") == "none":
         LOGGER.warning("Signing in to SMTP server %s over a connection that is not encrypted.", where)
-    try:
-        if method == "password":
-            password = _secret(smtp.get("password"))
-            if not password:
-                raise DeliveryError(
-                    "smtp_auth_failed",
-                    "The stored SMTP password cannot be decrypted with this server's credential key: enter it again",
-                    stage="auth",
-                    retryable=False,
-                )
-            client.login(smtp["username"], password)
-            return
-        token = _access_token(settings)
-        payload = f"user={smtp['username']}\x01auth=Bearer {token}\x01\x01"
-        client.auth("XOAUTH2", lambda challenge=None: payload if challenge is None else "", initial_response_ok=True)
-    except DeliveryError:
-        raise
-    except smtplib.SMTPAuthenticationError as exc:
-        hint = (
-            "check the user name and password"
-            if method == "password"
-            else "check that the application may send as this mailbox over SMTP (SMTP AUTH enabled, SMTP.Send or "
-            "mail.google.com permission granted)"
-        )
+    if not smtp.get("password"):
         raise DeliveryError(
-            "smtp_auth_failed", f"{where} refused the sign-in ({_smtp_reply(exc)}): {hint}", stage="auth", retryable=False
+            "smtp_auth_failed",
+            "No SMTP password is stored: enter it in Settings > Notifications, or with abr notification set --password",
+            stage="auth",
+            retryable=False,
+        )
+    password = _secret(smtp.get("password"))
+    if not password:
+        raise DeliveryError(
+            "smtp_auth_failed",
+            "The stored SMTP password cannot be decrypted with this server's credential key: enter it again",
+            stage="auth",
+            retryable=False,
+        )
+    try:
+        client.login(smtp["username"], password)
+    except smtplib.SMTPAuthenticationError as exc:
+        raise DeliveryError(
+            "smtp_auth_failed",
+            f"{where} refused the sign-in ({_smtp_reply(exc)}): check the user name and password",
+            stage="auth",
+            retryable=False,
         ) from exc
     except smtplib.SMTPNotSupportedError as exc:
         raise DeliveryError(
@@ -705,7 +507,7 @@ def send(notification: Notification, entry: dict[str, Any]) -> dict[str, Any]:
 def test_message(settings: dict[str, Any], recipients: list[str]) -> tuple[str, str]:
     """The subject and body of a test e-mail."""
     smtp = settings["smtp"]
-    auth = {"password": f"user {smtp['username']}", "oauth2": f"OAuth 2.0 as {smtp['username']}", "none": "no sign-in"}[smtp["auth"]]
+    auth = {"password": f"user {smtp['username']}", "none": "no sign-in"}[smtp["auth"]]
     return (
         "[AltaStor] Test e-mail",
         "This is a test message from AltaStor Backup & Replication.\n\n"
