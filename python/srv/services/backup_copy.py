@@ -339,6 +339,20 @@ def _announced_phase(phase_type: str, phase_reason: str, plan: dict[str, Any] | 
     return "ActiveFull", "DamagedChain" if plan.get("damaged") else "SourceNewChain"
 
 
+def _nothing_to_do(job: dict[str, Any], vm_id: str, phase_type: str, plan: dict[str, Any] | None) -> bool:
+    from python.srv.services.synthetic_full import (
+        _nothing_to_merge,
+        resolve_source_chain,
+    )
+
+    if phase_type == "Incremental":
+        return (plan or plan_copy(job, vm_id)) is None
+    if phase_type == "SyntheticFull":
+        points = resolve_source_chain(str(job.get("id") or ""), vm_id, str(job.get("repo_id") or ""))
+        return _nothing_to_merge(job, {}, points)
+    return False
+
+
 def copied_marker(destination: list[dict[str, Any]]) -> dict[str, Any] | None:
     return next((point for point in reversed(destination) if _copy_source(point)), None)
 
@@ -434,6 +448,7 @@ def create_copy_sessions(
             continue
 
         requires_task_id = None
+        chain_unchanged = True
         for phase_type, phase_reason in execution_phases(execution_type, execution_reason):
             synthetic = phase_type == "SyntheticFull"
             parameters = dict(normalized.get("task_parameters") or {})
@@ -478,7 +493,13 @@ def create_copy_sessions(
                 _append_task_log(task, level="warn", message=missing_warning["message"], component="session")
 
             announced_type, announced_reason = _announced_phase(phase_type, phase_reason, plan)
-            task["result"].update(resolved_backup_type=announced_type, resolved_backup_reason=announced_reason)
+            idle = chain_unchanged and _nothing_to_do(normalized, vm_id, phase_type, plan if execution_type == "Incremental" else None)
+            chain_unchanged = idle
+            announced = "" if idle else f" ({announced_type}, {announced_reason})"
+            task["result"].update(
+                resolved_backup_type=None if idle else announced_type,
+                resolved_backup_reason=None if idle else announced_reason,
+            )
             what = "synthetic full of the copied chain" if synthetic else "backup copy"
             window = copy_window_state(normalized)
             if not window["open"]:
@@ -496,7 +517,7 @@ def create_copy_sessions(
                 level="info",
                 message=(
                     f"Job {normalized.get('name')}: {what} of {target['vm_name']} into repository "
-                    f"{destination.get('name') or normalized.get('repo_name')} ({announced_type}, {announced_reason})"
+                    f"{destination.get('name') or normalized.get('repo_name')}{announced}"
                 ),
                 component="session",
             )

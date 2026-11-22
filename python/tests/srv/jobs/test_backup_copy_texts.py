@@ -78,6 +78,34 @@ class AnnouncedTypeTests(_Catalog):
         self.assertIn("(Incremental, ", line)
         self.assertEqual(result["resolved_backup_type"], "Incremental")
 
+    def _announcement(self, **start) -> tuple[str, dict]:
+        task = backup_copy.create_copy_sessions(JOBS[self.copy["id"]], trigger="manual", include_idle=True, **start)[0]
+        line = next(entry["message"] for entry in task["logs"] if f"Job {self.copy['name']}: " in entry["message"])
+        return line, task["result"]
+
+    def test_a_copy_with_nothing_new_announces_no_type(self) -> None:
+        line, result = self._announcement()
+
+        self.assertTrue(line.endswith("into repository Offsite"), line)
+        self.assertNotIn("(", line)
+        self.assertEqual((result["resolved_backup_type"], result["resolved_backup_reason"]), (None, None))
+
+    def test_a_synthetic_full_with_nothing_to_merge_announces_no_type(self) -> None:
+        line, result = self._announcement(force_synthetic=True)
+
+        self.assertIn("synthetic full of the copied chain", line)
+        self.assertNotIn("(SyntheticFull", line)
+        self.assertIsNone(result["resolved_backup_type"])
+
+    def test_a_synthetic_full_with_increments_to_merge_still_names_its_type(self) -> None:
+        self._point("i1", "Incremental", parent_point_id="f1")
+        self._copied("c2", "i1", kind="Incremental")
+
+        line, result = self._announcement(force_synthetic=True)
+
+        self.assertTrue(line.endswith("(SyntheticFull, ForceSynthetic)"), line)
+        self.assertEqual(result["resolved_backup_type"], "SyntheticFull")
+
     def test_the_announced_phase_rule(self) -> None:
         self.assertEqual(backup_copy._announced_phase("Incremental", "Manual", {"kind": "full", "damaged": False}), ("ActiveFull", "SourceNewChain"))
         self.assertEqual(backup_copy._announced_phase("Incremental", "Manual", {"kind": "full", "damaged": True}), ("ActiveFull", "DamagedChain"))
