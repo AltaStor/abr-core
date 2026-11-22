@@ -967,6 +967,8 @@ Syntax: abr restore start --restore-point <id> --new-name <new-name> --target-in
 Example: abr restore start --restore-point rp-2026-05-16-0200-f1 --new-name VM-SQL-01-DR --target-inventory DR-Inventory --target-host esxi-dr-01.company.local --datastore DR-SSD --network-map Production=DR-Network --datastore-map SATA-BULK=DR-SATA --power-on 
 Example (one disk and one adapter placed on their own): abr restore start --restore-point rp-2026-05-16-0200-f1 --new-name VM-SQL-01-DR --target-inventory DR-Inventory --target-host esxi-dr-01.company.local --datastore DR-SSD --disk-datastore "Hard disk 2=DR-SATA" --nic-network "Network adapter 2=DR-DMZ" --power-on 
 
+Windows guests: a VM restored to a new location is a new machine to Windows, so with its default SAN policy (OfflineShared) it brings the system disk up but leaves the data disks Offline in Disk Management. The data is there; bring the disks online in the guest with PowerShell: Get-Disk | Where-Object IsOffline | Set-Disk -IsOffline $false (and Set-Disk -IsReadOnly $false for a disk that comes up read-only), or set the policy in the source VM beforehand, so later restores come up online: diskpart, then san policy=OnlineAll. 
+
 DATASTORE PLACEMENT 
 
 --datastore is the target for the whole VM: every disk lands there, whatever datastore it came from. --datastore-map overrides that for one source datastore, which is what a VM spread over several datastores needs -- a system disk on SSD and a 2 TB database on bulk storage should not both land on the SSD. Repeat the flag per source datastore; disks whose datastore is not named keep going to --datastore. 

@@ -235,6 +235,19 @@ location with less free space at its last scan before the session starts. A VM t
 old TPM (BitLocker keys, for one) need their recovery keys; the session warns
 about it.
 
+A Windows guest restored out of place sees its disks as new ones: with the
+default SAN policy (`OfflineShared`) it boots from the system disk but leaves
+the data disks Offline in Disk Management. The data is there; bring the disks
+online in the guest:
+
+```powershell
+Get-Disk | Where-Object IsOffline | Set-Disk -IsOffline $false
+```
+
+(`Set-Disk -IsReadOnly $false` for a disk that comes up read-only), or set
+`san policy=OnlineAll` with `diskpart` in the source VM beforehand, so later
+restores come up online.
+
 **In place** (`abr restore start --in-place --force`, or *Original location*
 with the typed confirmation in the console) keeps the VM itself -- its id and
 cluster role -- and replaces its disks. The restored disks are written next to
