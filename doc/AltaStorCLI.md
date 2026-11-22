@@ -543,6 +543,10 @@ vddk_library: a path or null), the values in effect (effective_api,
 effective_vddk_library, and vddk_library_file, the file the library resolves to,
 e.g. libvixDiskLib.so.9.1.0.0) and where each comes from (api_source and
 vddk_library_source: hypervisor, global, or vddk_directory for the fallback).
+vddk_library_problem says why the VDDK transport cannot use that library now
+(for one, "There is no file ... on the backup server" once the file is gone),
+or is null when it can; settings vsphere show gives the same for each
+hypervisor's own library, so the problem is seen before a backup fails.
 
 Each session records, when it is created, the API, the library, the file the
 library resolves to and where each came from (job, hypervisor, global or

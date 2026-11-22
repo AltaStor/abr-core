@@ -422,6 +422,37 @@ class AccessResolutionTests(unittest.TestCase):
         self.assertEqual(disk_transport.tool_environment(parameters, base=service), {})
         self.assertIsNone(disk_transport.tool_environment({"vsphere_transport": "vddk"}, base=service))
 
+    def test_the_inventory_view_names_a_library_that_is_gone(self) -> None:
+        own = self._inventory(vddk_library=self.own)
+        self.assertIsNone(disk_transport.inventory_view(own)["vddk_library_problem"])
+
+        Path(self.own).unlink()
+        view = disk_transport.inventory_view(own)
+
+        self.assertEqual(view["effective_vddk_library"], self.own)
+        self.assertIn(f"There is no file {self.own} on the backup server", view["vddk_library_problem"])
+
+    def test_the_inventory_view_of_the_default_or_server_wide_library_has_no_problem_while_it_is_there(self) -> None:
+        self.assertIsNone(disk_transport.inventory_view(self._inventory())["vddk_library_problem"])
+        disk_transport.store_global_settings("vddk", self.server, updated_by="admin")
+        self.assertIsNone(disk_transport.inventory_view(self._inventory())["vddk_library_problem"])
+
+        Path(self.server).unlink()
+
+        self.assertIn("There is no file", disk_transport.inventory_view(self._inventory())["vddk_library_problem"])
+
+    def test_the_server_wide_settings_name_the_problem_on_the_inventory_entry(self) -> None:
+        from python.srv.services import vsphere_access
+
+        record = {"id": "vc", "name": "vc", "type": "vsphere", "metadata": {"vddk_library": self.own}}
+        other = {"id": "vc2", "name": "vc2", "type": "vsphere", "metadata": {}}
+        Path(self.own).unlink()
+        with patch.object(vsphere_access, "_vsphere_inventories", return_value=[record, other]):
+            entries = {entry["name"]: entry for entry in vsphere_access.settings_dto()["hypervisors"]}
+
+        self.assertIn("There is no file", entries["vc"]["vddk_library_problem"])
+        self.assertIsNone(entries["vc2"]["vddk_library_problem"])
+
     def test_a_library_the_launcher_does_not_know_is_refused(self) -> None:
         old = _launcher(self.root / "old", with_vddk=True)
         problem = disk_transport.transport_problem("vddk", old, library=self.own)

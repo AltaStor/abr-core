@@ -372,6 +372,9 @@ def inventory_view(record: dict[str, Any] | None, settings: dict[str, Any] | Non
         "effective_vddk_library": access["vddk_library"],
         "vddk_library_source": access["vddk_library_source"],
         "vddk_library_file": access["vddk_library_file"],
+        "vddk_library_problem": transport_problem(
+            VDDK, library=explicit_library(access["vddk_library"], access["vddk_library_source"])
+        ),
     }
 
 

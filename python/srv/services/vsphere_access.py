@@ -55,6 +55,15 @@ def vddk_library_or_error(text: str) -> str:
     return os.path.normpath(text)
 
 
+def _own_library_problem(record: dict[str, Any]) -> str | None:
+    library = disk_transport.inventory_library_setting(record)
+    if not library:
+        return None
+    return disk_transport.transport_problem(
+        disk_transport.VDDK, library=disk_transport.explicit_library(library, disk_transport.FROM_HYPERVISOR)
+    )
+
+
 def settings_dto() -> dict[str, Any]:
     settings = disk_transport.global_settings()
     directory, directory_source = disk_transport.vddk_directory()
@@ -83,6 +92,7 @@ def settings_dto() -> dict[str, Any]:
                 "name": str(record.get("name") or ""),
                 "api": disk_transport.inventory_transport_setting(record) or disk_transport.INHERIT,
                 "vddk_library": disk_transport.inventory_library_setting(record),
+                "vddk_library_problem": _own_library_problem(record),
                 "has_own_settings": _has_own_settings(record),
             }
             for record in _vsphere_inventories()
