@@ -65,7 +65,9 @@ def vm_key_for_task(task: dict[str, object]) -> tuple[str, str] | None:
 
 
 def _keep_backup_snapshot(result: dict[str, object], previous_result: dict[str, object]) -> None:
-    for field in ("backup_snapshot", "left_session_data", "swap_plan"):
+    # pve_run keeps a Proxmox VE run's task and whether vzdump succeeded: PVE moved the VM's dirty bitmaps on with a
+    # successful run also when the session failed afterwards, so the next backup must not chain onto them.
+    for field in ("backup_snapshot", "left_session_data", "swap_plan", "pve_run"):
         if field not in result and isinstance(previous_result.get(field), dict):
             result[field] = previous_result[field]
     if "replica_touched" not in result and previous_result.get("replica_touched") is True:

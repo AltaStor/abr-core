@@ -416,6 +416,19 @@ class ResultTests(unittest.TestCase):
             self.assertEqual(last_vzdump_task("inv-1", "9002", "c"), "a")
             self.assertIsNone(last_vzdump_task("inv-2", "9002", "now"))
 
+    def test_a_session_that_failed_after_a_successful_vzdump_run_still_moved_the_bitmaps(self):
+        from python.srv.core import task_pool
+
+        run = {"vmid": "9002", "vzdump_ok": True, "finished_at": "2026-11-20T05:00:00Z", "upid": "UPID:n1:1:2:3:vzdump"}
+        failed = {"message": "vzdump of VM 9002 on node n1 failed: the provider left no result file for this run"}
+        task_pool._keep_backup_snapshot(failed, {"pve_run": run, "progress": 90})
+        records = [
+            {"id": "a", "hypervisor_id": "inv-1", "result": {"pve_run": {**run, "finished_at": "2026-11-20T01:00:00Z"}}},
+            {"id": "lost", "hypervisor_id": "inv-1", "status": "failed", "result": failed},
+        ]
+        with patch.object(pve_backup, "catalog_records", return_value=records):
+            self.assertEqual(last_vzdump_task("inv-1", "9002", "now"), "lost")
+
 
 RESULT_FILE = "/run/abr/backup-9002.result.json"
 
