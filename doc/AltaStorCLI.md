@@ -403,7 +403,7 @@ figure above; minimum ignores both the job retention and its cycle and uses --im
 alone. A job keeping 13 days with weekly full backups on a repository set to 7 writes a 20-day 
 lock under job, and a 7-day lock under minimum. 
 
-The period runs from each backup's own creation, and stored restore points keep the lock they were written with - repo apply-immutability puts them under the current setting. Retention can be lengthened, never shortened or removed. An --immutability-days longer than the job's --retention-days locks data past the point the job still needs it and is paid for either way; repo add/edit warn when that happens. 
+The period runs from each backup's own creation, and stored restore points keep the lock they were written with - repo apply-immutability puts them under the current setting - until a newer backup is written into their chain: that backup extends the lock of the points it depends on to its own, under job and minimum alike and also after repo edit changed the period, so a chain is never held shorter than its newest point. The server then reads back how long the storage holds the chain's full backup; when the storage refused the extension, holds the full shorter or cannot be read, the backup still completes with a warning that names the restore point and the repo apply-immutability command, and the catalog keeps the date the storage really holds. Retention can be lengthened, never shortened or removed. An --immutability-days longer than the job's --retention-days locks data past the point the job still needs it and is paid for either way; repo add/edit warn when that happens. 
 
 abr repo share 
 

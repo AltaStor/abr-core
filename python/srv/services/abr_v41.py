@@ -74,6 +74,7 @@ from python.srv.core.secure_archive import (
 from python.srv.core.storage_tool import (
     IMMUTABILITY_MODES,
     IMMUTABILITY_RETENTION_SCOPES,
+    MANIFEST_BACKUP_NAME,
     STORAGE_LAYOUT_BY_ID,
     STORAGE_LAYOUT_BY_NAME,
     DiskToolCorruptBackup,
@@ -3534,6 +3535,7 @@ def repository_actual_retention_days(job: dict[str, Any] | None, immutability: d
     )
 
 
+OBJECT_LOCK_CHECK_MARGIN_SECONDS = 300
 OBJECT_LOCK_UNAVAILABLE_HINT = (
     "Either this storage does not implement Object Lock at all, or the bucket was created without it - "
     "Object Lock can only be turned on when a bucket is created, never afterwards - or the credentials "
@@ -3981,6 +3983,16 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
                 )
         if point_failed:
             continue
+        targets = _restore_point_abr_targets(point)
+        data_absent = any(
+            isinstance(result, dict) and result.get("metadata_only") and name != MANIFEST_BACKUP_NAME
+            for result, (_path, name) in zip(results, targets)
+        )
+        if str(point.get("id") or "") == segment_id or point.get("full_backup") or data_absent:
+            shortfall = _object_lock_shortfall(repository, targets, target)
+            if shortfall is not None:
+                failures.append({"restore_point_id": str(point.get("id") or ""), **shortfall})
+                continue
         stored = BACKUPS.get(str(point.get("id") or ""))
         if isinstance(stored, dict):
             stored = dict(stored)
@@ -3989,6 +4001,33 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
         extended.append(str(point.get("id") or ""))
 
     return {"extended_restore_points": extended, "failures": failures, "retention_days": remaining_days}
+
+
+def _object_lock_shortfall(repository: dict[str, Any], targets: list[tuple[str, str]], target: datetime) -> dict[str, Any] | None:
+    for abr_path, backup_name in targets:
+        if backup_name == MANIFEST_BACKUP_NAME:
+            continue
+        span = (target - _now_utc()).total_seconds() - OBJECT_LOCK_CHECK_MARGIN_SECONDS
+        needed = max(int(-(-span // 86400)), 1)
+        try:
+            info = read_storage_backup_info(repository, abr_path, backup_name, timeout=_s3_immutability_probe_timeout())
+        except StorageToolError as exc:
+            return {
+                "backup_name": backup_name,
+                "message": f"its Object Lock could not be read back after the extension: {condense_disk_tool_message(exc)}",
+            }
+        locked = isinstance(info, dict) and normalize_immutability_mode(info.get("immutability")) != "none"
+        held = int(info.get("retention_days") or 0) if locked else 0
+        if held < needed:
+            return {
+                "backup_name": backup_name,
+                "message": (
+                    f"the storage still holds it for only {held} more day(s), not the {needed} the newer backups on it need"
+                    if held
+                    else "the storage does not hold it under Object Lock any more"
+                ),
+            }
+    return None
 
 
 def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:

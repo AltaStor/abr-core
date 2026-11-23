@@ -251,6 +251,12 @@ def _resolve_compression_level(result: dict[str, Any]) -> int | None:
         return None
 
 
+def _relock_hint(record: dict[str, Any]) -> str:
+    name = str(record.get("repository_name") or "").strip()
+    target = f'--name "{name}"' if name else f"--id {record.get('repository_id')}"
+    return f"Run abr repo apply-immutability {target} to hold the stored backups again"
+
+
 def _record_session_warning(
     task: dict[str, Any], message: str, *, component: str = "retention", **details: Any
 ) -> None:
@@ -465,10 +471,17 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
                 expires_at=str(generation["expires_at"]),
                 skip_point_ids={str(normalized_record.get("id") or "")},
             )
-        except (OSError, ApiError):
+        except (OSError, ApiError) as exc:
             logger.exception(
                 "Could not extend the Object Lock of segment %s to the new block generation",
                 normalized_record.get("segment_id"),
+            )
+            _record_session_warning(
+                task,
+                "Object Lock could not be extended to the new block generation for the earlier restore points "
+                f"of this chain ({exc}); they may lose protection before this backup, which depends on them. "
+                f"{_relock_hint(normalized_record)}",
+                reason=str(exc),
             )
         else:
             for failure in report["failures"]:
@@ -483,7 +496,8 @@ def register_backup_from_completed_task(task: dict[str, Any]) -> dict[str, Any] 
                     task,
                     "Object Lock could not be extended to the new block generation for restore point "
                     f"{failure.get('restore_point_id')} ({failure.get('backup_name')}: {reason}); the backup it "
-                    "belongs to may lose protection before the newer backups that depend on it",
+                    "belongs to may lose protection before the newer backups that depend on it. "
+                    f"{_relock_hint(normalized_record)}",
                     restore_point_id=failure.get("restore_point_id"),
                     backup_name=failure.get("backup_name"),
                     reason=reason,
