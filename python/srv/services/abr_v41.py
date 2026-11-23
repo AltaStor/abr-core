@@ -6435,8 +6435,11 @@ _GFS_INELIGIBLE_REASONS = {"ForceFull", "ForceSynthetic"}
 
 def _apply_gfs_marks(points: list[dict[str, Any]], gfs: dict[str, Any]) -> None:
     enabled = _coerce_gfs_enabled(gfs.get("enabled"))
+    was_marked: dict[tuple[str, str], bool] = {}
     for point in points:
         marks = point.get("gfs_marks") if isinstance(point.get("gfs_marks"), dict) else {}
+        for tier in ("weekly", "monthly", "yearly"):
+            was_marked[(tier, str(point.get("id") or ""))] = bool(marks.get(tier))
         point["gfs_marks"] = {
             "weekly": bool(marks.get("weekly")),
             "monthly": bool(marks.get("monthly")),
@@ -6461,7 +6464,8 @@ def _apply_gfs_marks(points: list[dict[str, Any]], gfs: dict[str, Any]) -> None:
         chosen = []
         for period_key, bucket in grouped.items():
             bucket.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")))
-            chosen.append((period_key, bucket[-1]))
+            marked = [item for item in bucket if was_marked.get((key, str(item.get("id") or "")))]
+            chosen.append((period_key, marked[0] if marked else bucket[-1]))
         chosen.sort(key=lambda item: item[0], reverse=True)
         keep_ids = {entry["id"] for _period_key, entry in chosen[:count]}
         for point in full_points:

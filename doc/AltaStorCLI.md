@@ -93,7 +93,7 @@ Retention & GFS Coexistence Model
 
 retention-days (Operational) manages a short rolling window of daily recovery points (e.g., 14 days). 
 
-GFS (Long-term) flags specific scheduled Full backups to be frozen as Weekly/Monthly/Yearly milestones. 
+GFS (Long-term) flags specific scheduled Full backups to be frozen as Weekly/Monthly/Yearly milestones. A full that has a mark keeps it: a later full of the same week, month or year, a backup copy job's second copied full among them, does not take the mark over, so retention keeps the full that was marked first. In a period with no marked full yet the newest full of the period gets the mark, as before. 
 
 Rule of Exclusion: When a Full backup point reaches the end of the operational window, it is NOT deleted if it carries an active GFS archival mark. 
 
