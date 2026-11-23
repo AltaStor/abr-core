@@ -4786,17 +4786,46 @@ def _coerce_gfs_enabled(value: Any, *, default: bool = True) -> bool:
     return default if value is None else bool(value)
 
 
-def _ensure_encryption_key_strength(task_parameters: Any) -> None:
+MIN_ENCRYPTION_KEY_LENGTH = 12
+MIN_ENCRYPTION_KEY_CLASSES = 3
+
+
+def _encryption_key_classes(key: str) -> int:
+    return sum(
+        (
+            any(character.islower() for character in key),
+            any(character.isupper() for character in key),
+            any(character.isdigit() for character in key),
+            any(not character.isalnum() for character in key),
+        )
+    )
+
+
+def _known_encryption_keys(task_parameters: Any) -> set[str]:
+    stored = task_parameters if isinstance(task_parameters, dict) else {}
+    keys = {str(entry.get("key") or "") for entry in stored.get("encryption_keys") or [] if isinstance(entry, dict)}
+    keys.add(str(stored.get("encryption_key") or ""))
+    return {key.strip() for key in keys if key.strip()}
+
+
+def _ensure_encryption_key_strength(task_parameters: Any, known: set[str] | None = None) -> None:
     if not isinstance(task_parameters, dict):
         return
     key = task_parameters.get("encryption_key")
-    if not isinstance(key, str) or not key.strip():
+    if not isinstance(key, str) or not key.strip() or key.strip() in (known or set()):
         return
     _ensure(
-        len(key.strip()) >= MIN_PASSWORD_LENGTH,
+        key == key.strip(),
         422,
         "invalid_job",
-        f"Encryption key must be at least {MIN_PASSWORD_LENGTH} characters.",
+        "Encryption key must not start or end with a space: the key would be stored without it.",
+    )
+    _ensure(
+        len(key) >= MIN_ENCRYPTION_KEY_LENGTH and _encryption_key_classes(key) >= MIN_ENCRYPTION_KEY_CLASSES,
+        422,
+        "invalid_job",
+        f"Encryption key must be at least {MIN_ENCRYPTION_KEY_LENGTH} characters and mix at least "
+        f"{MIN_ENCRYPTION_KEY_CLASSES} of: lowercase letters, uppercase letters, digits, symbols.",
     )
 
 
@@ -5820,8 +5849,8 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         changed = True
     if "task_parameters" in payload and payload["task_parameters"] is not None:
         _ensure(isinstance(payload["task_parameters"], dict), 422, "invalid_job", "task_parameters must be an object")
-        _ensure_encryption_key_strength(payload["task_parameters"])
         stored_parameters = updated.get("task_parameters") if isinstance(updated.get("task_parameters"), dict) else {}
+        _ensure_encryption_key_strength(payload["task_parameters"], _known_encryption_keys(stored_parameters))
         merged = _merge_task_parameters(stored_parameters, payload["task_parameters"])
         updated["task_parameters"] = _validate_task_parameters(merged, previous=stored_parameters)
         changed = True

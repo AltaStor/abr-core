@@ -815,7 +815,7 @@ class AbrV41EngineTests(unittest.TestCase):
                 "inventory_id": inventory["id"],
                 "repo_id": "repo-1",
                 "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
-                "task_parameters": {"encryption_enabled": True, "encryption_key": "hunter2-key"},
+                "task_parameters": {"encryption_enabled": True, "encryption_key": "Hunter2-key-01"},
             }
         )
 
@@ -848,7 +848,7 @@ class AbrV41EngineTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(TASKS[session["id"]]["parameters"]["encryption_key"], "hunter2-key")
+        self.assertEqual(TASKS[session["id"]]["parameters"]["encryption_key"], "Hunter2-key-01")
 
     def _job_with_key(self, name: str, key: str, address: str):
         inventory = abr_v41.create_inventory_record(
@@ -878,32 +878,52 @@ class AbrV41EngineTests(unittest.TestCase):
             }
         )
 
-    def test_a_short_encryption_key_is_refused_on_create(self) -> None:
-        for key in ("a", "abcd", "seven77"):
+    def test_a_weak_encryption_key_is_refused_on_create(self) -> None:
+        for key in ("a", "abcd", "seven77", "abcd1234", "abcdefgh1234", "ABCDEFGH-ijk"[:11]):
             with self.subTest(key=key):
                 JOBS.clear()
                 with self.assertRaises(ApiError) as ctx:
-                    self._job_with_key(f"Short Key {len(key)}", key, "192.0.2.7%d" % len(key))
+                    self._job_with_key(f"Weak Key {len(key)}", key, "192.0.2.7%d" % len(key))
                 self.assertEqual(ctx.exception.status_code, 422)
                 self.assertEqual(ctx.exception.code, "invalid_job")
-                self.assertIn("at least 8 characters", ctx.exception.message)
+                self.assertIn("at least 12 characters and mix at least 3 of", ctx.exception.message)
 
-    def test_a_key_of_the_minimum_length_is_accepted(self) -> None:
-        job = self._job_with_key("Minimum Key", "eightch8", "192.0.2.80")
+    def test_a_key_with_a_space_at_either_end_is_refused(self) -> None:
+        for number, key in enumerate((" Twelve-chr12", "Twelve-chr12 ")):
+            with self.subTest(key=key):
+                JOBS.clear()
+                with self.assertRaises(ApiError) as ctx:
+                    self._job_with_key(f"Spaced Key {number}", key, f"192.0.2.9{number}")
+                self.assertIn("must not start or end with a space", ctx.exception.message)
 
-        self.assertEqual(job["encryption"]["enabled"], True)
-        self.assertEqual(job["encryption"]["key_set"], True)
+    def test_a_key_of_the_minimum_length_and_three_classes_is_accepted(self) -> None:
+        for name, key, address in (("Minimum Key", "Twelve-chr12", "192.0.2.80"), ("No Symbol Key", "Twelvechr123", "192.0.2.84")):
+            with self.subTest(key=key):
+                job = self._job_with_key(name, key, address)
 
-    def test_a_short_encryption_key_is_refused_on_edit(self) -> None:
-        job = self._job_with_key("Edit Short Key", "long-enough-key", "192.0.2.81")
+                self.assertEqual(job["encryption"]["enabled"], True)
+                self.assertEqual(job["encryption"]["key_set"], True)
+
+    def test_a_weak_encryption_key_is_refused_on_edit(self) -> None:
+        job = self._job_with_key("Edit Short Key", "Long-enough-key1", "192.0.2.81")
 
         with self.assertRaises(ApiError) as ctx:
             abr_v41.edit_job_record(
-                job["id"], {"task_parameters": {"encryption_enabled": True, "encryption_key": "a"}}
+                job["id"], {"task_parameters": {"encryption_enabled": True, "encryption_key": "weakkey1"}}
             )
 
         self.assertEqual(ctx.exception.status_code, 422)
-        self.assertIn("at least 8 characters", ctx.exception.message)
+        self.assertIn("at least 12 characters", ctx.exception.message)
+        self.assertEqual(JOBS[job["id"]]["task_parameters"]["encryption_key"], "Long-enough-key1")
+
+    def test_a_key_the_job_already_has_is_taken_again_whatever_its_strength(self) -> None:
+        job = self._job_with_key("Legacy Key", "Long-enough-key1", "192.0.2.85")
+        JOBS[job["id"]]["task_parameters"]["encryption_key"] = "abcd1234"
+
+        edited = abr_v41.edit_job_record(job["id"], {"task_parameters": {"encryption_enabled": True, "encryption_key": "abcd1234"}})
+
+        self.assertEqual(edited["encryption"]["enabled"], True)
+        self.assertEqual(JOBS[job["id"]]["task_parameters"]["encryption_key"], "abcd1234")
 
     def test_encryption_without_a_key_is_refused_rather_than_generated(self) -> None:
         inventory = abr_v41.create_inventory_record(
@@ -940,7 +960,7 @@ class AbrV41EngineTests(unittest.TestCase):
         self.assertIn("--encryption-key", ctx.exception.message)
 
     def test_an_edit_that_does_not_touch_the_key_leaves_an_older_short_key_alone(self) -> None:
-        job = self._job_with_key("Legacy Short Key", "long-enough-key", "192.0.2.83")
+        job = self._job_with_key("Legacy Short Key", "Long-enough-key1", "192.0.2.83")
         JOBS[job["id"]]["task_parameters"]["encryption_key"] = "old"
 
         edited = abr_v41.edit_job_record(job["id"], {"task_parameters": {"compression_level": 5}})
@@ -948,7 +968,7 @@ class AbrV41EngineTests(unittest.TestCase):
         self.assertEqual(edited["compression_level"], 5)
         self.assertEqual(JOBS[job["id"]]["task_parameters"]["encryption_key"], "old")
 
-    def _encrypted_setup(self, address: str, key: str = "hunter2-key"):
+    def _encrypted_setup(self, address: str, key: str = "Hunter2-key-01"):
         inventory = abr_v41.create_inventory_record(
             {
                 "name": "esxi",
@@ -1021,18 +1041,18 @@ class AbrV41EngineTests(unittest.TestCase):
 
     def test_deleting_the_job_leaves_an_encrypted_point_restorable(self) -> None:
         inventory, job = self._encrypted_setup("192.0.2.37")
-        self._encrypted_point(inventory, job, point_key="hunter2-key")
+        self._encrypted_point(inventory, job, point_key="Hunter2-key-01")
 
         abr_v41.delete_job_record(job["id"])
         session = self._start_encrypted_restore(inventory)
 
-        self.assertEqual(TASKS[session["id"]]["parameters"]["encryption_key"], "hunter2-key")
+        self.assertEqual(TASKS[session["id"]]["parameters"]["encryption_key"], "Hunter2-key-01")
 
     def test_the_points_own_key_wins_over_a_rotated_job_key(self) -> None:
         inventory, job = self._encrypted_setup("192.0.2.37")
         self._encrypted_point(inventory, job, point_key="written-with-this")
         abr_v41.edit_job_record(
-            job["id"], {"task_parameters": {"encryption_enabled": True, "encryption_key": "rotated-later"}}
+            job["id"], {"task_parameters": {"encryption_enabled": True, "encryption_key": "Rotated-later-01"}}
         )
 
         session = self._start_encrypted_restore(inventory)
@@ -1078,12 +1098,12 @@ class AbrV41EngineTests(unittest.TestCase):
 
     def test_the_stored_key_never_reaches_the_restore_point_dto(self) -> None:
         inventory, job = self._encrypted_setup("192.0.2.37")
-        point = self._encrypted_point(inventory, job, point_key="hunter2-key")
+        point = self._encrypted_point(inventory, job, point_key="Hunter2-key-01")
 
         dto = abr_v41.restore_point_to_dto(point)
 
         self.assertNotIn("encryption_key", dto)
-        self.assertNotIn("hunter2-key", json.dumps(dto))
+        self.assertNotIn("Hunter2-key-01", json.dumps(dto))
 
     def test_restore_start_rejects_duplicate_target_vm_name(self) -> None:
         inventory = abr_v41.create_inventory_record(
