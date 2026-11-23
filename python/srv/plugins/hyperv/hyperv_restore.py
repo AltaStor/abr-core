@@ -45,6 +45,7 @@ from ...core.storage_tool import chain_source_names, is_s3_repository
 from ...core.subprocess_util import ProcessCancelled
 from ...core.task_executor import TaskStopRequested, cancel_requested
 from ...core.utils import utc_now
+from ...services.backup_mode import restore_point_copied_at, restore_point_taken_at
 from ..vcenter.vcenter_backup import (
     VCenterBackupError,
     _disk_timeout_seconds,
@@ -484,7 +485,8 @@ def run_hyperv_restore(
     mode = "in_place" if str(parameters.get("restore_mode") or "") == "in_place" else "new_vm"
     point_id = str(parameters.get("point_id") or "")
     point = BACKUPS.get(point_id) if point_id else None
-    point_created = str((point or {}).get("created_at") or manifest.get("created_at") or "")
+    point_created = str(restore_point_taken_at(point) or manifest.get("created_at") or "")
+    point_copied = restore_point_copied_at(point)
     source_vm_name = str(manifest.get("vm_name") or parameters.get("source_vm_name") or "")
     source_vm_id = str(manifest.get("vm_external_id") or "")
     target_vm_name = str(parameters.get("target_vm_name") or source_vm_name)
@@ -515,6 +517,7 @@ def run_hyperv_restore(
         "prepare",
         3,
         f"{mode_label} recovery of {source_vm_name} from restore point {point_id} taken {point_created}"
+        + (f" (copied {point_copied})" if point_copied else "")
         + (
             f" as new VM {target_vm_name} on {requested_host}"
             if mode == "new_vm"

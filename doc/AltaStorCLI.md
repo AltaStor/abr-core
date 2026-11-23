@@ -787,7 +787,7 @@ A replication job takes the options of job create-replication. Until its replica
 
 abr job retention 
 
-Description: Apply the job's retention policy now to every backup chain the job wrote, or preview it with --dry-run. For a backup copy job that is its own chains in its destination; the restore points of its sources are never touched. Retention also runs after each backup, for that backup's own chain; this covers all of them at once, including VMs that have since left the job. 
+Description: Apply the job's retention policy now to every backup chain the job wrote, or preview it with --dry-run. For a backup copy job that is its own chains in its destination; the restore points of its sources are never touched. A copy's age, for --retention-days and for its GFS week, month and year, counts from the VM state it holds (the time of the source restore point it was copied from), not from the time the copy was made, so a point copied days late after an outage, behind a copy window or in a long first copy is not kept past the window. Its Object Lock still runs from the time the copy was written. Retention also runs after each backup, for that backup's own chain; this covers all of them at once, including VMs that have since left the job. 
 
 abr job retention --name <name> [--id <id>] [--dry-run] [--output json] 
 
@@ -924,7 +924,7 @@ Description: Show restore points that can be used for VM recovery.
 
 abr restore list [--vm <name-or-id>] [--backup <backup-id>] [--inventory <name-or-id>] [--job <name-or-id>] [--output json] 
 
---job lists the restore points one job wrote, a backup job or a backup copy job; with --output json a copy carries copy_source: the source job, repository and restore points it was copied from. 
+--job lists the restore points one job wrote, a backup job or a backup copy job; with --output json a copy carries copy_source: the source job, repository and restore points it was copied from. A point's time (CREATED, taken_at in --output json) is the time of the VM state it holds: for a copy, the time of the source restore point it was copied from, so a copy made days later shows the day the VM was in that state; the time the copy was made follows in a COPIED column (copied_at, empty for a point that is not a copy). created_at in --output json stays the time the point itself was written. 
 
 Note: 
 This command returns stable restore-point records including point ID, backup ID, VM ID/name, inventory, repository, time, type, and status. Empty results return success with `items: []`. 

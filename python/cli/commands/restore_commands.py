@@ -159,14 +159,16 @@ class RestoreCommands:
         start.set_defaults(handler=self.start)
 
     @staticmethod
-    def _point_columns() -> list[tuple[str, str]]:
+    def _point_columns(items: Any = None) -> list[tuple[str, str]]:
+        copied = isinstance(items, list) and any(isinstance(item, dict) and item.get("copied_at") for item in items)
         return [
             ("id", "POINT ID"),
             ("backup_id", "BACKUP ID"),
             ("vm_name", "VM NAME"),
             ("inventory_name", "INVENTORY"),
             ("repository_name", "REPOSITORY"),
-            ("created_at", "CREATED"),
+            ("taken_at", "CREATED"),
+            *([("copied_at", "COPIED")] if copied else []),
             ("point_type", "TYPE"),
             ("consistency", "CONSISTENCY"),
             ("status", "STATUS"),
@@ -189,6 +191,7 @@ class RestoreCommands:
     def _decorate_restore_point(item: dict[str, Any]) -> dict[str, Any]:
         decorated = dict(item)
         decorated.setdefault("backup_id", item.get("chain_id"))
+        decorated.setdefault("taken_at", item.get("created_at"))
         inventory = decorated.get("inventory") if isinstance(decorated.get("inventory"), dict) else {}
         repository = decorated.get("repository") if isinstance(decorated.get("repository"), dict) else {}
         decorated.setdefault("inventory_id", inventory.get("id"))
@@ -203,7 +206,7 @@ class RestoreCommands:
         items = payload.get("items") if isinstance(payload, dict) else None
         if isinstance(items, list):
             payload = {**payload, "items": [self._decorate_restore_point(item) for item in items]}
-        deps.context.print_output(payload, self._point_columns())
+        deps.context.print_output(payload, self._point_columns(items))
         return 0
 
     def point_list(self, args: argparse.Namespace) -> int:
@@ -212,7 +215,7 @@ class RestoreCommands:
         items = payload.get("items") if isinstance(payload, dict) else None
         if isinstance(items, list):
             payload = {**payload, "items": [self._decorate_restore_point(item) for item in items]}
-        deps.context.print_output(payload, self._point_columns())
+        deps.context.print_output(payload, self._point_columns(items))
         return 0
 
     @staticmethod

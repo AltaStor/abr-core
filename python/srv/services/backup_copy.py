@@ -48,6 +48,7 @@ from python.srv.services.api_errors import ApiError, api_error
 from python.srv.services.backup_mode import (
     object_lock_expiry,
     object_lock_generation_plan,
+    restore_point_taken_at,
 )
 from python.srv.services.share_mount import unmounted_share_message
 from python.srv.services.synthetic_full import (
@@ -368,7 +369,7 @@ def synthetic_copy_source(points: list[dict[str, Any]]) -> dict[str, Any] | None
         for point_id in source.get("point_ids") or [source.get("point_id")]:
             if point_id and str(point_id) not in point_ids:
                 point_ids.append(str(point_id))
-    kept = ("job_id", "job_name", "repository_id", "repository_name", "point_id", "created_at")
+    kept = ("job_id", "job_name", "repository_id", "repository_name", "point_id", "created_at", "taken_at")
     return {**{key: newest.get(key) for key in kept}, "point_ids": point_ids}
 
 
@@ -883,6 +884,7 @@ def _copy_once(
             "point_ids": [str(point.get("id") or "") for point in points],
             "execution_types": [str(point.get("execution_type") or "") for point in points],
             "created_at": target.get("created_at"),
+            "taken_at": restore_point_taken_at(target),
         }
 
         manifest_payload.update(

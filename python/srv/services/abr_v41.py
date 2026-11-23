@@ -140,7 +140,12 @@ from python.srv.services.backup_copy import (
     missing_copy_sources,
     no_source_left_message,
 )
-from python.srv.services.backup_mode import object_lock_actual_retention_days, object_lock_expiry
+from python.srv.services.backup_mode import (
+    object_lock_actual_retention_days,
+    object_lock_expiry,
+    restore_point_copied_at,
+    restore_point_taken_at,
+)
 from python.srv.services import clock_guard
 from python.srv.services.share_mount import (
     SMB_FILESYSTEMS,
@@ -6460,7 +6465,7 @@ def bind_backup_parent(task: dict[str, Any]) -> dict[str, Any]:
 
 
 def _point_period_key(point: dict[str, Any], *, kind: str) -> str:
-    created = _parse_dt(point.get("created_at"))
+    created = _parse_dt(restore_point_taken_at(point))
     if kind == "weekly":
         iso_year, iso_week, _ = created.isocalendar()
         return f"{iso_year:04d}-W{iso_week:02d}"
@@ -6501,7 +6506,7 @@ def _apply_gfs_marks(points: list[dict[str, Any]], gfs: dict[str, Any]) -> None:
             grouped[_point_period_key(point, kind=key)].append(point)
         chosen = []
         for period_key, bucket in grouped.items():
-            bucket.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")))
+            bucket.sort(key=lambda item: (str(restore_point_taken_at(item) or ""), str(item.get("id") or "")))
             candidates = [item for item in bucket if not _gfs_forced(item)] or bucket
             marked = [item for item in candidates if was_marked.get((key, str(item.get("id") or "")))]
             chosen.append((period_key, marked[0] if marked else candidates[-1]))
@@ -6901,11 +6906,11 @@ def _retention_dates(points: list[dict[str, Any]]) -> dict[str, datetime]:
     descendants = _descendant_ids(points)
     dates: dict[str, datetime] = {}
     for point_id, point in by_id.items():
-        candidates = [_parse_dt(point.get("created_at"))]
+        candidates = [_parse_dt(restore_point_taken_at(point))]
         for child_id in descendants.get(point_id, set()):
             child = by_id.get(child_id)
             if child is not None:
-                candidates.append(_parse_dt(child.get("created_at")))
+                candidates.append(_parse_dt(restore_point_taken_at(child)))
         dates[point_id] = min(candidates)
     return dates
 
@@ -7672,6 +7677,8 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
         {
             "id": point["id"],
             "created_at": point.get("created_at"),
+            "taken_at": restore_point_taken_at(point),
+            "copied_at": restore_point_copied_at(point),
             "execution_type": point.get("execution_type"),
             "execution_reason": point.get("execution_reason"),
             "gfs_marks": point.get("gfs_marks"),
@@ -9552,6 +9559,8 @@ def restore_point_to_dto(point: dict[str, Any]) -> dict[str, Any]:
             "type": point.get("repository_type"),
         },
         "created_at": point.get("created_at"),
+        "taken_at": restore_point_taken_at(point),
+        "copied_at": restore_point_copied_at(point),
         "point_type": _restore_point_type(point),
         "execution_type": point.get("execution_type"),
         "execution_reason": point.get("execution_reason"),
@@ -11797,7 +11806,9 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
     network_text = ", ".join(f"{source} -> {target}" for source, target in sorted((network_map or {}).items()))
     restore_summary = (
         f"{mode_label} recovery of {point.get('vm_name') or point.get('vm_id')} from restore point {point_id} "
-        f"({point.get('created_at')}, {_restore_point_type(point)}) to {target_vm_name} on "
+        f"({restore_point_taken_at(point)}, {_restore_point_type(point)}"
+        + (f", copied {restore_point_copied_at(point)}" if restore_point_copied_at(point) else "")
+        + f") to {target_vm_name} on "
         f"{target_inventory['name']}/{resolved_target_host_name}, storage {target_datastore_name}"
         + (f", datastore mapping {placement_text}" if placement_text and restore_mode != "in_place" else "")
         + (f", network mapping {network_text}" if network_text and restore_mode != "in_place" else "")
