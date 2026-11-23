@@ -235,6 +235,29 @@ location with less free space at its last scan before the session starts. A VM t
 old TPM (BitLocker keys, for one) need their recovery keys; the session warns
 about it.
 
+A restore rides out a short loss of the repository the way a backup does: when
+the host loses the share (a network outage, a Samba restart on the file server
+or on this server) or the S3 storage while it reads a disk, the server waits up
+to `ALTASTOR_HYPERV_RECONNECT_SECONDS` for the host to reach it again, removes
+the unfinished disk and restores that disk again from its full backup, up to
+`ALTASTOR_HYPERV_STORAGE_ATTEMPTS` times, with a warning in the session log.
+A share that does not come back in time, or a disk that cannot be read on any
+attempt, fails the restore naming the host and the share; any other failure
+(a wrong key, a full target volume) is not retried.
+
+A Windows guest restored out of place sees its disks as new ones: with the
+default SAN policy (`OfflineShared`) it boots from the system disk but leaves
+the data disks Offline in Disk Management. The data is there; bring the disks
+online in the guest:
+
+```powershell
+Get-Disk | Where-Object IsOffline | Set-Disk -IsOffline $false
+```
+
+(`Set-Disk -IsReadOnly $false` for a disk that comes up read-only), or set
+`san policy=OnlineAll` with `diskpart` in the source VM beforehand, so later
+restores come up online.
+
 **In place** (`abr restore start --in-place --force`, or *Original location*
 with the typed confirmation in the console) keeps the VM itself -- its id and
 cluster role -- and replaces its disks. The restored disks are written next to

@@ -550,6 +550,15 @@ def common_storage_path(paths: list[str]) -> str:
     return f"/{joined}" if absolute and joined else joined
 
 
+def session_data_folder(manifest: dict[str, Any], manifest_path: str, recorded: str) -> str:
+    if str(manifest.get("storage_mode") or manifest.get("repository_type") or "").strip().lower() == "s3":
+        return recorded
+    written = {str(manifest.get(key) or "").strip() for key in ("backup_root", "repository_storage_path")} - {""}
+    if not recorded or not manifest_path or recorded not in written:
+        return recorded
+    return str(Path(manifest_path).expanduser().parent)
+
+
 def chain_source_names(paths: list[str], names: list[str]) -> tuple[str, list[str]]:
     source_path = common_storage_path(paths)
     base = source_path.strip("/")

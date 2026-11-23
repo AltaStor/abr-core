@@ -254,6 +254,9 @@ class CatalogKeepsTheHeldDateTests(unittest.TestCase):
             "immutability_expires_at": "2026-10-25T00:00:00+00:00",
             "artifact": {"disks": [{"abr_path": "lab/vm-1/full", "abr_backup_name": "vm-1-disk-0"}]},
         }
+        read_back = patch.object(abr_v41, "read_storage_backup_info", return_value={"immutability": "governance", "retention_days": 3650})
+        read_back.start()
+        self.addCleanup(read_back.stop)
 
     def test_apply_immutability_never_asks_for_less_than_the_catalog_holds(self) -> None:
         with (

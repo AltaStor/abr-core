@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import sys
 
 from ..errors import CliStructuredError
 from ..exit_codes import INVALID_USAGE
@@ -41,6 +42,31 @@ def add_secret_argument(
     )
 
 
+_LAST_READ = {"without_terminal": False}
+
+
+def _read_without_terminal(_prompt: str, _stream: object = None) -> str:
+    _LAST_READ["without_terminal"] = True
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError
+    return line.rstrip("\r\n")
+
+
+def read_secret(prompt: str) -> str:
+    _LAST_READ["without_terminal"] = False
+    fallback = getpass.fallback_getpass
+    getpass.fallback_getpass = _read_without_terminal
+    try:
+        return getpass.getpass(prompt)
+    finally:
+        getpass.fallback_getpass = fallback
+
+
+def confirms(prompt: str, secret: str) -> bool:
+    return _LAST_READ["without_terminal"] or read_secret(prompt) == secret
+
+
 def resolve_secret(
     value: str | None,
     *,
@@ -57,8 +83,8 @@ def resolve_secret(
     if from_env:
         return from_env
     try:
-        secret = getpass.getpass(f"{prompt}: ")
-        if secret and confirm and getpass.getpass(f"Confirm {prompt[:1].lower()}{prompt[1:]}: ") != secret:
+        secret = read_secret(f"{prompt}: ")
+        if secret and confirm and not confirms(f"Confirm {prompt[:1].lower()}{prompt[1:]}: ", secret):
             raise CliStructuredError(
                 code="invalid_argument",
                 message=f"The two {prompt.lower()} entries did not match",

@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import stat
 import tempfile
 import unittest
 
@@ -273,7 +274,7 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
         self.assertEqual(request_mock.call_args.kwargs["json"]["name"], "admin")
 
     @patch("python.cli.api.client.requests.request")
-    @patch("python.cli.commands.auth_commands.getpass.getpass", side_effect=EOFError)
+    @patch("getpass.getpass", side_effect=EOFError)
     def test_login_without_a_terminal_or_the_password_variable_is_a_usage_error(self, _getpass, request_mock) -> None:
         os.environ.pop(PASSWORD_ENV_VAR, None)
 
@@ -299,7 +300,7 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
         )
         request_mock.assert_not_called()
 
-    @patch("python.cli.commands.auth_commands.getpass.getpass", side_effect=EOFError)
+    @patch("getpass.getpass", side_effect=EOFError)
     def test_the_cli_answers_a_missing_password_with_one_json_error_and_exit_2(self, _getpass) -> None:
         from python.cli import abr_cli
 
@@ -404,7 +405,7 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
         self.assertEqual(exit_code, 0)
         request_mock.assert_not_called()
 
-    @patch("python.cli.commands.auth_commands.getpass.getpass")
+    @patch("getpass.getpass")
     @patch("python.cli.api.client.requests.request")
     def test_change_password_prompts_for_current_and_new_password(self, request_mock, getpass_mock) -> None:
         getpass_mock.side_effect = ["CurrentPassw0rd", "NewPassw0rd1", "NewPassw0rd1"]
@@ -422,7 +423,7 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
         self.assertIn("Password changed", out.getvalue())
         self.assertEqual(getpass_mock.call_count, 3)
 
-    @patch("python.cli.commands.auth_commands.getpass.getpass")
+    @patch("getpass.getpass")
     @patch("python.cli.api.client.requests.request")
     def test_change_password_current_password_falls_back_to_env_var(self, request_mock, getpass_mock) -> None:
         getpass_mock.side_effect = ["NewPassw0rd1", "NewPassw0rd1"]
@@ -435,7 +436,7 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
         # Only the two "new password" prompts -- current password came from the env var.
         self.assertEqual(getpass_mock.call_count, 2)
 
-    @patch("python.cli.commands.auth_commands.getpass.getpass")
+    @patch("getpass.getpass")
     @patch("python.cli.api.client.requests.request")
     def test_change_password_reprompts_on_mismatched_confirmation(self, request_mock, getpass_mock) -> None:
         getpass_mock.side_effect = ["CurrentPassw0rd", "first-new-pw", "second-new-pw", "match-pw", "match-pw"]
@@ -447,7 +448,7 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
         self.assertEqual(request_mock.call_args.kwargs["json"]["new_password"], "match-pw")
         self.assertIn("didn't match", err.getvalue())
 
-    @patch("python.cli.commands.auth_commands.getpass.getpass")
+    @patch("getpass.getpass")
     @patch("python.cli.api.client.requests.request")
     def test_change_password_reprompts_on_too_short_new_password(self, request_mock, getpass_mock) -> None:
         getpass_mock.side_effect = ["CurrentPassw0rd", "short", "longenoughpw", "longenoughpw"]
@@ -459,7 +460,7 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
         self.assertEqual(request_mock.call_args.kwargs["json"]["new_password"], "longenoughpw")
         self.assertIn("at least 8 characters", err.getvalue())
 
-    @patch("python.cli.commands.auth_commands.getpass.getpass")
+    @patch("getpass.getpass")
     @patch("python.cli.api.client.requests.request")
     def test_change_password_propagates_wrong_current_password_error(self, request_mock, getpass_mock) -> None:
         import requests
@@ -479,7 +480,7 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
 
 
 class UserCommandsTests(_IsolatedConfigDirCase):
-    @patch("python.cli.commands.user_commands.getpass.getpass")
+    @patch("getpass.getpass")
     @patch("python.cli.api.client.requests.request")
     def test_add_prompts_for_and_confirms_password(self, request_mock, getpass_mock) -> None:
         getpass_mock.side_effect = ["Passw0rd!", "Passw0rd!"]
@@ -495,7 +496,7 @@ class UserCommandsTests(_IsolatedConfigDirCase):
             {"name": "alice", "fullName": "Alice", "role": "backup_operator", "password": "Passw0rd!"},
         )
 
-    @patch("python.cli.commands.user_commands.getpass.getpass")
+    @patch("getpass.getpass")
     def test_add_reprompts_on_password_mismatch(self, getpass_mock) -> None:
         getpass_mock.side_effect = ["first-pass", "second-pass", "match-pass", "match-pass"]
         with patch("python.cli.api.client.requests.request") as request_mock:
@@ -548,6 +549,63 @@ class CliUnauthorizedExitCodeTests(_IsolatedConfigDirCase):
                 with self.assertRaises(SystemExit) as exc:
                     main(["repo", "list"])
         self.assertEqual(exc.exception.code, UNAUTHORIZED)
+
+
+
+
+
+class PrivateConfigFileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        base = tempfile.TemporaryDirectory(prefix="abr-config-")
+        self.addCleanup(base.cleanup)
+        self.config = Path(base.name) / "cfg"
+        environment = patch.dict(os.environ, {token_store.CONFIG_DIR_ENV_VAR: str(self.config)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_the_token_file_is_0600_from_its_first_byte_in_a_0700_directory(self) -> None:
+        seen: list[int] = []
+        create = tempfile.mkstemp
+
+        def watched(*args, **kwargs):
+            descriptor, name = create(*args, **kwargs)
+            seen.append(stat.S_IMODE(os.fstat(descriptor).st_mode))
+            return descriptor, name
+
+        with patch("python.cli.token_store.tempfile.mkstemp", side_effect=watched):
+            token_store.save_token("http://a.test", "tok-1", "2099-01-01T00:00:00+00:00")
+
+        self.assertEqual(seen, [0o600])
+        self.assertEqual(stat.S_IMODE((self.config / "credentials.json").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o700)
+        self.assertEqual(token_store.load_token("http://a.test"), "tok-1")
+
+    def test_an_existing_looser_file_is_replaced_by_a_0600_one(self) -> None:
+        self.config.mkdir(mode=0o755)
+        (self.config / "credentials.json").write_text("{}")
+        os.chmod(self.config / "credentials.json", 0o644)
+
+        token_store.save_token("http://a.test", "tok-2", "2099-01-01T00:00:00+00:00")
+
+        self.assertEqual(stat.S_IMODE((self.config / "credentials.json").stat().st_mode), 0o600)
+        self.assertEqual(token_store.load_token("http://a.test"), "tok-2")
+
+    def test_a_failed_write_leaves_the_old_file_and_no_temporary_one(self) -> None:
+        token_store.save_token("http://a.test", "tok-old", "2099-01-01T00:00:00+00:00")
+
+        with patch("python.cli.token_store.json.dumps", side_effect=ValueError("boom")), self.assertRaises(ValueError):
+            token_store.save_token("http://a.test", "tok-new", "2099-01-01T00:00:00+00:00")
+
+        self.assertEqual(sorted(path.name for path in self.config.iterdir()), ["credentials.json"])
+        self.assertEqual(token_store.load_token("http://a.test"), "tok-old")
+
+    def test_the_trusted_certificates_file_is_written_the_same_way(self) -> None:
+        from python.cli import tls_trust
+
+        tls_trust._save_all({"https://a.test": "sha256:00"})
+
+        self.assertEqual(stat.S_IMODE((self.config / "trusted_certs.json").stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o700)
 
 
 if __name__ == "__main__":

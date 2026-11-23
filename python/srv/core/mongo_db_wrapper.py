@@ -55,6 +55,10 @@ _DATABASE: Database | None = None
 _T = TypeVar("_T")
 
 
+CATALOG_UNAVAILABLE_MESSAGE = "The catalog database is unavailable. Retry once it recovers."
+CATALOG_WRITE_FAILED_MESSAGE = "The catalog database is unavailable; the change was not applied. Retry once it recovers."
+
+
 def _run_db_write(write: Callable[[], _T]) -> _T:
     try:
         return write()
@@ -70,7 +74,7 @@ def _run_db_write(write: Callable[[], _T]) -> _T:
         raise api_error(
             503,
             "catalog_unavailable",
-            "The catalog database is unavailable; the change was not applied. Retry once it recovers.",
+            CATALOG_WRITE_FAILED_MESSAGE,
         ) from exc
 
 
@@ -561,8 +565,21 @@ def delete_backup(backup_id: str) -> bool:
 def load_system_state(state_id: str) -> dict[str, Any] | None:
     db = get_database()
     if db is not None:
-        record = db.get("system_state", "id", state_id)
-        return _normalize_record(record) if isinstance(record, dict) else None
+        try:
+            record = db.get("system_state", "id", state_id)
+        except PyMongoError as exc:
+            with CATALOG_LOCK:
+                known = SYSTEM_STATE.get(state_id)
+            if known is None:
+                raise api_error(503, "catalog_unavailable", CATALOG_UNAVAILABLE_MESSAGE) from exc
+            return dict(known)
+        normalized = _normalize_record(record) if isinstance(record, dict) else None
+        with CATALOG_LOCK:
+            if normalized is None:
+                SYSTEM_STATE.pop(state_id, None)
+            else:
+                SYSTEM_STATE[state_id] = dict(normalized)
+        return normalized
     with CATALOG_LOCK:
         record = SYSTEM_STATE.get(state_id)
         return dict(record) if record else None

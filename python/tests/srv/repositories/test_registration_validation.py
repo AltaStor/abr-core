@@ -152,6 +152,53 @@ class S3RegistrationValidationTests(unittest.TestCase):
         probe.assert_not_called()
 
 
+class S3OverlapTests(unittest.TestCase):
+    setUp = S3RegistrationValidationTests.setUp
+    tearDown = S3RegistrationValidationTests.tearDown
+
+    def _add(self, name: str, **s3) -> dict:
+        payload = {**S3_PAYLOAD, "name": name, "s3": {**S3_PAYLOAD["s3"], **s3}}
+        with patch.object(abr_v41, "probe_repository_access"):
+            return abr_v41.create_repository_record(payload)
+
+    def _refused(self, call) -> ApiError:
+        with self.assertRaises(ApiError) as caught:
+            call()
+        return caught.exception
+
+    def test_a_bucket_and_prefix_equal_inside_or_around_another_are_refused(self) -> None:
+        self._add("A", prefix="x/a")
+        for prefix in ("x/a", "x/a/", "/x/a", "x/a/b", "x", ""):
+            with self.subTest(prefix=prefix):
+                error = self._refused(lambda prefix=prefix: self._add("B", prefix=prefix))
+
+                self.assertEqual((error.status_code, error.code), (409, "repository_path_overlaps"))
+                self.assertIn("repository A", error.message)
+        self.assertEqual(sorted(record["name"] for record in REPOSITORIES.values()), ["A"])
+
+    def test_siblings_other_buckets_and_other_endpoints_are_taken(self) -> None:
+        self._add("A", prefix="x/a")
+        for name, s3 in (
+            ("sibling", {"prefix": "x/c"}),
+            ("not a path prefix", {"prefix": "x/ab"}),
+            ("other bucket", {"bucket": "other-bucket", "prefix": "x/a"}),
+            ("other endpoint", {"endpoint_url": "http://minio-2.local:9000", "prefix": "x/a"}),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(self._add(name, **s3)["name"], name)
+
+    def test_an_edit_onto_another_repository_is_refused_and_keeps_the_prefix(self) -> None:
+        self._add("A", prefix="x/a")
+        moved = self._add("B", prefix="y")
+
+        with patch.object(abr_v41, "probe_repository_access"):
+            error = self._refused(lambda: abr_v41.edit_repository_record(moved["id"], {"prefix": "x/a/inner"}))
+            abr_v41.edit_repository_record(moved["id"], {"description": "kept"})
+
+        self.assertEqual(error.code, "repository_path_overlaps")
+        self.assertEqual(REPOSITORIES[moved["id"]]["metadata"]["s3"]["prefix"], "y")
+
+
 class BucketProvisioningTests(unittest.TestCase):
     def setUp(self) -> None:
         REPOSITORIES.clear()
@@ -428,7 +475,7 @@ class SmbRegistrationValidationTests(_FolderCase):
         with self.assertRaises(ApiError) as caught:
             abr_v41.edit_repository_record(repository["id"], {"password": ""})
 
-        self.assertIn("needs --password with --username", caught.exception.message)
+        self.assertIn("needs password with username", caught.exception.message)
 
     def test_a_password_without_an_account_is_refused_on_create_and_on_edit(self) -> None:
         with self.assertRaises(ApiError) as created:

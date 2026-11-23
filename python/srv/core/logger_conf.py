@@ -157,6 +157,11 @@ def normalize_log_level(level: str) -> str:
     return "WARNING" if name == "WARN" else name
 
 
+class IsoTimeFormatter(logging.Formatter):
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        return datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="milliseconds")
+
+
 class WinrmDetailFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return record.levelno >= logging.WARNING or not (record.name == "pypsrp" or record.name.startswith("pypsrp."))
@@ -174,8 +179,8 @@ def _build_logging_config(log_dir: str, component: str, file_level: str = "DEBUG
                 "datefmt": "%H:%M:%S",
             },
             "file_format": {
+                "()": IsoTimeFormatter,
                 "format": "%(asctime)s | %(levelname)-8s | PID:%(process)d | %(name)s:%(funcName)s:%(lineno)d | %(message)s",
-                "datefmt": "%Y-%m-%d %H:%M:%S",
             },
         },
         "handlers": {

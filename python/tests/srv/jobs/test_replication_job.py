@@ -239,6 +239,32 @@ class ReplicationJobSettingsTests(unittest.TestCase):
         self.assertEqual(self._refused(self._create, target_host="esx-missing").status_code, 404)
         self.assertIn(self._refused(self._create, target_datastore="ds-missing").status_code, (404, 422))
 
+    def test_each_refusal_names_what_it_did_not_find(self) -> None:
+        cases = (
+            ({"source_job": "no-such-job"}, "Job not found: no-such-job"),
+            ({"target_host": "no-such-host"}, "Target host not found in inventory vc-dr: no-such-host"),
+            ({"target_datastore": "no-such-ds"}, "Target datastore not found in inventory vc-dr: no-such-ds"),
+        )
+        for changes, message in cases:
+            with self.subTest(changes=changes):
+                error = self._refused(self._create, **changes)
+
+                self.assertEqual((error.status_code, error.message), (404, message))
+                self.assertEqual([job for job in JOBS.values() if job["name"] == "sql-dr"], [])
+
+    def test_a_network_map_names_the_network_it_did_not_find(self) -> None:
+        error = self._refused(
+            abr_v41._ensure_restore_network_map_targets,
+            {"VM Network": "no-such-net"},
+            source_networks=["VM Network"],
+            target_networks=[{"name": "DR Network"}],
+            off_host_names=set(),
+            target_inventory_id=self.target_inventory["id"],
+            host=None,
+        )
+
+        self.assertEqual((error.status_code, error.message), (404, "Target network not found in inventory vc-dr: no-such-net"))
+
     def test_a_start_point_of_another_vm_is_refused_and_one_of_ours_is_kept(self) -> None:
         self._backup_job("web", [("vm-2", "web-01")])
         self._point("rp-w", "web", "vm-2", "web-01", "2026-11-01T01:00:00+00:00")

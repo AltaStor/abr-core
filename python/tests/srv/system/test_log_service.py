@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import logging
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 try:
@@ -20,6 +23,7 @@ except ModuleNotFoundError:
 
 from python.srv.api.auth_guard import require_session
 from python.srv.backup_server import app
+from python.srv.core import logger_conf
 from python.srv.services import system_log_service
 
 
@@ -47,6 +51,38 @@ class SystemLogParsingTests(unittest.TestCase):
         # No timezone in the file means local time, so the record has to carry
         # the appliance's offset rather than silently claiming UTC.
         self.assertRegex(entry["ts"], r"(\+|-)\d{2}:\d{2}$")
+
+    def test_parses_a_line_with_the_iso_time_and_its_offset(self) -> None:
+        (entry,) = system_log_service.parse_log_text(
+            _line("2026-11-21T12:40:22.123+02:00", "INFO", "python.srv.core.task_pool", "Task completed")
+        )
+
+        self.assertEqual(entry["ts"], "2026-11-21T12:40:22.123000+02:00")
+        self.assertEqual(entry["message"], "Task completed")
+
+    def test_a_file_with_lines_of_both_formats_is_parsed_whole(self) -> None:
+        text = "\n".join(
+            [
+                _line("2026-11-21 12:40:21", "INFO", "python.srv", "before the upgrade"),
+                _line("2026-11-21T12:40:22.001+02:00", "INFO", "python.srv", "after the upgrade"),
+            ]
+        )
+
+        entries = system_log_service.parse_log_text(text)
+
+        self.assertEqual(sorted(entry["message"] for entry in entries), ["after the upgrade", "before the upgrade"])
+        self.assertTrue(all(re.search(r"[+-]\d{2}:\d{2}$", entry["ts"]) for entry in entries))
+
+    def test_the_line_the_server_writes_carries_its_offset_and_is_parsed_back(self) -> None:
+        config = logger_conf._build_logging_config(tempfile.gettempdir(), "srv")["formatters"]["file_format"]
+        formatter = config["()"](config["format"])
+        record = logging.LogRecord("python.srv.core.task_pool", logging.INFO, __file__, 7, "Task completed", None, None, "run")
+
+        line = formatter.format(record)
+        (entry,) = system_log_service.parse_log_text(line)
+
+        self.assertRegex(line, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2} \| INFO ")
+        self.assertAlmostEqual(datetime.fromisoformat(entry["ts"]).timestamp(), record.created, delta=0.001)
 
     def test_critical_folds_into_error(self) -> None:
         (entry,) = system_log_service.parse_log_text(

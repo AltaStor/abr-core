@@ -9,7 +9,6 @@ import logging
 import os
 import socket
 import ssl
-import stat
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -18,7 +17,7 @@ from cryptography.hazmat.primitives import serialization
 
 from .errors import CliStructuredError
 from .exit_codes import GENERAL_ERROR
-from .token_store import CONFIG_DIR_ENV_VAR
+from .token_store import CONFIG_DIR_ENV_VAR, write_private_json
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +45,7 @@ def _load_all() -> dict[str, str]:
 
 
 def _save_all(data: dict[str, str]) -> None:
-    path = _trust_store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    write_private_json(_trust_store_path(), data)
 
 
 def _presented_certificate(context: ssl.SSLContext, host: str, port: int, timeout: float) -> bytes:

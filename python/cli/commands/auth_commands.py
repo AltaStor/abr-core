@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import getpass
 import os
 import re
 import sys
@@ -15,6 +14,7 @@ from ..cli_context import TOKEN_ENV_VAR
 from ..compact_help_formatter import CompactHelpFormatter
 from ..errors import CliStructuredError
 from ..exit_codes import INVALID_USAGE
+from ..parsing.secret_arguments import confirms, read_secret
 from .base import CommandDependencies
 
 USERNAME_ENV_VAR = "ABR_USERNAME"
@@ -38,7 +38,7 @@ def _prompt_totp_code() -> str:
     its history. Recovery codes are for the Web UI only."""
     while True:
         code = re.sub(r"\s", "", _prompt(
-            getpass.getpass,
+            read_secret,
             "Authentication code: ",
             missing="This account uses two-factor sign-in: run abr auth login in a terminal to enter the code",
         ))
@@ -146,7 +146,7 @@ class AuthCommands:
                 missing=f"No user name provided; pass --name, set {USERNAME_ENV_VAR} or run interactively",
             )
         password = os.environ.get(PASSWORD_ENV_VAR) or _prompt(
-            getpass.getpass,
+            read_secret,
             "Password: ",
             missing=f"No password provided; set {PASSWORD_ENV_VAR} or run interactively",
         )
@@ -212,7 +212,7 @@ class AuthCommands:
 
     def change_password(self, args) -> int:
         deps = CommandDependencies(args)
-        current_password = os.environ.get(PASSWORD_ENV_VAR) or getpass.getpass("Current password: ")
+        current_password = os.environ.get(PASSWORD_ENV_VAR) or read_secret("Current password: ")
         new_password = self._prompt_new_password()
 
         deps.context.api_client.post(
@@ -225,13 +225,12 @@ class AuthCommands:
     @staticmethod
     def _prompt_new_password() -> str:
         while True:
-            password = getpass.getpass("New password: ")
+            password = read_secret("New password: ")
             if len(password) < 8:
                 print("Password must be at least 8 characters", file=sys.stderr)
                 continue
 
-            confirm = getpass.getpass("Confirm new password: ")
-            if password != confirm:
+            if not confirms("Confirm new password: ", password):
                 print("Passwords didn't match", file=sys.stderr)
                 continue
 

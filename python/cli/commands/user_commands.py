@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import sys
 
 from ..compact_help_formatter import CompactHelpFormatter
 from ..parsing.common_arguments import add_name_or_id_selector
+from ..parsing.secret_arguments import confirms, read_secret
 from .base import CommandDependencies
 
 ROLE_HELP = (
@@ -133,13 +133,12 @@ class UserCommands:
     @staticmethod
     def _prompt_new_password(prompt: str = "Set password for new user: ") -> str:
         while True:
-            password = getpass.getpass(prompt)
+            password = read_secret(prompt)
             if len(password) < 8:
                 print("Password must be at least 8 characters", file=sys.stderr)
                 continue
 
-            confirm = getpass.getpass("Confirm password: ")
-            if password != confirm:
+            if not confirms("Confirm password: ", password):
                 print("Passwords didn't match", file=sys.stderr)
                 continue
 

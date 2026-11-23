@@ -21,7 +21,7 @@ from python.srv.services import two_factor
 from python.tests.cli.test_rbac_cli import CliApiCase
 from python.tests.srv.rbac.rbac_case import ADMIN_PASSWORD
 
-PROMPT = "python.cli.commands.auth_commands.getpass.getpass"
+PROMPT = "getpass.getpass"
 
 
 class TwoFactorCliTests(CliApiCase):

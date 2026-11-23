@@ -17,6 +17,7 @@ import shutil
 import socket
 import stat
 import threading
+import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time, timedelta, timezone
@@ -73,6 +74,7 @@ from python.srv.core.secure_archive import (
 from python.srv.core.storage_tool import (
     IMMUTABILITY_MODES,
     IMMUTABILITY_RETENTION_SCOPES,
+    MANIFEST_BACKUP_NAME,
     STORAGE_LAYOUT_BY_ID,
     STORAGE_LAYOUT_BY_NAME,
     DiskToolCorruptBackup,
@@ -104,6 +106,7 @@ from python.srv.core.storage_tool import (
     s3_block_generation_days,
     s3_endpoint_connect_error,
     sanitize_s3_config,
+    session_data_folder,
     verify_disk_tool_backup,
 )
 from python.srv.core.time_zones import load_zone
@@ -652,6 +655,29 @@ def _ensure_ascii_text(
         )
 
 
+LINE_BREAKING_CATEGORIES = frozenset({"Cc", "Zl", "Zp"})
+
+
+def _ensure_description_text(value: str | None, *, field: str, code: str) -> None:
+    if not value:
+        return
+    details: dict[str, Any] = {"field": field, "max_length": MAX_LONG_TEXT_LENGTH, "value": value}
+    _ensure(
+        len(value) <= MAX_LONG_TEXT_LENGTH,
+        400,
+        code,
+        f"{field} must be at most {MAX_LONG_TEXT_LENGTH} characters",
+        **details,
+    )
+    _ensure(
+        not any(unicodedata.category(character) in LINE_BREAKING_CATEGORIES for character in value),
+        400,
+        code,
+        f"{field} must be one line without control characters",
+        **details,
+    )
+
+
 def _validate_text_fields(
     payload: dict[str, Any],
     specs: tuple[tuple[str, str, int, bool], ...] | tuple[tuple[str, str, int, bool, bool], ...],
@@ -704,14 +730,14 @@ def _find_by_id(items: Iterable[dict[str, Any]], record_id: str, *, label: str) 
     for item in items:
         if str(item.get("id") or "") == str(record_id):
             return item
-    raise api_error(404, f"{label.lower()}_not_found", f"{label} not found", record_id=record_id)
+    raise api_error(404, f"{label.lower()}_not_found", f"{label} not found: {record_id}", record_id=record_id)
 
 
 def _find_by_name(items: Iterable[dict[str, Any]], name: str, *, label: str) -> dict[str, Any]:
     lowered = str(name).lower()
     matches = [item for item in items if str(item.get("name") or "").lower() == lowered]
     if not matches:
-        raise api_error(404, f"{label.lower()}_not_found", f"{label} not found", name=name)
+        raise api_error(404, f"{label.lower()}_not_found", f"{label} not found: {name}", name=name)
     if len(matches) > 1:
         raise api_error(409, f"ambiguous_{label.lower()}", f"Multiple {label.lower()} records matched the provided name", name=name)
     return matches[0]
@@ -1926,12 +1952,28 @@ def _apply_inventory_identity(record: dict[str, Any], identity: Any) -> dict[str
     return _record_inventory_identity(record, identity)
 
 
-def _recheck_inventory_connection(record: dict[str, Any]) -> dict[str, Any]:
+def _untrusted_certificate_error(record: dict[str, Any], exc: InventoryUnreachableError) -> ApiError:
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    host = str(metadata.get("host") or "")
+    port = int(metadata.get("port", 443) or 443)
+    message = (
+        f"The TLS certificate of {host}:{port} is not trusted by this appliance, so certificate verification is not "
+        f"turned on, and inventory {record.get('name')} is left as it was. Keep it --insecure, or give {host} a "
+        "certificate this appliance trusts"
+        if inventory_type_from_record(record) == "vsphere"
+        else f"{exc}. Inventory {record.get('name')} is left as it was"
+    )
+    return api_error(422, "inventory_unreachable", message, address=host, port=port, reason=exc.reason)
+
+
+def _recheck_inventory_connection(record: dict[str, Any], *, refuse_untrusted_certificate: bool = False) -> dict[str, Any]:
     updated = dict(record)
     checked_at = utc_now()
     try:
         proof = _proof_of_connection(assert_inventory_registrable(updated))
     except (EsxHostInClusterError, InventoryUnreachableError) as exc:
+        if refuse_untrusted_certificate and getattr(exc, "reason", None) == "certificate":
+            raise _untrusted_certificate_error(updated, exc) from exc
         updated["status"] = "unavailable"
         updated["status_error"] = str(exc)
         updated["status_checked_at"] = checked_at
@@ -1984,8 +2026,12 @@ def edit_inventory_record(record_id: str, payload: dict[str, Any]) -> dict[str, 
         normalized = apply_inventory_updates(normalized, updates)
     _ensure(any(key in payload for key in ("name", "address", "port", "protocol", "username", "password", "description", "token", "insecure", "api", "transport", "vddk_library")), 422, "invalid_inventory", "inventory edit requires at least one editable option")
     if connection_fields_changed(payload):
+        verifies = bool((normalized.get("metadata") or {}).get("verify_ssl", True))
+        endpoint_or_tls_changed = payload.get("insecure") is False or any(
+            payload.get(field) is not None for field in ("address", "port", "protocol")
+        )
         try:
-            normalized = _recheck_inventory_connection(normalized)
+            normalized = _recheck_inventory_connection(normalized, refuse_untrusted_certificate=verifies and endpoint_or_tls_changed)
         except HyperVAlreadyRegisteredError as exc:
             raise _already_registered_error(exc) from exc
     persist_hypervisor(normalized)
@@ -2785,7 +2831,7 @@ def _ensure_smb_repository_share(
         bool(str(server or "").strip()) and bool(str(share or "").strip()),
         422,
         "invalid_repository",
-        "smb repositories require --server and --share, or --address \\\\server\\share",
+        "smb repositories require server and share, or address \\\\server\\share",
     )
     account = str(username or "").strip()
     previous = str(previous_username or "").strip()
@@ -2794,7 +2840,7 @@ def _ensure_smb_repository_share(
         bool(account) or not given,
         422,
         "invalid_repository",
-        "An SMB repository's password needs the account it belongs to: give --username with --password, or "
+        "An SMB repository's password needs the account it belongs to: give username with password, or "
         "leave both out so the hosts open the share with the inventory's account",
     )
     keeps_stored = bool(previous) and account == previous and bool(str(stored_password or ""))
@@ -2802,10 +2848,10 @@ def _ensure_smb_repository_share(
         not account or given or keeps_stored,
         422,
         "invalid_repository",
-        f"The account {account} needs its own password: give --password with --username; the password of "
+        f"The account {account} needs its own password: give password with username; the password of "
         f"{previous} is not used for another account"
         if previous and account != previous
-        else "An SMB repository's account needs --password with --username",
+        else "An SMB repository's account needs password with username",
     )
 
 
@@ -2817,20 +2863,20 @@ def _refuse_local_repository_share(server: Any, share: Any) -> None:
         422,
         "invalid_repository",
         "A local repository has no SMB share: add the folder as an SMB repository "
-        "(--type smb --path --server --share) for Hyper-V hosts to reach it",
+        "(type smb, with path, server and share) for Hyper-V hosts to reach it",
     )
 
 
 def _ensure_appliance_folder(repo_type: str, path: str) -> None:
     """A file repository's path is a folder of this appliance; for an SMB one,
     where the appliance mounts the share, never the share itself."""
-    _ensure(bool(path), 422, "invalid_repository", f"{repo_type} repositories require --path")
+    _ensure(bool(path), 422, "invalid_repository", f"{repo_type} repositories require path")
     _ensure(
         repo_type != "smb" or not SMB_PATTERN.fullmatch(path.replace("\\", "/")),
         422,
         "invalid_repository",
-        "An SMB repository's --path is the folder this appliance mounts the share at; "
-        "give the share itself with --address or --server and --share",
+        "An SMB repository's path is the folder this appliance mounts the share at; "
+        "give the share itself as address, or as server and share",
         path=path,
     )
 
@@ -2840,14 +2886,14 @@ def _ensure_mountable_share(server: str | None, share: str | None, username: str
         bool(server) and bool(share),
         422,
         "invalid_repository",
-        "smb repositories require --address \\\\server\\share, or --server and --share",
+        "smb repositories require address \\\\server\\share, or server and share",
     )
     _ensure(
         bool(username) and bool(password),
         422,
         "invalid_repository",
-        "A share this server mounts needs --username and --password: its traffic is encrypted, which needs an account. "
-        "Give --path for a share mounted by hand",
+        "A share this server mounts needs username and password: its traffic is encrypted, which needs an account. "
+        "Give path for a share mounted by hand",
     )
 
 
@@ -2931,13 +2977,15 @@ def create_repository_record(
             parsed_server, parsed_share = _split_repository_address(repo_type, raw_address)
             server = server or parsed_server
             share = share or parsed_share
-        _ensure(bool(server), 422, "invalid_repository", f"{repo_type} repositories require --server")
-        _ensure(bool(share), 422, "invalid_repository", f"{repo_type} repositories require --share")
+        _ensure(bool(server), 422, "invalid_repository", f"{repo_type} repositories require server")
+        _ensure(bool(share), 422, "invalid_repository", f"{repo_type} repositories require share")
         path = _build_repository_path(repo_type, server, share)
     for existing in catalog_records(REPOSITORIES):
         if str(existing.get("name") or "").lower() == name.lower():
             raise api_error(409, "repository_name_exists", "Repository name already exists", name=name)
-    if repo_type != "s3":
+    if repo_type == "s3":
+        _refuse_overlapping_s3_repository(s3_config)
+    else:
         conflict = _find_overlapping_repository(path)
         if conflict is not None:
             raise api_error(
@@ -3113,6 +3161,8 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         _reject_storage_location_change_if_repository_has_backups(
             record_id, original_path=original_path, new_path=next_path
         )
+        if _s3_storage_key(next_s3) != _s3_storage_key(current_s3):
+            _refuse_overlapping_s3_repository(next_s3, exclude_id=record_id)
         comparable_metadata = dict(metadata)
         if isinstance(comparable_metadata.get("s3"), dict):
             comparable_s3 = dict(comparable_metadata["s3"])
@@ -3139,8 +3189,8 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
             changed = True
         server = str(metadata.get("server") or "").strip()
         share = str(metadata.get("share") or "").strip()
-        _ensure(bool(server), 422, "invalid_repository", f"{repo_type} repositories require --server")
-        _ensure(bool(share), 422, "invalid_repository", f"{repo_type} repositories require --share")
+        _ensure(bool(server), 422, "invalid_repository", f"{repo_type} repositories require server")
+        _ensure(bool(share), 422, "invalid_repository", f"{repo_type} repositories require share")
         updated["path"] = _build_repository_path(repo_type, server, share)
     for field_name in ("username", "password", "description"):
         if repo_type == "s3":
@@ -3485,6 +3535,7 @@ def repository_actual_retention_days(job: dict[str, Any] | None, immutability: d
     )
 
 
+OBJECT_LOCK_CHECK_MARGIN_SECONDS = 300
 OBJECT_LOCK_UNAVAILABLE_HINT = (
     "Either this storage does not implement Object Lock at all, or the bucket was created without it - "
     "Object Lock can only be turned on when a bucket is created, never afterwards - or the credentials "
@@ -3932,6 +3983,16 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
                 )
         if point_failed:
             continue
+        targets = _restore_point_abr_targets(point)
+        data_absent = any(
+            isinstance(result, dict) and result.get("metadata_only") and name != MANIFEST_BACKUP_NAME
+            for result, (_path, name) in zip(results, targets)
+        )
+        if str(point.get("id") or "") == segment_id or point.get("full_backup") or data_absent:
+            shortfall = _object_lock_shortfall(repository, targets, target)
+            if shortfall is not None:
+                failures.append({"restore_point_id": str(point.get("id") or ""), **shortfall})
+                continue
         stored = BACKUPS.get(str(point.get("id") or ""))
         if isinstance(stored, dict):
             stored = dict(stored)
@@ -3940,6 +4001,33 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
         extended.append(str(point.get("id") or ""))
 
     return {"extended_restore_points": extended, "failures": failures, "retention_days": remaining_days}
+
+
+def _object_lock_shortfall(repository: dict[str, Any], targets: list[tuple[str, str]], target: datetime) -> dict[str, Any] | None:
+    for abr_path, backup_name in targets:
+        if backup_name == MANIFEST_BACKUP_NAME:
+            continue
+        span = (target - _now_utc()).total_seconds() - OBJECT_LOCK_CHECK_MARGIN_SECONDS
+        needed = max(int(-(-span // 86400)), 1)
+        try:
+            info = read_storage_backup_info(repository, abr_path, backup_name, timeout=_s3_immutability_probe_timeout())
+        except StorageToolError as exc:
+            return {
+                "backup_name": backup_name,
+                "message": f"its Object Lock could not be read back after the extension: {condense_disk_tool_message(exc)}",
+            }
+        locked = isinstance(info, dict) and normalize_immutability_mode(info.get("immutability")) != "none"
+        held = int(info.get("retention_days") or 0) if locked else 0
+        if held < needed:
+            return {
+                "backup_name": backup_name,
+                "message": (
+                    f"the storage still holds it for only {held} more day(s), not the {needed} the newer backups on it need"
+                    if held
+                    else "the storage does not hold it under Object Lock any more"
+                ),
+            }
+    return None
 
 
 def _applied_period_text(applied_days: set[int], config: dict[str, Any]) -> str:
@@ -4584,7 +4672,7 @@ def normalize_job_record(record: dict[str, Any]) -> dict[str, Any]:
         task_parameters = metadata.get("task_parameters") if isinstance(metadata.get("task_parameters"), dict) else {}
     item["task_parameters"] = dict(task_parameters)
     item["enabled"] = _job_is_enabled(item)
-    item["schedule_state"] = "enabled" if item["schedule"] and item["enabled"] else "disabled" if item["schedule"] else "manual"
+    item["schedule_state"] = "disabled" if not item["enabled"] else "enabled" if item["schedule"] else "manual"
     item["vm_count"] = len(item["vm_ids"]) or len(item["vm_names"])
     if not item["enabled"]:
         item["status"] = "disabled"
@@ -4704,6 +4792,22 @@ def _schedule_from_request(raw: Any) -> dict[str, Any] | None:
     return _ensure_known_timezone(normalize_schedule_payload(raw))
 
 
+MIN_SYNTHETIC_FULL_MINUTES = 24 * 60
+
+
+def _synthetic_schedule_from_request(raw: Any) -> dict[str, Any] | None:
+    schedule = _schedule_from_request(raw)
+    if isinstance(schedule, dict) and schedule.get("kind") == "periodic":
+        _ensure(
+            int(schedule.get("interval_minutes") or 0) >= MIN_SYNTHETIC_FULL_MINUTES,
+            422,
+            "invalid_schedule",
+            f"A synthetic full rewrites the whole chain, so it runs at most once a day: every must be at least 1d, not {schedule.get('every')}",
+            every=schedule.get("every"),
+        )
+    return schedule
+
+
 def _ensure_unique_vms(vm_ids: list[str], vm_names: list[str]) -> None:
     seen: set[str] = set()
     for vm_id, vm_name in zip(vm_ids, vm_names):
@@ -4722,17 +4826,46 @@ def _coerce_gfs_enabled(value: Any, *, default: bool = True) -> bool:
     return default if value is None else bool(value)
 
 
-def _ensure_encryption_key_strength(task_parameters: Any) -> None:
+MIN_ENCRYPTION_KEY_LENGTH = 12
+MIN_ENCRYPTION_KEY_CLASSES = 3
+
+
+def _encryption_key_classes(key: str) -> int:
+    return sum(
+        (
+            any(character.islower() for character in key),
+            any(character.isupper() for character in key),
+            any(character.isdigit() for character in key),
+            any(not character.isalnum() for character in key),
+        )
+    )
+
+
+def _known_encryption_keys(task_parameters: Any) -> set[str]:
+    stored = task_parameters if isinstance(task_parameters, dict) else {}
+    keys = {str(entry.get("key") or "") for entry in stored.get("encryption_keys") or [] if isinstance(entry, dict)}
+    keys.add(str(stored.get("encryption_key") or ""))
+    return {key.strip() for key in keys if key.strip()}
+
+
+def _ensure_encryption_key_strength(task_parameters: Any, known: set[str] | None = None) -> None:
     if not isinstance(task_parameters, dict):
         return
     key = task_parameters.get("encryption_key")
-    if not isinstance(key, str) or not key.strip():
+    if not isinstance(key, str) or not key.strip() or key.strip() in (known or set()):
         return
     _ensure(
-        len(key.strip()) >= MIN_PASSWORD_LENGTH,
+        key == key.strip(),
         422,
         "invalid_job",
-        f"Encryption key must be at least {MIN_PASSWORD_LENGTH} characters.",
+        "Encryption key must not start or end with a space: the key would be stored without it.",
+    )
+    _ensure(
+        len(key) >= MIN_ENCRYPTION_KEY_LENGTH and _encryption_key_classes(key) >= MIN_ENCRYPTION_KEY_CLASSES,
+        422,
+        "invalid_job",
+        f"Encryption key must be at least {MIN_ENCRYPTION_KEY_LENGTH} characters and mix at least "
+        f"{MIN_ENCRYPTION_KEY_CLASSES} of: lowercase letters, uppercase letters, digits, symbols.",
     )
 
 
@@ -5251,7 +5384,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     active_full_days = _normalize_day_list(payload.get("active_full_days") or _split_csv(payload.get("active_full_days_csv")))
     synthetic_full_days = _normalize_day_list(payload.get("synthetic_full_days") or _split_csv(payload.get("synthetic_full_days_csv")))
     active_full_schedule = _schedule_from_request(payload.get("active_full_schedule"))
-    synthetic_full_schedule = _schedule_from_request(payload.get("synthetic_full_schedule"))
+    synthetic_full_schedule = _synthetic_schedule_from_request(payload.get("synthetic_full_schedule"))
     if "active_full_schedule" in payload and not _schedule_weekdays(active_full_schedule):
         active_full_days = []
     if "synthetic_full_schedule" in payload and not _schedule_weekdays(synthetic_full_schedule):
@@ -5284,7 +5417,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     task_parameters = _validate_task_parameters(task_parameters)
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
-    _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+    _ensure_description_text(description, field="Job description", code="invalid_job")
     _ensure(retention_days > 0, 422, "invalid_job", "retention-days must be greater than 0")
     _ensure_full_backup_schedule(
         {
@@ -5352,6 +5485,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
         "last_session_id": None,
     }
     _ensure_job_transport(job)
+    _ensure_job_guest_consistency(job, task_parameters)
     return job_to_dto(_persist_canonical_job(job))
 
 
@@ -5371,7 +5505,7 @@ def create_backup_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     active_full_days = _normalize_day_list(payload.get("active_full_days") or ())
     synthetic_full_days = _normalize_day_list(payload.get("synthetic_full_days") or ())
     active_full_schedule = _schedule_from_request(payload.get("active_full_schedule"))
-    synthetic_full_schedule = _schedule_from_request(payload.get("synthetic_full_schedule"))
+    synthetic_full_schedule = _synthetic_schedule_from_request(payload.get("synthetic_full_schedule"))
     if "active_full_schedule" in payload and not _schedule_weekdays(active_full_schedule):
         active_full_days = []
     if "synthetic_full_schedule" in payload and not _schedule_weekdays(synthetic_full_schedule):
@@ -5401,7 +5535,7 @@ def create_backup_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     task_parameters = _validate_task_parameters(task_parameters)
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
-    _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+    _ensure_description_text(description, field="Job description", code="invalid_job")
     _ensure(
         not any(str(existing.get("name") or "").lower() == name.lower() for existing in catalog_records(JOBS)),
         409,
@@ -5461,7 +5595,7 @@ def create_replication_job(payload: dict[str, Any]) -> dict[str, Any]:
     description = str(payload.get("description") or "").strip()
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
-    _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+    _ensure_description_text(description, field="Job description", code="invalid_job")
     _ensure(
         not any(str(existing.get("name") or "").lower() == name.lower() for existing in catalog_records(JOBS)),
         409,
@@ -5523,7 +5657,7 @@ def create_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     description = str(payload.get("description") or source_job.get("description") or "").strip()
     _ensure(bool(name.strip()), 422, "invalid_job", "Job name is required")
     _ensure_ascii_name(name, field="Job name", code="invalid_job")
-    _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+    _ensure_description_text(description, field="Job description", code="invalid_job")
     _ensure(retention_days > 0, 422, "invalid_job", "retention-days must be greater than 0")
     _ensure(not any(str(existing.get("name") or "").lower() == name.lower() for existing in catalog_records(JOBS)), 409, "job_name_exists", "Job name already exists", name=name)
     source_gfs = source_job.get("gfs") if isinstance(source_job.get("gfs"), dict) else {"weekly": 0, "monthly": 0, "yearly": 0, "enabled": True}
@@ -5706,7 +5840,8 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     for schedule_key, days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
         if schedule_key not in payload:
             continue
-        schedule_value = _schedule_from_request(payload[schedule_key])
+        read = _synthetic_schedule_from_request if schedule_key == "synthetic_full_schedule" else _schedule_from_request
+        schedule_value = read(payload[schedule_key])
         updated[schedule_key] = schedule_value
         updated[next_run_key] = _execution_schedule_next_run(schedule_value)
         updated[days_key] = _schedule_weekdays(schedule_value)
@@ -5740,7 +5875,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         updated[next_run_key] = _execution_schedule_next_run(schedule_value)
     if "description" in payload:
         description = str(payload.get("description") or "").strip()
-        _ensure_ascii_text(description, field="Job description", code="invalid_job", max_length=MAX_LONG_TEXT_LENGTH)
+        _ensure_description_text(description, field="Job description", code="invalid_job")
         updated["description"] = description
         changed = True
     if any(key in payload and (key == "verify_schedule" or payload[key] is not None) for key in VERIFY_SETTING_KEYS):
@@ -5754,8 +5889,8 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         changed = True
     if "task_parameters" in payload and payload["task_parameters"] is not None:
         _ensure(isinstance(payload["task_parameters"], dict), 422, "invalid_job", "task_parameters must be an object")
-        _ensure_encryption_key_strength(payload["task_parameters"])
         stored_parameters = updated.get("task_parameters") if isinstance(updated.get("task_parameters"), dict) else {}
+        _ensure_encryption_key_strength(payload["task_parameters"], _known_encryption_keys(stored_parameters))
         merged = _merge_task_parameters(stored_parameters, payload["task_parameters"])
         updated["task_parameters"] = _validate_task_parameters(merged, previous=stored_parameters)
         changed = True
@@ -5818,6 +5953,7 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         changed = apply_copy_settings(updated, payload, creating=False) or changed
     if _touches_full_backup_policy(payload):
         _ensure_full_backup_schedule(updated)
+    _ensure_job_guest_consistency(updated, payload.get("task_parameters"), current.get("task_parameters"))
     return _finish_job_edit(updated, payload, changed, was_enabled)
 
 
@@ -5849,6 +5985,21 @@ def _ensure_job_transport(job: dict[str, Any]) -> None:
     library = disk_transport.explicit_library(access["vddk_library"], access["vddk_library_source"])
     problem = disk_transport.transport_problem(override, library=library)
     _ensure(problem is None, 503, "transport_unavailable", str(problem), transport=override)
+
+
+def _ensure_job_guest_consistency(job: dict[str, Any], requested: Any, stored: dict[str, Any] | None = None) -> None:
+    asked = requested.get("hyperv_consistency") if isinstance(requested, dict) else None
+    if asked is None or _inventory_is_hyperv(job.get("inventory_id")):
+        return
+    kept = (stored or {}).get("hyperv_consistency")
+    if kept is not None and str(asked).strip().lower() == str(kept).strip().lower():
+        return
+    _ensure(
+        False,
+        422,
+        "invalid_job",
+        f"guest consistency applies to jobs of a Hyper-V inventory, and {job.get('inventory_name') or job.get('name')} is not one",
+    )
 
 
 def _finish_job_edit(updated: dict[str, Any], payload: dict[str, Any], changed: bool, was_enabled: bool) -> dict[str, Any]:
@@ -6323,8 +6474,11 @@ _GFS_INELIGIBLE_REASONS = {"ForceFull", "ForceSynthetic"}
 
 def _apply_gfs_marks(points: list[dict[str, Any]], gfs: dict[str, Any]) -> None:
     enabled = _coerce_gfs_enabled(gfs.get("enabled"))
+    was_marked: dict[tuple[str, str], bool] = {}
     for point in points:
         marks = point.get("gfs_marks") if isinstance(point.get("gfs_marks"), dict) else {}
+        for tier in ("weekly", "monthly", "yearly"):
+            was_marked[(tier, str(point.get("id") or ""))] = bool(marks.get(tier))
         point["gfs_marks"] = {
             "weekly": bool(marks.get("weekly")),
             "monthly": bool(marks.get("monthly")),
@@ -6349,7 +6503,8 @@ def _apply_gfs_marks(points: list[dict[str, Any]], gfs: dict[str, Any]) -> None:
         chosen = []
         for period_key, bucket in grouped.items():
             bucket.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")))
-            chosen.append((period_key, bucket[-1]))
+            marked = [item for item in bucket if was_marked.get((key, str(item.get("id") or "")))]
+            chosen.append((period_key, marked[0] if marked else bucket[-1]))
         chosen.sort(key=lambda item: item[0], reverse=True)
         keep_ids = {entry["id"] for _period_key, entry in chosen[:count]}
         for point in full_points:
@@ -6393,6 +6548,39 @@ def _find_overlapping_repository(candidate_path: str, *, exclude_id: str | None 
             if candidate == root or root in candidate.parents or candidate in root.parents:
                 return repo
     return None
+
+
+def _s3_storage_key(config: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+    endpoint = str(config.get("endpoint_url") or "").strip().rstrip("/").lower()
+    prefix = str(config.get("prefix") or "").replace("\\", "/")
+    return endpoint, str(config.get("bucket") or "").strip().lower(), tuple(part for part in prefix.split("/") if part)
+
+
+def _find_overlapping_s3_repository(config: dict[str, Any], *, exclude_id: str | None = None) -> dict[str, Any] | None:
+    endpoint, bucket, parts = _s3_storage_key(config)
+    for repo_id, repo in catalog_entries(REPOSITORIES):
+        if repo_id == exclude_id or str(repo.get("type") or "").lower() != "s3":
+            continue
+        other_endpoint, other_bucket, other_parts = _s3_storage_key(extract_s3_config(repo))
+        if (other_endpoint, other_bucket) != (endpoint, bucket):
+            continue
+        shorter = min(len(parts), len(other_parts))
+        if parts[:shorter] == other_parts[:shorter]:
+            return repo
+    return None
+
+
+def _refuse_overlapping_s3_repository(config: dict[str, Any], *, exclude_id: str | None = None) -> None:
+    conflict = _find_overlapping_s3_repository(config, exclude_id=exclude_id)
+    if conflict is not None:
+        raise api_error(
+            409,
+            "repository_path_overlaps",
+            f"Bucket {config.get('bucket')} and prefix {config.get('prefix') or '(none)'} overlap with the storage of "
+            f"repository {conflict.get('name')}: one is the same as or inside the other",
+            conflicting_repository=conflict.get("name"),
+            path=_build_s3_repository_path(config),
+        )
 
 
 def _resolve_owning_repository_id(path: Path) -> str | None:
@@ -8988,6 +9176,83 @@ def delete_backup_chain(
     return result
 
 
+def _manifest_parent_path(payload: dict[str, Any]) -> str:
+    candidates = [payload.get("parent_manifest_path")]
+    candidates += [disk.get("parent_manifest_path") for disk in payload.get("disks") or [] if isinstance(disk, dict)]
+    return next((str(value).strip() for value in candidates if str(value or "").strip()), "")
+
+
+def _previous_session_folder(manifest_path: Path, created_at: str) -> Path | None:
+    earlier: list[tuple[str, Path]] = []
+    for sibling in manifest_path.parent.parent.iterdir():
+        candidate = sibling / "manifest.json"
+        if sibling == manifest_path.parent or not candidate.is_file():
+            continue
+        try:
+            made = str(json.loads(candidate.read_text(encoding="utf-8")).get("created_at") or "")
+        except (OSError, ValueError):
+            continue
+        if made and made < created_at:
+            earlier.append((made, sibling))
+    return max(earlier)[1] if earlier else None
+
+
+def _imported_parent_point(payload: dict[str, Any], manifest_path: Path, repository: dict[str, Any], vm_id: str) -> dict[str, Any]:
+    recorded = _manifest_parent_path(payload)
+    parent_folder = (
+        manifest_path.parent.parent / Path(recorded).parent.name
+        if recorded
+        else _previous_session_folder(manifest_path, str(payload.get("created_at") or ""))
+    )
+    _ensure(
+        parent_folder is not None,
+        422,
+        "invalid_import",
+        f"{manifest_path.parent} is an incremental backup, and no backup it builds on is found next to it, so it cannot be imported",
+        path=str(manifest_path.parent),
+    )
+    wanted = str((parent_folder / "manifest.json").resolve())
+    for point in normalized_backup_points():
+        artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+        stored = str(artifact.get("manifest_path") or "")
+        if (
+            str(point.get("repository_id") or "") == str(repository.get("id") or "")
+            and str(point.get("vm_id") or "") == vm_id
+            and stored
+            and str(Path(stored).resolve()) == wanted
+            and point.get("status") != POINT_DELETING
+        ):
+            return point
+    raise api_error(
+        409,
+        "import_parent_missing",
+        f"{manifest_path.parent} is an incremental backup on {parent_folder}, which is not imported into repository "
+        f"{repository.get('name')}; import {parent_folder} first",
+        path=str(manifest_path.parent),
+        parent_path=str(parent_folder),
+    )
+
+
+def _refuse_imported_twice(manifest_path: Path, repository: dict[str, Any]) -> None:
+    wanted = str(manifest_path.resolve())
+    for point in normalized_backup_points():
+        artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+        stored = str(artifact.get("manifest_path") or "")
+        if (
+            stored
+            and str(point.get("repository_id") or "") == str(repository.get("id") or "")
+            and str(Path(stored).resolve()) == wanted
+            and point.get("status") != POINT_DELETING
+        ):
+            raise api_error(
+                409,
+                "import_already_done",
+                f"{manifest_path.parent} is already in repository {repository.get('name')} as restore point {point['id']}",
+                path=str(manifest_path.parent),
+                point_id=point["id"],
+            )
+
+
 def import_backup_chain(*, path_value: str, repo_name: str | None = None, repo_id: str | None = None) -> dict[str, Any]:
     # Imported at call time: backup_catalog imports this module, so a top-level
     # import here would close the cycle.
@@ -9004,13 +9269,27 @@ def import_backup_chain(*, path_value: str, repo_name: str | None = None, repo_i
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise api_error(422, "invalid_import", "Import manifest must contain valid JSON", path=str(manifest_path)) from exc
+    _refuse_imported_twice(manifest_path, repository)
     vm_name = str(payload.get("vm_name") or payload.get("name") or path.stem)
-    vm_id = str(payload.get("vm_id") or f"imported-{uuid4()}")
+    vm_id = str(payload.get("vm_id") or payload.get("vm_external_id") or f"imported-{uuid4()}")
     point_id = str(uuid4())
     try:
         compression_level = int(payload.get("compression_level"))
     except (TypeError, ValueError):
         compression_level = None
+    execution_type = str(payload.get("resolved_backup_type") or "").strip()
+    incremental = execution_type == "Incremental" or (not execution_type and str(payload.get("backup_mode") or "").lower() == "incremental")
+    parent = _imported_parent_point(payload, manifest_path, repository, vm_id) if incremental else None
+    disks = [
+        {
+            **disk,
+            "abr_path": session_data_folder(payload, str(manifest_path), str(disk.get("abr_path") or "")),
+            "repository_id": repository["id"],
+        }
+        if isinstance(disk, dict) and disk.get("abr_path")
+        else disk
+        for disk in payload.get("disks", [])
+    ]
     point = normalize_backup_point(
         {
             "id": point_id,
@@ -9018,25 +9297,29 @@ def import_backup_chain(*, path_value: str, repo_name: str | None = None, repo_i
             "job_name": "Imported Backup",
             "vm_id": vm_id,
             "vm_name": vm_name,
+            "hypervisor_kind": str(payload.get("hypervisor_kind") or "").strip().lower() or None,
             "inventory_id": None,
             "inventory_name": None,
             "repository_id": repository["id"],
             "repository_name": repository["name"],
             "repository_type": repository["type"],
-            "execution_type": "ActiveFull",
-            "execution_reason": "FirstRun",
-            "full_backup": True,
+            "execution_type": "Incremental" if parent else (execution_type if execution_type in {"ActiveFull", "SyntheticFull"} else "ActiveFull"),
+            "execution_reason": str(payload.get("resolved_backup_reason") or "") if parent or execution_type in {"ActiveFull", "SyntheticFull"} else "FirstRun",
+            "full_backup": parent is None,
+            "parent_point_id": parent["id"] if parent else None,
+            "segment_id": parent.get("segment_id") if parent else None,
+            "chain_id": parent.get("chain_id") if parent else None,
             "compression_level": compression_level,
             "encryption_enabled": bool(payload.get("encryption_enabled")),
             "consistency": payload.get("consistency"),
             "consistency_reason": payload.get("consistency_reason"),
             "logical_size_bytes": resolve_logical_size_bytes(payload),
             "compression_ratio": resolve_compression_ratio(payload),
-            "created_at": utc_now(),
+            "created_at": str(payload.get("created_at") or "") or utc_now(),
             "artifact": {
                 "manifest_path": str(manifest_path),
                 "backup_root": str(manifest_path.parent),
-                "disks": payload.get("disks", []),
+                "disks": disks,
             },
             "placements": [
                 {
@@ -9072,6 +9355,11 @@ def _host_selector_aliases(value: Any) -> set[str]:
     if parsed.hostname:
         aliases.add(str(parsed.hostname).lower())
     return aliases
+
+
+def _inventory_label(inventory_id: Any) -> str:
+    record = HYPERVISORS.get(str(inventory_id or ""))
+    return str((record or {}).get("name") or inventory_id or "")
 
 
 def _inventory_selector_aliases(inventory_id: str) -> set[str]:
@@ -9115,7 +9403,7 @@ def _resolve_host(inventory_id: str, identifier: str) -> dict[str, Any]:
                     host=identifier,
                     available_hosts=[str(resource.get("name") or "") for resource in host_records],
                 )
-        raise api_error(404, "host_not_found", "Target host not found in inventory", inventory_id=inventory_id, host=identifier)
+        raise api_error(404, "host_not_found", f"Target host not found in inventory {_inventory_label(inventory_id)}: {identifier}", inventory_id=inventory_id, host=identifier)
     if len(matches) > 1:
         raise api_error(409, "ambiguous_host", "Multiple hosts matched the provided selector", inventory_id=inventory_id, host=identifier)
     return matches[0]
@@ -10001,7 +10289,7 @@ def _resolve_restore_target_datastore(inventory_id: str, datastore_identifier: s
     raise api_error(
         404,
         "datastore_not_found",
-        "Target datastore not found in inventory",
+        f"Target datastore not found in inventory {_inventory_label(inventory_id)}: {identifier}",
         inventory_id=inventory_id,
         datastore=identifier,
     )
@@ -10356,7 +10644,7 @@ def _resolve_restore_target_network(
     raise api_error(
         404,
         "network_not_found",
-        "Target network not found in inventory",
+        f"Target network not found in inventory {_inventory_label(inventory_id)}: {identifier}",
         inventory_id=inventory_id,
         network=identifier,
     )
@@ -10535,7 +10823,14 @@ def _resolve_restore_network_selection(
                 host=(host or {}).get("name"),
                 inventory_id=target_inventory_id,
             )
-            _ensure(target_network is not None, 404, "network_not_found", "Target network not found in inventory", target_network_id=target_network_id, inventory_id=target_inventory_id)
+            _ensure(
+                target_network is not None,
+                404,
+                "network_not_found",
+                f"Target network not found in inventory {_inventory_label(target_inventory_id)}: {target_network_id}",
+                target_network_id=target_network_id,
+                inventory_id=target_inventory_id,
+            )
             target_network_name = str(target_network.get("name") or "")
             resolved[source_network] = target_network_name
             adapter_targets[position] = {
@@ -10616,7 +10911,7 @@ def _ensure_restore_network_map_targets(
                 (
                     "Target network is not available on the selected host"
                     if target_network_name in off_host_names
-                    else "Target network not found in inventory"
+                    else f"Target network not found in inventory {_inventory_label(target_inventory_id)}: {target_network_name}"
                 ),
                 inventory_id=target_inventory_id,
                 host=(host or {}).get("name"),
@@ -11821,6 +12116,18 @@ def import_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _imported_disk_folder(point: dict[str, Any], abr_path: str) -> str:
+    artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+    manifest_path = str(artifact.get("manifest_path") or "")
+    if not manifest_path or not abr_path:
+        return abr_path
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return abr_path
+    return session_data_folder(manifest, manifest_path, abr_path) if isinstance(manifest, dict) else abr_path
+
+
 def _verify_disk_artifact(
     point: dict[str, Any],
     disk: dict[str, Any],
@@ -11848,9 +12155,11 @@ def _verify_disk_artifact(
             "message": "Backup file present (existence check only; disk is not stored in .abr format)",
         }
 
-    repository = REPOSITORIES.get(str(disk.get("repository_id") or point.get("repository_id") or ""))
+    repository = REPOSITORIES.get(str(disk.get("repository_id") or "")) or REPOSITORIES.get(str(point.get("repository_id") or ""))
     if not isinstance(repository, dict):
         return {"disk_key": disk_key, "status": "failed", "message": "Repository not found for backup artifact"}
+    if not is_s3_repository(repository):
+        abr_path = _imported_disk_folder(point, abr_path)
 
     # Cheap existence pre-check: skip the expensive block-level verify read
     # entirely when the artifact is provably absent. A listing failure is

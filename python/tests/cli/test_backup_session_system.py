@@ -7,6 +7,7 @@ import base64
 import io
 import json
 import os
+import stat
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -864,6 +865,38 @@ class SystemCommandTests(unittest.TestCase):
             self.assertIn("ALTASTOR_BACKUP_PORT=9443", recovered_path.read_text(encoding="utf-8"))
             self.assertIn(f"Recovered server configuration written to {recovered_path}. ", output)
             self.assertIn("This is NOT applied automatically:", output)
+            self.assertIn("/etc/altastor-backup/server.conf", output)
+            self.assertNotIn("/etc/default/altastor-backup-server", output)
+            self.assertEqual(stat.S_IMODE(recovered_path.stat().st_mode), 0o600)
+
+    @patch("python.cli.api.client.requests.request")
+    def test_import_keeps_an_existing_sidecar_file_and_writes_beside_it(self, request_mock: object) -> None:
+        archive_bytes = encrypt_payload({"manifest": {"format_version": 1}}, "TestPassword123", iterations=1000)
+        request_mock.return_value = _FakeResponse(
+            {"restored": {"repositories": 0}, "configuration": {"ALTASTOR_BACKUP_PORT": "9443", "ABR_BOOTSTRAP_ADMIN_PASSWORD": "********"}}
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = Path(tmpdir) / "export.enc"
+            archive_path.write_bytes(archive_bytes)
+            existing = Path(f"{archive_path}-default.env")
+            existing.write_text("planted\n", encoding="utf-8")
+            os.chmod(existing, 0o666)
+            args = SimpleNamespace(
+                base_url="http://example.test", output="table", log_level="info", file=str(archive_path)
+            )
+
+            with patch.dict(os.environ, {PASSWORD_ENV_VAR: "TestPassword123"}), redirect_stdout(io.StringIO()) as stream:
+                exit_code = self._command().import_(args)
+
+            beside = Path(tmpdir) / "export.enc-default-2.env"
+            written = beside.read_text(encoding="utf-8")
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(existing.read_text(encoding="utf-8"), "planted\n")
+            self.assertEqual(stat.S_IMODE(beside.stat().st_mode), 0o600)
+            self.assertIn(f"written to {beside}. ", stream.getvalue())
+            self.assertIn("ALTASTOR_BACKUP_PORT=9443", written)
+            self.assertNotIn("ABR_BOOTSTRAP_ADMIN_PASSWORD=", written)
 
     def test_import_propagates_wrong_password_error_from_server(self) -> None:
         import requests
@@ -920,7 +953,7 @@ class SystemCommandTests(unittest.TestCase):
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop(PASSWORD_ENV_VAR, None)
-            with patch("python.cli.commands.system_commands.getpass.getpass", side_effect=EOFError):
+            with patch("getpass.getpass", side_effect=EOFError):
                 with self.assertRaises(CliStructuredError) as ctx:
                     self._command().export(args)
 
@@ -932,7 +965,7 @@ class SystemCommandTests(unittest.TestCase):
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop(PASSWORD_ENV_VAR, None)
-            with patch("python.cli.commands.system_commands.getpass.getpass", side_effect=EOFError):
+            with patch("getpass.getpass", side_effect=EOFError):
                 with self.assertRaises(CliStructuredError) as ctx:
                     self._command().import_(args)
 

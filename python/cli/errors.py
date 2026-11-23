@@ -56,7 +56,7 @@ def cli_error_from_parse_message(message: str) -> CliError:
         }
         return CliError(code="invalid_argument", message=message, exit_code=INVALID_USAGE, details=details)
 
-    unrecognized = re.search(r"unrecognized arguments: (?P<value>.+)", message)
+    unrecognized = re.search(r"unrecognized arguments: (?P<value>[^;]+)", message)
     if unrecognized:
         details = {"argument": unrecognized.group("value")}
         return CliError(code="invalid_argument", message=message, exit_code=INVALID_USAGE, details=details)

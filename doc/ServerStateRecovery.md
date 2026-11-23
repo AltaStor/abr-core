@@ -152,8 +152,12 @@ Prompts for the password from step 1.
   is written.
 
 - Recovered server configuration (if any) is written to a file next to the
-  export, not applied automatically - paths/ports can differ on the new
-  host. Review and merge into `/etc/default/altastor-backup-server` by hand.
+  export (`<export>-default.env`, readable only by its owner; when that name is
+  taken, `<export>-default-2.env` and so on, so an existing file is never
+  overwritten), not applied automatically - paths/ports can differ on the new
+  host. Review and merge into `/etc/altastor-backup/server.conf` by hand.
+  Secret settings, such as the bootstrap admin password, are not exported:
+  they are left as comments to fill in by hand.
 
 ## 4. Re-verify repositories
 

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import getpass
 import os
 import sys
 
@@ -11,6 +10,7 @@ from ..compact_help_formatter import CompactHelpFormatter
 from ..errors import CliStructuredError
 from ..exit_codes import INVALID_STATE, INVALID_USAGE
 from ..models.views import human_size
+from ..parsing.secret_arguments import confirms, read_secret
 from .base import CommandDependencies
 
 PASSWORD_ENV_VAR = "ABR_EXPORT_PASSWORD"
@@ -21,7 +21,7 @@ CATALOG_TABLE_LABELS = {
 
 def _read_password(prompt: str) -> str:
     try:
-        return getpass.getpass(prompt)
+        return read_secret(prompt)
     except EOFError as exc:
         raise CliStructuredError(
             code="invalid_argument",
@@ -247,7 +247,8 @@ class SystemCommands:
                 f"Recovered server configuration written to {recovered_configuration_file}. "
                 "This is NOT applied automatically: review it (storage paths and ports may "
                 "differ on this host) and merge what's appropriate into "
-                "/etc/default/altastor-backup-server, then restart the service"
+                "/etc/altastor-backup/server.conf, then restart the service. Secret settings were not "
+                "exported and are left as comments"
             )
 
         print(
@@ -285,9 +286,16 @@ class SystemCommands:
                 print("Password must be at least 8 characters", file=sys.stderr)
                 continue
 
-            confirm = _read_password("Confirm export password: ")
+            try:
+                matched = confirms("Confirm export password: ", password)
+            except EOFError as exc:
+                raise CliStructuredError(
+                    code="invalid_argument",
+                    message=f"No password provided; set {PASSWORD_ENV_VAR} or run interactively",
+                    exit_code=INVALID_USAGE,
+                ) from exc
 
-            if password != confirm:
+            if not matched:
                 print("Passwords didn`t match", file=sys.stderr)
                 continue
 

@@ -175,13 +175,13 @@ def _note(record_id: str, error: str | None) -> None:
 def _password(record: dict[str, Any]) -> str:
     password = str(_metadata(record).get("password") or "")
     if not password:
-        raise api_error(422, "invalid_repository", f"Repository {record.get('name')} has no password to mount its share with; edit it with --password")
+        raise api_error(422, "invalid_repository", f"Repository {record.get('name')} has no password to mount its share with; edit it with a password")
     if is_encrypted(password):
         raise api_error(
             503,
             "repository_password_unreadable",
             f"The password of repository {record.get('name')} cannot be decrypted with this server's credential key, so its "
-            "share cannot be mounted; edit the repository with --password",
+            "share cannot be mounted; edit the repository with its password again",
         )
     return password
 
@@ -250,8 +250,8 @@ def refuse_path_edit(record: dict[str, Any], payload: dict[str, Any]) -> None:
         raise api_error(
             422,
             "invalid_repository",
-            f"Repository {record.get('name')} is a share this server mounts itself at {record.get('path')}; it takes no --path. "
-            "Change --address, --username or --password, or add the share mounted by hand as a new repository with --path",
+            f"Repository {record.get('name')} is a share this server mounts itself at {record.get('path')}; it takes no path. "
+            "Change address, username or password, or add the share mounted by hand as a new repository with path",
         )
 
 

@@ -411,6 +411,7 @@ class InventoryDTO(_LenientModel):
     effective_vddk_library: DocStr = Field(default=None, description="vSphere only: the VDDK library file its VDDK sessions use")
     vddk_library_source: DocStr = Field(default=None, description="vSphere only: where effective_vddk_library comes from, hypervisor, global, or vddk_directory (the VDDK directory's lib64/libvixDiskLib.so, the fallback)")
     vddk_library_file: DocStrOrNull = Field(default=None, description="vSphere only: the file effective_vddk_library resolves to, e.g. libvixDiskLib.so.9.1.0.0; null when there is none")
+    vddk_library_problem: DocStrOrNull = Field(default=None, description="vSphere only: why the VDDK transport cannot use effective_vddk_library now (for one, the file is gone), or null when it can")
     created_at: str
     updated_at: str
     last_scan_at: str | None = None
@@ -2034,6 +2035,7 @@ class VsphereHypervisorSettingsDTO(_LenientModel):
     name: DocStr = None
     api: DocStr = Field(default=None, description="vddk, soap, or inherit")
     vddk_library: DocStrOrNull = Field(default=None, description="The hypervisor's own VDDK library file, or null")
+    vddk_library_problem: DocStrOrNull = Field(default=None, description="Why its own VDDK library cannot be used now, or null")
     has_own_settings: DocBool = Field(default=None, description="true when apply_to_existing_hypervisors would hand it back to the server-wide values")
 
 

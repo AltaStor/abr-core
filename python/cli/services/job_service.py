@@ -740,6 +740,8 @@ class JobService:
             if self._schedule_detail_fields_present(args):
                 raise ValueError("--schedule none removes the schedule, so it takes no --time, --days, --day-of-month or --every")
             payload["schedule"] = None
+        elif stored_schedule is not None and self._is_empty_value(getattr(args, "schedule", None)) and self._schedule_detail_fields_present(args):
+            payload["schedule"] = self._merge_schedule_details(stored_schedule, args, enabled_override=enabled_override)
         elif enabled_override is None or self._schedule_detail_fields_present(args) or getattr(args, "schedule", None):
             schedule = self.build_schedule_payload(args, current_schedule=stored_schedule)
             if schedule is not None:

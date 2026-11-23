@@ -1488,7 +1488,7 @@ class VCenterNode(Hypervisor):
                 }
             )
 
-        vm_path = f"[{datastore_name}]"
+        vm_path = f"[{datastore_name}] {folder}/{folder}.vmx"
         source_firmware = config_metadata.get("firmware")
         requested_firmware = _normalize_vm_firmware(source_firmware)
         if requested_firmware is None:

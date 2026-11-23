@@ -511,6 +511,59 @@ class SyntheticFullRunTests(unittest.TestCase):
         removed = [call.args[2] for call in remove_mock.call_args_list]
         self.assertEqual(removed, ["01-disk.vmdk", "02-disk.vmdk"])
 
+    def _available_chain(self) -> None:
+        for point_id, parent in (("p1", None), ("p2", "p1"), ("p3", "p2")):
+            BACKUPS[point_id]["status"] = "available"
+            BACKUPS[point_id]["parent_point_id"] = parent
+
+    def _damaged_artifact(self, point, disk, **_kwargs):
+        if point["id"] == "p1":
+            return {"disk_key": "2000", "status": "corrupt", "message": "CRC32C mismatch for restored chunk 0!", "corrupt_ranges": 1, "data_ranges": 4}
+        return {"disk_key": "2000", "status": "ok", "message": "Verified"}
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_merge_that_reads_damaged_data_marks_the_damaged_point_as_verify_does(self, copy_mock, _remove) -> None:
+        self._available_chain()
+        copy_mock.side_effect = StorageToolError("CRC32C mismatch for restored chunk 0!")
+
+        with patch.object(abr_v41, "_verify_disk_artifact", side_effect=self._damaged_artifact), self.assertRaises(SyntheticFullError) as caught:
+            synthetic_full.run_synthetic_full(self._task())
+
+        self.assertIn("CRC32C mismatch for restored chunk 0!", str(caught.exception))
+        self.assertIn("damaged data in restore point(s) p1", str(caught.exception))
+        self.assertIn("marked corrupt", str(caught.exception))
+        self.assertEqual(BACKUPS["p1"]["status"], "corrupt")
+        self.assertEqual((BACKUPS["p1"]["corruption"]["kind"], BACKUPS["p1"]["corruption"]["found_by"]), ("damaged", "synthetic full"))
+        self.assertEqual(BACKUPS["p1"]["corruption"]["session_id"], "task-new")
+        self.assertEqual([BACKUPS[point_id]["corruption"]["kind"] for point_id in ("p2", "p3")], ["dependent", "dependent"])
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_a_merge_failure_that_is_not_damaged_data_verifies_nothing(self, copy_mock, _remove) -> None:
+        self._available_chain()
+        copy_mock.side_effect = StorageToolError("connection reset by peer")
+
+        with patch.object(abr_v41, "_verify_disk_artifact") as verify, self.assertRaises(SyntheticFullError) as caught:
+            synthetic_full.run_synthetic_full(self._task())
+
+        verify.assert_not_called()
+        self.assertIn("connection reset by peer", str(caught.exception))
+        self.assertNotEqual(BACKUPS["p1"]["status"], "corrupt")
+
+    @patch("python.srv.services.synthetic_full.remove_disk_tool_backup")
+    @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
+    def test_damaged_data_the_verify_does_not_find_again_marks_nothing_and_says_so(self, copy_mock, _remove) -> None:
+        self._available_chain()
+        copy_mock.side_effect = StorageToolError("backup is corrupt: chunk 3")
+        intact = {"disk_key": "2000", "status": "ok", "message": "Verified"}
+
+        with patch.object(abr_v41, "_verify_disk_artifact", return_value=intact), self.assertRaises(SyntheticFullError) as caught:
+            synthetic_full.run_synthetic_full(self._task())
+
+        self.assertIn("found no damaged restore point", str(caught.exception))
+        self.assertTrue(all(BACKUPS[point_id]["status"] != "corrupt" for point_id in ("p1", "p2", "p3")))
+
     @patch("python.srv.services.synthetic_full.copy_disk_tool_chain")
     def test_a_share_that_is_not_mounted_refuses_the_merge_before_anything_is_written(self, copy_mock) -> None:
         with patch.object(synthetic_full, "unmounted_share_message", return_value="The share is not mounted"), self.assertRaises(

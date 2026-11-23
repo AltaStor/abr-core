@@ -141,14 +141,14 @@ class JobLifecycleParserTests(unittest.TestCase):
                 "7",
                 "--set-encryption",
                 "--encryption-key",
-                "s3cr3t-key",
+                "S3cr3t-key-01",
             ]
         )
 
         self.assertEqual(args.compression_level, 7)
         self.assertTrue(args.set_encryption)
         self.assertFalse(args.reset_encryption)
-        self.assertEqual(args.encryption_key, "s3cr3t-key")
+        self.assertEqual(args.encryption_key, "S3cr3t-key-01")
 
     def test_job_create_parser_rejects_compression_level_out_of_range(self) -> None:
         with self.assertRaises(SystemExit):
@@ -761,11 +761,11 @@ class JobPayloadBuilderTests(unittest.TestCase):
         return SimpleNamespace(**base)
 
     def test_create_backup_job_payload_includes_compression_and_encryption_updates(self) -> None:
-        args = self._base_create_args(compression_level=7, set_encryption=True, encryption_key="s3cr3t-key")
+        args = self._base_create_args(compression_level=7, set_encryption=True, encryption_key="S3cr3t-key-01")
 
         payload = self.service.create_backup_job_payload(args)
 
-        self.assertEqual(payload["task_parameters"], {"compression_level": 7, "encryption_enabled": True, "encryption_key": "s3cr3t-key"})
+        self.assertEqual(payload["task_parameters"], {"compression_level": 7, "encryption_enabled": True, "encryption_key": "S3cr3t-key-01"})
 
     def test_create_backup_job_payload_drops_reset_encryption_noop(self) -> None:
         args = self._base_create_args(reset_encryption=True)
@@ -775,7 +775,7 @@ class JobPayloadBuilderTests(unittest.TestCase):
         self.assertNotIn("task_parameters", payload)
 
     def test_create_backup_job_payload_rejects_encryption_key_without_set_encryption(self) -> None:
-        args = self._base_create_args(encryption_key="s3cr3t-key")
+        args = self._base_create_args(encryption_key="S3cr3t-key-01")
 
         with self.assertRaisesRegex(ValueError, "--encryption-key requires --set-encryption"):
             self.service.create_backup_job_payload(args)
@@ -895,6 +895,27 @@ class JobPayloadBuilderTests(unittest.TestCase):
         payload = self.service.build_edit_payload({"id": "job-1"}, self._base_edit_args(schedule="daily", time="22:00"))
 
         self.assertEqual(payload["schedule"], {"type": "daily", "time": "22:00", "enabled": True})
+
+    def test_edit_payload_details_without_a_type_keep_the_stored_type(self) -> None:
+        daily = {"id": "job-1", "schedule": {"type": "daily", "time": "22:00", "enabled": False}}
+        weekly = {"id": "job-1", "schedule": {"type": "weekly", "days": ["Mon"], "time": "22:00", "enabled": True}}
+
+        timed = self.service.build_edit_payload(daily, self._base_edit_args(time="23:00"))
+        moved = self.service.build_edit_payload(weekly, self._base_edit_args(days=["Tue", "Wed"]))
+
+        self.assertEqual(timed["schedule"], {"type": "daily", "time": "23:00", "enabled": False})
+        self.assertEqual(moved["schedule"], {"type": "weekly", "days": ["Tue", "Wed"], "time": "22:00", "enabled": True})
+
+    def test_edit_payload_detail_the_stored_type_does_not_take_is_refused(self) -> None:
+        daily = {"id": "job-1", "schedule": {"type": "daily", "time": "22:00", "enabled": True}}
+
+        with self.assertRaisesRegex(ValueError, "^Daily schedules do not accept --days$"):
+            self.service.build_edit_payload(daily, self._base_edit_args(days=["Tue"]))
+
+    def test_edit_payload_details_without_a_stored_schedule_still_need_the_type(self) -> None:
+        for job in ({"id": "job-1"}, {"id": "job-1", "schedule": {"type": "cron", "expression": "0 1 * * *"}}):
+            with self.subTest(job=job), self.assertRaisesRegex(ValueError, "^Schedule details require --schedule$"):
+                self.service.build_edit_payload(job, self._base_edit_args(time="23:00"))
 
     def test_edit_payload_supports_compression_level_update(self) -> None:
         args = self._base_edit_args(compression_level=9)
@@ -1424,7 +1445,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
                 "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
-                "task_parameters": {"compression_level": 7, "encryption_enabled": True, "encryption_key": "s3cr3t-key"},
+                "task_parameters": {"compression_level": 7, "encryption_enabled": True, "encryption_key": "S3cr3t-key-01"},
             }
         )
 
@@ -1436,7 +1457,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
 
         # The raw key must still be present on the stored record for backup execution.
         stored = JOBS[job["id"]]
-        self.assertEqual(stored["task_parameters"]["encryption_key"], "s3cr3t-key")
+        self.assertEqual(stored["task_parameters"]["encryption_key"], "S3cr3t-key-01")
 
     def test_create_job_rejects_out_of_range_compression_level(self) -> None:
         with self.assertRaises(abr_v41.ApiError):
@@ -1497,7 +1518,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
                 "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
-                "task_parameters": {"encryption_enabled": True, "encryption_key": "s3cr3t-key"},
+                "task_parameters": {"encryption_enabled": True, "encryption_key": "S3cr3t-key-01"},
             }
         )
 
@@ -1505,7 +1526,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
 
         self.assertEqual(edited["encryption"]["enabled"], True)
         self.assertEqual(edited["encryption"]["key_set"], True)
-        self.assertEqual(JOBS[job["id"]]["task_parameters"]["encryption_key"], "s3cr3t-key")
+        self.assertEqual(JOBS[job["id"]]["task_parameters"]["encryption_key"], "S3cr3t-key-01")
 
     def test_turning_encryption_off_drops_the_stored_key(self) -> None:
         job = abr_v41.create_backup_job(
@@ -1515,7 +1536,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
                 "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
-                "task_parameters": {"encryption_enabled": True, "encryption_key": "s3cr3t-key"},
+                "task_parameters": {"encryption_enabled": True, "encryption_key": "S3cr3t-key-01"},
             }
         )
 
@@ -1539,7 +1560,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
 
         encrypted = abr_v41.edit_job_record(
             job["id"],
-            {"task_parameters": {"encryption_enabled": True, "encryption_key": "top-secret"}},
+            {"task_parameters": {"encryption_enabled": True, "encryption_key": "Top-secret-01"}},
         )
         self.assertEqual(encrypted["encryption"]["enabled"], True)
         self.assertEqual(encrypted["encryption"]["key_set"], True)
@@ -1559,7 +1580,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
                 "inventory_id": self.inventory["id"],
                 "repo_id": "repo-1",
                 "active_full_schedule": {"type": "weekly", "days": ["sunday"], "time": "02:00"},
-                "task_parameters": {"compression_level": 8, "encryption_enabled": True, "encryption_key": "hunter2-key"},
+                "task_parameters": {"compression_level": 8, "encryption_enabled": True, "encryption_key": "Hunter2-key-01"},
             }
         )
 
@@ -1570,7 +1591,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
         parameters = tasks[0]["parameters"]
         self.assertEqual(parameters["compression_level"], 8)
         self.assertTrue(parameters["encryption_enabled"])
-        self.assertEqual(parameters["encryption_key"], "hunter2-key")
+        self.assertEqual(parameters["encryption_key"], "Hunter2-key-01")
         # Execution-resolved fields must win over anything stashed in task_parameters.
         self.assertEqual(parameters["resolved_backup_type"], "ActiveFull")
 

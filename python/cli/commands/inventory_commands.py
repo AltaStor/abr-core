@@ -172,7 +172,12 @@ class InventoryCommands:
         edit_library.add_argument(
             "--reset-vddk-lib", action="store_true", help="vSphere only: use the server-wide VDDK library"
         )
-        edit.add_argument("--secure", action="store_true", help="Enable SSL verification")
+        edit.add_argument(
+            "--secure",
+            action="store_true",
+            help="Enable SSL verification; refused, and the inventory left as it is, when this appliance does not trust "
+            "the endpoint's certificate",
+        )
         edit.set_defaults(handler=self.edit)
 
     @staticmethod

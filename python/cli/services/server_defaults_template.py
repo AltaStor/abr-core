@@ -6,6 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from python.cli.core.logger_conf import REDACTED_VALUE
 from python.cli.core.logger_conf import redact_text as _redact_text
 
 DEFAULTS_ENV_PATH = Path(__file__).resolve().parents[2] / "srv" / "defaults.env"
@@ -41,4 +42,16 @@ def render_recovered_server_defaults(configuration: dict[str, Any]) -> str:
         for key, value in sorted(remaining.items()):
             lines.append(f"{key}={value}")
 
-    return _redact_text("\n".join(lines) + "\n")
+    return _without_masked_values(_redact_text("\n".join(lines) + "\n"))
+
+
+def _without_masked_values(text: str) -> str:
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        key, _, value = stripped.partition("=")
+        if stripped and not stripped.startswith("#") and REDACTED_VALUE in value:
+            lines.append(f"# {key} was not exported: its value is secret. Set it here by hand if this server needs it.")
+        else:
+            lines.append(line)
+    return "\n".join(lines) + "\n"

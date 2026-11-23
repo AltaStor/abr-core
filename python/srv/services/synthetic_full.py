@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import errno
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -48,6 +49,34 @@ class SyntheticFullError(RuntimeError):
 
 class SyntheticFullValidationError(SyntheticFullError):
     pass
+
+
+DAMAGED_DATA = re.compile(r"crc32c mismatch|\bis corrupt\b", re.IGNORECASE)
+
+
+def damaged_chain_note(points: list[dict[str, Any]], session_id: str) -> str:
+    from python.srv.services.abr_v41 import (
+        normalized_backup_points,
+        verify_backup_chain,
+    )
+    from python.srv.services.api_errors import ApiError
+
+    point_ids = {str(point.get("id") or "") for point in points}
+    chain_ids = {str(point.get("chain_id") or "") for point in normalized_backup_points() if str(point.get("id") or "") in point_ids}
+    damaged: list[str] = []
+    for chain_id in sorted(chain for chain in chain_ids if chain):
+        try:
+            report = verify_backup_chain(chain_id, point_ids=point_ids, session_id=session_id, found_by="synthetic full")
+        except (ApiError, StorageToolError, OSError) as exc:
+            logger.warning("Could not verify chain %s after its synthetic full read damaged data: %s", chain_id, exc)
+            return f"The chain could not be verified afterwards ({exc}); check it with abr backup verify --id {chain_id}"
+        damaged.extend(report["corrupt"]["damaged"])
+    if not damaged:
+        return "Verifying the chain afterwards found no damaged restore point"
+    return (
+        f"Verifying the chain found damaged data in restore point(s) {', '.join(damaged)}: they and the restore points "
+        "that build on them are marked corrupt and are not offered for restore, and the job's next run takes an active full"
+    )
 
 
 def is_synthetic_full_task(task: dict[str, Any]) -> bool:
@@ -532,6 +561,8 @@ def run_synthetic_full(
                 raise TaskStopRequested("Synthetic full cancelled; the merged backup was discarded") from exc
             except StorageToolError as exc:
                 detail = _no_room_detail(repository, points, free_at_start)
+                if not detail and DAMAGED_DATA.search(str(exc)):
+                    detail = f"{exc}. {damaged_chain_note(points, task_id)}"
                 raise SyntheticFullError(
                     f"Merging disk {position + 1}/{total} failed: {detail or exc}"
                 ) from exc

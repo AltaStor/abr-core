@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import os
-import stat
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -54,11 +54,20 @@ def _load_all() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def write_private_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data, indent=2, sort_keys=True))
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
 def _write_all(data: dict[str, Any]) -> None:
-    path = _credentials_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    write_private_json(_credentials_path(), data)
 
 
 def _matching_keys(data: dict[str, Any], base_url: str) -> set[str]:

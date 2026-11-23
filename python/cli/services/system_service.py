@@ -177,10 +177,23 @@ class SystemService:
         )
 
         if configuration:
-            recovered_path = Path(file).with_name(Path(file).name + "-default.env")
-            recovered_path.write_text(
-                render_recovered_server_defaults(configuration), encoding="utf-8"
+            recovered_path = write_beside(
+                Path(file).with_name(Path(file).name + "-default.env"),
+                render_recovered_server_defaults(configuration),
             )
             result = {**result, "recovered_configuration_file": str(recovered_path)}
 
         return result
+
+
+def write_beside(wanted: Path, text: str) -> Path:
+    for number in range(1, 1000):
+        path = wanted if number == 1 else wanted.with_name(f"{wanted.stem}-{number}{wanted.suffix}")
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+    raise FileExistsError(f"No free file name beside {wanted}")
