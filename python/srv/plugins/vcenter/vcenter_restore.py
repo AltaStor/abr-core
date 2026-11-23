@@ -31,6 +31,7 @@ from ...core.storage_tool import (
     is_s3_repository,
     redact_disk_tool_command,
     run_disk_tool_process,
+    session_data_folder,
 )
 from ...core.utils import utc_now
 
@@ -563,6 +564,8 @@ def _resolve_abr_restore_layers(
             )
 
         abr_path = str(disk_entry.get("abr_path") or "").strip()
+        if repository_type != "s3":
+            abr_path = session_data_folder(manifest, _manifest_path_for_point(point), abr_path)
         abr_backup_name = str(disk_entry.get("abr_backup_name") or "").strip()
         if not abr_path or not abr_backup_name:
             raise VCenterBackupError(

@@ -703,7 +703,7 @@ abr job create-copy --name "Copied Job" --source "Existing Job"
 
 abr job create-backup-copy 
 
-Description: Create a backup copy job. It copies the restore points of its sources - backup jobs (--source-job) or whole repositories, the points of the jobs in them (--source-repo) - into another repository (--repository), where it keeps a chain of its own for each VM with its own retention, GFS, Object Lock dates and encryption key, independently of the sources. It reads stored backups only and never touches the VMs, vCenter or the Hyper-V hosts, so it runs whether a VM is on, off or gone. Copies are restored like any other restore point (abr restore list --job <name>). 
+Description: Create a backup copy job. It copies the restore points of its sources - backup jobs (--source-job) or whole repositories, the points of the jobs in them and the chains imported into them with backup import (--source-repo) - into another repository (--repository), where it keeps a chain of its own for each VM with its own retention, GFS, Object Lock dates and encryption key, independently of the sources. It reads stored backups only and never touches the VMs, vCenter or the Hyper-V hosts, so it runs whether a VM is on, off or gone. Copies are restored like any other restore point (abr restore list --job <name>). 
 
 abr job create-backup-copy --name <name> (--source-job <name> ... | --source-job-id <id> ... | --source-repo <name> ... | --source-repo-id <id> ...) (--repository <name> | --repository-id <id>) [--mode <periodic|immediate>] [--vm <vm> ... | --vms "<vm1,vm2,...>"] [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--run-after-job <name> | --run-after-job-id <id>] [--copy-window "<[days] HH:MM-HH:MM>" ...] [--retry-count <0..20>] [--retry-interval <minutes>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--gfs-weekly <n>] [--gfs-monthly <n>] [--gfs-yearly <n>] [--active-full-schedule ...] [--synthetic-full-schedule ...] [--verify-schedule ...] [--compression-level <0..9>] [--set-encryption [--encryption-key]] 
 
@@ -904,6 +904,8 @@ abr backup import
 Description: Import a backup chain from an external path. 
 
 abr backup import --path <path> --repo <name> 
+
+--path is one session folder (or its manifest.json). The import is catalog-only: the restore point refers to the files where they are, and they are read from that folder even when the session was written at another path, as after a repository folder was moved or copied to a new server. The point keeps the backup type and time its manifest records. An incremental joins the chain of the session it builds on, so a chain is imported full first, then each incremental in order; an incremental whose parent session is not imported yet is refused (409 import_parent_missing, naming the folder to import first). A session already in the repository is refused too (409 import_already_done, naming its restore point), so one folder never becomes two points. backup verify and abr repo verify check an imported chain in the folder it was imported from, at the path it was written to or at another one. 
 
 RESTORE COMMANDS 
 

@@ -184,9 +184,10 @@ def source_points(job: dict[str, Any]) -> list[dict[str, Any]]:
     selected = []
     for point in normalized_backup_points():
         point_job_id = str(point.get("job_id") or "")
-        if not point_job_id or point_job_id == copy_job_id or not _available(point):
+        if (point_job_id and point_job_id == copy_job_id) or not _available(point):
             continue
-        if point_job_id not in jobs and str(point.get("repository_id") or "") not in repositories:
+        in_source_repository = str(point.get("repository_id") or "") in repositories
+        if not in_source_repository and not (point_job_id and point_job_id in jobs):
             continue
         if wanted_vms and str(point.get("vm_id") or "") not in wanted_vms:
             continue

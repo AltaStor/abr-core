@@ -105,6 +105,7 @@ from python.srv.core.storage_tool import (
     s3_block_generation_days,
     s3_endpoint_connect_error,
     sanitize_s3_config,
+    session_data_folder,
     verify_disk_tool_backup,
 )
 from python.srv.core.time_zones import load_zone
@@ -9132,6 +9133,83 @@ def delete_backup_chain(
     return result
 
 
+def _manifest_parent_path(payload: dict[str, Any]) -> str:
+    candidates = [payload.get("parent_manifest_path")]
+    candidates += [disk.get("parent_manifest_path") for disk in payload.get("disks") or [] if isinstance(disk, dict)]
+    return next((str(value).strip() for value in candidates if str(value or "").strip()), "")
+
+
+def _previous_session_folder(manifest_path: Path, created_at: str) -> Path | None:
+    earlier: list[tuple[str, Path]] = []
+    for sibling in manifest_path.parent.parent.iterdir():
+        candidate = sibling / "manifest.json"
+        if sibling == manifest_path.parent or not candidate.is_file():
+            continue
+        try:
+            made = str(json.loads(candidate.read_text(encoding="utf-8")).get("created_at") or "")
+        except (OSError, ValueError):
+            continue
+        if made and made < created_at:
+            earlier.append((made, sibling))
+    return max(earlier)[1] if earlier else None
+
+
+def _imported_parent_point(payload: dict[str, Any], manifest_path: Path, repository: dict[str, Any], vm_id: str) -> dict[str, Any]:
+    recorded = _manifest_parent_path(payload)
+    parent_folder = (
+        manifest_path.parent.parent / Path(recorded).parent.name
+        if recorded
+        else _previous_session_folder(manifest_path, str(payload.get("created_at") or ""))
+    )
+    _ensure(
+        parent_folder is not None,
+        422,
+        "invalid_import",
+        f"{manifest_path.parent} is an incremental backup, and no backup it builds on is found next to it, so it cannot be imported",
+        path=str(manifest_path.parent),
+    )
+    wanted = str((parent_folder / "manifest.json").resolve())
+    for point in normalized_backup_points():
+        artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+        stored = str(artifact.get("manifest_path") or "")
+        if (
+            str(point.get("repository_id") or "") == str(repository.get("id") or "")
+            and str(point.get("vm_id") or "") == vm_id
+            and stored
+            and str(Path(stored).resolve()) == wanted
+            and point.get("status") != POINT_DELETING
+        ):
+            return point
+    raise api_error(
+        409,
+        "import_parent_missing",
+        f"{manifest_path.parent} is an incremental backup on {parent_folder}, which is not imported into repository "
+        f"{repository.get('name')}; import {parent_folder} first",
+        path=str(manifest_path.parent),
+        parent_path=str(parent_folder),
+    )
+
+
+def _refuse_imported_twice(manifest_path: Path, repository: dict[str, Any]) -> None:
+    wanted = str(manifest_path.resolve())
+    for point in normalized_backup_points():
+        artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+        stored = str(artifact.get("manifest_path") or "")
+        if (
+            stored
+            and str(point.get("repository_id") or "") == str(repository.get("id") or "")
+            and str(Path(stored).resolve()) == wanted
+            and point.get("status") != POINT_DELETING
+        ):
+            raise api_error(
+                409,
+                "import_already_done",
+                f"{manifest_path.parent} is already in repository {repository.get('name')} as restore point {point['id']}",
+                path=str(manifest_path.parent),
+                point_id=point["id"],
+            )
+
+
 def import_backup_chain(*, path_value: str, repo_name: str | None = None, repo_id: str | None = None) -> dict[str, Any]:
     # Imported at call time: backup_catalog imports this module, so a top-level
     # import here would close the cycle.
@@ -9148,13 +9226,27 @@ def import_backup_chain(*, path_value: str, repo_name: str | None = None, repo_i
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise api_error(422, "invalid_import", "Import manifest must contain valid JSON", path=str(manifest_path)) from exc
+    _refuse_imported_twice(manifest_path, repository)
     vm_name = str(payload.get("vm_name") or payload.get("name") or path.stem)
-    vm_id = str(payload.get("vm_id") or f"imported-{uuid4()}")
+    vm_id = str(payload.get("vm_id") or payload.get("vm_external_id") or f"imported-{uuid4()}")
     point_id = str(uuid4())
     try:
         compression_level = int(payload.get("compression_level"))
     except (TypeError, ValueError):
         compression_level = None
+    execution_type = str(payload.get("resolved_backup_type") or "").strip()
+    incremental = execution_type == "Incremental" or (not execution_type and str(payload.get("backup_mode") or "").lower() == "incremental")
+    parent = _imported_parent_point(payload, manifest_path, repository, vm_id) if incremental else None
+    disks = [
+        {
+            **disk,
+            "abr_path": session_data_folder(payload, str(manifest_path), str(disk.get("abr_path") or "")),
+            "repository_id": repository["id"],
+        }
+        if isinstance(disk, dict) and disk.get("abr_path")
+        else disk
+        for disk in payload.get("disks", [])
+    ]
     point = normalize_backup_point(
         {
             "id": point_id,
@@ -9162,25 +9254,29 @@ def import_backup_chain(*, path_value: str, repo_name: str | None = None, repo_i
             "job_name": "Imported Backup",
             "vm_id": vm_id,
             "vm_name": vm_name,
+            "hypervisor_kind": str(payload.get("hypervisor_kind") or "").strip().lower() or None,
             "inventory_id": None,
             "inventory_name": None,
             "repository_id": repository["id"],
             "repository_name": repository["name"],
             "repository_type": repository["type"],
-            "execution_type": "ActiveFull",
-            "execution_reason": "FirstRun",
-            "full_backup": True,
+            "execution_type": "Incremental" if parent else (execution_type if execution_type in {"ActiveFull", "SyntheticFull"} else "ActiveFull"),
+            "execution_reason": str(payload.get("resolved_backup_reason") or "") if parent or execution_type in {"ActiveFull", "SyntheticFull"} else "FirstRun",
+            "full_backup": parent is None,
+            "parent_point_id": parent["id"] if parent else None,
+            "segment_id": parent.get("segment_id") if parent else None,
+            "chain_id": parent.get("chain_id") if parent else None,
             "compression_level": compression_level,
             "encryption_enabled": bool(payload.get("encryption_enabled")),
             "consistency": payload.get("consistency"),
             "consistency_reason": payload.get("consistency_reason"),
             "logical_size_bytes": resolve_logical_size_bytes(payload),
             "compression_ratio": resolve_compression_ratio(payload),
-            "created_at": utc_now(),
+            "created_at": str(payload.get("created_at") or "") or utc_now(),
             "artifact": {
                 "manifest_path": str(manifest_path),
                 "backup_root": str(manifest_path.parent),
-                "disks": payload.get("disks", []),
+                "disks": disks,
             },
             "placements": [
                 {
@@ -11977,6 +12073,18 @@ def import_catalog_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _imported_disk_folder(point: dict[str, Any], abr_path: str) -> str:
+    artifact = point.get("artifact") if isinstance(point.get("artifact"), dict) else {}
+    manifest_path = str(artifact.get("manifest_path") or "")
+    if not manifest_path or not abr_path:
+        return abr_path
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return abr_path
+    return session_data_folder(manifest, manifest_path, abr_path) if isinstance(manifest, dict) else abr_path
+
+
 def _verify_disk_artifact(
     point: dict[str, Any],
     disk: dict[str, Any],
@@ -12004,9 +12112,11 @@ def _verify_disk_artifact(
             "message": "Backup file present (existence check only; disk is not stored in .abr format)",
         }
 
-    repository = REPOSITORIES.get(str(disk.get("repository_id") or point.get("repository_id") or ""))
+    repository = REPOSITORIES.get(str(disk.get("repository_id") or "")) or REPOSITORIES.get(str(point.get("repository_id") or ""))
     if not isinstance(repository, dict):
         return {"disk_key": disk_key, "status": "failed", "message": "Repository not found for backup artifact"}
+    if not is_s3_repository(repository):
+        abr_path = _imported_disk_folder(point, abr_path)
 
     # Cheap existence pre-check: skip the expensive block-level verify read
     # entirely when the artifact is provably absent. A listing failure is

@@ -112,6 +112,31 @@ class _Catalog(unittest.TestCase):
         return caught.exception
 
 
+class ImportedSourceTests(_Catalog):
+    def setUp(self) -> None:
+        super().setUp()
+        REPOSITORIES["moved"] = {"id": "moved", "name": "Moved", "type": "local", "path": tempfile.mkdtemp()}
+        self._point("m1", "ActiveFull", job_id="", repo="moved", chain_id=f"backup::-::{VM}::moved")
+        self._point("m2", "Incremental", job_id="", repo="moved", chain_id=f"backup::-::{VM}::moved", parent_point_id="m1")
+
+    def test_a_source_repository_brings_its_imported_chain_and_the_plan_copies_it_whole(self) -> None:
+        copy = self._copy_job(source_jobs=[], source_repositories=["Moved"])
+        job = abr_v41.normalize_job_record(JOBS[copy["id"]])
+
+        plan = backup_copy.plan_copy(job, VM)
+
+        self.assertEqual([point["id"] for point in backup_copy.source_points(job)], ["m1", "m2"])
+        self.assertEqual((plan["kind"], [point["id"] for point in plan["points"]]), ("full", ["m1", "m2"]))
+
+    def test_a_source_job_alone_still_brings_only_its_own_points(self) -> None:
+        self._point("f1", "ActiveFull")
+        copy = self._copy_job()
+
+        points = backup_copy.source_points(abr_v41.normalize_job_record(JOBS[copy["id"]]))
+
+        self.assertEqual([point["id"] for point in points], ["f1"])
+
+
 class CopyPlanTests(_Catalog):
     def setUp(self) -> None:
         super().setUp()
