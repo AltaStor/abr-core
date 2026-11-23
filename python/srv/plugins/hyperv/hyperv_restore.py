@@ -62,7 +62,14 @@ from .hyperv import (
     _slot_sort_key,
     reconnect_seconds,
 )
-from .hyperv_backup import WORKER_MODE, connection_settings, open_node
+from .hyperv_backup import (
+    WORKER_MODE,
+    _storage_opens,
+    _wait_for_storage,
+    connection_settings,
+    lost_storage_reading,
+    open_node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +240,119 @@ def _layer_logical_bytes(layer: dict[str, Any]) -> int:
         if isinstance(entry, dict) and entry.get("abr_backup_name") == layer.get("abr_backup_name"):
             return int(entry.get("logical_bytes") or 0)
     return 0
+
+
+def _restore_disk_layers(
+    node: Any,
+    node_name: str,
+    runs: list[dict[str, Any]],
+    target: str,
+    *,
+    repository: dict[str, Any],
+    encryption_key: str,
+    task_id: str,
+    slot: str,
+    vm_name: str,
+    label: str,
+    progress: int,
+    span: int,
+    timeout: int,
+    progress_callback: Any,
+) -> None:
+    attempts = env_int("ALTASTOR_HYPERV_STORAGE_ATTEMPTS")
+    attempt = 1
+    while True:
+        failure = None
+        for position, layer in enumerate(runs):
+            storage_args, storage_env = vhdx_tool.storage_invocation(repository, abr_path=layer["abr_path"])
+            command = [
+                "restore",
+                "--json",
+                *(
+                    ["--source-names", ",".join(layer["source_names"])]
+                    if layer.get("source_names")
+                    else ["--name", layer["abr_backup_name"]]
+                ),
+                *storage_args,
+                "--vhdx",
+                target,
+            ]
+            if position:
+                command.append("--force")
+            if encryption_key:
+                command.extend(["--key", encryption_key])
+            layer_base = progress + int(position * span / len(runs))
+            report = _disk_tool_progress_reporter(
+                progress_callback,
+                base_progress=layer_base,
+                progress_span=max(1, int(span / len(runs))),
+                message_prefix=(
+                    label
+                    if layer.get("source_names")
+                    else f"{label}, backup {position + 1}/{len(runs)}"
+                ),
+                worker_mode=WORKER_MODE,
+            )
+            run = node.run_disk_tool(
+                node_name,
+                command,
+                env=storage_env,
+                on_progress=lambda percent, report=report: report(percent, 0),
+                should_cancel=lambda: cancel_requested(task_id),
+                timeout=timeout,
+                on_notice=lambda message, layer_base=layer_base: _warn(progress_callback, "transfer", layer_base, message),
+            )
+            result = run.get("result") or {}
+            if run.get("exit_code") == 0 and result.get("status") in (None, "ok"):
+                continue
+            if vhdx_tool.ended_unexpectedly(run.get("result"), run.get("lines") or [], run.get("exit_code")):
+                raise HyperVRestoreError(
+                    vhdx_tool.unexpected_end_message(
+                        node_name, run["exit_code"], run.get("lines") or [], f"restoring disk {slot} of {vm_name}"
+                    )
+                )
+            detail = vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
+            failure = (detail, layer, storage_args, storage_env)
+            break
+        if failure is None:
+            break
+        detail, layer, storage_args, storage_env = failure
+        storage = lost_storage_reading(repository, storage_env, detail)
+        if not storage:
+            raise HyperVRestoreError(f"Restoring disk {slot} from {layer['abr_backup_name']} failed: {detail}")
+        lost = f"{node_name} lost {storage.what} while reading disk {slot} from {layer['abr_backup_name']}"
+        logger.warning("%s (attempt %d of %d): %s", lost, attempt, attempts, detail)
+        waited = _wait_for_storage(
+            node,
+            node_name,
+            storage_args,
+            storage_env,
+            task_id,
+            lost,
+            storage,
+            lambda message, progress=progress: _warn(progress_callback, "transfer", progress, message),
+            _storage_opens(node, node_name, storage_args, storage_env, task_id),
+        )
+        if waited is None:
+            raise HyperVRestoreError(
+                f"Restoring disk {slot} from {layer['abr_backup_name']} failed: {lost}, and could not "
+                f"{storage.regain} it again within {reconnect_seconds()} s. Check the network between "
+                f"{node_name} and {storage.peer}"
+            )
+        if attempt >= attempts:
+            raise HyperVRestoreError(
+                f"Restoring disk {slot} from {layer['abr_backup_name']} failed: {lost}; it {storage.back} "
+                f"again each time, but the disk could not be read on any of {attempts} attempts: {detail}"
+            )
+        node.remove_files(node_name, [target])
+        attempt += 1
+        again = f"it {storage.back} again after {waited} s" if waited else f"it {storage.comes_back} again"
+        _warn(
+            progress_callback,
+            "transfer",
+            progress,
+            f"{lost}; {again}, so the disk is restored again from the start (attempt {attempt} of {attempts})",
+        )
 
 
 def _restore_runs(layers: list[dict[str, Any]], repository: dict[str, Any]) -> list[dict[str, Any]]:
@@ -631,60 +751,22 @@ def run_hyperv_restore(
                 )
                 written_files.append(target)
                 runs = _restore_runs(layers, repository)
-                for position, layer in enumerate(runs):
-                    storage_args, storage_env = vhdx_tool.storage_invocation(repository, abr_path=layer["abr_path"])
-                    command = [
-                        "restore",
-                        "--json",
-                        *(
-                            ["--source-names", ",".join(layer["source_names"])]
-                            if layer.get("source_names")
-                            else ["--name", layer["abr_backup_name"]]
-                        ),
-                        *storage_args,
-                        "--vhdx",
-                        target,
-                    ]
-                    if position:
-                        # An incremental goes onto the disk its parent left.
-                        command.append("--force")
-                    if encryption_key:
-                        command.extend(["--key", encryption_key])
-                    layer_base = progress + int(position * span / len(runs))
-                    report = _disk_tool_progress_reporter(
-                        progress_callback,
-                        base_progress=layer_base,
-                        progress_span=max(1, int(span / len(runs))),
-                        message_prefix=(
-                            f"Restoring disk {index}/{len(plan)}"
-                            if layer.get("source_names")
-                            else f"Restoring disk {index}/{len(plan)}, backup {position + 1}/{len(runs)}"
-                        ),
-                        worker_mode=WORKER_MODE,
-                    )
-                    run = node.run_disk_tool(
-                        node_name,
-                        command,
-                        env=storage_env,
-                        on_progress=lambda percent, report=report: report(percent, 0),
-                        should_cancel=lambda: cancel_requested(task_id),
-                        timeout=_disk_timeout_seconds(
-                            tool_timeout_seconds, int(disk.get("capacity_bytes") or 0) / 1024**3
-                        ),
-                        on_notice=lambda message, layer_base=layer_base: _warn(progress_callback, "transfer", layer_base, message),
-                    )
-                    result = run.get("result") or {}
-                    if run.get("exit_code") != 0 or result.get("status") not in (None, "ok"):
-                        if vhdx_tool.ended_unexpectedly(run.get("result"), run.get("lines") or [], run.get("exit_code")):
-                            raise HyperVRestoreError(
-                                vhdx_tool.unexpected_end_message(
-                                    node_name, run["exit_code"], run.get("lines") or [], f"restoring disk {slot} of {target_vm_name}"
-                                )
-                            )
-                        detail = vhdx_tool.failure_message(result, run.get("lines") or [], run.get("exit_code"))
-                        raise HyperVRestoreError(
-                            f"Restoring disk {slot} from {layer['abr_backup_name']} failed: {detail}"
-                        )
+                _restore_disk_layers(
+                    node,
+                    node_name,
+                    runs,
+                    target,
+                    repository=repository,
+                    encryption_key=encryption_key,
+                    task_id=task_id,
+                    slot=slot,
+                    vm_name=target_vm_name,
+                    label=f"Restoring disk {index}/{len(plan)}",
+                    progress=progress,
+                    span=span,
+                    timeout=_disk_timeout_seconds(tool_timeout_seconds, int(disk.get("capacity_bytes") or 0) / 1024**3),
+                    progress_callback=progress_callback,
+                )
                 total_read += item["written_bytes"]
                 total_sent += item["written_bytes"]
                 if item["provisioning"] == "fixed":

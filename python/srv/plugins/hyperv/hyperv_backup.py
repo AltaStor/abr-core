@@ -110,6 +110,9 @@ _NETWORK_LOST = re.compile(
     r"|network location cannot be reached|connection was forcibly closed|network connection was aborted",
     re.IGNORECASE,
 )
+_READ_FAILED = re.compile(
+    r"error reading file|failed to read from data file|failed to load data range|read error", re.IGNORECASE
+)
 _S3_NETWORK = re.compile(
     r"network error|couldn't connect|could not connect|failed to connect|connection refused|connection reset"
     r"|timed out|timeout was reached|could not resolve host",
@@ -208,6 +211,15 @@ def lost_storage(repository: dict[str, Any], storage_env: dict[str, str], tool_e
         )
     share = str(storage_env.get("ABR_SMB_SHARE") or vhdx_tool.windows_share(repository) or "")
     if not share or not (_WRITE_FAILED.search(tool_error or "") or _NETWORK_LOST.search(tool_error or "")):
+        return None
+    return LostStorage(f"the repository share {share}", "open", "open", "opened", "opens", "the file server")
+
+
+def lost_storage_reading(repository: dict[str, Any], storage_env: dict[str, str], tool_error: str) -> LostStorage | None:
+    if is_s3_repository(repository):
+        return lost_storage(repository, storage_env, tool_error)
+    share = str(storage_env.get("ABR_SMB_SHARE") or vhdx_tool.windows_share(repository) or "")
+    if not share or not (_READ_FAILED.search(tool_error or "") or _NETWORK_LOST.search(tool_error or "")):
         return None
     return LostStorage(f"the repository share {share}", "open", "open", "opened", "opens", "the file server")
 
