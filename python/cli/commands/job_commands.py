@@ -581,7 +581,7 @@ class JobCommands:
                     f"--{prefix}-every",
                     dest=f"{dest}_every",
                     type=duration_type(f"--{prefix}-every"),
-                    help=f"{label} periodic interval like 15m, 1h, 6h, or 1d",
+                    help=f"{label} periodic interval like 15m, 1h, 6h, or 1d" + (" (at least 1d)" if prefix == "synthetic-full" else ""),
                 )
                 full_state = parser.add_mutually_exclusive_group()
                 full_state.add_argument(

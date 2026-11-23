@@ -4752,6 +4752,22 @@ def _schedule_from_request(raw: Any) -> dict[str, Any] | None:
     return _ensure_known_timezone(normalize_schedule_payload(raw))
 
 
+MIN_SYNTHETIC_FULL_MINUTES = 24 * 60
+
+
+def _synthetic_schedule_from_request(raw: Any) -> dict[str, Any] | None:
+    schedule = _schedule_from_request(raw)
+    if isinstance(schedule, dict) and schedule.get("kind") == "periodic":
+        _ensure(
+            int(schedule.get("interval_minutes") or 0) >= MIN_SYNTHETIC_FULL_MINUTES,
+            422,
+            "invalid_schedule",
+            f"A synthetic full rewrites the whole chain, so it runs at most once a day: every must be at least 1d, not {schedule.get('every')}",
+            every=schedule.get("every"),
+        )
+    return schedule
+
+
 def _ensure_unique_vms(vm_ids: list[str], vm_names: list[str]) -> None:
     seen: set[str] = set()
     for vm_id, vm_name in zip(vm_ids, vm_names):
@@ -5299,7 +5315,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     active_full_days = _normalize_day_list(payload.get("active_full_days") or _split_csv(payload.get("active_full_days_csv")))
     synthetic_full_days = _normalize_day_list(payload.get("synthetic_full_days") or _split_csv(payload.get("synthetic_full_days_csv")))
     active_full_schedule = _schedule_from_request(payload.get("active_full_schedule"))
-    synthetic_full_schedule = _schedule_from_request(payload.get("synthetic_full_schedule"))
+    synthetic_full_schedule = _synthetic_schedule_from_request(payload.get("synthetic_full_schedule"))
     if "active_full_schedule" in payload and not _schedule_weekdays(active_full_schedule):
         active_full_days = []
     if "synthetic_full_schedule" in payload and not _schedule_weekdays(synthetic_full_schedule):
@@ -5420,7 +5436,7 @@ def create_backup_copy_job(payload: dict[str, Any]) -> dict[str, Any]:
     active_full_days = _normalize_day_list(payload.get("active_full_days") or ())
     synthetic_full_days = _normalize_day_list(payload.get("synthetic_full_days") or ())
     active_full_schedule = _schedule_from_request(payload.get("active_full_schedule"))
-    synthetic_full_schedule = _schedule_from_request(payload.get("synthetic_full_schedule"))
+    synthetic_full_schedule = _synthetic_schedule_from_request(payload.get("synthetic_full_schedule"))
     if "active_full_schedule" in payload and not _schedule_weekdays(active_full_schedule):
         active_full_days = []
     if "synthetic_full_schedule" in payload and not _schedule_weekdays(synthetic_full_schedule):
@@ -5755,7 +5771,8 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     for schedule_key, days_key, next_run_key in EXECUTION_SCHEDULE_FIELDS:
         if schedule_key not in payload:
             continue
-        schedule_value = _schedule_from_request(payload[schedule_key])
+        read = _synthetic_schedule_from_request if schedule_key == "synthetic_full_schedule" else _schedule_from_request
+        schedule_value = read(payload[schedule_key])
         updated[schedule_key] = schedule_value
         updated[next_run_key] = _execution_schedule_next_run(schedule_value)
         updated[days_key] = _schedule_weekdays(schedule_value)

@@ -2237,7 +2237,7 @@ class AbrV41EngineTests(unittest.TestCase):
 
         moved = abr_v41.edit_job_record(
             job["id"],
-            {"synthetic_full_schedule": {"type": "periodic", "every": "12h"}},
+            {"synthetic_full_schedule": {"type": "periodic", "every": "2d"}},
         )
 
         self.assertEqual(moved["synthetic_full_days"], [])
