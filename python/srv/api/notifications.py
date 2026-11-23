@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
-from fastapi import Body, Request
+from fastapi import Body, Path, Request
 
-from python.srv.services import email_channel, notification_service, rbac, script_channel
+from python.srv.services import apprise_runner, email_channel, notification_service
+from python.srv.services.api_errors import api_error
 from python.srv.services.notification_events import events_dto
 
 from ._routing import build_router, register
@@ -15,12 +16,13 @@ from .schemas import (
     EmailNotificationSettingsRequest,
     EmailTestRequest,
     EmailTestResult,
+    ChatDeliveryList,
+    ChatTestResult,
+    MessagingList,
+    MessagingPlatformDTO,
+    MessagingSettingsRequest,
+    MessagingTestRequest,
     NotificationEventList,
-    NotificationScriptContentDTO,
-    NotificationScriptDTO,
-    NotificationScriptRunDTO,
-    NotificationScriptSettingsRequest,
-    NotificationScriptUploadRequest,
     unset_excluded,
 )
 
@@ -63,8 +65,8 @@ def test_email(request: Request, payload: EmailTestRequest = Body(default_factor
     in `settings`, to `to` or the configured recipients; nothing is saved. A
     message the server did not take answers 502 with the reason as the error
     code (smtp_connection_failed, smtp_tls_failed, smtp_auth_failed,
-    oauth_token_failed, smtp_sender_refused, smtp_recipients_refused,
-    smtp_error) and `details.stage`."""
+    smtp_sender_refused, smtp_recipients_refused, smtp_error) and
+    `details.stage`."""
     body = unset_excluded(payload)
     result = notification_service.send_test(body.get("settings"), body.get("to"))
     request.state.audit.details["recipients"] = result["recipients"]
@@ -82,85 +84,110 @@ def list_deliveries() -> EmailDeliveryList:
     return {"items": notification_service.EMAIL.history.items()}
 
 
-def _script_payload(request: Request) -> dict:
-    """What a script prints can hold anything, so a run's output is only for
-    those who could read the script itself."""
-    settings = script_channel.load_settings()
-    runs = notification_service.SCRIPT.history.items()[:20]
-    if not rbac.role_allows(getattr(getattr(request.state, "audit", None), "role", None), "notification.script"):
-        runs = [{key: value for key, value in run.items() if key != "output"} for run in runs]
-    return {**script_channel.settings_dto(settings), "events": events_dto(settings.get("events")), "runs": runs}
+PLATFORM = Path(description="telegram, slack, discord or ntfy")
 
 
-def get_script(request: Request) -> NotificationScriptDTO:
-    """The notification script: its file (never the content), whether it runs,
-    on which events, and its latest runs. `available` is false where
-    ABR_NOTIFICATION_SCRIPTS=0 switches the feature off."""
-    return _script_payload(request)
+def _channel(platform: str) -> notification_service._Channel:
+    channel = notification_service.MESSAGING.get(platform)
+    if channel is None:
+        raise api_error(
+            404,
+            "notification_platform_not_found",
+            f"No messaging platform {platform!r}: it is one of {', '.join(notification_service.MESSAGING)}",
+        )
+    return channel
 
 
-def update_script_settings(
+def _platform_payload(channel: notification_service._Channel) -> dict:
+    settings = channel.module.load_settings()
+    return {
+        **channel.module.settings_dto(settings),
+        "events": events_dto(settings.get("events")),
+        "deliveries": channel.history.items()[:20],
+    }
+
+
+def list_messaging() -> MessagingList:
+    """Every messaging platform the appliance can notify through (Telegram,
+    Slack, Discord, ntfy) with its settings, events and latest
+    deliveries, and whether Apprise, which sends them, is installed. `added`
+    says which ones were set up."""
+    return {
+        "apprise": apprise_runner.availability(),
+        "items": [_platform_payload(channel) for channel in notification_service.MESSAGING.values()],
+    }
+
+
+def get_platform(platform: str = PLATFORM) -> MessagingPlatformDTO:
+    """One messaging platform's settings (secrets only as *_set flags),
+    whether Apprise is installed, the events with whether each sends a
+    message, and the latest deliveries."""
+    return _platform_payload(_channel(platform))
+
+
+def update_platform(
     request: Request,
-    payload: NotificationScriptSettingsRequest = Body(default_factory=NotificationScriptSettingsRequest),
-) -> NotificationScriptDTO:
-    """Change whether the script runs, on which events and how long it may
-    take; fields left out keep their value. Refused as a whole, with every
-    problem by field, when a value is invalid or there is no script to enable
-    (422 invalid_notification_script)."""
-    _settings, changed = script_channel.update_settings(
+    platform: str = PLATFORM,
+    payload: MessagingSettingsRequest = Body(default_factory=MessagingSettingsRequest),
+) -> MessagingPlatformDTO:
+    """Change a messaging platform's settings, which adds it when it was not.
+    Telegram takes bot_token and chat_ids; Slack and Discord take webhook_url;
+    ntfy takes webhook_url, the topic's URL, and access_token for a server with
+    access control. Fields left out keep their value, and so does a secret sent
+    as null. The whole change is refused, with every problem by field in
+    `error.details.fields`, when a value is invalid, or when the platform is on
+    and a setting is missing or Apprise cannot read the settings (422
+    invalid_notification_settings)."""
+    channel = _channel(platform)
+    _settings, changed = channel.module.update_settings(
         unset_excluded(payload), updated_by=getattr(request.state, "user_name", None)
     )
-    request.state.audit.details["changed"] = changed
-    return _script_payload(request)
+    request.state.audit.details.update(platform=platform, changed=changed)
+    return _platform_payload(channel)
 
 
-def upload_script(
+def remove_platform(request: Request, platform: str = PLATFORM) -> MessagingPlatformDTO:
+    """Remove a messaging platform: its settings and secret go, and it sends
+    nothing until it is added again. Its delivery history stays."""
+    channel = _channel(platform)
+    channel.module.remove(updated_by=getattr(request.state, "user_name", None))
+    request.state.audit.details["platform"] = platform
+    return _platform_payload(channel)
+
+
+def test_platform(
     request: Request,
-    payload: NotificationScriptUploadRequest = Body(default_factory=NotificationScriptUploadRequest),
-) -> NotificationScriptDTO:
-    """Store the script, in place of any earlier one. It runs on the appliance
-    as the server's service user. It must be text of at most 256 KiB, starting
-    with a #! line naming an interpreter the appliance has (422
-    invalid_notification_script). The audit log records its name, size and
-    SHA-256, not its content."""
-    settings = script_channel.upload(unset_excluded(payload), updated_by=getattr(request.state, "user_name", None))
-    file = settings["file"]
-    request.state.audit.details.update(script=file["name"], size=file["size"], sha256=file["sha256"])
-    return _script_payload(request)
-
-
-def get_script_content(request: Request) -> NotificationScriptContentDTO:
-    """The stored script, to review it; reading it is recorded in the audit log."""
-    result = script_channel.content()
-    request.state.audit.details.update(script=result["name"], sha256=result["sha256"])
+    platform: str = PLATFORM,
+    payload: MessagingTestRequest = Body(default_factory=MessagingTestRequest),
+) -> ChatTestResult:
+    """Send a test message now, with the stored settings and any unsaved
+    changes in `settings`; nothing is saved. A message that did not go answers
+    502 with the reason as the error code (connection_failed, tls_failed,
+    delivery_refused, delivery_failed, timed_out, apprise_missing,
+    apprise_not_started, apprise_url_refused, apprise_failed), `details.stage`,
+    and `details.delivered_to`, the chats (Telegram) that did get it."""
+    channel = _channel(platform)
+    result = notification_service.send_chat_test(channel, unset_excluded(payload).get("settings"))
+    request.state.audit.details.update(platform=platform, delivered_to=result["delivered_to"])
     return result
 
 
-def delete_script(request: Request) -> NotificationScriptDTO:
-    """Delete the script, which also stops it running."""
-    script_channel.remove(updated_by=getattr(request.state, "user_name", None))
-    return _script_payload(request)
+def list_platform_deliveries(platform: str = PLATFORM) -> ChatDeliveryList:
+    """A messaging platform's latest deliveries (up to 50), newest first."""
+    return {"items": _channel(platform).history.items()}
 
 
-def test_script(request: Request) -> NotificationScriptRunDTO:
-    """Run the script now on a sample event (`event` is `test`), whether or not
-    it is switched on, and wait for it. A script that fails answers 200 with
-    `status` failed, the reason in `error`, its exit code and output."""
-    result = notification_service.run_script_test()
-    request.state.audit.details.update(sha256=result.get("sha256"), status=result.get("status"), exit_code=result.get("exit_code"))
-    return result
-
-
+# The fixed paths come before /{platform}, which would otherwise take them.
 register(router, [
     ("/email", get_email_settings, ["GET"], "notification.view"),
     ("/email", update_email_settings, ["PUT"], "notification.edit"),
     ("/email/test", test_email, ["POST"], "notification.test"),
     ("/email/deliveries", list_deliveries, ["GET"], "notification.view"),
     ("/events", list_events, ["GET"], "notification.view"),
-    ("/script", get_script, ["GET"], "notification.view"),
-    ("/script", update_script_settings, ["PUT"], "notification.script"),
-    ("/script/file", upload_script, ["PUT"], "notification.script"),
-    ("/script/file", get_script_content, ["GET"], "notification.script"),
-    ("/script/file", delete_script, ["DELETE"], "notification.script"),
-    ("/script/test", test_script, ["POST"], "notification.script"),
+    ("/messaging", list_messaging, ["GET"], "notification.view"),
+    ("/{platform}", get_platform, ["GET"], "notification.view"),
+    ("/{platform}", update_platform, ["PUT"], "notification.edit"),
+    ("/{platform}", remove_platform, ["DELETE"], "notification.edit"),
+    ("/{platform}/test", test_platform, ["POST"], "notification.test"),
+    ("/{platform}/deliveries", list_platform_deliveries, ["GET"], "notification.view"),
 ])

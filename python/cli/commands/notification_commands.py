@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 from ..compact_help_formatter import CompactHelpFormatter
@@ -12,10 +12,55 @@ from ..parsing.secret_arguments import add_secret_argument, resolve_secret
 from .base import CommandDependencies
 
 SETTINGS_PATH = "api/v1/notifications/email"
-SCRIPT_PATH = "api/v1/notifications/script"
+NOTIFICATIONS_PATH = "api/v1/notifications"
 SMTP_PASSWORD_ENV_VAR = "ABR_SMTP_PASSWORD"
-OAUTH_CLIENT_SECRET_ENV_VAR = "ABR_SMTP_OAUTH_CLIENT_SECRET"
-OAUTH_REFRESH_TOKEN_ENV_VAR = "ABR_SMTP_OAUTH_REFRESH_TOKEN"
+NTFY_ACCESS_TOKEN_ENV_VAR = "ABR_NTFY_ACCESS_TOKEN"
+
+
+@dataclass(frozen=True, slots=True)
+class _Platform:
+    """A messaging platform as the CLI offers it."""
+
+    name: str
+    service: str
+    # Where a secret flag without a value reads the secret from.
+    env_var: str
+    # What its main secret is called: "bot token", "webhook URL", "topic URL".
+    what: str
+    about: str
+    # The flag that sets it.
+    flag: str
+
+
+PLATFORMS = {
+    platform.name: platform
+    for platform in (
+        _Platform(
+            "telegram", "Telegram", "ABR_TELEGRAM_BOT_TOKEN", "bot token",
+            "A bot made with @BotFather posts to up to ten chats; add the bot to each group or channel first.",
+            "--bot-token",
+        ),
+        _Platform(
+            "slack", "Slack", "ABR_SLACK_WEBHOOK_URL", "webhook URL",
+            "A Slack app's incoming webhook posts to one channel; its URL, https://hooks.slack.com/services/..., is "
+            "the setting.",
+            "--webhook-url",
+        ),
+        _Platform(
+            "discord", "Discord", "ABR_DISCORD_WEBHOOK_URL", "webhook URL",
+            "A Discord channel's webhook (Edit Channel > Integrations > Webhooks) posts to it; its URL, "
+            "https://discord.com/api/webhooks/..., is the setting.",
+            "--webhook-url",
+        ),
+        _Platform(
+            "ntfy", "ntfy", "ABR_NTFY_TOPIC_URL", "topic URL",
+            "Messages are published to a topic on ntfy.sh or on a server of your own: https://ntfy.sh/<topic> or "
+            "https://<your server>/<topic>. On ntfy.sh anyone who knows the topic can read it, so pick a long, "
+            "unguessable name. A server with access control also takes an access token (--access-token).",
+            "--topic-url",
+        ),
+    )
+}
 
 
 def _addresses(values: list[str] | None) -> list[str]:
@@ -28,26 +73,6 @@ def _event_ids(values: list[str] | None) -> list[str]:
 
 def _settings_patch(args: argparse.Namespace) -> dict[str, Any]:
     """The `set` and `test` flags as a settings change; unset flags are left out."""
-    oauth = {
-        key: value
-        for key, value in (
-            ("provider", args.oauth_provider),
-            ("tenant_id", args.oauth_tenant),
-            ("client_id", args.oauth_client_id),
-            ("grant", args.oauth_grant),
-            ("token_url", args.oauth_token_url),
-            ("scope", args.oauth_scope),
-            (
-                "client_secret",
-                resolve_secret(args.oauth_client_secret, env_var=OAUTH_CLIENT_SECRET_ENV_VAR, prompt="OAuth client secret"),
-            ),
-            (
-                "refresh_token",
-                resolve_secret(args.oauth_refresh_token, env_var=OAUTH_REFRESH_TOKEN_ENV_VAR, prompt="OAuth refresh token"),
-            ),
-        )
-        if value is not None
-    }
     smtp = {
         key: value
         for key, value in (
@@ -62,8 +87,6 @@ def _settings_patch(args: argparse.Namespace) -> dict[str, Any]:
         )
         if value is not None
     }
-    if oauth:
-        smtp["oauth2"] = oauth
     sender = {key: value for key, value in (("address", args.sender), ("name", args.sender_name)) if value is not None}
     patch: dict[str, Any] = {}
     if smtp:
@@ -87,21 +110,9 @@ def _add_settings_flags(parser: argparse.ArgumentParser) -> None:
     verify.add_argument("--no-verify-tls", dest="verify_tls", action="store_const", const=False, help="Do not check the server certificate")
     smtp.add_argument("--timeout", type=int, metavar="SECONDS", help="Give up on the server after this long, 5-300 (default 30)")
     auth = parser.add_argument_group("Authentication")
-    auth.add_argument("--auth", choices=("password", "oauth2", "none"), help="How to sign in to the SMTP server")
-    auth.add_argument("--username", help="password: the account to sign in as; oauth2: the mailbox the token sends as")
+    auth.add_argument("--auth", choices=("password", "none"), help="How to sign in to the SMTP server")
+    auth.add_argument("--username", help="password: the account to sign in as")
     add_secret_argument(auth, "--password", env_var=SMTP_PASSWORD_ENV_VAR, help_text="SMTP password (an empty value clears it)")
-    auth.add_argument("--oauth-provider", choices=("microsoft", "google", "custom"), help="OAuth 2.0 provider")
-    auth.add_argument("--oauth-tenant", help="Microsoft: the directory (tenant) ID or domain")
-    auth.add_argument("--oauth-client-id", help="The application (client) ID")
-    add_secret_argument(auth, "--oauth-client-secret", env_var=OAUTH_CLIENT_SECRET_ENV_VAR, help_text="The client secret")
-    auth.add_argument(
-        "--oauth-grant",
-        choices=("client_credentials", "refresh_token"),
-        help="client_credentials (an app sends as the mailbox; Microsoft) or refresh_token (a user consented once)",
-    )
-    add_secret_argument(auth, "--oauth-refresh-token", env_var=OAUTH_REFRESH_TOKEN_ENV_VAR, help_text="refresh_token grant: the refresh token")
-    auth.add_argument("--oauth-token-url", help="custom provider: the token endpoint (https://)")
-    auth.add_argument("--oauth-scope", help="Overrides the provider's scope for SMTP")
     sender = parser.add_argument_group("Sender")
     sender.add_argument("--from", dest="sender", metavar="ADDRESS", help="The address notifications are sent from")
     sender.add_argument("--from-name", dest="sender_name", metavar="NAME", help="The sender's display name: one line, at most 100 characters")
@@ -112,21 +123,10 @@ def _print_settings(deps: CommandDependencies, payload: dict[str, Any]) -> None:
         deps.context.print_output(payload)
         return
     smtp = payload.get("smtp") or {}
-    oauth = smtp.get("oauth2") or {}
     sender = payload.get("sender") or {}
     auth = smtp.get("auth")
     if auth == "password":
         auth_text = f"user name and password ({smtp.get('username') or 'no user'}, password {'set' if smtp.get('password_set') else 'not set'})"
-    elif auth == "oauth2":
-        secret = "client secret " + ("set" if oauth.get("client_secret_set") else "not set")
-        if oauth.get("grant") == "refresh_token":
-            secret = "refresh token " + ("set" if oauth.get("refresh_token_set") else "not set")
-        auth_text = (
-            f"OAuth 2.0, {oauth.get('provider')} ({oauth.get('grant')}), mailbox {smtp.get('username') or '-'}, "
-            f"client {oauth.get('client_id') or '-'}"
-            + (f", tenant {oauth['tenant_id']}" if oauth.get("tenant_id") else "")
-            + f", {secret}"
-        )
     else:
         auth_text = "none"
     rows = [
@@ -153,20 +153,31 @@ def _print_settings(deps: CommandDependencies, payload: dict[str, Any]) -> None:
         print(f"\nLast delivery: {latest.get('queued_at')} {latest.get('event')} \"{latest.get('subject')}\" - {outcome}")
 
 
-def _print_script(deps: CommandDependencies, payload: dict[str, Any]) -> None:
+def _print_platform(deps: CommandDependencies, payload: dict[str, Any], platform: _Platform) -> None:
+    """A messaging platform's settings as a table."""
     if deps.context.output != "table":
         deps.context.print_output(payload)
         return
-    file = payload.get("file") or {}
-    state = "on" if payload.get("enabled") else "off"
-    if not payload.get("available", True):
-        state = "switched off on this appliance (ABR_NOTIFICATION_SCRIPTS=0)"
+    if not payload.get("added"):
+        print(f"{platform.service} is not set up: abr notification {platform.name} set adds it.")
+        return
+    if platform.name == "telegram":
+        token = "set" if payload.get("bot_token_set") else "not set"
+        settings = [
+            ("Bot token", token + (f" (bot {payload['bot_id']})" if payload.get("bot_id") else "")),
+            ("Chats", ", ".join(payload.get("chat_ids") or []) or "-"),
+        ]
+    else:
+        url = f"set ({payload.get('webhook_host')})" if payload.get("webhook_url_set") else "not set"
+        settings = [(platform.what[:1].upper() + platform.what[1:], url)]
+        if platform.name == "ntfy":
+            settings.append(("Access token", "set" if payload.get("access_token_set") else "none"))
+    apprise = payload.get("apprise") or {}
     rows = [
-        ("Notification script", state),
-        ("File", f"{file.get('name')} ({file.get('size')} bytes)" if file else "none uploaded"),
-        ("SHA-256", file.get("sha256") or "-"),
-        ("Uploaded", f"{file.get('uploaded_at') or '-'} by {file.get('uploaded_by') or '-'}"),
-        ("Time limit", f"{payload.get('timeout_seconds')} s"),
+        ("Notifications", "on" if payload.get("enabled") else "off"),
+        *settings,
+        ("Apprise", apprise.get("version") or "-" if apprise.get("available") else "not installed (the apprise package)"),
+        ("Last changed", f"{payload.get('updated_at') or '-'} by {payload.get('updated_by') or '-'}"),
     ]
     width = max(len(label) for label, _ in rows)
     for label, value in rows:
@@ -174,25 +185,78 @@ def _print_script(deps: CommandDependencies, payload: dict[str, Any]) -> None:
     print("\nEvents:")
     for event in payload.get("events") or []:
         print(f"  [{'x' if event.get('enabled') else ' '}] {event.get('id'):<26} {event.get('name')}")
-    runs = payload.get("runs") or []
-    if runs:
-        print("\nLatest runs:")
-    for run in runs[:10]:
-        error = run.get("error") or {}
-        outcome = run.get("status") + (f" ({error.get('code')}: {error.get('message')})" if error else "")
-        print(f"  {run.get('queued_at')}  {run.get('event'):<26} exit {run.get('exit_code')}  {outcome}")
+    deliveries = payload.get("deliveries") or []
+    if deliveries:
+        latest = deliveries[0]
+        error = latest.get("error") or {}
+        outcome = latest.get("status") + (f" ({error.get('code')}: {error.get('message')})" if error else "")
+        print(f"\nLast delivery: {latest.get('queued_at')} {latest.get('event')} \"{latest.get('subject')}\" - {outcome}")
+
+
+def _chat_ids(values: list[str] | None) -> list[str]:
+    return [item.strip() for value in values or [] for item in value.replace(";", ",").split(",") if item.strip()]
+
+
+def _events_patch(on: list[str] | None, off: list[str] | None) -> dict[str, bool]:
+    enable, disable = _event_ids(on), _event_ids(off)
+    both = sorted(set(enable) & set(disable))
+    if both:
+        raise ValueError(f"Both on and off: {', '.join(both)}")
+    return {**{event_id: True for event_id in enable}, **{event_id: False for event_id in disable}}
+
+
+def _platform_patch(args: argparse.Namespace, platform: _Platform) -> dict[str, Any]:
+    """The settings flags of `set` and `test` as a change; unset flags are left out."""
+    patch: dict[str, Any] = {}
+    if platform.name == "telegram":
+        token = resolve_secret(args.bot_token, env_var=platform.env_var, prompt="Telegram bot token")
+        if token is not None:
+            patch["bot_token"] = token
+        if args.chats:
+            patch["chat_ids"] = _chat_ids(args.chats)
+        return patch
+    url = resolve_secret(args.webhook_url, env_var=platform.env_var, prompt=f"{platform.service} {platform.what}")
+    if url is not None:
+        patch["webhook_url"] = url
+    if platform.name == "ntfy":
+        token = resolve_secret(args.access_token, env_var=NTFY_ACCESS_TOKEN_ENV_VAR, prompt="ntfy access token")
+        if token is not None:
+            patch["access_token"] = token
+    return patch
+
+
+def _add_platform_flags(parser: argparse.ArgumentParser, platform: _Platform) -> None:
+    if platform.name == "telegram":
+        add_secret_argument(
+            parser, "--bot-token", env_var=platform.env_var, help_text="The bot's token from @BotFather (an empty value clears it)"
+        )
+        parser.add_argument(
+            "--chats", action="append", metavar="IDS",
+            help="The whole list of chats, comma-separated or repeated: -1001234567890 or @channelname (at most 10)",
+        )
+    else:
+        add_secret_argument(
+            parser, platform.flag, env_var=platform.env_var, dest="webhook_url",
+            help_text=f"The {platform.service} {platform.what} (an empty value clears it)",
+        )
+    if platform.name == "ntfy":
+        add_secret_argument(
+            parser, "--access-token", env_var=NTFY_ACCESS_TOKEN_ENV_VAR,
+            help_text="An access token (tk_...) for a server with access control (an empty value clears it)",
+        )
 
 
 class NotificationCommands:
     def register(self, registry) -> None:
         group = registry.add_parser(
             "notification",
-            help="E-mail notifications and the notification script",
+            help="E-mail and messaging (Telegram, Slack, Discord, ntfy) notifications",
             description=(
                 "Notification commands: the SMTP server, how the appliance signs in to it, the sender and "
-                "recipients, the events that send e-mail, a test e-mail and the delivery history, and the script "
-                "the appliance can run on events (abr notification script). The web console's Settings > "
-                "Notifications changes the same settings."
+                "recipients, the events that send e-mail, a test e-mail and the delivery history; and the "
+                "messaging platforms, Telegram, Slack, Discord and ntfy, sent through Apprise (abr "
+                "notification platforms lists them; abr notification telegram|slack|discord|ntfy). The web "
+                "console's Settings > Notifications changes the same settings."
             ),
             formatter_class=CompactHelpFormatter,
         )
@@ -213,14 +277,12 @@ class NotificationCommands:
                 "Change the e-mail notification settings; options left out keep their value. The server "
                 "refuses the whole change, naming every problem, when a value is invalid or when "
                 "notifications are on and a setting delivery needs is missing.\n\n"
-                f"Secrets are read from {SMTP_PASSWORD_ENV_VAR}, {OAUTH_CLIENT_SECRET_ENV_VAR} and "
-                f"{OAUTH_REFRESH_TOKEN_ENV_VAR}, or prompted for, when their flag is given without a value.\n\n"
+                f"The password is read from {SMTP_PASSWORD_ENV_VAR}, or prompted for, when --password is given "
+                "without a value.\n\n"
                 "Examples:\n"
                 "  abr notification set --smtp-host smtp.example.com --smtp-port 587 --security starttls \\\n"
                 "      --auth password --username backup@example.com --password \\\n"
                 "      --from backup@example.com --recipients ops@example.com,dba@example.com --enable\n"
-                "  abr notification set --auth oauth2 --oauth-provider microsoft --oauth-tenant contoso.onmicrosoft.com \\\n"
-                "      --oauth-client-id 0f1e... --oauth-client-secret --username backup@contoso.com\n"
                 "  abr notification set --add-recipient oncall@example.com --remove-recipient dba@example.com\n"
                 "  abr notification set --disable"
             ),
@@ -296,81 +358,90 @@ class NotificationCommands:
         events_set.add_argument("--disable", action="append", metavar="EVENTS", help="Event IDs to switch off, comma-separated or repeated")
         events_set.set_defaults(handler=self.events_set)
 
-        script = commands.add_parser(
-            "script",
-            help="The script the appliance runs on events",
+        platforms = commands.add_parser(
+            "platforms",
+            help="List the messaging platforms and which are set up.",
             description=(
-                "Notification script commands. The script runs on the appliance as the server's service user, "
-                "so it can do whatever that user can: upload only code you trust. See doc/Notifications.md for "
-                "what it receives."
+                "List the messaging platforms (Telegram, Slack, Discord, ntfy), whether each is set up "
+                "and on, and its last delivery; and whether Apprise, which sends them, is installed.\n\n"
+                "Examples:\n  abr notification platforms"
             ),
             formatter_class=CompactHelpFormatter,
         )
-        script_commands = script.add_subparsers(dest="notification_script_command", required=True)
-        script_show = script_commands.add_parser(
-            "show",
-            help="Show the script's file, settings and latest runs.",
-            description="Show the uploaded script, whether it runs, on which events, and its latest runs.\n\nExamples:\n  abr notification script show",
-            formatter_class=CompactHelpFormatter,
-        )
-        script_show.set_defaults(handler=self.script_show)
-        script_upload = script_commands.add_parser(
-            "upload",
-            help="Upload the script, replacing any earlier one.",
+        platforms.set_defaults(handler=self.platforms)
+        for platform in PLATFORMS.values():
+            self._register_platform(commands, platform)
+
+    def _register_platform(self, commands, platform: _Platform) -> None:
+        name, service = platform.name, platform.service
+        parser = commands.add_parser(
+            name,
+            help=f"{service} messages, sent through Apprise",
             description=(
-                "Upload a script of at most 256 KiB, in place of any earlier one. It must be text starting with a "
-                "#! line naming an interpreter the appliance has. Uploading does not switch it on, and a "
-                "replacement keeps the state of the one it replaces.\n\n"
-                "Examples:\n  abr notification script upload --file ./notify-teams.sh"
+                f"{service} notification commands. Messages go out through Apprise (/usr/bin/apprise, the apprise "
+                f"package), with their own choice of events. {platform.about}"
             ),
             formatter_class=CompactHelpFormatter,
         )
-        script_upload.add_argument("--file", required=True, metavar="PATH", help="The script file on this machine")
-        script_upload.set_defaults(handler=self.script_upload)
-        script_content = script_commands.add_parser(
-            "content",
-            help="Print the stored script.",
-            description="Print the stored script, to review it. Reading it is recorded in the audit log.\n\nExamples:\n  abr notification script content > stored.sh",
-            formatter_class=CompactHelpFormatter,
-        )
-        script_content.set_defaults(handler=self.script_content)
-        script_set = script_commands.add_parser(
-            "set",
-            help="Change whether the script runs, on which events and for how long.",
-            description=(
-                "Change the script's settings; options left out keep their value. Its events are chosen apart "
-                "from those that send e-mail.\n\n"
-                "Examples:\n"
-                "  abr notification script set --enable --timeout 120\n"
-                "  abr notification script set --event-on job.succeeded --event-off repository.low_space\n"
-                "  abr notification script set --disable"
+        actions = parser.add_subparsers(dest=f"notification_{name}_command", required=True)
+        secret_flag = platform.flag
+        examples = {
+            "show": f"  abr notification {name} show",
+            "set": (
+                f"  abr notification {name} set {secret_flag}"
+                + (" --chats -1001234567890" if name == "telegram" else "")
+                + f" --enable\n  abr notification {name} set --event-on job.succeeded --event-off repository.low_space"
             ),
-            formatter_class=CompactHelpFormatter,
-        )
-        script_state = script_set.add_mutually_exclusive_group()
-        script_state.add_argument("--enable", dest="enabled", action="store_const", const=True, help="Run the script on its events")
-        script_state.add_argument("--disable", dest="enabled", action="store_const", const=False, help="Stop running it (the script is kept)")
-        script_set.add_argument("--timeout", type=int, metavar="SECONDS", help="Stop a run after this long, 5-600 (default 60)")
-        script_set.add_argument("--event-on", action="append", metavar="EVENTS", help="Event IDs that run the script, comma-separated or repeated")
-        script_set.add_argument("--event-off", action="append", metavar="EVENTS", help="Event IDs that no longer run it, comma-separated or repeated")
-        script_set.set_defaults(handler=self.script_set)
-        script_remove = script_commands.add_parser(
-            "remove",
-            help="Delete the script.",
-            description="Delete the script, which also stops it running.\n\nExamples:\n  abr notification script remove",
-            formatter_class=CompactHelpFormatter,
-        )
-        script_remove.set_defaults(handler=self.script_remove)
-        script_test = script_commands.add_parser(
-            "test",
-            help="Run the script now on a sample event.",
-            description=(
-                "Run the script now on a sample event, whether or not it is switched on, and print how it went. "
-                "Exits 1 when the script fails.\n\nExamples:\n  abr notification script test"
+            "test": f"  abr notification {name} test" + ("\n  abr notification telegram test --chats 123456789" if name == "telegram" else ""),
+            "history": f"  abr notification {name} history",
+            "remove": f"  abr notification {name} remove",
+        }
+        descriptions = {
+            "show": f"Show the {service} settings, whether Apprise is installed, the events that send a message and the last delivery.",
+            "set": (
+                f"Change the {service} settings, which sets {service} up when it was not; options left out keep "
+                "their value. The server refuses the whole change, naming every problem, when a value is invalid or "
+                f"when notifications are on and a setting is missing or Apprise cannot read it. {secret_flag} without "
+                f"a value reads {platform.env_var}, or prompts."
             ),
-            formatter_class=CompactHelpFormatter,
-        )
-        script_test.set_defaults(handler=self.script_test)
+            "test": (
+                f"Send a test message now and report whether {service} took it, or why not. Options test changes "
+                "without saving them. Exits 1 when it was not sent."
+            ),
+            "history": f"List the latest {service} deliveries, newest first: sent, waiting for a retry, or failed and why. Times are UTC.",
+            "remove": f"Remove {service}: its settings and {platform.what} are deleted and it sends nothing. Its delivery history stays.",
+        }
+        helps = {
+            "show": f"Show the {service} settings.",
+            "set": f"Set up or change {service}.",
+            "test": f"Send a test {service} message.",
+            "history": f"List the latest {service} deliveries.",
+            "remove": f"Remove {service}.",
+        }
+        handlers = {
+            "show": self.platform_show,
+            "set": self.platform_set,
+            "test": self.platform_test,
+            "history": self.platform_history,
+            "remove": self.platform_remove,
+        }
+        for action, handler in handlers.items():
+            sub = actions.add_parser(
+                action,
+                help=helps[action],
+                description=f"{descriptions[action]}\n\nExamples:\n{examples[action]}",
+                formatter_class=CompactHelpFormatter,
+            )
+            if action == "set":
+                state = sub.add_mutually_exclusive_group()
+                state.add_argument("--enable", dest="enabled", action="store_const", const=True, help="Send messages")
+                state.add_argument("--disable", dest="enabled", action="store_const", const=False, help="Stop sending messages (the settings are kept)")
+            if action in ("set", "test"):
+                _add_platform_flags(sub, platform)
+            if action == "set":
+                sub.add_argument("--event-on", action="append", metavar="EVENTS", help="Event IDs that send a message, comma-separated or repeated")
+                sub.add_argument("--event-off", action="append", metavar="EVENTS", help="Event IDs that no longer send one, comma-separated or repeated")
+            sub.set_defaults(handler=handler, platform=name)
 
     def show(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
@@ -462,64 +533,87 @@ class NotificationCommands:
         deps.context.api_client.put(SETTINGS_PATH, json={"events": events})
         return self.events_list(args)
 
-    def script_show(self, args: argparse.Namespace) -> int:
+    def platforms(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
-        _print_script(deps, deps.context.api_client.get(SCRIPT_PATH))
-        return 0
-
-    def script_upload(self, args: argparse.Namespace) -> int:
-        path = Path(args.file).expanduser()
-        try:
-            content = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise ValueError(f"Cannot read {path} as a text file: {exc}") from exc
-        deps = CommandDependencies(args)
-        payload = {"name": path.name, "script_content": content}
-        _print_script(deps, deps.context.api_client.put(f"{SCRIPT_PATH}/file", json=payload))
-        return 0
-
-    def script_content(self, args: argparse.Namespace) -> int:
-        deps = CommandDependencies(args)
-        result = deps.context.api_client.get(f"{SCRIPT_PATH}/file")
+        payload = deps.context.api_client.get(f"{NOTIFICATIONS_PATH}/messaging")
         if deps.context.output != "table":
-            deps.context.print_output(result)
-        else:
-            print(result.get("script_content") or "", end="")
+            deps.context.print_output(payload)
+            return 0
+        for item in payload.get("items", []):
+            item["state"] = ("on" if item.get("enabled") else "off") if item.get("added") else "not set up"
+            latest = (item.get("deliveries") or [{}])[0]
+            item["last"] = f"{latest.get('queued_at')} {latest.get('status')}" if latest else ""
+        deps.context.print_output(payload, [("id", "PLATFORM"), ("name", "NAME"), ("state", "STATE"), ("last", "LAST DELIVERY")])
+        apprise = payload.get("apprise") or {}
+        if not apprise.get("available"):
+            print("\nApprise is not installed (the apprise package): nothing can be sent.")
         return 0
 
-    def script_set(self, args: argparse.Namespace) -> int:
-        on, off = _event_ids(args.event_on), _event_ids(args.event_off)
-        both = sorted(set(on) & set(off))
-        if both:
-            raise ValueError(f"Both on and off: {', '.join(both)}")
-        payload: dict[str, Any] = {}
+    @staticmethod
+    def _platform(args: argparse.Namespace) -> tuple[str, _Platform]:
+        return f"{NOTIFICATIONS_PATH}/{args.platform}", PLATFORMS[args.platform]
+
+    def platform_show(self, args: argparse.Namespace) -> int:
+        path, platform = self._platform(args)
+        deps = CommandDependencies(args)
+        _print_platform(deps, deps.context.api_client.get(path), platform)
+        return 0
+
+    def platform_set(self, args: argparse.Namespace) -> int:
+        path, platform = self._platform(args)
+        patch = _platform_patch(args, platform)
         if args.enabled is not None:
-            payload["enabled"] = args.enabled
-        if args.timeout is not None:
-            payload["timeout_seconds"] = args.timeout
-        if on or off:
-            payload["events"] = {**{event_id: True for event_id in on}, **{event_id: False for event_id in off}}
-        if not payload:
-            raise ValueError("Nothing to change: pass --enable, --disable, --timeout, --event-on or --event-off")
+            patch["enabled"] = args.enabled
+        events = _events_patch(args.event_on, args.event_off)
+        if events:
+            patch["events"] = events
+        if not patch:
+            raise ValueError(f"Nothing to change: pass at least one option (abr notification {platform.name} set --help lists them)")
         deps = CommandDependencies(args)
-        _print_script(deps, deps.context.api_client.put(SCRIPT_PATH, json=payload))
+        _print_platform(deps, deps.context.api_client.put(path, json=patch), platform)
         return 0
 
-    def script_remove(self, args: argparse.Namespace) -> int:
+    def platform_test(self, args: argparse.Namespace) -> int:
+        path, platform = self._platform(args)
+        patch = _platform_patch(args, platform)
         deps = CommandDependencies(args)
-        _print_script(deps, deps.context.api_client.delete(f"{SCRIPT_PATH}/file"))
-        return 0
-
-    def script_test(self, args: argparse.Namespace) -> int:
-        deps = CommandDependencies(args)
-        result = deps.context.api_client.post(f"{SCRIPT_PATH}/test", json={}, timeout=660)
-        failed = result.get("status") != "sent"
+        result = deps.context.api_client.post(f"{path}/test", json={"settings": patch} if patch else {}, timeout=700)
         if deps.context.output != "table":
             deps.context.print_output(result)
-            return 1 if failed else 0
-        error = result.get("error") or {}
-        outcome = f"{error.get('code')}: {error.get('message')}" if failed else "succeeded"
-        print(f"{result.get('script')}: {outcome} (exit code {result.get('exit_code')}, {result.get('duration_ms')} ms)")
-        if result.get("output"):
-            print(result["output"])
-        return 1 if failed else 0
+            return 0
+        where = ", ".join(result.get("delivered_to") or []) if platform.name == "telegram" else f"the {platform.what}"
+        print(f"Test message sent to {where} in {result.get('duration_ms')} ms.")
+        return 0
+
+    def platform_remove(self, args: argparse.Namespace) -> int:
+        path, platform = self._platform(args)
+        deps = CommandDependencies(args)
+        payload = deps.context.api_client.delete(path)
+        if deps.context.output != "table":
+            deps.context.print_output(payload)
+        else:
+            print(f"{platform.service} removed.")
+        return 0
+
+    def platform_history(self, args: argparse.Namespace) -> int:
+        path, _platform = self._platform(args)
+        deps = CommandDependencies(args)
+        payload = deps.context.api_client.get(f"{path}/deliveries")
+        if deps.context.output == "table":
+            for item in payload.get("items", []):
+                error = item.get("error") or {}
+                item["outcome"] = f"{error.get('code')}: {error.get('message')}" if error else ""
+                item["to"] = ", ".join(item.get("delivered_to") or [])
+        deps.context.print_output(
+            payload,
+            [
+                ("queued_at", "QUEUED (UTC)"),
+                ("event", "EVENT"),
+                ("status", "STATUS"),
+                ("attempts", "ATTEMPTS"),
+                ("subject", "SUBJECT"),
+                ("to", "SENT TO"),
+                ("outcome", "ERROR"),
+            ],
+        )
+        return 0

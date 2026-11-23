@@ -6,6 +6,7 @@ from __future__ import annotations
 import queue
 import time
 import unittest
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,7 +14,7 @@ from unittest.mock import patch
 from python.srv.core.mongo_db_wrapper import SYSTEM_STATE
 from python.srv.services import notification_service
 from python.srv.services.notification_events import DeliveryError, Notification
-from python.tests.srv.notifications.test_script_channel import in_memory
+from python.tests.srv.notifications.memory import in_memory
 
 NOTIFICATION = Notification("job.failed", 'Backup job "nightly" failed', "The body\n", "error", {"job_name": "nightly"})
 
@@ -240,13 +241,13 @@ class InterruptedAttemptTests(_RestartCase):
         self.module.outcomes = []
         return self.restarted()
 
-    def test_an_e_mail_cut_off_in_the_middle_is_sent_again(self) -> None:
+    def test_a_delivery_cut_off_in_the_middle_is_sent_again(self) -> None:
         after = self.interrupted(repeat=True)
         self.drain(after)
         entry = self.only_entry(after)
         self.assertEqual((entry["status"], entry["attempts"]), ("sent", 2))
 
-    def test_a_script_cut_off_in_the_middle_is_not_run_again(self) -> None:
+    def test_a_channel_that_does_not_repeat_fails_one_cut_off(self) -> None:
         after = self.interrupted(repeat=False)
         self.drain(after)
         entry = self.only_entry(after)
@@ -255,7 +256,7 @@ class InterruptedAttemptTests(_RestartCase):
         self.assertEqual(len(self.module.sent), 1)
         self.assertEqual(after.waiting.items(), {})
 
-    def test_a_script_run_that_never_started_runs_after_a_restart(self) -> None:
+    def test_a_channel_that_does_not_repeat_still_sends_one_never_started(self) -> None:
         self.module.REPEAT_AFTER_RESTART = False
         self.submit(self.channel())
         after = self.restarted()
@@ -274,18 +275,25 @@ class InterruptedAttemptTests(_RestartCase):
         self.assertEqual(self.only_entry(after)["status"], "sent")
 
     def test_the_real_channels_say_whether_they_repeat(self) -> None:
-        from python.srv.services import email_channel, script_channel
+        from python.srv.services import chat_channels, email_channel
 
         self.assertIs(email_channel.REPEAT_AFTER_RESTART, True)
-        self.assertIs(script_channel.REPEAT_AFTER_RESTART, False)
+        for platform in chat_channels.PLATFORMS.values():
+            self.assertIs(platform.REPEAT_AFTER_RESTART, True)
 
 
 class StartupTests(unittest.TestCase):
-    def test_every_channel_is_taken_up_and_one_failure_does_not_stop_the_other(self) -> None:
-        with patch.object(notification_service.EMAIL, "resume", side_effect=RuntimeError("catalog")) as email, patch.object(notification_service.SCRIPT, "resume", return_value=0) as script:
+    def test_every_channel_is_taken_up_and_one_failure_does_not_stop_the_others(self) -> None:
+        with ExitStack() as stack:
+            email = stack.enter_context(patch.object(notification_service.EMAIL, "resume", side_effect=RuntimeError("catalog")))
+            others = [
+                stack.enter_context(patch.object(channel, "resume", return_value=0))
+                for channel in notification_service.MESSAGING.values()
+            ]
             notification_service.resume_waiting()
         email.assert_called_once()
-        script.assert_called_once()
+        for other in others:
+            other.assert_called_once()
 
 
 class SecondsUntilTests(unittest.TestCase):

@@ -93,35 +93,40 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   sends them in the background, retries a delivery that can still succeed
   (three attempts) and records every outcome in a delivery history and the
   server log. STARTTLS, SSL/TLS or plain connections with certificate
-  verification; sign-in with a user name and password, OAuth 2.0 (Microsoft
-  365 client credentials or refresh token, Google Workspace refresh token, or
-  any provider's token endpoint; SASL XOAUTH2) or none. Events: job failed,
+  verification; sign-in with a user name and password, or none. Events: job failed,
   finished with warnings or succeeded (one e-mail per run, listing every VM),
   restore failed or finished, repository running out of space, server clock
   jump, and an installed HTTPS certificate about to expire. Settings are
   checked as a whole and refused with every problem by field; secrets are
   stored encrypted and never returned. A test e-mail reports why it was not
-  sent (connection, TLS, sign-in, OAuth token, sender or recipients refused).
+  sent (connection, TLS, sign-in, sender or recipients refused).
   `abr notification show|set|test|history|events list|events set`,
   `GET|PUT /api/v1/notifications/email`, `POST
   /api/v1/notifications/email/test`, `GET
   /api/v1/notifications/email/deliveries`, `GET /api/v1/notifications/events`,
   functions `notification.view`, `notification.edit`, `notification.test`. See
   `doc/Notifications.md`.
-- A notification script: an Administrator uploads a script the appliance runs
-  on chosen events, to reach what e-mail does not. It gets the event as JSON on
-  standard input, in a file and in `ABR_*` variables, with the facts of the
-  event in `details`. It runs as the service user, so uploading one takes the
-  new function `notification.script` (Administrator only), and
-  `ABR_NOTIFICATION_SCRIPTS=0` switches the feature off. It is kept encrypted,
-  checked on upload (text, at most 256 KiB, a `#!` line with an interpreter the
-  appliance has), run with a minimal environment and a time limit that also
-  ends what it started, and audited by name and SHA-256, never by content. A
-  run's exit code and the end of its output are kept; a run that fails is not
-  repeated. `abr notification script show|upload|content|set|remove|test`,
-  `GET|PUT /api/v1/notifications/script`, `GET|PUT|DELETE
-  /api/v1/notifications/script/file`, `POST
-  /api/v1/notifications/script/test`.
+- Messaging platforms: Telegram, Slack, Discord and ntfy notifications, sent
+  through Apprise (`/usr/bin/apprise` from the Debian package `apprise`, run as
+  a program of its own; the server package needs `apprise (>= 1.9)`). Each is
+  added when its settings are first saved and can be removed again (its
+  history stays). Telegram: a bot token and up to ten chats, each sent to on
+  its own, so a retry repeats none. Slack: an incoming webhook URL, posting as
+  AltaStor. Discord: a channel webhook URL, long messages split. ntfy: a
+  topic URL on ntfy.sh or a server of one's own, and an access token for a
+  server with access control; failures go at high priority. Each has its own
+  switch, events, test message and delivery history, with the e-mail's retries
+  and restart handling. Secrets are stored encrypted and never returned; they
+  reach Apprise in a private file, never on its command line, and Apprise
+  loads no plugins, configuration or cache of its own. Apprise is asked
+  whether it can read the settings before a platform is switched on.
+  Microsoft Teams is not offered: Debian 13's Apprise 1.9.3 cannot read the
+  workflow URLs Teams gives now. `abr notification platforms` and `abr
+  notification telegram|slack|discord|ntfy show|set|test|history|remove`;
+  `GET /api/v1/notifications/messaging`, `GET|PUT|DELETE
+  /api/v1/notifications/{platform}`, `POST .../test`, `GET .../deliveries`,
+  under `notification.view`, `notification.edit` and `notification.test`.
+  `ABR_APPRISE` names another Apprise program.
 - `GET /api/v1/auth/me` reports the session's `expires_at` and
   `absolute_expires_at`; sent with `X-ABR-Refresh` it renews nothing, so the
   Web UI reads the expiry without moving it.

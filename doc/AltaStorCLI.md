@@ -18,7 +18,7 @@ role = built-in roles and the functions each allows
 
 audit = the record of every command and user or role change 
 
-notification = e-mail notifications (SMTP server, sign-in, recipients, events, deliveries) and the notification script 
+notification = e-mail notifications (SMTP server, sign-in, recipients, events, deliveries), and the messaging platforms (Telegram, Slack, Discord, ntfy) through Apprise 
 
 repo = backup storage targets 
 
@@ -258,7 +258,7 @@ abr --output json audit list --function job. --limit 500
 
 NOTIFICATION COMMANDS 
 
-E-mail notifications: the SMTP server, how the appliance signs in to it (user name and password, or OAuth 2.0), the sender and recipients, and the events that send e-mail; and the script the appliance can run on events. The Web UI's Settings > Notifications changes the same settings. See doc/Notifications.md. 
+E-mail notifications: the SMTP server, how the appliance signs in to it (user name and password, or none), the sender and recipients, and the events that send e-mail; and the messaging platforms, Telegram, Slack, Discord and ntfy, sent through Apprise (/usr/bin/apprise, the apprise package), each added on its own with its own events. The Web UI's Settings > Notifications changes the same settings. See doc/Notifications.md. 
 
 abr notification show 
 
@@ -268,18 +268,17 @@ abr notification show [--output json]
 
 abr notification set 
 
-Description: Change the settings; options left out keep their value. The server refuses the whole change, naming every problem by field, when a value is invalid or when notifications are on and a setting delivery needs is missing (exit 2). A secret flag without a value reads ABR_SMTP_PASSWORD, ABR_SMTP_OAUTH_CLIENT_SECRET or ABR_SMTP_OAUTH_REFRESH_TOKEN, or prompts; an empty value removes the stored secret. The sender name (--from-name) is one line of at most 100 characters; --smtp-host is a host name of at most 253 characters or an IP address. 
+Description: Change the settings; options left out keep their value. The server refuses the whole change, naming every problem by field, when a value is invalid or when notifications are on and a setting delivery needs is missing (exit 2). --password without a value reads ABR_SMTP_PASSWORD, or prompts; an empty value removes the stored password. The sender name (--from-name) is one line of at most 100 characters; --smtp-host is a host name of at most 253 characters or an IP address. 
 
-abr notification set [--enable | --disable] [--smtp-host <host>] [--smtp-port <port>] [--security starttls|ssl|none] [--verify-tls | --no-verify-tls] [--timeout <seconds>] [--auth password|oauth2|none] [--username <user-or-mailbox>] [--password [<pass>]] [--oauth-provider microsoft|google|custom] [--oauth-tenant <tenant>] [--oauth-client-id <id>] [--oauth-client-secret [<secret>]] [--oauth-grant client_credentials|refresh_token] [--oauth-refresh-token [<token>]] [--oauth-token-url <url>] [--oauth-scope <scope>] [--from <address>] [--from-name <name>] [--recipients <a,b> | --add-recipient <a> --remove-recipient <b>] [--space-threshold <percent>] 
+abr notification set [--enable | --disable] [--smtp-host <host>] [--smtp-port <port>] [--security starttls|ssl|none] [--verify-tls | --no-verify-tls] [--timeout <seconds>] [--auth password|none] [--username <user>] [--password [<pass>]] [--from <address>] [--from-name <name>] [--recipients <a,b> | --add-recipient <a> --remove-recipient <b>] [--space-threshold <percent>] 
 
 Examples: 
 abr notification set --smtp-host smtp.example.com --smtp-port 587 --security starttls --auth password --username backup@example.com --password --from backup@example.com --recipients ops@example.com --enable 
-abr notification set --auth oauth2 --oauth-provider microsoft --oauth-tenant contoso.onmicrosoft.com --oauth-client-id 0f1e... --oauth-client-secret --username backup@contoso.com 
 abr notification set --disable 
 
 abr notification test 
 
-Description: Send a test e-mail now and report whether the SMTP server took it, or why not: smtp_connection_failed, smtp_tls_failed, smtp_auth_failed, oauth_token_failed, smtp_sender_refused, smtp_recipients_refused or smtp_error, with the stage it reached (exit 1). The set options test a change without saving it. --to sends it to those addresses instead of the recipients, also while no recipients are saved; without --to at least one recipient must be saved. 
+Description: Send a test e-mail now and report whether the SMTP server took it, or why not: smtp_connection_failed, smtp_tls_failed, smtp_auth_failed, smtp_sender_refused, smtp_recipients_refused or smtp_error, with the stage it reached (exit 1). The set options test a change without saving it. --to sends it to those addresses instead of the recipients, also while no recipients are saved; without --to at least one recipient must be saved. 
 
 abr notification test [--to <addresses>] [any abr notification set option except --enable, --disable and the recipient options] 
 
@@ -296,35 +295,45 @@ abr notification events set --enable <ids> --disable <ids>
 Examples: 
 abr notification events set --enable job.succeeded,restore.succeeded --disable repository.low_space 
 
-abr notification script show 
+abr notification platforms 
 
-Description: Show the uploaded script (name, size, SHA-256, who uploaded it), whether it runs, on which events, and its latest runs. 
+Description: List the messaging platforms (telegram, slack, discord, ntfy), whether each is set up and on, and its last delivery, and say when Apprise, which sends them, is not installed. 
 
-abr notification script show [--output json] 
+abr notification platforms [--output json] 
 
-abr notification script upload 
+abr notification <platform> show 
 
-Description: Upload the script the appliance runs on events, in place of any earlier one: text of at most 256 KiB starting with a #! line naming an interpreter the appliance has. It runs on the appliance as the service user, so it can do whatever that user can. Uploading does not switch it on. 
+Description: Show a platform's settings (the secret only as set or not set: Telegram's bot token with the bot's number, or the webhook or topic URL with its host, and ntfy's access token), whether Apprise is installed and its version, every event with whether it sends a message, and the last delivery. <platform> is telegram, slack, discord or ntfy. 
 
-abr notification script upload --file <path> 
+abr notification <platform> set 
 
-abr notification script content 
+Description: Set the platform up, or change it; options left out keep their value. Telegram takes --bot-token and --chats, the whole list of chats (at most 10): a number such as -1001234567890, or a public channel's @name, with a forum topic after a colon; the bot must be in each chat. Slack and Discord take --webhook-url: a Slack incoming webhook (https://hooks.slack.com/services/...) or a Discord channel webhook (https://discord.com/api/webhooks/...). ntfy takes --topic-url, https://ntfy.sh/<topic> or https://<your server>/<topic> (on ntfy.sh anyone who knows the topic can read it: make it long and hard to guess), and --access-token (tk_...) for a server with access control. A secret flag without a value reads ABR_TELEGRAM_BOT_TOKEN, ABR_SLACK_WEBHOOK_URL, ABR_DISCORD_WEBHOOK_URL, ABR_NTFY_TOPIC_URL or ABR_NTFY_ACCESS_TOKEN, or prompts; an empty value removes it. The server refuses the whole change, naming every problem by field, when a value is invalid, or when the platform is on and a setting or Apprise is missing, or Apprise cannot read the settings (exit 2). Its events are chosen apart from those that send e-mail. 
 
-Description: Print the stored script. Reading it is recorded in the audit log. 
+abr notification telegram set [--enable | --disable] [--bot-token [<token>]] [--chats <ids>] [--event-on <ids>] [--event-off <ids>] 
+abr notification slack|discord set [--enable | --disable] [--webhook-url [<url>]] [--event-on <ids>] [--event-off <ids>] 
+abr notification ntfy set [--enable | --disable] [--topic-url [<url>]] [--access-token [<token>]] [--event-on <ids>] [--event-off <ids>] 
 
-abr notification script set 
+Examples: 
+abr notification telegram set --bot-token --chats -1001234567890 --enable 
+abr notification slack set --webhook-url --enable 
+abr notification discord set --event-on job.succeeded --event-off repository.low_space 
+abr notification ntfy set --topic-url https://ntfy.sh/abr-alerts-7f3k9q2m --enable 
 
-Description: Change whether the script runs, on which events (chosen apart from those that send e-mail) and its time limit. 
+abr notification <platform> test 
 
-abr notification script set [--enable | --disable] [--timeout <seconds>] [--event-on <ids>] [--event-off <ids>] 
+Description: Send a test message now and report whether the platform took it, or why not: connection_failed, tls_failed, delivery_refused, delivery_failed, timed_out, apprise_missing, apprise_not_started, apprise_url_refused or apprise_failed, with the stage it reached (exit 1). --bot-token and --chats (Telegram), --webhook-url, or --topic-url and --access-token (ntfy) test a change without saving it. 
 
-abr notification script remove 
+abr notification telegram test [--bot-token [<token>]] [--chats <ids>] 
+abr notification slack|discord test [--webhook-url [<url>]] 
+abr notification ntfy test [--topic-url [<url>]] [--access-token [<token>]] 
 
-Description: Delete the script, which also stops it running. 
+abr notification <platform> history 
 
-abr notification script test 
+Description: The platform's latest 50 deliveries, newest first: event, status, attempts, where it went (Telegram: the chats that got it; a retry goes only to the others) and the error. Times are UTC. 
 
-Description: Run the script now on a sample event, whether or not it is switched on, and print how it went. Exits 1 when the script fails. 
+abr notification <platform> remove 
+
+Description: Remove the platform: its settings and secret are deleted and it sends nothing until it is set up again. Its delivery history stays. 
 
 REPOSITORY COMMANDS 
 

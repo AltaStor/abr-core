@@ -21,6 +21,7 @@ MONGODB_URL="https://fastdl.mongodb.org/linux/${MONGODB_ARCHIVE}"
 # lives in the separate abr-vmdk-tools repository and is built there, so none
 # of the C++ toolchain is installed here.
 APT_PACKAGES=(
+  apprise
   ca-certificates
   curl
   git
