@@ -6469,7 +6469,11 @@ def _point_period_key(point: dict[str, Any], *, kind: str) -> str:
     return f"{created.year:04d}"
 
 
-_GFS_INELIGIBLE_REASONS = {"ForceFull", "ForceSynthetic"}
+_GFS_FORCED_REASONS = {"ForceFull", "ForceSynthetic"}
+
+
+def _gfs_forced(point: dict[str, Any]) -> bool:
+    return str(point.get("execution_reason") or "") in _GFS_FORCED_REASONS
 
 
 def _apply_gfs_marks(points: list[dict[str, Any]], gfs: dict[str, Any]) -> None:
@@ -6484,12 +6488,7 @@ def _apply_gfs_marks(points: list[dict[str, Any]], gfs: dict[str, Any]) -> None:
             "monthly": bool(marks.get("monthly")),
             "yearly": bool(marks.get("yearly")),
         }
-    full_points = [
-        point
-        for point in points
-        if bool(point.get("full_backup"))
-        and str(point.get("execution_reason") or "") not in _GFS_INELIGIBLE_REASONS
-    ]
+    full_points = [point for point in points if bool(point.get("full_backup"))]
     for key in ("weekly", "monthly", "yearly"):
         # A disabled policy suspends protection (counts stay configured for a later re-enable).
         count = int(gfs.get(key) or 0) if enabled else 0
@@ -6503,8 +6502,9 @@ def _apply_gfs_marks(points: list[dict[str, Any]], gfs: dict[str, Any]) -> None:
         chosen = []
         for period_key, bucket in grouped.items():
             bucket.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")))
-            marked = [item for item in bucket if was_marked.get((key, str(item.get("id") or "")))]
-            chosen.append((period_key, marked[0] if marked else bucket[-1]))
+            candidates = [item for item in bucket if not _gfs_forced(item)] or bucket
+            marked = [item for item in candidates if was_marked.get((key, str(item.get("id") or "")))]
+            chosen.append((period_key, marked[0] if marked else candidates[-1]))
         chosen.sort(key=lambda item: item[0], reverse=True)
         keep_ids = {entry["id"] for _period_key, entry in chosen[:count]}
         for point in full_points:

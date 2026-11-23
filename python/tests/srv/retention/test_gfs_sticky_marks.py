@@ -54,12 +54,53 @@ class StickyGfsMarkTests(unittest.TestCase):
 
         self.assertEqual(weekly(points), {"w1": False, "w2": True, "w2-later": False, "w3": True})
 
-    def test_a_manual_full_never_takes_a_mark(self) -> None:
-        points = [full("manual", "2026-11-21T10:00:00+00:00", reason="ForceFull")]
+    def test_a_forced_full_that_is_the_only_full_of_its_week_takes_the_mark(self) -> None:
+        for reason in ("ForceFull", "ForceSynthetic"):
+            with self.subTest(reason):
+                points = [full("forced", "2026-11-21T10:00:00+00:00", reason=reason)]
+
+                abr_v41._apply_gfs_marks(points, WEEKLY)
+
+                self.assertEqual(weekly(points), {"forced": True})
+                self.assertTrue(points[0]["gfs_protected"])
+
+    def test_a_forced_full_does_not_take_the_mark_from_a_regular_full_of_the_week(self) -> None:
+        points = [full("regular", "2026-11-17T10:00:00+00:00")]
+        abr_v41._apply_gfs_marks(points, WEEKLY)
+
+        points.append(full("forced", "2026-11-19T10:00:00+00:00", reason="ForceFull"))
+        abr_v41._apply_gfs_marks(points, WEEKLY)
+
+        self.assertEqual(weekly(points), {"regular": True, "forced": False})
+
+    def test_a_regular_full_later_in_the_week_takes_the_mark_a_forced_one_held(self) -> None:
+        points = [full("forced", "2026-11-17T10:00:00+00:00", reason="ForceFull")]
+        abr_v41._apply_gfs_marks(points, WEEKLY)
+
+        points.append(full("scheduled", "2026-11-19T10:00:00+00:00"))
+        abr_v41._apply_gfs_marks(points, WEEKLY)
+
+        self.assertEqual(weekly(points), {"forced": False, "scheduled": True})
+
+    def test_a_second_forced_full_of_the_week_leaves_the_mark_on_the_first(self) -> None:
+        points = [full("first", "2026-11-17T10:00:00+00:00", reason="ForceFull")]
+        abr_v41._apply_gfs_marks(points, WEEKLY)
+
+        points.append(full("second", "2026-11-19T10:00:00+00:00", reason="ForceFull"))
+        abr_v41._apply_gfs_marks(points, WEEKLY)
+
+        self.assertEqual(weekly(points), {"first": True, "second": False})
+
+    def test_weeks_of_forced_fulls_count_against_the_kept_number_like_any_week(self) -> None:
+        points = [
+            full("w1", "2026-11-03T10:00:00+00:00", reason="ForceFull"),
+            full("w2", "2026-11-10T10:00:00+00:00"),
+            full("w3", "2026-11-17T10:00:00+00:00", reason="ForceFull"),
+        ]
 
         abr_v41._apply_gfs_marks(points, WEEKLY)
 
-        self.assertEqual(weekly(points), {"manual": False})
+        self.assertEqual(weekly(points), {"w1": False, "w2": True, "w3": True})
 
     def test_a_disabled_policy_clears_the_marks_and_a_new_one_starts_from_the_newest(self) -> None:
         points = [full("a", "2026-11-17T10:00:00+00:00")]

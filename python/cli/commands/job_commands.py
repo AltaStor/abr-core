@@ -331,7 +331,10 @@ class JobCommands:
             "--force-full",
             dest="full",
             action="store_true",
-            help="Force a full backup instead of an incremental backup",
+            help=(
+                "Force a full backup instead of an incremental backup. It gets a GFS mark only for a week, month or "
+                "year in which the job made no full of its own"
+            ),
         )
         start_kind.add_argument(
             "--synthetic",
@@ -339,7 +342,8 @@ class JobCommands:
             action="store_true",
             help=(
                 "Build a full backup by merging the stored chain in the repository instead of reading "
-                "the VM again. Needs a full backup followed by at least one incremental"
+                "the VM again. Needs a full backup followed by at least one incremental. Like --full, it gets a "
+                "GFS mark only for a period in which the job made no full of its own"
             ),
         )
         start.add_argument(
@@ -518,7 +522,15 @@ class JobCommands:
                 ),
             )
         if include_policy_flags:
-            parser.add_argument("--gfs-weekly", type=int, default=gfs_default, help="Weekly GFS count")
+            parser.add_argument(
+                "--gfs-weekly",
+                type=int,
+                default=gfs_default,
+                help=(
+                    "Weekly GFS count: how many weeks keep one full each. A full forced with job start --full or "
+                    "--synthetic gets a week's mark only when the job made no full of its own that week"
+                ),
+            )
             parser.add_argument("--gfs-monthly", type=int, default=gfs_default, help="Monthly GFS count")
             parser.add_argument("--gfs-yearly", type=int, default=gfs_default, help="Yearly GFS count")
             gfs_state = parser.add_mutually_exclusive_group()
