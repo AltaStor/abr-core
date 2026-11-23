@@ -2981,7 +2981,9 @@ def create_repository_record(
     for existing in catalog_records(REPOSITORIES):
         if str(existing.get("name") or "").lower() == name.lower():
             raise api_error(409, "repository_name_exists", "Repository name already exists", name=name)
-    if repo_type != "s3":
+    if repo_type == "s3":
+        _refuse_overlapping_s3_repository(s3_config)
+    else:
         conflict = _find_overlapping_repository(path)
         if conflict is not None:
             raise api_error(
@@ -3157,6 +3159,8 @@ def edit_repository_record(record_id: str, payload: dict[str, Any]) -> dict[str,
         _reject_storage_location_change_if_repository_has_backups(
             record_id, original_path=original_path, new_path=next_path
         )
+        if _s3_storage_key(next_s3) != _s3_storage_key(current_s3):
+            _refuse_overlapping_s3_repository(next_s3, exclude_id=record_id)
         comparable_metadata = dict(metadata)
         if isinstance(comparable_metadata.get("s3"), dict):
             comparable_s3 = dict(comparable_metadata["s3"])
@@ -6454,6 +6458,39 @@ def _find_overlapping_repository(candidate_path: str, *, exclude_id: str | None 
             if candidate == root or root in candidate.parents or candidate in root.parents:
                 return repo
     return None
+
+
+def _s3_storage_key(config: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+    endpoint = str(config.get("endpoint_url") or "").strip().rstrip("/").lower()
+    prefix = str(config.get("prefix") or "").replace("\\", "/")
+    return endpoint, str(config.get("bucket") or "").strip().lower(), tuple(part for part in prefix.split("/") if part)
+
+
+def _find_overlapping_s3_repository(config: dict[str, Any], *, exclude_id: str | None = None) -> dict[str, Any] | None:
+    endpoint, bucket, parts = _s3_storage_key(config)
+    for repo_id, repo in catalog_entries(REPOSITORIES):
+        if repo_id == exclude_id or str(repo.get("type") or "").lower() != "s3":
+            continue
+        other_endpoint, other_bucket, other_parts = _s3_storage_key(extract_s3_config(repo))
+        if (other_endpoint, other_bucket) != (endpoint, bucket):
+            continue
+        shorter = min(len(parts), len(other_parts))
+        if parts[:shorter] == other_parts[:shorter]:
+            return repo
+    return None
+
+
+def _refuse_overlapping_s3_repository(config: dict[str, Any], *, exclude_id: str | None = None) -> None:
+    conflict = _find_overlapping_s3_repository(config, exclude_id=exclude_id)
+    if conflict is not None:
+        raise api_error(
+            409,
+            "repository_path_overlaps",
+            f"Bucket {config.get('bucket')} and prefix {config.get('prefix') or '(none)'} overlap with the storage of "
+            f"repository {conflict.get('name')}: one is the same as or inside the other",
+            conflicting_repository=conflict.get("name"),
+            path=_build_s3_repository_path(config),
+        )
 
 
 def _resolve_owning_repository_id(path: Path) -> str | None:
