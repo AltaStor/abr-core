@@ -130,10 +130,10 @@ class QuiesceFailureOptionTests(_Stores):
             }
         )
 
-    def test_a_job_fails_on_a_failed_quiesce_unless_told_otherwise(self) -> None:
+    def test_a_hyperv_job_falls_back_by_default_without_storing_a_choice(self) -> None:
         job = self._job()
 
-        self.assertEqual(job["on_quiesce_failure"], "fail")
+        self.assertEqual(job["on_quiesce_failure"], "crash_consistent")
         self.assertNotIn("on_quiesce_failure", JOBS[job["id"]]["task_parameters"])
 
     def test_a_job_can_fall_back_to_a_crash_consistent_backup_and_back(self) -> None:

@@ -599,7 +599,11 @@ def run_hyperv_backup(
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
 
     consistency = _choice(parameters, "hyperv_consistency", CONSISTENCY_CHOICES, "application")
-    consistency_fallback = _flag(parameters, "hyperv_consistency_fallback", True)
+    on_quiesce_failure = str(parameters.get("on_quiesce_failure") or "").strip().lower().replace("-", "_")
+    if on_quiesce_failure in ("fail", "crash_consistent"):
+        consistency_fallback = on_quiesce_failure == "crash_consistent"
+    else:
+        consistency_fallback = _flag(parameters, "hyperv_consistency_fallback", True)
     try:
         compression_level = _resolve_compression_level(parameters)
         encryption_algorithm, encryption_key = _resolve_encryption_settings(parameters)
@@ -711,6 +715,13 @@ def run_hyperv_backup(
             try:
                 checkpoint = node.create_recovery_checkpoint(vm_id, achieved)
             except HyperVError as exc:
+                if achieved == "application" and on_quiesce_failure == "fail":
+                    raise HyperVBackupError(
+                        f"Application-consistent checkpoint of {vm_name} failed ({exc}). The job is set to fail when the "
+                        "guest cannot be quiesced (--on-quiesce-failure fail), so no backup is taken. Check the Backup "
+                        "(volume shadow copy) integration service in the guest, or set --on-quiesce-failure "
+                        "crash-consistent to take a crash-consistent backup instead"
+                    ) from exc
                 if achieved != "application" or not consistency_fallback:
                     raise HyperVBackupError(f"Hyper-V could not checkpoint {vm_name}: {exc}") from exc
                 message = (

@@ -118,7 +118,7 @@ It mirrors the VMware backup step for step:
 | VMware | Hyper-V |
 | --- | --- |
 | ESXi host connected? | VM state backup-ready? (running, off, saved or paused; not mid-transition, not critical, not merging disks or migrating) |
-| Quiesced snapshot | Recovery checkpoint (snapshot type 32768), application-consistent through the guest's VSS, crash-consistent as a fallback |
+| Quiesced snapshot | Recovery checkpoint (snapshot type 32768), application-consistent through the guest's VSS, crash-consistent as a fallback (or a failed session with `--on-quiesce-failure fail`) |
 | abr-vmdk-tool reads the snapshot disk through VDDK, CBT says what changed | abr-vhdx-tool on the host reads the checkpoint's disk, RCT says what changed |
 | Remove the snapshot | Turn the checkpoint into a reference point |
 

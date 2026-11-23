@@ -45,10 +45,12 @@ from python.srv.core.mongo_db_wrapper import (
     delete_hypervisor,
     delete_job,
     delete_repository,
+    load_system_state,
     persist_backup,
     persist_hypervisor,
     persist_job,
     persist_repository,
+    persist_system_state,
     persist_task,
     refuse_unstorable_repository_secrets,
     replace_resources_for_hypervisor,
@@ -1418,6 +1420,36 @@ def _resource_label(resource: dict[str, Any] | None, fallback: str | None = None
 def _inventory_is_hyperv(inventory_id: Any) -> bool:
     record = HYPERVISORS.get(str(inventory_id or ""))
     return isinstance(record, dict) and inventory_type_from_record(record) == "hyper-v"
+
+
+HYPERV_QUIESCE_STATE = "hyperv_quiesce_failure"
+
+
+def default_quiesce_failure(job: dict[str, Any]) -> str:
+    return "crash_consistent" if _inventory_is_hyperv(job.get("inventory_id")) else "fail"
+
+
+def keep_hyperv_jobs_falling_back() -> list[str]:
+    if load_system_state(HYPERV_QUIESCE_STATE) is not None:
+        return []
+    moved = []
+    for job in catalog_records(JOBS):
+        parameters = job.get("task_parameters") if isinstance(job.get("task_parameters"), dict) else {}
+        if str(job.get("job_type") or "backup") != "backup" or not _inventory_is_hyperv(job.get("inventory_id")):
+            continue
+        if str(parameters.get("on_quiesce_failure") or "") != "fail":
+            continue
+        _persist_canonical_job({**job, "task_parameters": {**parameters, "on_quiesce_failure": "crash_consistent"}})
+        moved.append(str(job.get("name") or job.get("id")))
+    persist_system_state({"id": HYPERV_QUIESCE_STATE, "fallback_kept_at": utc_now(), "jobs": moved})
+    if moved:
+        LOGGER.info(
+            "Set on_quiesce_failure to crash_consistent on %d Hyper-V job(s), which fell back to crash-consistent "
+            "checkpoints before Hyper-V honoured the setting: %s",
+            len(moved),
+            ", ".join(moved),
+        )
+    return moved
 
 
 def _ensure_hyperv_reaches_repository(inventory_id: Any, repository: dict[str, Any]) -> None:
@@ -5109,7 +5141,7 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         "synthetic_full_next_run_at": normalized.get("synthetic_full_next_run_at"),
         **verify_schedule_view(normalized),
         "compression_level": compression_level,
-        "on_quiesce_failure": str(task_parameters.get("on_quiesce_failure") or "fail"),
+        "on_quiesce_failure": str(task_parameters.get("on_quiesce_failure") or default_quiesce_failure(normalized)),
         **_job_transport_view(normalized),
         "encryption": {
             "enabled": encryption_enabled,

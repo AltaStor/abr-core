@@ -482,9 +482,11 @@ class JobCommands:
                 dest="on_quiesce_failure",
                 choices=("fail", "crash-consistent"),
                 help=(
-                    "What a backup of a VMware VM does when VMware Tools cannot quiesce the guest, for example because "
-                    "a pre-freeze script or a VSS writer fails: fail (the default) ends that VM's session as failed; "
-                    "crash-consistent takes the snapshot again without quiescing and completes with a warning."
+                    "What a backup does when the guest cannot be quiesced: on VMware when VMware Tools cannot quiesce it "
+                    "(a pre-freeze script or a VSS writer fails), on Hyper-V when the application-consistent checkpoint "
+                    "fails (no Backup integration service, VSS errors). fail ends that VM's session as failed with no "
+                    "restore point; crash-consistent takes a crash-consistent snapshot or checkpoint instead and "
+                    "completes with a warning. The default is fail for a VMware job and crash-consistent for a Hyper-V job."
                 ),
             )
         if include_compression_encryption_flags:
@@ -517,8 +519,8 @@ class JobCommands:
                 choices=("application", "crash"),
                 help=(
                     "Hyper-V only: recovery checkpoint consistency. application quiesces a running guest "
-                    "through VSS and falls back to crash-consistent when it cannot (default); crash never "
-                    "involves the guest"
+                    "through VSS and falls back to crash-consistent when it cannot (default), unless "
+                    "--on-quiesce-failure is fail; crash never involves the guest"
                 ),
             )
         if include_policy_flags:

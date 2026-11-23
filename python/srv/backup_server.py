@@ -88,7 +88,7 @@ from .services import (
     repository_shares,
     tls_certificate_service,
 )
-from .services.abr_v41 import PRODUCT_NAME, product_version
+from .services.abr_v41 import PRODUCT_NAME, keep_hyperv_jobs_falling_back, product_version
 from .services import vsphere_access
 from .core.server_defaults import env_int
 from .core.task_pool import TaskProcessPool
@@ -309,6 +309,10 @@ async def lifespan(_: FastAPI):
                 logger.info("Gave %d user(s) from before roles existed the Administrator role.", roled)
         except Exception:
             logger.exception("User role backfill failed; continuing startup without it.")
+        try:
+            keep_hyperv_jobs_falling_back()
+        except Exception:
+            logger.exception("Could not keep the crash-consistent fallback of the Hyper-V jobs; continuing startup.")
         SESSIONS.clear()
         SESSIONS.update(load_sessions())
 

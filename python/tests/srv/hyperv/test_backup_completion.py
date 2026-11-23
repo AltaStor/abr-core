@@ -791,6 +791,35 @@ class ConsistencyReasonTests(unittest.TestCase):
         self.assertEqual(manifest["consistency_reason"], "vss_failed")
         self.assertTrue(any("crash-consistent one instead" in warning for warning in result["warnings"]))
 
+    def test_on_quiesce_failure_fail_ends_the_session_with_no_point_and_names_the_setting(self) -> None:
+        for value in ("fail",):
+            with self.subTest(value):
+                with self.assertRaises(hyperv_backup.HyperVBackupError) as caught:
+                    self._backup({"on_quiesce_failure": value}, "Running", refuse_application=True)
+
+                message = str(caught.exception)
+                self.assertIn("Application-consistent checkpoint of et-vm failed", message)
+                self.assertIn("--on-quiesce-failure fail", message)
+                self.assertIn("Backup (volume shadow copy) integration service", message)
+
+    def test_on_quiesce_failure_crash_consistent_falls_back_as_before(self) -> None:
+        for value in ("crash_consistent", "crash-consistent"):
+            with self.subTest(value):
+                result, _manifest, asked = self._backup({"on_quiesce_failure": value}, "Running", refuse_application=True)
+
+                self.assertEqual(asked, ["application", "crash"])
+                self.assertEqual((result["consistency"], result["consistency_reason"]), ("crash", "vss_failed"))
+
+    def test_on_quiesce_failure_fail_takes_an_application_checkpoint_when_vss_works(self) -> None:
+        result, _manifest, asked = self._backup({"on_quiesce_failure": "fail"}, "Running")
+
+        self.assertEqual((asked, result["consistency"]), (["application"], "application"))
+
+    def test_on_quiesce_failure_fail_does_not_touch_a_vm_that_is_off(self) -> None:
+        result, _manifest, asked = self._backup({"on_quiesce_failure": "fail"}, "Off")
+
+        self.assertEqual((asked, result["consistency_reason"]), (["crash"], "vm_not_running"))
+
     def test_a_vm_that_is_not_running_says_it_had_no_guest_to_quiesce(self) -> None:
         result, manifest, asked = self._backup({}, "Off")
 
