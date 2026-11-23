@@ -21,6 +21,7 @@ from python.srv.plugins.pve.pve_backup import (
     TaskLog,
     build_run_file,
     disk_bitmaps,
+    exported_sizes,
     disk_outputs,
     drive_device,
     fleecing_storage,
@@ -199,6 +200,36 @@ class RunFileTests(unittest.TestCase):
             disk_bitmaps(_disks(), previous, False), {"scsi0": "new", "efidisk0": "new", "tpmstate0": "new"}
         )
         self.assertEqual(disk_bitmaps(_disks(), None, True)["scsi0"], "new")
+
+    def test_bitmaps_compare_the_configured_size_of_an_efi_disk_not_the_exported_one(self):
+        disks = [dict(disk, capacity_bytes=4 << 20) if disk["drive"] == "efidisk0" else disk for disk in _disks()]
+        previous = {
+            "disks": [
+                {"drive": "scsi0", "capacity_bytes": 5 << 30, "configured_bytes": 5 << 30},
+                {"drive": "efidisk0", "capacity_bytes": 528 << 10, "configured_bytes": 4 << 20},
+            ]
+        }
+        self.assertEqual(disk_bitmaps(disks, previous, True)["efidisk0"], "use")
+        resized = [dict(disk, capacity_bytes=8 << 20) if disk["drive"] == "efidisk0" else disk for disk in disks]
+        self.assertEqual(disk_bitmaps(resized, previous, True)["efidisk0"], "new")
+        older = {"disks": [{"drive": "efidisk0", "capacity_bytes": 528 << 10}]}
+        self.assertEqual(disk_bitmaps(disks, older, True)["efidisk0"], "new")
+
+    def test_the_run_file_expects_an_efi_disk_at_the_size_pve_exported_before(self):
+        disks = [dict(disk, capacity_bytes=4 << 20) if disk["drive"] == "efidisk0" else disk for disk in _disks()]
+        previous = {
+            "disks": [
+                {"drive": "scsi0", "capacity_bytes": 5 << 30, "configured_bytes": 5 << 30},
+                {"drive": "efidisk0", "capacity_bytes": 528 << 10, "configured_bytes": 4 << 20},
+                {"drive": "tpmstate0", "capacity_bytes": 4 << 20, "configured_bytes": 4 << 20},
+            ]
+        }
+        bitmaps = disk_bitmaps(disks, previous, True)
+        self.assertEqual(
+            exported_sizes(disks, previous, bitmaps),
+            {"scsi0": 5 << 30, "efidisk0": 528 << 10, "tpmstate0": 4 << 20},
+        )
+        self.assertEqual(exported_sizes(disks, None, disk_bitmaps(disks, None, True))["efidisk0"], 4 << 20)
 
     def test_the_run_file_names_each_disk_by_its_drive_and_carries_only_given_secrets(self):
         now = datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc)

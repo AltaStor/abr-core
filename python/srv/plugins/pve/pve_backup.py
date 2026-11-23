@@ -238,11 +238,16 @@ def last_vzdump_task(hypervisor_id: str, vmid: str, exclude_task_id: str) -> str
 
 
 def disk_bitmaps(disks: list[dict[str, Any]], previous: dict[str, Any] | None, incremental: bool) -> dict[str, str]:
-    """use for a disk the previous backup of this chain had at the same size, new for any other."""
+    """use for a disk the previous backup of this chain had at the same size, new for any other.
+
+    The sizes compared are those of the guest configuration. A backup records the size PVE exported as well, which
+    differs for an EFI disk: its volume holds the OVMF variables, 528 KiB of a 4 MiB volume. Backups made before the
+    configured size was recorded compare the exported one.
+    """
     if not incremental or previous is None:
         return {disk["drive"]: "new" for disk in disks}
     earlier = {
-        str(entry.get("drive") or ""): int(entry.get("capacity_bytes") or 0)
+        str(entry.get("drive") or ""): int(entry.get("configured_bytes") or entry.get("capacity_bytes") or 0)
         for entry in previous.get("disks") or []
         if isinstance(entry, dict)
     }
@@ -263,6 +268,27 @@ def disk_bandwidth(limit: int, parallel: int, disks: int) -> int:
     return max(limit // max(min(parallel, disks), 1), 1)
 
 
+def exported_sizes(
+    disks: list[dict[str, Any]], previous: dict[str, Any] | None, bitmaps: dict[str, str]
+) -> dict[str, int]:
+    """The size PVE is expected to report for each disk, which the provider compares before it keeps a bitmap.
+
+    For a disk whose bitmap is kept it is the size PVE exported at the previous backup: an EFI disk exports only the
+    OVMF variables of its volume, 528 KiB of 4 MiB. Any other disk is expected at its configured size.
+    """
+    exported = {
+        str(entry.get("drive") or ""): int(entry.get("capacity_bytes") or 0)
+        for entry in (previous or {}).get("disks") or []
+        if isinstance(entry, dict)
+    }
+    return {
+        disk["drive"]: (exported.get(disk["drive"]) or int(disk["capacity_bytes"]))
+        if bitmaps.get(disk["drive"]) == "use"
+        else int(disk["capacity_bytes"])
+        for disk in disks
+    }
+
+
 def build_run_file(
     *,
     run_id: str,
@@ -277,6 +303,7 @@ def build_run_file(
     immutability: dict[str, Any] | None,
     now: datetime,
     bandwidth_limit: int | None = None,
+    sizes: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     parallel = env_int("ALTASTOR_PVE_PARALLEL_DISKS")
     options: dict[str, Any] = {"compression": int(compression), "parallel_disks": parallel}
@@ -301,7 +328,7 @@ def build_run_file(
             drive_device(disk["drive"]): {
                 "name": backup_name(disk["drive"]),
                 "bitmap": bitmaps[disk["drive"]],
-                "size": int(disk["capacity_bytes"]),
+                "size": int((sizes or {}).get(disk["drive"]) or disk["capacity_bytes"]),
             }
             for disk in disks
         },
@@ -483,6 +510,7 @@ def disk_outputs(
                 "format": disk["format"],
                 "uuid": None,
                 "capacity_bytes": size,
+                "configured_bytes": int(disk["capacity_bytes"]),
                 "capacity_gb": round(size / (1 << 30), 2),
                 "logical_sector_size": int(tool.get("sector_size") or 512),
                 "physical_sector_size": int(tool.get("physical_sector_size") or 512),
@@ -1333,6 +1361,7 @@ def _start(
         immutability=immutability_option(repository),
         now=datetime.now(timezone.utc),
         bandwidth_limit=parameters.get("pve_bandwidth_limit"),
+        sizes=exported_sizes(disks, previous if incremental else None, bitmaps),
     )
     # The secrets stay out of the run file: the node helper keeps them in memory and hands them to the task alone. A
     # run without any says so with an empty set.
