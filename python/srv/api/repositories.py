@@ -9,6 +9,7 @@ from python.srv.services import abr_v41, default_repository, repository_shares
 
 from ._routing import build_router, register
 from .schemas import (
+    SMB_MOUNT_REFUSALS,
     CreateRepositoryRequest,
     RemovedResult,
     RepositoryDTO,
@@ -115,14 +116,14 @@ def apply_repository_immutability(repository_id: str) -> RepositoryImmutabilityA
 
 
 register(router, [
-    ("", create_repository, ["POST"], "repository.create"),
+    ("", create_repository, ["POST"], "repository.create", SMB_MOUNT_REFUSALS),
     ("/test-s3", test_s3_connection, ["POST"], "repository.create"),
-    ("/test-smb", test_smb_connection, ["POST"], "repository.create"),
+    ("/test-smb", test_smb_connection, ["POST"], "repository.create", SMB_MOUNT_REFUSALS),
     ("/test-immutability", test_s3_immutability, ["POST"], "repository.create"),
     ("", list_repositories, ["GET"], "repository.view"),
     ("/shares", list_repository_shares, ["GET"], "repository.view"),
     ("/{repository_id}", get_repository, ["GET"], "repository.view"),
-    ("/{repository_id}", patch_repository, ["PATCH"], "repository.edit"),
+    ("/{repository_id}", patch_repository, ["PATCH"], "repository.edit", SMB_MOUNT_REFUSALS),
     ("/{repository_id}", delete_repository, ["DELETE"], "repository.delete"),
     ("/{repository_id}/rescan", rescan_repository, ["POST"], "repository.rescan"),
     ("/{repository_id}/verify", verify_repository, ["POST"], "repository.verify"),

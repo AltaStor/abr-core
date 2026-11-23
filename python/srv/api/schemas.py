@@ -493,6 +493,68 @@ class RepositoryStorageDTO(_LenientModel):
     permissions: StoragePermissionsDTO | DocObject = None
 
 
+class ApiErrorBodyDTO(_LenientModel):
+    code: str = Field(description="Why the request was refused, a stable name a client can branch on")
+    message: str = Field(description="The reason in plain words")
+    details: DocObject = Field(default=None, description="More about the refusal, when there is more; validation_error lists the fields in issues")
+
+
+class ApiErrorDTO(_LenientModel):
+    error: ApiErrorBodyDTO
+
+
+SMB_MOUNT_REFUSALS = {
+    422: {
+        "model": ApiErrorDTO,
+        "description": (
+            "Refused; error.code says why. validation_error: a field has the wrong type or form (error.details.issues "
+            "names each). invalid_repository: the repository cannot be made as asked, for example an SMB address not "
+            "written \\\\server\\share or //server/share, or a share this server mounts itself given without username "
+            "and password. share_mount_failed: this server could not mount the SMB share (smb without path); the message "
+            "carries mount.cifs's error: 13 the account or password is refused, 2 the share or the folder in it does not "
+            "exist, 113 no address of the server answers, 111 the server refuses the connection on its SMB port."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {
+                    "share_mount_failed": {
+                        "summary": "a wrong account (mount error 13)",
+                        "value": {"error": {"code": "share_mount_failed", "message": (
+                            "The share of repository \\\\files01\\backups could not be mounted: //files01/backups could not be "
+                            "mounted: mount error 13 (Permission denied): the user name or password is wrong, or the account may not open this share"
+                        )}},
+                    },
+                    "invalid_repository": {
+                        "summary": "a malformed address",
+                        "value": {"error": {"code": "invalid_repository", "message": "SMB shares must be written \\\\server\\share or //server/share"}},
+                    },
+                    "validation_error": {
+                        "summary": "a field of the wrong type",
+                        "value": {"error": {"code": "validation_error", "message": "Request validation failed", "details": {
+                            "issues": [{"location": ["body", "verify_tls"], "message": "Input should be a valid boolean", "type": "bool_parsing"}],
+                        }}},
+                    },
+                },
+            },
+        },
+    },
+}
+
+
+class RepositoryMetadataDTO(_LenientModel):
+    managed_mount: DocBool = Field(
+        default=None,
+        description=(
+            "smb: true when this server mounts the share itself (the repository was added without path); it is mounted at "
+            "/run/altastor-backup-mounts/<repository id>, which is then the repository's path. Absent for a share mounted by hand"
+        ),
+    )
+    server: DocStr = Field(default=None, description="smb: the server of the share; for a local repository this server shares, the server Hyper-V hosts are given")
+    share: DocStr = Field(default=None, description="smb: the share, and a folder in it when one was given")
+    username: DocStr = Field(default=None, description="smb: the account the share is opened with")
+    password: DocStr = Field(default=None, description="smb: the account's password, always masked; it is never returned")
+
+
 class RepositoryDTO(_LenientModel):
     id: str
     name: str
@@ -505,7 +567,7 @@ class RepositoryDTO(_LenientModel):
     last_verify: LastVerifyDTO | DocObject = None
     s3: S3RepositoryDTO | DocObject = None
     address: DocStr = None
-    metadata: DocObject = None
+    metadata: RepositoryMetadataDTO | DocObject = None
     bucket: str | None = None
     prefix: str | None = None
     region: str | None = None
