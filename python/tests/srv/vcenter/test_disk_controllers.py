@@ -413,6 +413,36 @@ class SoapShellTests(unittest.TestCase):
         self.assertEqual(result["planned_disks"][0]["disk_uuid"], "6000C29a-0000-1111-2222-333344445551")
 
 
+class RestoreFolderTests(unittest.TestCase):
+    def _shell(self, name: str, create_disks: bool = True) -> tuple[dict, object]:
+        node, folder = _shell_node()
+        node._datastore_folder_exists = lambda datastore, wanted: False  # type: ignore[method-assign]
+        result = node.create_vm_shell(
+            vm_name=name,
+            host_name="esx-01.local",
+            datastore_name="ds-01",
+            config_metadata={"firmware": "bios", "network_adapters": []},
+            disk_layout=[{"label": "Hard disk 1", "capacity_gb": 1, "file_name": "01-web 01.vmdk"}],
+            create_disks=create_disks,
+        )
+        return result, folder.configs[0]
+
+    def test_a_name_with_spaces_puts_the_vm_and_its_disks_in_one_dashed_folder(self) -> None:
+        for create_disks in (True, False):
+            with self.subTest(create_disks=create_disks):
+                result, config = self._shell("web 01 restored", create_disks)
+
+                self.assertEqual(config.name, "web 01 restored")
+                self.assertEqual(config.files.vmPathName, "[ds-01] web-01-restored/web-01-restored.vmx")
+                self.assertEqual(result["disk_paths"], ["[ds-01] web-01-restored/01-web 01.vmdk"])
+
+    def test_a_plain_name_keeps_its_folder(self) -> None:
+        result, config = self._shell("web-01-restored")
+
+        self.assertEqual(config.files.vmPathName, "[ds-01] web-01-restored/web-01-restored.vmx")
+        self.assertEqual(result["disk_paths"], ["[ds-01] web-01-restored/01-web 01.vmdk"])
+
+
 class _AdoptVm:
     def __init__(self, devices: list[object]) -> None:
         self._moId = "vm-77"

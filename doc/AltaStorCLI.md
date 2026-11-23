@@ -970,7 +970,7 @@ An in-place restore keeps the VM itself and replaces only its disks, so everythi
 Requires that the backup captured the VM's original host and datastore -- if the source VM's placement is unknown, in-place restore is refused with restore_mode_unsupported. 
  
 2. Out-of-Place / Advanced DR (Restore as a new VM on another host) 
-Description: A duplicate VM is deployed on a secondary host or recovery site for testing or disaster recovery. 
+Description: A duplicate VM is deployed on a secondary host or recovery site for testing or disaster recovery. The new name may contain spaces ("SQL 01 DR"); on vSphere the VM and all its disks go into one datastore folder named after it with dashes for the spaces ([DR-SSD] SQL-01-DR/), and a name whose VM or datastore folder already exists is refused before anything is made. 
 Syntax: abr restore start --restore-point <id> --new-name <new-name> --target-inventory <name> --target-host <host> --datastore <name> [--network-map <src=dst>] [--nic-network <adapter=dst>] [--datastore-map <src=dst>] [--disk-datastore <disk=dst>] [--power-on] 
 Example: abr restore start --restore-point rp-2026-05-16-0200-f1 --new-name VM-SQL-01-DR --target-inventory DR-Inventory --target-host esxi-dr-01.company.local --datastore DR-SSD --network-map Production=DR-Network --datastore-map SATA-BULK=DR-SATA --power-on 
 Example (one disk and one adapter placed on their own): abr restore start --restore-point rp-2026-05-16-0200-f1 --new-name VM-SQL-01-DR --target-inventory DR-Inventory --target-host esxi-dr-01.company.local --datastore DR-SSD --disk-datastore "Hard disk 2=DR-SATA" --nic-network "Network adapter 2=DR-DMZ" --power-on 
