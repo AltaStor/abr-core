@@ -3296,7 +3296,7 @@ def _repository_storage_location_mismatch(repository: dict[str, Any]) -> str | N
 
 
 def _verify_local_repository(
-    repository: dict[str, Any], *, whole_chains: bool = False, check_backups: bool = True
+    repository: dict[str, Any], *, whole_chains: bool = False, check_backups: bool = True, samba: bool = False
 ) -> dict[str, Any]:
     path = Path(str(repository.get("path") or ""))
     checks: list[dict[str, Any]] = []
@@ -3340,7 +3340,7 @@ def _verify_local_repository(
     except OSError as exc:
         checks.append({"name": "filesystem_probe", "status": "failed", "message": str(exc)})
         return {"status": "error", "checks": checks, "message": f"Filesystem probe failed: {exc}"}
-    share_check = share_mount_check(repository)
+    share_check = share_mount_check(repository, samba=True) if samba else share_mount_check(repository)
     if share_check is not None:
         checks.append(share_check)
         if share_check["status"] == "failed":
@@ -4262,7 +4262,7 @@ def _test_mounted_smb_share(name: str, server: str, share: str, username: Any, p
 def _repository_verification_result(repository: dict[str, Any]) -> dict[str, Any]:
     repo_type = str(repository.get("type") or "")
     if is_file_repository(repository):
-        return _verify_local_repository(repository, whole_chains=True)
+        return _verify_local_repository(repository, whole_chains=True, samba=True)
     if repo_type == "s3":
         return _verify_s3_repository(repository, whole_chains=True)
     return _verify_remote_repository(repository)

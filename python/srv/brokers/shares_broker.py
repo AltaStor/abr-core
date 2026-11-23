@@ -469,6 +469,33 @@ def remove_share(samba: Samba, arguments: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def include_shares(samba: Samba, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    _arguments(arguments, ())
+
+    with _locked(samba):
+        _preflight(samba)
+        shares = sorted(_our_sections(samba))
+        if not shares:
+            return {"included": False, "shares": []}
+        snapshot = _snapshot(samba)
+        included = _with_include(samba, snapshot.smb_conf)
+        if included == snapshot.smb_conf:
+            return {"included": False, "shares": shares}
+
+        try:
+            _write_smb_conf(samba, snapshot, included)
+            if _command(samba, ["testparm", "-s", str(samba.smb_conf)], check=False).returncode != 0:
+                raise BrokerError(FAILED, f"the Samba configuration does not validate with the line {samba.include_line}")
+            _reload(samba)
+        except BaseException as exc:
+            _restore(samba, snapshot)
+            if isinstance(exc, BrokerError):
+                raise BrokerError(exc.code, f"{exc.message}; the previous Samba configuration is restored") from exc
+            raise
+
+    return {"included": True, "shares": shares}
+
+
 def close_shares(samba: Samba) -> dict[str, Any]:
     with _locked(samba):
         has_file = samba.shares_conf.is_file()
@@ -515,6 +542,7 @@ def operations(samba: Samba) -> dict[str, Operation]:
     return {
         "add-share": lambda arguments: add_share(samba, arguments),
         "remove-share": lambda arguments: remove_share(samba, arguments),
+        "include-shares": lambda arguments: include_shares(samba, arguments),
     }
 
 
