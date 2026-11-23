@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pwd
 import secrets
 import shutil
 import socket
@@ -480,6 +481,10 @@ def list_shares() -> dict[str, Any]:
     return {"items": [share_view(record) for record in sorted(records, key=lambda item: str(item.get("path") or ""))]}
 
 
+class _SmbclientFailed(Exception):
+    pass
+
+
 def _smbclient(target: str, auth: Path, command: str) -> None:
     try:
         done = subprocess.run(
@@ -490,10 +495,52 @@ def _smbclient(target: str, auth: Path, command: str) -> None:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise api_error(502, "repository_share_check_failed", f"smbclient could not be run: {exc}") from exc
+        raise _check_failed(f"smbclient could not be run: {exc}") from exc
     if done.returncode != 0 or "NT_STATUS_" in done.stdout:
         lines = [line for line in (done.stderr + done.stdout).splitlines() if line.strip()]
-        raise api_error(502, "repository_share_check_failed", f"smbclient {target} failed: {lines[-1].strip() if lines else done.returncode}")
+        raise _SmbclientFailed(f"smbclient {target} failed: {lines[-1].strip() if lines else done.returncode}")
+
+
+def _check_failed(message: str) -> ApiError:
+    return api_error(409, "repository_share_check_failed", message)
+
+
+def service_account() -> str:
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        return f"uid {os.geteuid()}"
+
+
+def _owner_of(folder: Path) -> str | None:
+    try:
+        uid = folder.stat().st_uid
+    except OSError:
+        return None
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f"uid {uid}"
+
+
+def _smbclient_failure(record: dict[str, Any], folder: Path, failure: str) -> ApiError:
+    metadata = _metadata(record)
+    account = service_account()
+    owner = _owner_of(folder)
+    if owner is not None and owner != account:
+        return _check_failed(
+            f"{folder} belongs to {owner}, not to {account}: Samba writes into the share as {account}, so nothing can be "
+            f"written through {network_path(record)} and Hyper-V backups into it fail. Give the folder back with "
+            f"chown -R {account} {folder} ({failure})"
+        )
+    if "NT_STATUS_CONNECTION_REFUSED" in failure or "NT_STATUS_IO_TIMEOUT" in failure or "NT_STATUS_HOST_UNREACHABLE" in failure:
+        return _check_failed(f"Samba (smbd) on this server does not answer at {share_server()}, so {network_path(record)} cannot be reached ({failure})")
+    if "tree connect failed" in failure or "NT_STATUS_LOGON_FAILURE" in failure:
+        return _check_failed(
+            f"Samba refuses the share's account {metadata.get('username')} for {network_path(record)}: the account is no longer "
+            f"in Samba's passdb (pdbedit -L lists them) or its password was changed outside AltaStor ({failure})"
+        )
+    return _check_failed(failure)
 
 
 def check_share(record: dict[str, Any]) -> dict[str, Any]:
@@ -517,14 +564,17 @@ def check_share(record: dict[str, Any]) -> dict[str, Any]:
         auth.chmod(0o600)
         sent.write_text(f"AltaStor Backup share check {utc_now()}\n")
 
-        _smbclient(target, auth, f'put "{sent}" "{name}"')
-        if not (folder / name).exists():
-            raise api_error(502, "repository_share_check_failed", f"the test file written through {network_path(record)} did not appear in {folder}")
+        try:
+            _smbclient(target, auth, f'put "{sent}" "{name}"')
+            if not (folder / name).exists():
+                raise _check_failed(f"the test file written through {network_path(record)} did not appear in {folder}")
 
-        _smbclient(target, auth, f'get "{name}" "{received}"; del "{name}"')
+            _smbclient(target, auth, f'get "{name}" "{received}"; del "{name}"')
+        except _SmbclientFailed as exc:
+            raise _smbclient_failure(record, folder, str(exc)) from exc
         if not received.is_file() or received.read_text() != sent.read_text():
-            raise api_error(502, "repository_share_check_failed", f"the test file read back through {network_path(record)} differs from the one written")
+            raise _check_failed(f"the test file read back through {network_path(record)} differs from the one written")
         if (folder / name).exists():
-            raise api_error(502, "repository_share_check_failed", f"the test file is still in {folder} after it was deleted through the share")
+            raise _check_failed(f"the test file is still in {folder} after it was deleted through the share")
 
     return {**share_view(record), "checked": True, "message": f"{network_path(record)} as {metadata.get('username')}: write, read back and delete passed"}

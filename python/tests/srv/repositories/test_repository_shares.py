@@ -685,8 +685,44 @@ class CheckTests(_SharesCase):
                     leftover.unlink()
                 setattr(self.smbclient, attribute, value)
                 error = self.refused(self.check)
-                self.assertEqual((error.status_code, error.code), (502, "repository_share_check_failed"))
+                self.assertEqual((error.status_code, error.code), (409, "repository_share_check_failed"))
                 self.assertIn(text, error.message)
+
+    def test_a_folder_that_changed_hands_is_named_with_its_owner_and_the_fix(self) -> None:
+        self.smbclient.status = "NT_STATUS_ACCESS_DENIED opening remote file \\abr-share-check-1-a.txt\n"
+        with (
+            patch.object(repository_shares, "_owner_of", return_value="root"),
+            patch.object(repository_shares, "service_account", return_value="altastor-backup"),
+        ):
+            error = self.refused(self.check)
+
+        self.assertEqual((error.status_code, error.code), (409, "repository_share_check_failed"))
+        self.assertIn(f"{self.folder} belongs to root, not to altastor-backup", error.message)
+        self.assertIn(f"chown -R altastor-backup {self.folder}", error.message)
+        self.assertIn("NT_STATUS_ACCESS_DENIED", error.message)
+
+    def test_a_folder_of_the_service_account_keeps_the_plain_failure(self) -> None:
+        self.smbclient.status = "NT_STATUS_ACCESS_DENIED opening remote file \\abr-share-check-1-a.txt\n"
+
+        error = self.refused(self.check)
+
+        self.assertNotIn("belongs to", error.message)
+        self.assertIn("NT_STATUS_ACCESS_DENIED", error.message)
+
+    def test_an_smbd_that_does_not_answer_is_named(self) -> None:
+        self.smbclient.status = "do_connect: Connection to 192.0.2.5 failed (Error NT_STATUS_CONNECTION_REFUSED)\n"
+
+        error = self.refused(self.check)
+
+        self.assertEqual(error.status_code, 409)
+        self.assertIn("Samba (smbd) on this server does not answer", error.message)
+
+    def test_an_account_samba_refuses_is_named(self) -> None:
+        self.smbclient.status = "tree connect failed: NT_STATUS_ACCESS_DENIED\n"
+
+        error = self.refused(self.check)
+
+        self.assertIn(f"refuses the share's account {self.stored()['metadata']['username']}", error.message)
 
     def test_a_repository_that_is_not_shared_or_a_missing_smbclient_is_refused(self) -> None:
         self.unshare()
@@ -698,7 +734,9 @@ class CheckTests(_SharesCase):
 
     def test_an_smbclient_that_cannot_run_is_named(self) -> None:
         with patch.object(repository_shares.subprocess, "run", side_effect=subprocess.TimeoutExpired(["smbclient"], 60)):
-            self.assertIn("smbclient could not be run", self.refused(self.check).message)
+            error = self.refused(self.check)
+        self.assertEqual(error.status_code, 409)
+        self.assertIn("smbclient could not be run", error.message)
 
 
 class _BrokerProcess:
