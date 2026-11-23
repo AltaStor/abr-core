@@ -883,17 +883,27 @@ abr backup info --id <id>
 
 abr backup delete 
 
-Description: Delete a backup chain from the repository.  
+Description: Delete a backup chain from the repository, or move it to the recycle bin when the recycle bin keeps deleted backups (abr settings recycle-bin). 
 
-abr backup delete --id <id> [--force] 
+abr backup delete --id <id> [--force] [--yes] 
 
 Behavior: 
+• Confirmation: in a terminal it asks first, naming the chain, its VM and how many restore points it has, and whether the chain goes to the recycle bin (and for how many days) or is deleted for good: "Delete chain <id> of <VM> (<n> restore point(s)) for good? [y/N]". Only y or yes goes on; anything else deletes nothing (exit code 2). --yes skips the question. Without a terminal (a script, a pipe, cron) --yes is required: without it nothing is deleted and the command exits 2 with "add --yes to delete without asking". 
+• Recycle bin: when abr settings recycle-bin set --keep-days N set N above 0, the delete moves the chain's restore points to the recycle bin instead of deleting their data. Their status becomes deleted, with deleted_at, deleted_by and purge_after (N days later); their data stays in the repository. Until then they are not restored, copied, verified or replicated, no job builds on them or merges them, and job retention neither counts nor removes them: the job's next run starts a new chain with an active full. abr backup list shows "in the recycle bin until <date>" in STATUS (or "N point(s) in the recycle bin until <date>" next to newer restore points), and abr backup info shows recycle_bin and a column IN RECYCLE BIN UNTIL. abr backup undelete brings them back. Once purge_after has passed the server deletes them for good by itself, in a delete session with trigger recycle_bin, at most BACKUPSERVER_DELETE_RETRY_SECONDS (900 s) later; a forward clock jump that blocks retention (abr system clock) blocks this too. Running abr backup delete on a chain whose restore points are all in the recycle bin deletes them for good at once; on a chain that also has newer restore points it moves only those, and the ones already there keep their date. GFS-protected restore points still need --force to go to the recycle bin, but not to leave it. S3 Object Lock works as below when the data is finally deleted. A repository whose only restore points are in the recycle bin cannot be removed until they are deleted for good (repository_has_backups names the chains). The delete is audited, and the backup.deleted notification is sent, either way. 
 • Safety enforcement: If deletion would orphan dependent increments, the command fails with a dependency protection error regardless of --force. If deletion would violate GFS protection, the command fails with a dependency protection error unless --force is given. 
 • --force: deliberately deletes a chain that carries an active GFS archival mark, discarding data the GFS policy marked for retention. This is the supported way to retire a repository whose only remaining chains are GFS-protected -- without it, such a chain (and the repository holding it) can never be removed. 
-• Executing this command physically and permanently deletes data blocks from the storage.
+• Without the recycle bin, or for a chain already in it, this command physically and permanently deletes data blocks from the storage.
 • Interrupted delete: each restore point is marked deleting before its data is removed, newest first, so a delete (or a retention pass) cut short by a server crash never leaves a half-removed point offered for restore. Such a point stays deleting, abr backup verify skips it with a warning, and the server finishes removing it on its own when it starts again (and every BACKUPSERVER_DELETE_RETRY_SECONDS after). The older points the delete had not reached yet are left as they were; run abr backup delete again to remove them.
 • S3 Object Lock: restore points whose data the lock still holds, and the older points they need to restore, are not deleted yet. They are marked for deletion (status deleting) and the server removes them by itself once the lock expires, whether or not their job still exists or runs (it tries every BACKUPSERVER_DELETE_RETRY_SECONDS, 900 s by default). The command says how many were kept and until when, and exits non-zero since the chain is not gone yet. Until then they cannot be restored, and no job builds on them, merges them, copies them or extends their lock; abr backup list shows "N point(s) deleting after <date>" in STATUS, and abr backup info shows pending_deletion and each point's status. Running abr backup delete again tries the storage again at once. 
  
+
+abr backup undelete 
+
+Description: Bring a deleted backup chain back from the recycle bin. 
+
+abr backup undelete --id <id> 
+
+Every restore point of the chain in the recycle bin comes back with the status it had before the delete (a corrupt point stays corrupt): it can be restored again, and the job's retention counts it again, so a point already past the job's retention goes at the job's next retention pass. A chain with nothing in the recycle bin (deleted for good, or never deleted) is refused with backup_not_in_recycle_bin (exit code 4). When restore points taken since the delete build on older restore points of the chain, bringing the deleted ones back would put them into one segment with the newer ones; that is refused with backup_undelete_conflict, naming them, and nothing comes back. Needs backup.undelete (Administrator, Backup Administrator); recorded in the audit log. API: POST /api/v1/backups/{id}/undelete, with ?segment=<full backup restore point ID> to bring back one segment only. 
 
 abr backup verify 
 
@@ -1051,6 +1061,26 @@ abr settings vsphere set --api soap --update-existing-hypervisors --yes
 At least one option is required (exit code 2); nothing is asked. A new server needs none: it starts on vddk with the oVDDK library when that is installed (above). A VMware VDDK library must stay in the lib64 folder of its bundle: its transport plugins are found only through that folder. 
 
 The library is checked as for inventory add --vddk-lib. ovddk takes the oVDDK library the backup server has, and is refused when it has none. default, or the VDDK directory's own lib64/libvixDiskLib.so, makes it follow the VDDK directory again, so it changes with ABR_VMDK_TOOL_VDDK_DIR. Hypervisors with their own values keep them, unless --update-existing-hypervisors removes the API and VDDK library of each, so they all use the server-wide values from now on. It names those hypervisors and asks first; --yes skips the question, and without a terminal to ask on it is required (exit code 2 otherwise). The command then prints the hypervisors it changed. An API the server cannot use is refused (transport_unavailable), and the server's reason for refusing a value is printed as it is. Needs inventory.edit; recorded in the audit log. 
+
+abr settings recycle-bin show 
+
+Description: Show how many days a deleted backup chain stays in the recycle bin (keep_days), and who set it when. 
+
+abr settings recycle-bin show [--output json] 
+
+keep_days is 0 until an administrator sets it: abr backup delete then deletes the data at once, as before the recycle bin. Needs backup.view. API: GET /api/v1/system/recycle-bin. 
+
+abr settings recycle-bin set 
+
+Description: Set how many days a deleted backup chain stays in the recycle bin. 
+
+abr settings recycle-bin set --keep-days <0-365> 
+
+Examples: 
+abr settings recycle-bin set --keep-days 14 
+abr settings recycle-bin set --keep-days 0 
+
+0 turns the recycle bin off: later deletes delete the data at once. Chains already in the recycle bin keep the purge date they got. A value outside 0-365 is refused (invalid_deleted_backups_settings). Needs system.recycle_bin (Administrator); recorded in the audit log. API: PUT /api/v1/system/recycle-bin {"keep_days": N}. 
 
 abr system version 
 

@@ -637,8 +637,11 @@ class RestorePointDTO(_LenientModel):
     gfs_marks: GfsMarksDTO | DocObject = None
     gfs_protected: bool = False
     parent_point_id: str | None = None
-    status: str | None = Field(default=None, description="available, missing, chain_broken, or deleting: a delete or retention pass is removing it (a pass cut short finishes on its own), or S3 Object Lock still holds it and it is removed once the lock expires; a deleting point is not offered for restore")
+    status: str | None = Field(default=None, description="available, missing, chain_broken, deleted: it is in the recycle bin (see purge_after), or deleting: a delete or retention pass is removing it (a pass cut short finishes on its own), or S3 Object Lock still holds it and it is removed once the lock expires; deleted and deleting points are not offered for restore")
     deletion_requested_at: DocStr = Field(default=None, description="With status deleting: when its removal was asked for")
+    deleted_at: DocStr = Field(default=None, description="With status deleted: when abr backup delete moved it to the recycle bin")
+    deleted_by: DocStr = Field(default=None, description="With status deleted: the user who deleted it")
+    purge_after: DocStr = Field(default=None, description="With status deleted: when the server deletes it for good, unless abr backup undelete brings it back first")
     vm_id: str | None = None
     vm_name: str | None = None
     repository_id: str | None = None
@@ -672,7 +675,7 @@ class BackupChainDTO(_LenientModel):
     vm: _Ref
     inventory: _Ref
     repository: _Ref
-    status: str | None = Field(default=None, description="The status of the chain's newest restore point, or of its first point that is missing, broken or failed; corrupt points older than a newest point that is not corrupt are counted in corrupt instead")
+    status: str | None = Field(default=None, description="The status of the chain's newest restore point outside the recycle bin, or of its first such point that is missing, broken or failed; corrupt points older than a newest point that is not corrupt are counted in corrupt instead. deleted when the whole chain is in the recycle bin")
     restore_point_count: int = 0
     created_at: str | None = None
     last_restore_point_at: str | None = None
@@ -681,6 +684,7 @@ class BackupChainDTO(_LenientModel):
     gfs_protected: bool = False
     corrupt: DocObject = Field(default=None, description="Restore points of the chain marked corrupt by a verify: restore_point_count, damaged_point_ids and found_at, the latest find; null when there are none")
     pending_deletion: DocObject = Field(default=None, description="Restore points of the chain waiting for deletion: restore_point_count, requested_at, and delete_after, the latest Object Lock date among them; null when there are none")
+    recycle_bin: DocObject = Field(default=None, description="Restore points of the chain in the recycle bin: restore_points, deleted_at (the first delete), deleted_by, purge_after (the first of them the server deletes for good) and whole_chain; null when there are none")
     restore_points: list[RestorePointDTO] | DocArray = []
 
 
@@ -1779,6 +1783,25 @@ class BackupDeleteResult(_LenientModel):
     deleted: DocBool = None
     restore_point_count: DocInt = None
     artifacts_removed: DocBool = None
+    recycle_bin: DocObject = Field(default=None, description="When the recycle bin keeps deleted backups: restore_points moved there, keep_days, and purge_after, when the server deletes them for good; their data stays in the repository until then")
+    message: DocStr = None
+
+
+class BackupUndeleteResult(_LenientModel):
+    id: DocStr = None
+    undeleted_restore_points: DocInt = Field(default=None, description="The restore points brought back from the recycle bin")
+    message: DocStr = None
+    backup: BackupChainDTO | DocObject = None
+
+
+class RecycleBinSettingsDTO(_LenientModel):
+    keep_days: DocInt = Field(default=None, description="Days a deleted backup chain stays in the recycle bin before the server deletes its data for good; 0 deletes at once, as before the recycle bin")
+    updated_at: DocStrOrNull = None
+    updated_by: DocStrOrNull = None
+
+
+class RecycleBinSettingsRequest(_LenientModel):
+    keep_days: RawInt | None = Field(default=None, description="A whole number from 0 to 365; 0 turns the recycle bin off. Chains already in it keep their purge date")
 
 
 class BackupVerifyResult(_LenientModel):

@@ -145,10 +145,10 @@ class JobScheduler:
         if self._deletion_sweep is not None and self._deletion_sweep.is_alive():
             return
         self._deletion_sweep_at = now
-        from python.srv.services.abr_v41 import retry_pending_deletions
+        from python.srv.services.abr_v41 import sweep_deletions
 
         self._deletion_sweep = threading.Thread(
-            target=retry_pending_deletions,
+            target=sweep_deletions,
             name="pending-deletion-retry",
             daemon=True,
         )

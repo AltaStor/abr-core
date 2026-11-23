@@ -8,6 +8,7 @@ from fastapi import Body, Query, Request
 from python.srv.services import (
     abr_v41,
     clock_guard,
+    deleted_backups,
     support_bundle_service,
     system_log_service,
     tls_certificate_service,
@@ -20,6 +21,8 @@ from .schemas import (
     CatalogRestoreResult,
     CatalogSnapshotRequest,
     CatalogSnapshotResult,
+    RecycleBinSettingsDTO,
+    RecycleBinSettingsRequest,
     SupportBundleResult,
     SystemClockDTO,
     SystemHealthDTO,
@@ -179,6 +182,22 @@ def update_vsphere_settings(
     return {**settings, "updated_hypervisors": updated}
 
 
+def get_recycle_bin_settings() -> RecycleBinSettingsDTO:
+    """How long a deleted backup chain stays in the recycle bin before the server deletes its data for good."""
+    return deleted_backups.settings_view()
+
+
+def update_recycle_bin_settings(
+    request: Request, payload: RecycleBinSettingsRequest
+) -> RecycleBinSettingsDTO:
+    """Set the days a deleted backup chain stays in the recycle bin, 0 to 365 (422 invalid_deleted_backups_settings
+    otherwise); 0 deletes at once. Chains already in the recycle bin keep the purge date they got."""
+    body = unset_excluded(payload)
+    settings = deleted_backups.set_keep_days(body.get("keep_days"), user=getattr(request.state, "user_name", None))
+    request.state.audit.details["keep_days"] = settings["keep_days"]
+    return settings
+
+
 register(router, [
     ("/version", system_version, ["GET"], "system.view"),
     ("/info", system_info, ["GET"], "system.view"),
@@ -194,4 +213,6 @@ register(router, [
     ("/tls-certificate", revert_tls_certificate, ["DELETE"], "tls.edit"),
     ("/vsphere", get_vsphere_settings, ["GET"], "inventory.view"),
     ("/vsphere", update_vsphere_settings, ["PUT"], "inventory.edit"),
+    ("/recycle-bin", get_recycle_bin_settings, ["GET"], "backup.view"),
+    ("/recycle-bin", update_recycle_bin_settings, ["PUT"], "system.recycle_bin"),
 ])

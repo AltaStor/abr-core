@@ -244,7 +244,7 @@ class BackupCommandTests(unittest.TestCase):
         request_mock.return_value = _FakeResponse(
             {"id": "backup-1", "deleted": True, "restore_point_count": 1, "artifacts_removed": 3}
         )
-        args = SimpleNamespace(base_url="http://example.test", output="table", log_level="info", id="backup-1")
+        args = SimpleNamespace(base_url="http://example.test", output="table", log_level="info", id="backup-1", yes=True)
 
         stream = io.StringIO()
         with redirect_stdout(stream):
@@ -593,7 +593,7 @@ class EmptyIdSelectorTests(unittest.TestCase):
     def _cases(self):
         return [
             ("backup delete", "Backup", lambda value: BackupCommands().delete(
-                SimpleNamespace(**self.BASE, id=value, force=False)
+                SimpleNamespace(**self.BASE, id=value, force=False, yes=True)
             )),
             ("backup verify", "Backup", lambda value: BackupCommands().verify(
                 SimpleNamespace(**self.BASE, id=value)

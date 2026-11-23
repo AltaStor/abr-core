@@ -148,7 +148,7 @@ from python.srv.services.backup_mode import (
     restore_point_copied_at,
     restore_point_taken_at,
 )
-from python.srv.services import backup_retries, clock_guard
+from python.srv.services import backup_retries, clock_guard, deleted_backups
 from python.srv.services.share_mount import (
     SMB_FILESYSTEMS,
     mount_holding,
@@ -3984,7 +3984,7 @@ def extend_segment_object_lock(segment_id: str, *, expires_at: str, skip_point_i
     for point in normalized_backup_points():
         if str(point.get("segment_id") or "") != segment_id or str(point.get("id") or "") in skip:
             continue
-        if point.get("status") == POINT_DELETING:
+        if point.get("status") in POINTS_LEAVING:
             continue
         repository = REPOSITORIES.get(str(point.get("repository_id") or ""))
         if not isinstance(repository, dict) or not is_s3_repository(repository):
@@ -4091,7 +4091,7 @@ def _apply_immutability_to_existing_backups(record_id: str) -> dict[str, Any]:
     points = [
         point
         for point in normalized_backup_points()
-        if str(point.get("repository_id") or "") == record_id and point.get("status") != POINT_DELETING
+        if str(point.get("repository_id") or "") == record_id and point.get("status") not in POINTS_LEAVING
     ]
     updated: list[str] = []
     failures: list[dict[str, Any]] = []
@@ -4487,6 +4487,17 @@ def remove_repository_record(record_id: str) -> dict[str, Any]:
         raise api_error(409, "repository_in_use", "Repository cannot be removed while jobs still reference it", jobs=linked_jobs)
     ensure_repository_not_used_by_copies(repository)
     repo_points = [point for point in normalized_backup_points() if str(point.get("repository_id") or "") == record_id]
+    binned = [point for point in repo_points if deleted_backups.in_bin(point)]
+    if binned and len(binned) == len(repo_points):
+        raise api_error(
+            409,
+            "repository_has_backups",
+            f"Repository cannot be removed while the recycle bin holds {len(binned)} of its restore point(s), whose data "
+            f"is still in it until {min(str(point.get('purge_after') or '') for point in binned)}; delete their chains "
+            "for good with abr backup delete first",
+            restore_point_count=len(repo_points),
+            backup_ids=sorted({str(point.get("chain_id") or "") for point in binned}),
+        )
     if repo_points:
         raise api_error(409, "repository_has_backups", "Repository cannot be removed while backup chains still reference it", restore_point_count=len(repo_points))
     from python.srv.services import repository_mounts
@@ -6196,7 +6207,7 @@ def grouped_backup_points() -> dict[str, list[dict[str, Any]]]:
 
 def _points_for_job_vm_repo(job_id: str, vm_id: str, repository_id: str | None) -> list[dict[str, Any]]:
     chain_id = _chain_id_for_point(job_id, vm_id, repository_id)
-    return [point for point in grouped_backup_points().get(chain_id, []) if point.get("status") != POINT_DELETING]
+    return [point for point in grouped_backup_points().get(chain_id, []) if point.get("status") not in POINTS_LEAVING]
 
 
 def _latest_successful_point(job_id: str, vm_id: str, repository_id: str | None) -> dict[str, Any] | None:
@@ -6813,6 +6824,7 @@ POINT_MISSING = "missing"
 POINT_CHAIN_BROKEN = "chain_broken"
 POINT_DELETING = "deleting"
 POINT_CORRUPT = "corrupt"
+POINTS_LEAVING = frozenset({POINT_DELETING, deleted_backups.POINT_IN_BIN})
 
 
 def _missing_ancestor(point: dict[str, Any], by_id: dict[str, dict[str, Any]], gone: set[str], unknown: set[str]) -> str | None:
@@ -6843,7 +6855,7 @@ def reconcile_repository_points(repository: dict[str, Any]) -> dict[str, int]:
     for point in points:
         point_id = str(point.get("id") or "")
         status = str(point.get("status") or "available")
-        if status == POINT_DELETING:
+        if status in POINTS_LEAVING:
             continue
         locations = _point_artifact_locations(point)
         if not locations:
@@ -7709,8 +7721,10 @@ def _chain_name(points: list[dict[str, Any]]) -> str:
 
 def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
     latest = points[-1]
+    in_use = [point for point in points if not deleted_backups.in_bin(point)]
+    shown = in_use[-1] if in_use else latest
     unhealthy = next(
-        (point for point in points if _normalize_backup_health(point.get("status")) == "invalid" and not _corrupt_behind(point, latest)),
+        (point for point in in_use if _normalize_backup_health(point.get("status")) == "invalid" and not _corrupt_behind(point, shown)),
         None,
     )
     restore_points = [
@@ -7728,6 +7742,9 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "status": point.get("status"),
             "corruption": point.get("corruption") if point.get("status") == POINT_CORRUPT and isinstance(point.get("corruption"), dict) else None,
             "deletion_requested_at": point.get("deletion_requested_at"),
+            "deleted_at": point.get("deleted_at"),
+            "deleted_by": point.get("deleted_by"),
+            "purge_after": point.get("purge_after"),
             "vm_id": point.get("vm_id"),
             "vm_name": point.get("vm_name"),
             "repository_id": point.get("repository_id"),
@@ -7759,7 +7776,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
             "name": latest.get("repository_name"),
             "type": latest.get("repository_type"),
         },
-        "status": (unhealthy or latest).get("status"),
+        "status": (unhealthy or shown).get("status"),
         "restore_point_count": len(points),
         "created_at": points[0].get("created_at"),
         "last_restore_point_at": latest.get("created_at"),
@@ -7768,6 +7785,7 @@ def backup_chain_to_dto(points: list[dict[str, Any]]) -> dict[str, Any]:
         "gfs_protected": any(bool(point.get("gfs_protected")) for point in points),
         "pending_deletion": _pending_deletion_summary(points),
         "corrupt": _corruption_summary(points),
+        "recycle_bin": deleted_backups.bin_view(points),
         "restore_points": restore_points,
     }
 
@@ -8247,11 +8265,15 @@ def verify_backup_chain(
     work_items: list[tuple[dict[str, Any], dict[str, Any], str]] = []
 
     for point in points:
-        if point.get("status") == POINT_DELETING:
+        if point.get("status") in POINTS_LEAVING:
             warnings.append(
                 {
                     "point_id": point["id"],
-                    "message": "Restore point is waiting for deletion and is not offered for restore, so it was not verified",
+                    "message": (
+                        f"Restore point is in the recycle bin until {point.get('purge_after')} and is not offered for restore, so it was not verified"
+                        if deleted_backups.in_bin(point)
+                        else "Restore point is waiting for deletion and is not offered for restore, so it was not verified"
+                    ),
                 }
             )
             continue
@@ -8345,7 +8367,7 @@ def verify_backup_chain(
         "result": result_state,
         "warnings": warnings,
         "errors": errors,
-        "checked_restore_points": sum(1 for point in points if point.get("status") != POINT_DELETING),
+        "checked_restore_points": sum(1 for point in points if point.get("status") not in POINTS_LEAVING),
         "checked_artifacts": checked_artifacts,
         "corrupt": apply_verify_marks(outcomes, session_id=session_id, found_by=found_by),
     }
@@ -8627,7 +8649,7 @@ def _job_verify_targets(job_id: str) -> list[tuple[str, list[dict[str, Any]]]]:
     targets = []
     for vm_id, repository_id in _job_chains(job_id):
         chain_id = _chain_id_for_point(job_id, vm_id, repository_id)
-        points = [point for point in grouped_backup_points().get(chain_id, []) if point.get("status") != POINT_DELETING]
+        points = [point for point in grouped_backup_points().get(chain_id, []) if point.get("status") not in POINTS_LEAVING]
         if points:
             targets.append((chain_id, points))
     return targets
@@ -8812,7 +8834,14 @@ def _create_delete_session(backup_id: str, points: list[dict[str, Any]]) -> dict
 
 
 def _run_delete_session(
-    backup_id: str, task_id: str, *, segment_id: str | None, force: bool
+    backup_id: str,
+    task_id: str,
+    *,
+    segment_id: str | None,
+    force: bool,
+    permanently: bool = False,
+    user: str | None = None,
+    point_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     try:
         report = delete_backup_chain(
@@ -8820,6 +8849,9 @@ def _run_delete_session(
             segment_id=segment_id,
             force=force,
             progress_callback=lambda update: _update_session_result(task_id, {**update, "log_entry": False}),
+            permanently=permanently,
+            user=user,
+            point_ids=point_ids,
         )
     except ApiError as exc:
         _update_session_result(
@@ -8863,7 +8895,7 @@ def _ensure_chain_not_read(points: list[dict[str, Any]], backup_id: str, segment
 
 
 def delete_backup_chain_request(
-    backup_id: str, *, segment_id: str | None = None, force: bool = False, wait: bool = True
+    backup_id: str, *, segment_id: str | None = None, force: bool = False, wait: bool = True, user: str | None = None
 ) -> dict[str, Any]:
     chains = grouped_backup_points()
     points = chains.get(backup_id)
@@ -8875,13 +8907,13 @@ def delete_backup_chain_request(
     task_id = str(task["id"])
 
     if wait:
-        report = _run_delete_session(backup_id, task_id, segment_id=segment_id, force=force)
+        report = _run_delete_session(backup_id, task_id, segment_id=segment_id, force=force, user=user)
         return {**report, "session_id": task_id}
 
     thread = threading.Thread(
         target=_run_delete_session,
         args=(backup_id, task_id),
-        kwargs={"segment_id": segment_id, "force": force},
+        kwargs={"segment_id": segment_id, "force": force, "user": user},
         name=f"delete-{task_id}",
         daemon=True,
     )
@@ -9033,6 +9065,14 @@ def _deletion_due(point: dict[str, Any], now: datetime) -> bool:
         return True
 
 
+def sweep_deletions() -> None:
+    try:
+        purge_recycle_bin()
+    except Exception:
+        LOGGER.exception("Could not delete the restore points whose time in the recycle bin is up")
+    retry_pending_deletions()
+
+
 def retry_pending_deletions(now: datetime | None = None) -> int:
     current = now or _now_utc()
     removed = 0
@@ -9086,18 +9126,191 @@ def retry_pending_deletions(now: datetime | None = None) -> int:
     return removed
 
 
+_RECYCLE_BIN_LOCK = threading.RLock()
+
+
+def _move_to_recycle_bin(
+    backup_id: str,
+    points: list[dict[str, Any]],
+    days: int,
+    *,
+    segment_id: str | None,
+    gfs_overridden: bool,
+    user: str | None,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+) -> dict[str, Any]:
+    with _RECYCLE_BIN_LOCK:
+        purge_after = deleted_backups.move_to_bin(points, days, user=user)
+    LOGGER.info(
+        "Moved %d restore point(s) of backup chain %s to the recycle bin; they are deleted for good after %s",
+        len(points),
+        backup_id,
+        purge_after,
+    )
+    if progress_callback is not None:
+        progress_callback({"progress": 100, "message": f"Moved {len(points)} restore point(s) to the recycle bin"})
+    result: dict[str, Any] = {
+        "id": backup_id,
+        "deleted": True,
+        "restore_point_count": len(points),
+        "artifacts_removed": False,
+        "recycle_bin": {"restore_points": len(points), "keep_days": days, "purge_after": purge_after},
+        "message": (
+            f"Moved {len(points)} restore point(s) to the recycle bin. Their data stays in the repository until "
+            f"{purge_after}, when the server deletes it for good; until then they are not restored, copied, verified "
+            f"or used by a job. abr backup undelete --id {backup_id} brings them back; abr backup delete --id "
+            f"{backup_id} run again deletes them now."
+        ),
+    }
+    if segment_id is not None:
+        result["segment_id"] = segment_id
+    if gfs_overridden:
+        result["gfs_protection_overridden"] = True
+    return result
+
+
+def _undelete_conflicts(points: list[dict[str, Any]], binned: list[dict[str, Any]]) -> list[str]:
+    ids = {str(point.get("id") or "") for point in binned}
+
+    def misplaced(chosen: list[dict[str, Any]]) -> set[str]:
+        found: set[str] = set()
+        for segment in _segment_points(chosen):
+            members = {str(point.get("id") or "") for point in segment}
+            found.update(
+                str(point.get("id") or "")
+                for point in segment
+                if str(point.get("execution_type") or "") == "Incremental"
+                and str(point.get("parent_point_id") or "")
+                and str(point.get("parent_point_id") or "") not in members
+            )
+        return found
+
+    live = [point for point in points if not deleted_backups.in_bin(point)]
+    after = [point for point in points if not deleted_backups.in_bin(point) or str(point.get("id") or "") in ids]
+    return sorted(misplaced(after) - misplaced(live) - ids)
+
+
+def undelete_backup_chain(backup_id: str, *, segment_id: str | None = None) -> dict[str, Any]:
+    with _RECYCLE_BIN_LOCK:
+        points = grouped_backup_points().get(backup_id)
+        if not points:
+            raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
+        binned = [point for point in points if deleted_backups.in_bin(point)]
+        if segment_id is not None:
+            binned = next(
+                (segment for segment in _segment_points(binned) if str(segment[0].get("id") or "") == segment_id), []
+            )
+        _ensure(
+            bool(binned),
+            409,
+            "backup_not_in_recycle_bin",
+            (
+                f"Restore point {segment_id} does not start a segment of backup chain {backup_id} in the recycle bin"
+                if segment_id is not None
+                else f"Backup chain {backup_id} has no restore point in the recycle bin: it was deleted for good, "
+                "or it was never deleted"
+            ),
+            backup_id=backup_id,
+            segment_id=segment_id,
+        )
+        conflicts = _undelete_conflicts(points, binned)
+        _ensure(
+            not conflicts,
+            409,
+            "backup_undelete_conflict",
+            f"Restore point(s) {', '.join(conflicts)} were taken after these restore points were deleted and build "
+            "on older ones; bringing these back would put them into one segment with those, which retention and "
+            "segment deletes then cut wrongly, so they stay in the recycle bin",
+            backup_id=backup_id,
+            restore_point_ids=conflicts,
+        )
+        brought = deleted_backups.bring_back(binned)
+    LOGGER.info("Brought %d restore point(s) of backup chain %s back from the recycle bin", brought, backup_id)
+    return {
+        "id": backup_id,
+        "undeleted_restore_points": brought,
+        "message": (
+            f"Brought {brought} restore point(s) back from the recycle bin: they can be restored again, and the job's "
+            "retention counts them again"
+        ),
+        "backup": backup_chain_to_dto(grouped_backup_points()[backup_id]),
+    }
+
+
+def purge_recycle_bin(now: datetime | None = None) -> int:
+    moment = now or _now_utc()
+    due: dict[str, set[str]] = {}
+    for chain_id, points in grouped_backup_points().items():
+        for point in points:
+            if deleted_backups.purge_due(point, moment):
+                due.setdefault(chain_id, set()).add(str(point.get("id") or ""))
+    if not due:
+        return 0
+    block = clock_guard.retention_block()
+    if block:
+        LOGGER.warning("The recycle bin deleted nothing: %s", block)
+        return 0
+    purged = 0
+    for chain_id, point_ids in due.items():
+        with _RECYCLE_BIN_LOCK:
+            current = {
+                str(point.get("id") or "")
+                for point in grouped_backup_points().get(chain_id) or []
+                if deleted_backups.purge_due(point, moment)
+            }
+            ids = point_ids & current
+            if not ids:
+                continue
+            chain_points = [point for point in grouped_backup_points()[chain_id] if point["id"] in ids]
+            unmounted = _point_repository_unmounted(chain_points[-1])
+            if unmounted:
+                LOGGER.warning("Restore point(s) of backup chain %s due to leave the recycle bin are kept: %s", chain_id, unmounted)
+                continue
+            task = _create_delete_session(chain_id, chain_points)
+            persist_task({**task, "trigger": "recycle_bin"})
+            audit_service.record_server_start(
+                function_id="backup.delete",
+                target=audit_service.target_from_path({"backup_id": chain_id}),
+                trigger="recycle_bin",
+                session_ids=[task["id"]],
+                details={"restore_point_ids": sorted(ids)},
+            )
+            try:
+                report = _run_delete_session(
+                    chain_id, str(task["id"]), segment_id=None, force=True, permanently=True, point_ids=ids
+                )
+            except Exception:
+                LOGGER.exception("The recycle bin could not delete restore point(s) of backup chain %s", chain_id)
+                continue
+        purged += len(ids)
+        LOGGER.info(
+            "The recycle bin deleted %d restore point(s) of backup chain %s for good: %s",
+            len(ids),
+            chain_id,
+            report.get("message") or "their time in the recycle bin is up",
+        )
+    return purged
+
+
 def delete_backup_chain(
     backup_id: str,
     *,
     segment_id: str | None = None,
     force: bool = False,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    permanently: bool = False,
+    user: str | None = None,
+    point_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     chains = grouped_backup_points()
     points = chains.get(backup_id)
     if not points:
         raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
-    if segment_id is not None:
+    if point_ids is not None:
+        points = [point for point in points if str(point.get("id") or "") in point_ids]
+        if not points:
+            raise api_error(404, "backup_not_found", "Backup chain not found", backup_id=backup_id)
+    elif segment_id is not None:
         # A segment is one full backup and the incrementals chained onto it —
         # the same grouping `apply_retention_to_chain` uses, keyed by the id of
         # the segment's oldest point (normally the full backup).
@@ -9109,7 +9322,8 @@ def delete_backup_chain(
             )
         points = segment
     _ensure_chain_not_read(points, backup_id, segment_id)
-    gfs_protected_point_ids = [point["id"] for point in points if bool(point.get("gfs_protected"))]
+    in_use = [point for point in points if point.get("status") not in POINTS_LEAVING]
+    gfs_protected_point_ids = [point["id"] for point in in_use if bool(point.get("gfs_protected"))]
     if gfs_protected_point_ids and not force:
         raise api_error(409, "gfs_protected_backup", "Backup delete would violate GFS protection", backup_id=backup_id)
     if gfs_protected_point_ids:
@@ -9126,6 +9340,17 @@ def delete_backup_chain(
     ]
     if inconsistent:
         raise api_error(409, "inconsistent_backup_chain", "Repository/catalog state is inconsistent", restore_point_ids=inconsistent)
+    keep_days = 0 if permanently else deleted_backups.keep_days()
+    if keep_days and in_use:
+        return _move_to_recycle_bin(
+            backup_id,
+            in_use,
+            keep_days,
+            segment_id=segment_id,
+            gfs_overridden=bool(gfs_protected_point_ids),
+            user=user,
+            progress_callback=progress_callback,
+        )
     for repository_id in dict.fromkeys(str(point.get("repository_id") or "") for point in points):
         _ensure_share_mounted(REPOSITORIES.get(repository_id))
 
@@ -9176,7 +9401,7 @@ def delete_backup_chain(
             _delete_local_point_cache(point)
             delete_backup(point["id"])
 
-    if segment_id is None:
+    if segment_id is None and len(points) == len(chains.get(backup_id) or []):
         _discard_chain_leftovers(points)
 
     kept_points = len(retained_points) + len(kept_for_chain)
@@ -9267,7 +9492,7 @@ def _imported_parent_point(payload: dict[str, Any], manifest_path: Path, reposit
             and str(point.get("vm_id") or "") == vm_id
             and stored
             and str(Path(stored).resolve()) == wanted
-            and point.get("status") != POINT_DELETING
+            and point.get("status") not in POINTS_LEAVING
         ):
             return point
     raise api_error(
@@ -11400,6 +11625,8 @@ def _unavailable_reason(point: dict[str, Any]) -> str:
         return f"it builds on restore point {point.get('missing_ancestor_id')}, whose data is missing from the repository"
     if status == POINT_DELETING:
         return "it is being deleted"
+    if status == deleted_backups.POINT_IN_BIN:
+        return f"it is in the recycle bin until {point.get('purge_after')}"
     return f"its status is {status or 'unknown'}"
 
 
@@ -11500,6 +11727,8 @@ def plan_restore_session(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[
         if missing_ancestor
         else _deleting_point_message(point)
         if point.get("status") == POINT_DELETING
+        else deleted_backups.restore_refusal(point)
+        if deleted_backups.in_bin(point)
         else corrupt_point_message(point)
         if point.get("status") == POINT_CORRUPT
         else "Restore point is not available for restore",
