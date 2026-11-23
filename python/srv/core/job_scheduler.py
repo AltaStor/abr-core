@@ -105,6 +105,12 @@ class JobScheduler:
             except Exception as exc:
                 logger.exception("Unexpected error in job scheduler loop: %s", exc)
             try:
+                from python.srv.services.backup_retries import start_due_retries
+
+                start_due_retries()
+            except Exception:
+                logger.exception("Could not start the due retries of failed backups")
+            try:
                 self._retry_access_locks()
             except Exception as exc:
                 logger.exception("Could not start the relocation block retry: %s", exc)

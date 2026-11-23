@@ -184,6 +184,18 @@ class JobCommands:
             formatter_class=CompactHelpFormatter,
         )
         self._add_common_job_create_arguments(create, for_copy=False)
+        create.add_argument(
+            "--retry-count",
+            dest="retry_count",
+            type=int,
+            help="Retries of a VM whose backup failed, 0-20 (default 3; 0 turns retries off). Each retry backs up only that VM",
+        )
+        create.add_argument(
+            "--retry-interval",
+            dest="retry_interval_minutes",
+            type=int,
+            help="Minutes between those retries, 0-1440 (default 10)",
+        )
         create.set_defaults(handler=self.create)
 
         create_copy = commands.add_parser(
@@ -646,8 +658,22 @@ class JobCommands:
                 "rules; none means any time. A copy waits outside the window and stops when it closes"
             ),
         )
-        parser.add_argument("--retry-count", dest="retry_count", type=int, help=f"{only}retries of a VM whose copy failed, 0-20 (default 5 for periodic, 3 for immediate)")
-        parser.add_argument("--retry-interval", dest="retry_interval_minutes", type=int, help=f"{only}minutes between those retries, 0-1440 (default 0 for periodic, 10 for immediate)")
+        retried = "" if creating else "Backup and backup copy jobs: "
+        parser.add_argument(
+            "--retry-count",
+            dest="retry_count",
+            type=int,
+            help=(
+                f"{retried}retries of a VM whose backup or copy failed, 0-20 (a backup job made with job create: default 3, "
+                "jobs from before backup retries: 0; a copy job: default 5 for periodic, 3 for immediate)"
+            ),
+        )
+        parser.add_argument(
+            "--retry-interval",
+            dest="retry_interval_minutes",
+            type=int,
+            help=f"{retried}minutes between those retries, 0-1440 (a backup job: default 10; a copy job: 0 for periodic, 10 for immediate)",
+        )
 
     @staticmethod
     def _add_replication_arguments(parser: argparse.ArgumentParser, *, creating: bool) -> None:
@@ -846,6 +872,13 @@ class JobCommands:
                 elif key == "backup_copy":
                     if isinstance(value, dict):
                         shown.update(_backup_copy_rows(value))
+                elif key == "retry":
+                    if isinstance(value, dict):
+                        shown["retry"] = (
+                            f"{value.get('count')} time(s), {value.get('interval_minutes')} minute(s) apart"
+                            if value.get("count")
+                            else "off"
+                        )
                 elif key == "source_job" and payload.get("job_type") == "backup-copy":
                     continue
                 elif key == "last_run" and isinstance(value, dict):

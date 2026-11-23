@@ -337,6 +337,13 @@ class JobDTO(_LenientModel):
     repository: _Ref
     source_job: _Ref | DocObject = None
     backup_copy: DocObject = Field(default=None, description="Backup copy jobs only: copy_mode, source_jobs, source_repositories, run_after_job and retry; a source or run-after job that no longer exists carries missing: true")
+    retry: DocObject = Field(
+        default=None,
+        description=(
+            "Backup jobs only: count and interval_minutes of the retries of a VM whose backup failed. A retry is a new session "
+            "of that VM in the same run, after interval_minutes; its first log line says which attempt it is. count 0: no retries"
+        ),
+    )
     replication: DocObject = Field(default=None, description="Replication jobs only: source job and VM, target environment, host, datastore, network map, replica name, run_after_source, the replica: its VM, the restore point it is at and the time of the last successful update, and run_pending with pending_trigger (what asked for the next run and since when) when a trigger arrived while a run was going")
     schedule: ScheduleDTO | DocObject = None
     schedule_summary: str | None = None
@@ -1086,6 +1093,8 @@ class CreateJobRequest(_LenientModel):
     verify_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description=VERIFY_SCHEDULE)
     verify_enabled: LaxBool | None = Field(default=None, description=VERIFY_STATE)
     verify_whole_chain_every: RawInt | None = Field(default=None, description=VERIFY_WHOLE_CHAIN_EVERY)
+    retry_count: RawInt | None = Field(default=None, description="Retries of a VM whose backup failed, 0 to 20, each a new session of that VM in the same run; omitted: 3")
+    retry_interval_minutes: RawInt | None = Field(default=None, description="Minutes between those retries, 0 to 1440; omitted: 10")
     description: LaxStr | None = None
     task_parameters: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = None
     backup_options: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = Field(default=None, description="Older spelling of task_parameters, read only when task_parameters is absent")
@@ -1120,6 +1129,11 @@ COPY_RUN_AFTER = "Periodic copies only: start the copy each time a run of this j
 COPY_RETRY_COUNT = "Retries of a VM whose copy failed, 0 to 20, within the same session; null or omitted: 5 for periodic, 3 for immediate"
 COPY_WINDOW = "When copies may move data: rules '[days] HH:MM-HH:MM' (days separated by commas in week order, mon,wed,fri; no days is every day; the end may be past midnight, 22:00-06:00) or objects {days, start, end}, in the server's time zone. A copy waits outside them and stops when they close; empty or none: any time"
 COPY_RETRY_INTERVAL = "Minutes between those retries, 0 to 1440; null or omitted: 0 for periodic, 10 for immediate"
+JOB_RETRY_COUNT = (
+    "Backup jobs: retries of a VM whose backup failed, 0 to 20, each a new session of that VM in the same run; omitted on "
+    "create: 3. Backup copy jobs: retries within the same session; null or omitted: 5 for periodic, 3 for immediate"
+)
+JOB_RETRY_INTERVAL = "Minutes between those retries, 0 to 1440; backup jobs: 10 when omitted; copy jobs: 0 for periodic, 10 for immediate"
 
 
 class CreateBackupCopyJobRequest(_LenientModel):
@@ -1227,8 +1241,8 @@ class UpdateJobRequest(_LenientModel):
     source_repository_ids: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_REPOSITORY_IDS)
     run_after_job: LaxStr | None = Field(default=None, description=COPY_RUN_AFTER)
     run_after_job_id: LaxStr | None = Field(default=None, description=COPY_RUN_AFTER)
-    retry_count: RawInt | None = Field(default=None, description=COPY_RETRY_COUNT)
-    retry_interval_minutes: RawInt | None = Field(default=None, description=COPY_RETRY_INTERVAL)
+    retry_count: RawInt | None = Field(default=None, description=JOB_RETRY_COUNT)
+    retry_interval_minutes: RawInt | None = Field(default=None, description=JOB_RETRY_INTERVAL)
     copy_window: list[Any] | LaxStr | None = Field(default=None, description=COPY_WINDOW)
 
 

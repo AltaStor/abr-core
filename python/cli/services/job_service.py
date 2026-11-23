@@ -467,6 +467,7 @@ class JobService:
             payload["retention_min_fulls"] = int(args.retention_min_fulls)
         if getattr(args, "verify_whole_chain_every", None) is not None:
             payload["verify_whole_chain_every"] = int(args.verify_whole_chain_every)
+        payload.update(self._retry_fields(args))
         task_parameter_updates = self._build_task_parameter_updates(args)
         # Nothing exists yet to clear, so drop any None (reset) markers.
         non_null_updates = {key: value for key, value in task_parameter_updates.items() if value is not None}
@@ -499,6 +500,7 @@ class JobService:
         ("restore_point_id", "--restore-point"),
     )
     REPLICATION_SHARED_COPY_FLAGS = ("source_jobs", "source_job_ids")
+    RETRY_FIELDS = ("retry_count", "retry_interval_minutes")
     BACKUP_ONLY_FLAGS = (
         ("inventory", "--inventory"),
         ("inventory_id", "--inventory-id"),
@@ -511,6 +513,9 @@ class JobService:
     def _cleared(values: list[str]) -> list[str] | None:
         flat = [item for value in values for item in parse_csv_values(value)]
         return [] if [item.lower() for item in flat] == ["none"] else flat
+
+    def _retry_fields(self, args: Any) -> dict[str, Any]:
+        return {name: int(getattr(args, name)) for name in self.RETRY_FIELDS if getattr(args, name, None) is not None}
 
     def _backup_copy_fields(self, args: Any) -> dict[str, Any]:
         fields: dict[str, Any] = {}
@@ -672,7 +677,7 @@ class JobService:
             mismatched = given(self.REPLICATION_OPTION_FLAGS)
             if mismatched:
                 raise ValueError(f"{', '.join(mismatched)} apply to replication jobs only, and {job.get('name')} is a {label} job")
-            mismatched = given(self.BACKUP_ONLY_FLAGS if is_copy else self.COPY_OPTION_FLAGS)
+            mismatched = given(self.BACKUP_ONLY_FLAGS if is_copy else self.COPY_OPTION_FLAGS, () if is_copy else self.RETRY_FIELDS)
             if mismatched:
                 kind = "backup jobs" if is_copy else "backup copy jobs"
                 raise ValueError(f"{', '.join(mismatched)} apply to {kind} only, and {job.get('name')} is a {label} job")
@@ -680,6 +685,8 @@ class JobService:
             payload.update(self._backup_copy_fields(args))
             if getattr(args, "all_vms", False):
                 payload["vms"] = []
+        elif not is_replication:
+            payload.update(self._retry_fields(args))
 
         if getattr(args, "new_name", None):
             payload["name"] = self._normalize_name(args.new_name, label="Job name")

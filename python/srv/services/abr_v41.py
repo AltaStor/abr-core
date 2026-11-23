@@ -148,7 +148,7 @@ from python.srv.services.backup_mode import (
     restore_point_copied_at,
     restore_point_taken_at,
 )
-from python.srv.services import clock_guard
+from python.srv.services import backup_retries, clock_guard
 from python.srv.services.share_mount import (
     SMB_FILESYSTEMS,
     mount_holding,
@@ -5125,6 +5125,7 @@ def job_to_dto(job: dict[str, Any]) -> dict[str, Any]:
         },
         "source_job": (copy_job_view(normalized)["source_jobs"] or [None])[0] if normalized["job_type"] == "backup-copy" else None,
         "backup_copy": copy_job_view(normalized) if normalized["job_type"] == "backup-copy" else None,
+        "retry": backup_retries.retry_view(normalized) if normalized["job_type"] == "backup" else None,
         "replication": replication_service.replication_view(normalized) if normalized["job_type"] == replication_service.REPLICATION_JOB_TYPE else None,
         "schedule": _schedule_dto(normalized.get("schedule")),
         "schedule_summary": normalized.get("schedule_summary"),
@@ -5202,10 +5203,10 @@ def job_run_summary(job: dict[str, Any]) -> dict[str, Any] | None:
     finished: list[str] = []
     for session_id in run.get("session_ids") or []:
         task = TASKS.get(str(session_id))
-        if not isinstance(task, dict):
+        if not isinstance(task, dict) or task.get("retried_by"):
             continue
         session = session_to_dto(task, include_logs=False)
-        result = _session_run_result(task)
+        result = "running" if backup_retries.retry_pending(task) else _session_run_result(task)
         vm_key = str(task.get("resource_external_id") or session_id)
         entry = vms.setdefault(
             vm_key,
@@ -5523,6 +5524,7 @@ def create_backup_job(payload: dict[str, Any]) -> dict[str, Any]:
     }
     _ensure_job_transport(job)
     _ensure_job_guest_consistency(job, task_parameters)
+    job["retry_count"], job["retry_interval_minutes"] = backup_retries.settings_from_request(payload, {}, creating=True)
     return job_to_dto(_persist_canonical_job(job))
 
 
@@ -5931,7 +5933,13 @@ def edit_job_record(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         merged = _merge_task_parameters(stored_parameters, payload["task_parameters"])
         updated["task_parameters"] = _validate_task_parameters(merged, previous=stored_parameters)
         changed = True
-    copy_only = [key for key in COPY_JOB_FIELDS if payload.get(key) is not None]
+    retries = ("retry_count", "retry_interval_minutes")
+    if updated["job_type"] == "backup" and any(payload.get(key) is not None for key in retries):
+        updated["retry_count"], updated["retry_interval_minutes"] = backup_retries.settings_from_request(payload, current, creating=False)
+        changed = True
+    copy_only = [
+        key for key in COPY_JOB_FIELDS if payload.get(key) is not None and not (updated["job_type"] == "backup" and key in retries)
+    ]
     _ensure(
         updated["job_type"] == "backup-copy" or not copy_only,
         422,
