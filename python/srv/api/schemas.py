@@ -681,10 +681,23 @@ class BackupList(_LenientModel):
     items: list[BackupChainDTO]
 
 
+class SessionWarningDTO(_LenientModel):
+    code: DocStr = Field(
+        default=None,
+        description=(
+            "What the warning is about, a stable name a client can pick warnings by: crash_consistent (the backup is "
+            "crash-consistent because the guest could not be quiesced, on VMware and Hyper-V alike), change_tracking_reset, "
+            "disk_size_changed, ... Warnings from before codes were given may have none"
+        ),
+    )
+    message: str = Field(description="The warning in plain words")
+    vm_name: DocStr = Field(default=None, description="The VM the warning is about, when it is about one")
+
+
 class SessionVerifyDTO(_LenientModel):
     id: DocStr = None
     result: DocStr = None
-    warnings: DocObjectArray = None
+    warnings: list[SessionWarningDTO | DocObject] | None = None
     errors: list[Any] = []
     checked_restore_points: DocInt = None
     checked_artifacts: DocInt = None
@@ -729,7 +742,7 @@ class SessionDTO(_LenientModel):
     processed_bytes: int | None = None
     transferred_bytes: int | None = None
     errors: list[SessionErrorDTO] | DocArray = None
-    warnings: DocObjectArray = None
+    warnings: list[SessionWarningDTO | DocObject] | None = None
     message: DocStr = None
     triggered_by: DocStr = None
     run_id: DocStr = None

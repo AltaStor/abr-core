@@ -783,6 +783,33 @@ class ConsistencyReasonTests(unittest.TestCase):
         manifest = json.loads((task_root / "manifest.json").read_text(encoding="utf-8"))
         return result, manifest, asked
 
+    def _warnings(self, parameters: dict, state: str, refuse_application: bool = False) -> list[dict]:
+        sent: list[dict] = []
+
+        def emit(callback, stage, progress, message, **extra):
+            if isinstance(extra.get("warning"), dict):
+                sent.append(extra["warning"])
+
+        with patch.object(hyperv_backup, "_emit_progress", side_effect=emit):
+            self._backup(parameters, state, refuse_application=refuse_application)
+        return sent
+
+    def test_the_crash_consistent_fallback_warning_carries_its_code_and_the_vm(self) -> None:
+        warnings = self._warnings({}, "Running", refuse_application=True)
+
+        [warning] = [w for w in warnings if w["code"] == "crash_consistent"]
+        self.assertEqual(warning["vm_name"], "et-vm")
+        self.assertIn("taking a crash-consistent one instead", warning["message"])
+
+    def test_every_warning_of_a_run_has_a_code_a_message_and_the_vm(self) -> None:
+        warnings = self._warnings({"resolved_backup_type": "Incremental"}, "Running", refuse_application=True)
+
+        self.assertTrue(warnings)
+        for warning in warnings:
+            self.assertEqual(set(warning), {"code", "message", "vm_name"})
+            self.assertTrue(warning["code"] and warning["message"])
+        self.assertIn("no_previous_backup", [w["code"] for w in warnings])
+
     def test_a_guest_that_cannot_do_vss_says_so_on_the_session_and_the_point(self) -> None:
         result, manifest, asked = self._backup({}, "Running", refuse_application=True)
 
