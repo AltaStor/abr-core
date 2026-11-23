@@ -56,6 +56,27 @@ EVENTS: tuple[Event, ...] = (
         True,
     ),
     Event(
+        "backup.deleted",
+        "Backup deleted",
+        "A user deleted a backup chain or a segment of it (abr backup delete, or the Web UI); says who, what and when.",
+        False,
+    ),
+    Event("repository.removed", "Repository removed", "A user removed a repository; says who, which one and when.", False),
+    Event("user.created", "User created", "A user created another user account; says who, which account, its role and when.", False),
+    Event(
+        "user.role_changed",
+        "User role changed",
+        "A user changed the role of a user account; says who, which account, its new role and when.",
+        False,
+    ),
+    Event(
+        "repository.immutability_changed",
+        "Repository immutability changed",
+        "A user changed the Object Lock setting of a repository, switching it off among others; says who, which "
+        "repository, the new setting and when.",
+        False,
+    ),
+    Event(
         "tls.certificate_expiring",
         "HTTPS certificate expiring",
         f"The HTTPS certificate an administrator installed expires within {CERTIFICATE_WARNING_DAYS} days, or has "

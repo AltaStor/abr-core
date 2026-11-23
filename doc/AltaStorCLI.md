@@ -286,7 +286,7 @@ Description: The latest 50 deliveries, newest first: event, status (queued, retr
 
 abr notification events list 
 
-Description: The events that can send e-mail (job.failed, job.warning, job.succeeded, restore.failed, restore.succeeded, repository.low_space, system.clock_jump, tls.certificate_expiring), whether each does, and its default. 
+Description: The events that can send e-mail (job.failed, job.warning, job.succeeded, restore.failed, restore.succeeded, repository.low_space, system.clock_jump, tls.certificate_expiring, and the privileged actions backup.deleted, repository.removed, user.created, user.role_changed and repository.immutability_changed, which are off by default and name the user, the object, the new value and the time), whether each does, and its default. 
 
 abr notification events set --enable <ids> --disable <ids> 
 
