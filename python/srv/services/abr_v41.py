@@ -6802,6 +6802,13 @@ def apply_retention_to_chain(
             "run has finished"
         )
         return failures
+    restoring = _restores_reading(points)
+    if restoring:
+        report["skipped_reason"] = (
+            f"restore session {restoring[0]['id']} is reading this chain; its expired restore points go once that "
+            "restore has finished"
+        )
+        return failures
     unmounted = _point_repository_unmounted(points[-1])
     if unmounted:
         report["skipped_reason"] = unmounted
@@ -8528,17 +8535,42 @@ def _run_delete_session(
     return report
 
 
+def _restores_reading(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The restore sessions that are queued or running for a restore point of the chain these points make up: the
+    chain must keep its data until they have finished."""
+    point_ids = {str(point.get("id") or "") for point in points} - {""}
+    return [
+        task
+        for task in catalog_records(TASKS)
+        if isinstance(task, dict)
+        and str(task.get("task_type") or "") == "restore"
+        and _session_state(task) in _ACTIVE_SESSION_STATES
+        and str((task.get("parameters") if isinstance(task.get("parameters"), dict) else {}).get("point_id") or "")
+        in point_ids
+    ]
+
+
 def _ensure_chain_not_read(points: list[dict[str, Any]], backup_id: str, segment_id: str | None) -> None:
+    what = "segment" if segment_id is not None else "chain"
     reading = replication_service.sessions_reading(str(points[0].get("job_id") or ""), str(points[0].get("vm_id") or ""))
     _ensure(
         not reading,
         409,
         "backup_chain_in_use",
         f"Replication session {reading[0]['id'] if reading else ''} is reading the restore points of this backup "
-        f"chain to update its replica; delete the {'segment' if segment_id is not None else 'chain'} once that run "
-        "has finished",
+        f"chain to update its replica; delete the {what} once that run has finished",
         backup_id=backup_id,
         session_id=reading[0]["id"] if reading else None,
+    )
+    restoring = _restores_reading(points)
+    _ensure(
+        not restoring,
+        409,
+        "backup_chain_in_use",
+        f"Restore session {restoring[0]['id'] if restoring else ''} is reading the restore points of this backup "
+        f"chain; delete the {what} once that restore has finished",
+        backup_id=backup_id,
+        session_id=restoring[0]["id"] if restoring else None,
     )
 
 

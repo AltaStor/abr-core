@@ -276,6 +276,44 @@ class ChainGuardTests(_Triggers):
         self.assertEqual(report["removed"], [])
         self.assertIn("replication session rep-1 is reading this chain", report["skipped_reason"])
 
+    def _restore_session(self, status: str, point_id: str = "rp-1", session_id: str = "res-1") -> dict:
+        task = {
+            "id": session_id,
+            "task_type": "restore",
+            "status": status,
+            "parameters": {"point_id": point_id},
+            "created_at": _ago(2),
+        }
+        TASKS[session_id] = task
+        return task
+
+    def test_retention_skips_a_chain_a_restore_reads(self) -> None:
+        self._restore_session("running")
+        source = abr_v41.normalize_job_record(JOBS[SOURCE_JOB_ID])
+        report = abr_v41.new_retention_report(source, "vm-1", self.repository["id"])
+
+        failures = abr_v41.apply_retention_to_chain(source, vm_id="vm-1", repository_id=self.repository["id"], report=report)
+
+        self.assertEqual(failures, [])
+        self.assertEqual(report["removed"], [])
+        self.assertIn("restore session res-1 is reading this chain", report["skipped_reason"])
+
+    def test_a_chain_a_restore_reads_cannot_be_deleted(self) -> None:
+        self._restore_session("queued", point_id="rp-2")
+        chain = str(abr_v41.normalize_backup_point(dict(abr_v41.BACKUPS["rp-1"]))["chain_id"])
+
+        with self.assertRaises(abr_v41.ApiError) as caught:
+            abr_v41.delete_backup_chain_request(chain, wait=False)
+        self.assertEqual((caught.exception.status_code, caught.exception.code), (409, "backup_chain_in_use"))
+        self.assertIn("Restore session res-1 is reading the restore points of this backup chain", caught.exception.message)
+
+    def test_a_finished_restore_or_one_of_another_chain_holds_nothing(self) -> None:
+        self._restore_session("completed")
+        self._restore_session("running", point_id="rp-other", session_id="res-2")
+        chain = str(abr_v41.normalize_backup_point(dict(abr_v41.BACKUPS["rp-1"]))["chain_id"])
+
+        self.assertEqual(abr_v41._restores_reading(abr_v41.grouped_backup_points()[chain]), [])
+
     def test_a_finished_replication_no_longer_holds_the_chain(self) -> None:
         self._replication_session("completed")
 
