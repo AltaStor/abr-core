@@ -321,7 +321,8 @@ service user (`SO_PEERCRED`), runs nothing but its three operations,
 line back into `smb.conf` when it was lost while shares remain; the server
 asks for it at its start), and checks every argument itself: the share and
 account names (`abr-xxxxxxxx$`, `abr-smb-xxxxxxxx`), the password, and a folder
-given without symbolic links that belongs to the service user. It keeps the
+given without symbolic links that belongs to the service user and has no `%`
+in its path (Samba reads `%U`, `%m` and the like as macros there). It keeps the
 shares in `/etc/altastor-backup/samba-shares.conf` (root:altastor-backup,
 0640) and adds one `include` line for it to `smb.conf`, which it removes with
 the last share and otherwise leaves as it was, owner and mode included. It

@@ -794,6 +794,17 @@ class CheckTests(_SharesCase):
         self.assertIn(f"has no share {self.stored()['metadata']['share']}", error.message)
         self.assertEqual(self.smbclient.commands, [])
 
+    def test_a_share_on_a_folder_with_a_samba_macro_is_refused_without_running_smbclient(self) -> None:
+        macro = self.root / "repo-%m"
+        macro.mkdir()
+        REPOSITORIES[self.repository["id"]] = {**self.stored(), "path": str(macro)}
+
+        error = self.refused(self.check)
+
+        self.assertEqual((error.status_code, error.code), (409, "repository_share_check_failed"))
+        self.assertIn("holds %, which Samba reads as a macro", error.message)
+        self.assertEqual(self.smbclient.commands, [])
+
     def test_a_share_samba_does_not_have_is_not_blamed_on_the_account(self) -> None:
         self.smbclient.status = "tree connect failed: NT_STATUS_BAD_NETWORK_NAME\n"
 
@@ -846,6 +857,18 @@ class SambaServingTests(_SharesCase):
         self.smb_conf.unlink()
 
         self.assertIsNone(repository_shares.include_problem())
+
+    def test_a_share_made_on_a_folder_with_a_samba_macro_is_named_by_verify_and_check(self) -> None:
+        macro = self.root / "repo-%U"
+        macro.mkdir()
+        record = {**self.stored(), "path": str(macro)}
+        REPOSITORIES[self.repository["id"]] = record
+
+        check = share_mount.share_mount_check(record, samba=True)
+
+        self.assertEqual(check["status"], "failed")
+        self.assertIn("the folder name holds %, which Samba reads as a macro", check["message"])
+        self.assertIn("abr repo share del", check["message"])
 
     def test_a_repository_that_is_not_shared_has_no_samba_problem(self) -> None:
         self.unshare()

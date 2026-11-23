@@ -118,6 +118,12 @@ def _check_folder(samba: Samba, raw: str) -> tuple[Path, str]:
         raise BrokerError(REFUSED, f"{raw} is not a folder")
     if os.path.realpath(raw) != raw:
         raise BrokerError(REFUSED, f"{raw} must be given without symbolic links or relative parts")
+    if "%" in raw:
+        raise BrokerError(
+            REFUSED,
+            f"{raw} holds %, which Samba reads as a macro (%U the connecting account, %m the client's name and so on), "
+            "so the share would serve another folder; choose a folder whose name has no %",
+        )
 
     status = os.stat(raw)
     if status.st_uid != _service_account(samba).pw_uid:

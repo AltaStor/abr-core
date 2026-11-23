@@ -192,6 +192,13 @@ def samba_serving_problem(record: dict[str, Any]) -> str | None:
     if not is_shared(record):
         return None
     share = str(_metadata(record).get("share") or "")
+    folder = _folder(record)
+    if "%" in folder:
+        return (
+            f"Samba does not serve {folder} through {network_path(record)}: the folder name holds %, which Samba reads as a "
+            "macro, so the share serves another folder. Remove the share with abr repo share del and move the repository "
+            "to a folder whose name has no %"
+        )
     problem = include_problem()
     if problem is None:
         configured = _read_configured_shares()

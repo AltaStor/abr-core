@@ -123,6 +123,28 @@ class AddShareRefusalTests(_BrokerCase):
         self.assertEqual((self.system.accounts, self.system.samba_accounts), ({}, {}))
         self.assertNotIn("smbcontrol", self.tools_run())
 
+    def test_a_folder_whose_name_holds_a_samba_macro_is_refused_with_the_reason(self) -> None:
+        for name in ("r-%U", "r-%m", "r-%S", "r-100%"):
+            with self.subTest(name):
+                folder = self.system.root / name
+                folder.mkdir()
+
+                error = self.refused(lambda folder=folder: self.add(folder=folder))
+
+                self.assertIn("holds %, which Samba reads as a macro", error.message)
+                self.assertIn("choose a folder whose name has no %", error.message)
+                self.assert_nothing_changed()
+
+    def test_a_space_a_hash_and_a_semicolon_are_shared_as_before(self) -> None:
+        for index, name in enumerate(("r 1", "r#2", "r;3")):
+            with self.subTest(name):
+                folder = self.system.root / name
+                folder.mkdir()
+
+                self.add(f"abr-aaaaaaa{index}$", f"abr-smb-aaaaaaa{index}", folder)
+
+                self.assertEqual(self.ours()[f"abr-aaaaaaa{index}$"]["path"], str(folder))
+
     def test_a_stopped_smbd_is_refused_and_never_started(self) -> None:
         self.system.running = False
 
