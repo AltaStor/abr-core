@@ -146,8 +146,12 @@ backups on their own schedules, as for the other platforms. PVE keeps a disk's d
 one disk can be backed up in full within an incremental session:
 
 - the TPM state is backed up in full every time, since PVE attaches it only for the backup;
-- a disk whose bitmap PVE lost, after the VM was restarted, stopped or migrated, is backed up in full, with a warning;
-  when every disk was, the session is a full with the reason `IncrementalFallbackToFull`;
+- a disk whose bitmap PVE lost, after the VM was restarted or stopped, or migrated with its disks moved to another
+  storage, is backed up in full, with a warning; when every disk was, the session is a full with the reason
+  `IncrementalFallbackToFull`. A live migration, also by HA, that leaves the disks on shared storage keeps the bitmaps,
+  and the next backup is an incremental;
+- a backup whose vzdump run succeeded but which was not registered, for example because its result file was lost,
+  moved the bitmaps on: the next backup is a full;
 - a disk added or resized since the previous backup starts a new bitmap.
 
 Each disk's chain starts at its own newest full backup, so a synthetic full merges each disk from there, and a restore
@@ -269,9 +273,9 @@ every earlier key of the job, and each restore point records which key it was wr
 | What | Tested | Expected, not yet tested |
 | --- | --- | --- |
 | Proxmox VE | 9.2 | Later 9.x releases, once tested; PVE 8 is not supported |
-| VM storages backed up and restored to | LVM-thin, directory storage with raw and qcow2 disks, ZFS | Ceph RBD, iSCSI, ZFS over iSCSI |
-| Fleecing storages | LVM-thin, ZFS sparse and not sparse | Thick LVM, directory storage |
-| Repositories | S3 (MinIO) through the backup server; SMB 3.1.1 through the provider with runs written by hand | SMB through the backup server; AWS S3 and other S3 services with Object Lock |
+| VM storages backed up and restored to | LVM-thin, directory storage with raw and qcow2 disks, ZFS, Ceph RBD, thick LVM on iSCSI (shared), ZFS over iSCSI | Other storages that hold VM disk images |
+| Fleecing storages | LVM-thin, ZFS sparse and not sparse, directory storage, Ceph RBD, thick LVM on iSCSI, ZFS over iSCSI | |
+| Repositories | S3 (MinIO), also with Object Lock, and SMB 3.1.1, both through the backup server | AWS S3 and other S3 services |
 
 A storage type counts as supported once a restore to it has been tested. Restores write through PVE's own `qemu-img`,
 so every storage that holds VM disk images is expected to work.
@@ -310,7 +314,8 @@ task takes them, and then in the processes that use them.
 | `... has no AltaStor node helper in /etc/pve/priv/abr-node-helper` | The cluster was set up before the backup server used the helper: run `abr inventory rescan`, or set the cluster up again with `abr inventory edit --password` |
 | `The node helper on ... could not keep the secrets of ...` | See `journalctl -t abr-node-helper` on that node; `/run/abr` must be writable, and the run file must be there |
 | `presented SSH host key ..., which is not one of its own host keys` | The node's SSH host key changed outside the cluster's records; check the node, then set the cluster up again |
-| `PVE no longer had the dirty bitmap of ...` | Expected after the VM was restarted, stopped or migrated: those disks were backed up in full |
+| `PVE no longer had the dirty bitmap of ...` | Expected after the VM was restarted or stopped, or migrated with its disks moved to another storage: those disks were backed up in full |
+| `lvcreate ... vm-<vmid>-fleece-0 ... already exists`, after `Block device drive-...-fleecing is in use` in the PVE task log | A vzdump task of the VM was killed outright (SIGKILL, out of memory) and left its fleecing images attached to the VM, which PVE's own clean-up does not detach for a backup provider. Unlock the VM (`qm unlock <vmid>`) and stop and start it; the next backup removes the images |
 | `Fleecing storage ... has ... free` | Free room on that storage, or give the job another one |
 | `All ... kernel NBD devices of node ... are in use` | Too many restores at once on that node, or other NBD users; run the restore when one has ended |
 | `cannot name a Proxmox VE VM` | Choose a name of letters, digits and hyphens, in parts separated by dots |
