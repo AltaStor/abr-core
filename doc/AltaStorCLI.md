@@ -142,7 +142,7 @@ abr auth logout
 
 abr auth change-password 
 
-Description: Change your own password. Prompts for the current and new password. The new password follows the same rules as for a new user and must differ from the current one. Invalidates your other sessions; this one stays valid. 
+Description: Change your own password. Prompts for the current and new password. The new password follows the same rules as for a new user and must differ from the current one. Invalidates your other sessions; this one stays valid. Without a terminal it reads both passwords from stdin, one line each (only the new one when ABR_PASSWORD gives the current one); with nothing on stdin it refuses (exit 2) and says so, e.g. "No new password: run the command in a terminal, or give the password on its stdin (one line)". 
 
 abr auth change-password 
 
@@ -177,7 +177,7 @@ At least one enabled Administrator always remains: the last one cannot be demote
 
 abr user add 
 
-Description: Add a new user with a role. Prompts for the password; there is no --password flag. The name is 1 to 64 Latin letters, numbers, spaces, dots, underscores or hyphens and starts with a letter or number. The password is 8 to 128 characters, not only spaces, and not the user name. 
+Description: Add a new user with a role. Prompts for the password; there is no --password flag. Without a terminal it reads the password as one line from stdin, so a script can pipe it in (printf '%s\n' "$PASSWORD" | abr user add --name alice --role auditor); with nothing on stdin, or a password shorter than 8 characters there, it refuses (exit 2) with one Error line and creates nothing. The name is 1 to 64 Latin letters, numbers, spaces, dots, underscores or hyphens and starts with a letter or number. The password is 8 to 128 characters, not only spaces, and not the user name. 
 
 abr user add --name <name> --role <role> [--full-name <text>] 
 
@@ -186,7 +186,7 @@ abr user add --name alice --full-name "Alice Doe" --role backup_operator
 
 abr user edit 
 
-Description: Change a user's login name, full name, role, enabled state, or password. A role change applies to the user's next request. A new login name keeps the user's password and sessions. --reset-password prompts for a new password and ends the user's sessions; your own password is changed with abr auth change-password, which asks for the current one. Disabling a user ends their sessions and stops them signing in. 
+Description: Change a user's login name, full name, role, enabled state, or password. A role change applies to the user's next request. A new login name keeps the user's password and sessions. --reset-password prompts for a new password (without a terminal: one line from stdin, refused with exit 2 when there is none) and ends the user's sessions; your own password is changed with abr auth change-password, which asks for the current one. Disabling a user ends their sessions and stops them signing in. 
 
 abr user edit --name <name> [--id <id>] [--new-name <name>] [--reset-password] [--role <role>] [--full-name <text>] [--enable | --disable] 
 

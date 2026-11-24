@@ -4,11 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import sys
 
 from ..compact_help_formatter import CompactHelpFormatter
 from ..parsing.common_arguments import add_name_or_id_selector
-from ..parsing.secret_arguments import confirms, read_secret
+from ..parsing.secret_arguments import STDIN_HINT, read_new_password
 from .base import CommandDependencies
 
 ROLE_HELP = (
@@ -37,9 +36,11 @@ class UserCommands:
             "add",
             help="Add a new user.",
             description=(
-                "Add a new user with one role.\n\n"
+                "Add a new user with one role. Prompts for the password (with confirmation); without a "
+                "terminal it reads the password as one line from stdin, so a script can pipe it in.\n\n"
                 "Examples:\n"
-                '  abr user add --name jdoe --full-name "Jane Doe" --role backup_operator'
+                '  abr user add --name jdoe --full-name "Jane Doe" --role backup_operator\n'
+                '  printf \'%s\\n\' "$PASSWORD" | abr user add --name jdoe --role auditor'
             ),
             formatter_class=CompactHelpFormatter,
         )
@@ -68,7 +69,9 @@ class UserCommands:
         add_name_or_id_selector(edit, name_help="Login name", id_help="User ID")
         edit.add_argument("--new-name", help="New login name")
         edit.add_argument(
-            "--reset-password", action="store_true", help="Prompt for a new password for the user"
+            "--reset-password",
+            action="store_true",
+            help="Prompt for a new password for the user; without a terminal it is read as one line from stdin",
         )
         edit.add_argument("--full-name", help="New display/full name")
         edit.add_argument("--role", help=ROLE_HELP)
@@ -130,27 +133,15 @@ class UserCommands:
             raise ValueError(f"Multiple users matched name: {args.name}")
         return str(matches[0]["id"])
 
-    @staticmethod
-    def _prompt_new_password(prompt: str = "Set password for new user: ") -> str:
-        while True:
-            password = read_secret(prompt)
-            if len(password) < 8:
-                print("Password must be at least 8 characters", file=sys.stderr)
-                continue
-
-            if not confirms("Confirm password: ", password):
-                print("Passwords didn't match", file=sys.stderr)
-                continue
-
-            return password
-
     def add(self, args: argparse.Namespace) -> int:
         deps = CommandDependencies(args)
         payload = {
             "name": args.name,
             "fullName": args.full_name,
             "role": args.role,
-            "password": self._prompt_new_password(),
+            "password": read_new_password(
+                "Set password for new user: ", "Confirm password: ", missing=f"No password for the new user: {STDIN_HINT}"
+            ),
         }
         deps.context.print_output(deps.context.api_client.post("api/v1/users", json=payload))
         return 0
@@ -173,7 +164,9 @@ class UserCommands:
         deps = CommandDependencies(args)
         user_id = self._resolve_id(deps, args)
         if args.reset_password:
-            payload["password"] = self._prompt_new_password("New password for the user: ")
+            payload["password"] = read_new_password(
+                "New password for the user: ", "Confirm password: ", missing=f"No new password for the user: {STDIN_HINT}"
+            )
         deps.context.print_output(deps.context.api_client.patch(f"api/v1/users/{user_id}", json=payload))
         return 0
 
