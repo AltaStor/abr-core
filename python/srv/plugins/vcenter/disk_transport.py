@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import struct
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
@@ -504,3 +505,32 @@ def transport_problem(transport: str, tool_path: Path | None = None, *, library:
 
 def tool_api_args(transport: str | None) -> list[str]:
     return ["--api", SOAP] if transport == SOAP else []
+
+
+CONNECTION_FAILURES: dict[str, tuple[str, str]] = {
+    "VIX_E_HOST_NETWORK_CONN_REFUSED": ("The server refused connection", "The server refused the connection"),
+    "VIX_E_CANNOT_CONNECT_TO_HOST": ("Cannot connect to the host", "Connecting to the host failed"),
+    "VIX_E_HOST_NOT_CONNECTED": ("Unable to connect to the host", "Not connected to the host"),
+    "VIX_E_HOST_CONNECTION_LOST": ("The connection to the host was lost", "Connection to the host lost"),
+    "VIX_E_HOST_TCP_CONN_LOST": ("The connection was lost", "The TCP connection was lost"),
+    "VIX_E_HOST_TCP_SOCKET_ERROR": ("There was an error in communication", "A TCP socket error occurred"),
+    "VIX_E_HOST_SERVER_NOT_FOUND": ("The specified server could not be contacted", "The server was not found"),
+    "VIX_E_HOST_SERVER_NOT_AVAILABLE": ("The host is not available", "The server is not available"),
+    "VIX_E_HOST_SERVER_SHUTDOWN": ("The server shutdown", "The server is shutting down"),
+    "VIX_E_VM_HOST_DISCONNECTED": (
+        "Unable to communicate with the virtual machine's host because it is disconnected",
+        "The host of the virtual machine is disconnected",
+    ),
+    "VIX_E_NET_HTTP_COULDNT_CONNECT": ("Failed to connect to host or proxy", "The HTTP connection could not be established"),
+    "VIX_E_NET_HTTP_OPERATION_TIMEDOUT": ("Network operation timed out", "The HTTP operation timed out"),
+    "VIX_E_NET_HTTP_TRANSFER": ("Failure sending/receiving network data", "The HTTP transfer failed"),
+}
+
+CONNECTION_FAILURE = re.compile(
+    "|".join(re.escape(text) for texts in CONNECTION_FAILURES.values() for text in texts),
+    re.IGNORECASE,
+)
+
+
+def is_connection_failure(text: object) -> bool:
+    return bool(CONNECTION_FAILURE.search(str(text or "")))

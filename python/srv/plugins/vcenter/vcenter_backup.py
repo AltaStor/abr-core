@@ -26,6 +26,7 @@ from .disk_transport import (
     VDDK,
     describe_access,
     describe_tool_environment,
+    is_connection_failure,
     parameters_library,
     tool_api_args,
     tool_environment,
@@ -1385,7 +1386,7 @@ def _disk_failure_message(
     free_before: int | None,
     data_host: str | None = None,
 ) -> str:
-    if _CONNECTION_LOST.search(tool_error or ""):
+    if _CONNECTION_LOST.search(tool_error or "") or is_connection_failure(tool_error):
         detail = next(
             (line.strip()[len("Error:"):].strip() for line in reversed(tool_error.splitlines()) if line.strip().startswith("Error:")),
             tool_error.strip().splitlines()[-1].strip(),
