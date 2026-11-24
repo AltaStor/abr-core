@@ -1142,6 +1142,16 @@ def _disk_timeout_seconds(base_timeout_seconds: int, capacity_gb: Any) -> int:
     return max(base_timeout_seconds, needed_seconds)
 
 
+def disk_entry_timeout_seconds(base_timeout_seconds: int, disk: dict[str, Any]) -> int:
+    capacity_gb: Any = disk.get("capacity_gb")
+    if capacity_gb in (None, ""):
+        try:
+            capacity_gb = int(disk.get("capacity_bytes") or 0) / 1024**3
+        except (TypeError, ValueError):
+            capacity_gb = None
+    return _disk_timeout_seconds(base_timeout_seconds, capacity_gb)
+
+
 def _format_vm_spec(vm_moref: str | None, service_type: str) -> str | None:
     if not vm_moref:
         return None

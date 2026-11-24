@@ -693,6 +693,7 @@ def _copy_once(
         _resolve_compression_level,
         _resolve_encryption_settings,
         _resolve_tool_timeout_seconds,
+        disk_entry_timeout_seconds,
     )
     from python.srv.services.abr_v41 import repository_actual_retention_days
 
@@ -820,7 +821,7 @@ def _copy_once(
                     source_encryption_key=source_key,
                     retention_days=retention_days,
                     retention_till=retention_till,
-                    timeout=timeout_seconds,
+                    timeout=disk_entry_timeout_seconds(timeout_seconds, merge["template"]),
                     on_progress=_on_progress,
                     should_cancel=lambda: cancel_requested(task_id) or _window_closed(job),
                 )
