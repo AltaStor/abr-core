@@ -198,7 +198,17 @@ class RestoreDiskPlacementTests(unittest.TestCase):
         with self.assertRaises(ApiError) as error:
             self._resolve(["Hard disk 9=nvme"])
         self.assertEqual(error.exception.status_code, 422)
-        self.assertIn("does not carry", error.exception.message)
+        self.assertEqual(
+            error.exception.message,
+            "Disk placement names a disk this restore point does not carry: Hard disk 9 "
+            "(the point carries: Hard disk 1 (disk-1), Hard disk 2 (disk-2))",
+        )
+        self.assertEqual(error.exception.details["disk"], "Hard disk 9")
+
+    def test_of_several_placements_the_unknown_disk_is_the_one_named(self) -> None:
+        with self.assertRaises(ApiError) as error:
+            self._resolve(["hard disk 2=nvme", "aqa-no-such-disk=nvme"])
+        self.assertIn("does not carry: aqa-no-such-disk (", error.exception.message)
 
     def test_in_place_refuses_a_disk_placement(self) -> None:
         with self.assertRaises(ApiError) as error:
@@ -269,6 +279,12 @@ class RestoreNicNetworkPlacementTests(unittest.TestCase):
             self._resolve(["Network adapter 9=DMZ"])
         self.assertEqual(error.exception.code, "invalid_restore")
         self.assertEqual(error.exception.status_code, 422)
+        self.assertEqual(
+            error.exception.message,
+            "Adapter placement names an adapter this restore point does not carry: Network adapter 9 "
+            "(the point carries: Network adapter 1 (nic-1), Network adapter 2 (nic-2))",
+        )
+        self.assertEqual(error.exception.details["adapter"], "Network adapter 9")
 
     def test_an_adapter_placed_twice_to_different_targets_is_refused(self) -> None:
         with self.assertRaises(ApiError) as error:

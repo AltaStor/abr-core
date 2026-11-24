@@ -10737,6 +10737,14 @@ def _restore_disk_identities(source_vm: dict[str, Any]) -> list[dict[str, Any]]:
     return [disk for disk in (source_vm.get("disks") or []) if isinstance(disk, dict)]
 
 
+def _carried_items(items: list[dict[str, Any]]) -> str:
+    names = []
+    for item in items:
+        label, identifier = str(item.get("label") or "").strip(), str(item.get("id") or "").strip()
+        names.append(f"{label} ({identifier})" if label and identifier else label or identifier)
+    return ", ".join(name for name in names if name) or "none"
+
+
 def _resolve_restore_disk_placement(
     source_vm: dict[str, Any],
     *,
@@ -10770,7 +10778,8 @@ def _resolve_restore_disk_placement(
             position is not None,
             422,
             "invalid_restore",
-            "Disk placement names a disk this restore point does not carry",
+            f"Disk placement names a disk this restore point does not carry: {requested_disk} "
+            f"(the point carries: {_carried_items(disks)})",
             disk=requested_disk,
             disks=[{"id": disk.get("id"), "label": disk.get("label")} for disk in disks],
         )
@@ -10830,7 +10839,8 @@ def _resolve_restore_nic_network_mappings(
             nic is not None,
             422,
             "invalid_restore",
-            "Adapter placement names an adapter this restore point does not carry",
+            f"Adapter placement names an adapter this restore point does not carry: {requested_nic} "
+            f"(the point carries: {_carried_items(nics)})",
             adapter=requested_nic,
             adapters=[{"id": item.get("id"), "label": item.get("label")} for item in nics],
         )
@@ -11174,7 +11184,8 @@ def _ensure_restore_network_map_targets(
             source_network in source_network_set,
             422,
             "invalid_restore",
-            "Network map names a source network this restore point does not carry",
+            f"Network map names a source network this restore point does not carry: {source_network} "
+            f"(the point carries: {', '.join(sorted(source_network_set)) or 'none'})",
             source_network=source_network,
             networks=sorted(source_network_set),
         )

@@ -1006,7 +1006,7 @@ The source datastore is read from the restore point's own manifest, so mapping w
 
 --disk-datastore places a single disk, named by the disk label or ID that abr restore context lists ("Hard disk 2"). It covers the layout --datastore-map cannot express: all disks on one datastore at the source, where only the data disk should move to faster storage at the target. Disks that shared a source datastore no longer have to travel together. 
 
-Precedence is disk, then source datastore, then whole VM: --disk-datastore wins over --datastore-map, which wins over --datastore. A disk the restore point does not carry is rejected rather than ignored, and free space is still checked against the datastore each disk actually lands on, per-disk placement included. 
+Precedence is disk, then source datastore, then whole VM: --disk-datastore wins over --datastore-map, which wins over --datastore. A disk the restore point does not carry is rejected rather than ignored, and so are a --nic-network adapter and a --network-map source network it does not carry (abr job create-replication too); the refusal names the value and lists what the point carries, e.g. "Network map names a source network this restore point does not carry: aqa-src-x (the point carries: VM Network)", and free space is still checked against the datastore each disk actually lands on, per-disk placement included. 
 
 In-place restore takes no mapping and no disk placement: each restored disk goes to the datastore and folder of the disk it replaces, and a disk the VM no longer has goes back to the datastore it came from (into a folder named like the VM's own), or to the VM's own folder when the host does not see that datastore, so a VM spread over several datastores stays spread. 
 
