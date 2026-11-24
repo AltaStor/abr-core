@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 try:
+    from python.srv.core import task_pool
     from python.srv.core.job_scheduler import JobScheduler
     from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS
     from python.srv.services import abr_v41
@@ -21,6 +22,7 @@ except ModuleNotFoundError:
     venv_lib = repo_root / ".venv" / "lib"
     for site_packages in sorted(venv_lib.glob("python*/site-packages")):
         sys.path.insert(0, str(site_packages))
+    from python.srv.core import task_pool
     from python.srv.core.job_scheduler import JobScheduler
     from python.srv.core.mongo_db_wrapper import BACKUPS, HYPERVISORS, JOBS, REPOSITORIES, RESOURCES_BY_HV, TASKS
     from python.srv.services import abr_v41
@@ -342,7 +344,7 @@ class JobSchedulerTests(unittest.TestCase):
 
         self.assertEqual(list(TASKS.keys()), ["task-existing"])
 
-    def test_scheduler_marks_stale_running_task_failed_and_enqueues_replacement(self) -> None:
+    def _stale_running_task(self) -> None:
         created_at = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
         stale_updated_at = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
         HYPERVISORS["hv-1"] = {"id": "hv-1", "kind": "mock"}
@@ -389,6 +391,9 @@ class JobSchedulerTests(unittest.TestCase):
             "updated_at": stale_updated_at,
         }
 
+    def test_scheduler_marks_stale_running_task_failed_and_enqueues_replacement(self) -> None:
+        self._stale_running_task()
+
         self.scheduler._dispatch_due_jobs()
 
         self.assertEqual(TASKS["task-stale"]["status"], "failed")
@@ -399,6 +404,14 @@ class JobSchedulerTests(unittest.TestCase):
         replacement = replacement_tasks[0]
         self.assertEqual(replacement["job_id"], "job-1")
         self.assertEqual(replacement["status"], "queued")
+
+    def test_a_task_the_pool_is_running_is_never_stale_however_long_it_waits(self) -> None:
+        self._stale_running_task()
+        with patch.object(task_pool, "_IN_FLIGHT", {"task-stale"}):
+            self.scheduler._dispatch_due_jobs()
+
+        self.assertEqual(TASKS["task-stale"]["status"], "running")
+        self.assertEqual(list(TASKS), ["task-stale"])
 
     def test_scheduler_handles_mixed_naive_and_aware_timestamps(self) -> None:
         created_at = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()

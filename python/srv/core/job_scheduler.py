@@ -545,6 +545,8 @@ class JobScheduler:
         notification_detectors.task_finished(dict(task))
 
     def _has_pending_task(self, job: dict[str, Any], now: datetime) -> bool:
+        from python.srv.core.task_pool import task_in_flight
+
         job_id = str(job["id"])
         running_timeout_seconds = self._resolve_running_task_timeout_seconds(job)
         for task in catalog_records(TASKS):
@@ -555,6 +557,8 @@ class JobScheduler:
                 return True
             if status != "running":
                 continue
+            if task_in_flight(str(task.get("id") or "")):
+                return True
 
             updated_at = _parse_timestamp(task.get("updated_at")) or _parse_timestamp(task.get("created_at"))
             if updated_at is None:
