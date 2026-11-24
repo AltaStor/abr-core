@@ -98,7 +98,6 @@ def settings_dto() -> dict[str, Any]:
             for record in _vsphere_inventories()
         ],
         "detected_vddk_libraries": disk_transport.detected_libraries(),
-        "confirmed": bool(settings["updated_by"]),
         "updated_at": settings["updated_at"],
         "updated_by": settings["updated_by"],
     }

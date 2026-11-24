@@ -611,7 +611,8 @@ class StartingSettingsTests(_Catalog):
 
         self.assertEqual((settings["api"], settings["vddk_library"]), ("vddk", str(self.ovddk)))
         dto = vsphere_access.settings_dto()
-        self.assertEqual((dto["vddk_library_source"], dto["confirmed"]), ("global", False))
+        self.assertEqual(dto["vddk_library_source"], "global")
+        self.assertNotIn("confirmed", dto)
 
     def test_without_ovddk_a_fresh_install_follows_the_vddk_directory_and_says_why(self) -> None:
         settings, logs = self._start()
@@ -683,10 +684,10 @@ class StartingSettingsTests(_Catalog):
         self.assertEqual([(item["kind"], item["path"]) for item in found], [("ovddk", str(self.ovddk)), ("vmware_vddk", str(self.root / "tools" / "vddk-link" / "lib64" / "libvixDiskLib.so"))])
         self.assertEqual(vsphere_access.settings_dto()["detected_vddk_libraries"], found)
 
-    def test_an_administrator_setting_the_same_values_confirms_them(self) -> None:
+    def test_an_administrator_setting_the_same_values_changes_nothing_but_who_set_them(self) -> None:
         self._library(self.ovddk)
         self._start()
 
         settings, changed, _updated = vsphere_access.update_settings({"api": "vddk", "vddk_library": str(self.ovddk)}, updated_by="admin")
 
-        self.assertEqual((changed, settings["confirmed"], settings["updated_by"]), ([], True, "admin"))
+        self.assertEqual((changed, settings["updated_by"]), ([], "admin"))
