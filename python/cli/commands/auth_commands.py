@@ -20,9 +20,6 @@ from .base import CommandDependencies
 USERNAME_ENV_VAR = "ABR_USERNAME"
 PASSWORD_ENV_VAR = "ABR_PASSWORD"
 TOTP_CODE_PATTERN = re.compile(r"^[0-9]{6}$")
-VSPHERE_SETTINGS_PATH = "api/v1/system/vsphere"
-VSPHERE_EDIT_PERMISSION = "inventory.edit"
-LIBRARY_KIND_NAMES = {"ovddk": "oVDDK", "vmware_vddk": "VMware VDDK", "system": "system library"}
 
 
 def _prompt(read, prompt: str, *, missing: str) -> str:
@@ -175,9 +172,6 @@ class AuthCommands:
                 "security policy. Change it now: abr auth change-password",
                 file=sys.stderr,
             )
-        elif not getattr(args, "print_token", False):
-            deps.context.api_client.token = result["token"]
-            _print_vsphere_note(deps.context.api_client, result.get("permissions") or [])
         return 0
 
     def logout(self, args) -> int:
@@ -235,26 +229,3 @@ class AuthCommands:
                 continue
 
             return password
-
-
-def _print_vsphere_note(client, permissions: list[str]) -> None:
-    if VSPHERE_EDIT_PERMISSION not in permissions:
-        return
-    try:
-        settings = client.get(VSPHERE_SETTINGS_PATH, refresh=True)
-    except (requests.RequestException, CliStructuredError):
-        return
-    if not isinstance(settings, dict) or settings.get("confirmed") is not False:
-        return
-    library = settings.get("vddk_library")
-    kind = next(
-        (item.get("kind") for item in settings.get("detected_vddk_libraries") or [] if item.get("path") == library), None
-    )
-    described = f"{library} ({LIBRARY_KIND_NAMES.get(kind, kind)})" if library and kind else library or (
-        f"from the VDDK directory ({settings.get('effective_vddk_library')})"
-    )
-    print(
-        f"NOTE: the server-wide vSphere settings are the ones the server started with: API {settings.get('api')}, "
-        f"VDDK library {described}. Keep or change them: abr settings vsphere set",
-        file=sys.stderr,
-    )

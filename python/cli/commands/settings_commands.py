@@ -15,7 +15,6 @@ LIB64_NOTE = (
     "A VMware VDDK library must stay in the lib64 folder of its bundle: its transport plugins are found only "
     "through that folder."
 )
-LIBRARY_KINDS = {"ovddk": "oVDDK", "vmware_vddk": "VMware VDDK", "system": "system library"}
 
 
 class SettingsCommands:
@@ -57,11 +56,10 @@ class SettingsCommands:
             help="Change the server-wide vSphere API and VDDK library.",
             description=(
                 "Change the server-wide API and VDDK library. The library is checked on the backup server: a full "
-                "path to a readable file that exports VixDiskLib_InitEx. Options left out keep their value. Without "
-                "options, in a terminal, it asks for the API and lists the libraries found on the backup server, "
-                "oVDDK first when it is installed. " + LIB64_NOTE + "\n\n"
+                "path to a readable file that exports VixDiskLib_InitEx. Options left out keep their value; at "
+                "least one is needed. A new server starts on vddk with the oVDDK library when it is installed. "
+                + LIB64_NOTE + "\n\n"
                 "Examples:\n"
-                "  abr settings vsphere set\n"
                 "  abr settings vsphere set --vddk-lib ovddk\n"
                 "  abr settings vsphere set --vddk-lib /opt/vmware-vix-disklib/lib64/libvixDiskLib.so.9.1.0.0\n"
                 "  abr settings vsphere set --vddk-lib default\n"
@@ -100,8 +98,6 @@ class SettingsCommands:
             changes["api"] = args.api
         if args.vddk_lib is not None:
             changes["vddk_library"] = self._library_value(client, args.vddk_lib)
-        if not changes and not args.update_existing_hypervisors and sys.stdin.isatty():
-            changes = self._ask(client.get(VSPHERE_PATH) or {})
         if args.update_existing_hypervisors:
             changes["apply_to_existing_hypervisors"] = True
             own = [
@@ -142,50 +138,6 @@ class SettingsCommands:
                 raise CliStructuredError(code="invalid_argument", message="oVDDK is not installed on the backup server", exit_code=INVALID_USAGE)
             return str(found[0]["path"])
         return value
-
-    @staticmethod
-    def _ask(current: dict) -> dict:
-        source = "the server-wide value" if current.get("vddk_library") else "from the VDDK directory"
-        print(f"vSphere API: {current.get('api')}; VDDK library: {current.get('effective_vddk_library')} ({source})")
-        api = SettingsCommands._answer(f"API, vddk or soap [{current.get('api') or 'vddk'}]: ") or str(current.get("api") or "vddk")
-        if api not in ("vddk", "soap"):
-            raise CliStructuredError(code="invalid_argument", message=f"The API is vddk or soap, not {api}", exit_code=INVALID_USAGE)
-        changes: dict = {"api": api}
-        if api == "soap":
-            return changes
-        detected = [item for item in current.get("detected_vddk_libraries") or [] if item.get("path") != current.get("default_vddk_library")]
-        options: list[tuple[str | None, str]] = [
-            (str(item["path"]), f"{item['path']} ({LIBRARY_KINDS.get(str(item.get('kind')), item.get('kind'))})") for item in detected
-        ]
-        options.append((None, f"follow the VDDK directory ({current.get('default_vddk_library')})"))
-        default = next((index for index, item in enumerate(detected) if item.get("kind") == "ovddk"), None)
-        if default is None:
-            effective = current.get("vddk_library")
-            default = next((index for index, (path, _label) in enumerate(options) if path == effective), len(options) - 1)
-        print("VDDK libraries on the backup server:")
-        for index, (_path, label) in enumerate(options, start=1):
-            print(f"  {index}) {label}")
-        print(f"  {len(options) + 1}) another file")
-        print(LIB64_NOTE)
-        answer = SettingsCommands._answer(f"VDDK library [{default + 1}]: ") or str(default + 1)
-        if not answer.isdigit() or not 1 <= int(answer) <= len(options) + 1:
-            raise CliStructuredError(code="invalid_argument", message=f"Choose a number from 1 to {len(options) + 1}", exit_code=INVALID_USAGE)
-        choice = int(answer)
-        if choice == len(options) + 1:
-            path = SettingsCommands._answer("Full path of the VDDK library file: ")
-            if not path:
-                raise CliStructuredError(code="cancelled", message="Nothing was changed", exit_code=INVALID_USAGE)
-            changes["vddk_library"] = path
-        else:
-            changes["vddk_library"] = options[choice - 1][0]
-        return changes
-
-    @staticmethod
-    def _answer(question: str) -> str:
-        try:
-            return input(question).strip()
-        except EOFError:
-            return ""
 
     @staticmethod
     def _confirm(names: list[str]) -> None:

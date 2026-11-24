@@ -169,15 +169,6 @@ class ApiClientAuthHeaderTests(unittest.TestCase):
         )
 
 
-STARTED = {
-    "api": "vddk",
-    "vddk_library": "/opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so",
-    "effective_vddk_library": "/opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so",
-    "detected_vddk_libraries": [{"path": "/opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so", "kind": "ovddk"}],
-    "confirmed": False,
-}
-
-
 class AuthCommandsTests(_IsolatedConfigDirCase):
     @patch("python.cli.api.client.requests.request")
     def test_login_stores_token_and_prints_confirmation(self, request_mock) -> None:
@@ -211,56 +202,6 @@ class AuthCommandsTests(_IsolatedConfigDirCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("WARNING", err.getvalue())
         self.assertIn("does not meet the minimum security policy", err.getvalue())
-
-    def _login_with_settings(self, settings, *, permissions=("inventory.view", "inventory.edit"), **flags):
-        login = {
-            "token": "tok-abc",
-            "expires_at": "2099-01-01T00:00:00+00:00",
-            "user": {"id": "u1", "name": "admin"},
-            "permissions": list(permissions),
-        }
-        replies = [_FakeResponse(login), settings if isinstance(settings, Exception) else _FakeResponse(settings)]
-        out, err = io.StringIO(), io.StringIO()
-        with (
-            patch("python.cli.api.client.requests.request", side_effect=replies) as request_mock,
-            patch.dict(os.environ, {PASSWORD_ENV_VAR: "Sup3rSecretPW"}),
-            redirect_stdout(out),
-            redirect_stderr(err),
-        ):
-            exit_code = AuthCommands().login(_args(name="admin", **flags))
-        return exit_code, err.getvalue(), request_mock
-
-    def test_login_names_vsphere_settings_nobody_has_confirmed_yet(self) -> None:
-        exit_code, err, request_mock = self._login_with_settings(STARTED)
-
-        self.assertEqual(exit_code, 0)
-        self.assertIn("NOTE: the server-wide vSphere settings are the ones the server started with: API vddk, VDDK library /opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so (oVDDK)", err)
-        self.assertIn("abr settings vsphere set", err)
-        settings_call = request_mock.call_args_list[1]
-        self.assertEqual(settings_call.kwargs["headers"]["Authorization"], "Bearer tok-abc")
-        self.assertEqual(settings_call.kwargs["headers"]["X-ABR-Refresh"], "1")
-
-    def test_login_names_the_vddk_directory_when_no_library_is_set(self) -> None:
-        settings = {**STARTED, "vddk_library": None, "effective_vddk_library": "/opt/altastor-backup/tools/vddk/lib64/libvixDiskLib.so"}
-        _code, err, _mock = self._login_with_settings(settings)
-        self.assertIn("VDDK library from the VDDK directory (/opt/altastor-backup/tools/vddk/lib64/libvixDiskLib.so)", err)
-
-    def test_login_says_nothing_about_vsphere_settings_in_these_cases(self) -> None:
-        cases = {
-            "confirmed": ({**STARTED, "confirmed": True}, {}),
-            "an older server without the field": ({key: value for key, value in STARTED.items() if key != "confirmed"}, {}),
-            "the settings cannot be read": (requests.ConnectionError("down"), {}),
-        }
-        for label, (settings, flags) in cases.items():
-            with self.subTest(label):
-                exit_code, err, _mock = self._login_with_settings(settings, **flags)
-                self.assertEqual(exit_code, 0)
-                self.assertNotIn("NOTE", err)
-        for label, (permissions, flags) in {"a user who cannot change them": (("inventory.view",), {}), "--print-token": (("inventory.edit",), {"print_token": True})}.items():
-            with self.subTest(label):
-                _code, err, request_mock = self._login_with_settings(STARTED, permissions=permissions, **flags)
-                self.assertEqual(request_mock.call_count, 1)
-                self.assertNotIn("NOTE", err)
 
     @patch("python.cli.api.client.requests.request")
     def test_login_falls_back_to_username_env_var(self, request_mock) -> None:

@@ -100,66 +100,18 @@ class SettingsVsphereCliTests(unittest.TestCase):
         self.assertEqual(self._run("--update-existing-hypervisors", tty=True, answer="y"), (0, {"apply_to_existing_hypervisors": True}))
         self.assertEqual(self._run("--update-existing-hypervisors", tty=True, answer="n")[0], INVALID_USAGE)
 
-    def test_set_without_a_change_is_refused(self) -> None:
-        self.assertEqual(self._run()[0], INVALID_USAGE)
+    def test_set_without_a_change_is_refused_even_in_a_terminal(self) -> None:
+        for tty in (False, True):
+            with self.subTest(tty=tty):
+                code, refused = self._run(tty=tty, answers=[])
+                self.assertEqual(code, INVALID_USAGE)
+                self.assertIn("Give --api, --vddk-lib or --update-existing-hypervisors", str(refused))
 
     def test_ovddk_names_the_ovddk_library_the_server_found(self) -> None:
         self.assertEqual(self._run("--vddk-lib", "ovddk", settings=FOUND), (0, {"vddk_library": "/opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so"}))
         code, refused = self._run("--vddk-lib", "ovddk", settings={**FOUND, "detected_vddk_libraries": []})
         self.assertEqual(code, INVALID_USAGE)
         self.assertIn("oVDDK is not installed", str(refused))
-
-    def test_in_a_terminal_set_without_options_asks_for_the_api_and_the_library(self) -> None:
-        cases = {
-            "enter takes vddk and oVDDK": ([" ", ""], {"api": "vddk", "vddk_library": "/opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so"}),
-            "a listed VMware VDDK": (["vddk", "2"], {"api": "vddk", "vddk_library": "/opt/vmware-vix-disklib/lib64/libvixDiskLib.so"}),
-            "the VDDK directory": (["", "3"], {"api": "vddk", "vddk_library": None}),
-            "another file": (["", "4", "/srv/vddk/lib64/libvixDiskLib.so.8"], {"api": "vddk", "vddk_library": "/srv/vddk/lib64/libvixDiskLib.so.8"}),
-            "soap asks nothing more": (["soap"], {"api": "soap"}),
-        }
-        for label, (answers, sent) in cases.items():
-            with self.subTest(label):
-                self.assertEqual(self._run(tty=True, answers=answers, settings=FOUND), (0, sent))
-        self._run(tty=True, answers=["", ""], settings=FOUND)
-        printed = self.printed.getvalue()
-        self.assertIn("1) /opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so (oVDDK)", printed)
-        self.assertIn("4) another file", printed)
-        self.assertIn("lib64 folder of its bundle", printed)
-
-    def test_the_library_of_the_vddk_directory_is_offered_once(self) -> None:
-        directory = {"path": FOUND["default_vddk_library"], "kind": "vmware_vddk"}
-        settings = {**FOUND, "detected_vddk_libraries": [*FOUND["detected_vddk_libraries"], directory]}
-        self.assertEqual(self._run(tty=True, answers=["", "3"], settings=settings), (0, {"api": "vddk", "vddk_library": None}))
-        self.assertEqual(self.printed.getvalue().count(FOUND["default_vddk_library"]), 2)
-        self.assertIn("4) another file", self.printed.getvalue())
-
-    def test_without_ovddk_the_current_library_is_offered_first(self) -> None:
-        settings = {**FOUND, "vddk_library": "/opt/vmware-vix-disklib/lib64/libvixDiskLib.so", "detected_vddk_libraries": FOUND["detected_vddk_libraries"][1:]}
-        self.assertEqual(self._run(tty=True, answers=["", ""], settings=settings), (0, {"api": "vddk", "vddk_library": "/opt/vmware-vix-disklib/lib64/libvixDiskLib.so"}))
-        self.assertIn("VDDK library [1]", str(self._answers_asked(settings)))
-
-    def _answers_asked(self, settings: dict) -> list[str]:
-        asked: list[str] = []
-
-        def answer(question: str) -> str:
-            asked.append(question)
-            return ""
-
-        args = build_parser().parse_args(["--base-url", "http://127.0.0.1:8000", "--output", "json", "settings", "vsphere", "set"])
-        with (
-            patch("python.cli.api.client.AltaStorApiClient.get", return_value=settings),
-            patch("python.cli.api.client.AltaStorApiClient.put", return_value={}),
-            patch("sys.stdin.isatty", return_value=True),
-            patch("builtins.input", side_effect=answer),
-            redirect_stdout(io.StringIO()),
-        ):
-            args.handler(args)
-        return asked
-
-    def test_a_wrong_answer_changes_nothing(self) -> None:
-        for answers in (["nbd"], ["", "9"], ["", "x"], ["", "4", ""]):
-            with self.subTest(answers=answers):
-                self.assertEqual(self._run(tty=True, answers=answers, settings=FOUND)[0], INVALID_USAGE)
 
 
 class JobTransportCliTests(unittest.TestCase):

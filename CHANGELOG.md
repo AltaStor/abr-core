@@ -25,7 +25,11 @@ Includes every fix shipped in v26.09.1 and v26.09.2.
   whatever the service's own environment has. On the first start the
   server-wide API is VDDK and the inventories that carried the old `vddk`
   default follow it, so nothing changes. Needs abr-disk-tools a14e078 or later
-  for a library file.
+  for a library file. A new server starts on VDDK with the oVDDK library
+  (`ABR_VSPHERE_API=vddk`, `ABR_VSPHERE_VDDK_LIB=ovddk` in defaults.env) when
+  it is installed; nothing asks for these at setup: `abr auth login` prints no
+  note about them, `abr settings vsphere set` needs an option, and `GET
+  /api/v1/system/vsphere` has no `confirmed` field.
 
 - Two-factor sign-in with an authenticator app such as Google Authenticator or
   Microsoft Authenticator (TOTP, RFC 6238), optional and per user, set up and
