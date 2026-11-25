@@ -32,6 +32,7 @@ from python.srv.core.utils import utc_now
 from . import abr_v41
 
 _DEFAULT_MONGODB_LOG_PATH = "/var/log/mongodb/mongod.log"
+VDDK_LOG_DIR = Path(SYSTEM_LOG_DIR) / "vddk"
 _SYSTEMCTL_TIMEOUT_SECONDS = 10
 _UNIT_SECRET_ENVIRONMENT = re.compile(
     r'(?im)^(\s*Environment="?[A-Za-z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|APIKEY)[A-Za-z0-9_]*\s*=\s*)([^"\s]+)'
@@ -279,6 +280,35 @@ def _component_log_files(component: str) -> tuple[list[Path], list[Path]]:
     return [], searched
 
 
+def _collect_vddk_logs(warnings: list[str]) -> list[tuple[str, bytes]]:
+    files: list[tuple[str, bytes]] = []
+    if not VDDK_LOG_DIR.exists():
+        warnings.append(f"No VDDK logs: {VDDK_LOG_DIR} does not exist")
+        return files
+
+    def _unreadable(exc: OSError) -> None:
+        where = Path(exc.filename) if exc.filename else VDDK_LOG_DIR
+        warnings.append(f"Failed to read {where}: {exc}{_ownership_hint(where)}")
+
+    for top, dirs, names in os.walk(VDDK_LOG_DIR, onerror=_unreadable):
+        dirs.sort()
+        for name in sorted(names):
+            path = Path(top) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                content = path.read_bytes()
+            except PermissionError as exc:
+                warnings.append(f"Failed to read {path}: {exc}{_ownership_hint(path)}")
+                continue
+            except OSError as exc:
+                warnings.append(f"Failed to read {path}: {exc}")
+                continue
+            files.append((f"logs/vddk/{path.relative_to(VDDK_LOG_DIR).as_posix()}", _redact_log_bytes(content)))
+
+    return files
+
+
 def _collect_logs(warnings: list[str]) -> list[tuple[str, bytes]]:
     files: list[tuple[str, bytes]] = []
 
@@ -290,6 +320,8 @@ def _collect_logs(warnings: list[str]) -> list[tuple[str, bytes]]:
             continue
         for log_file in found:
             _collect_log_file(log_file, arc_dir, files, warnings)
+
+    files.extend(_collect_vddk_logs(warnings))
 
     mongodb_log = Path(_mongodb_log_path())
     mongodb_logs = _rotated_siblings(mongodb_log)

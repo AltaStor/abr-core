@@ -59,6 +59,7 @@ class SupportBundleServiceUnitTests(unittest.TestCase):
                 patch(
                     "python.srv.services.support_bundle_service._run_tool", return_value=None
                 ),
+                patch.object(support_bundle_service, "VDDK_LOG_DIR", tmp_path / "vddk"),
             ]
 
             if mongodb_defaults_text is not None:
@@ -972,6 +973,103 @@ class CatalogCollectionTests(unittest.TestCase):
         files, _ = self._collect()
 
         self.assertFalse([name for name in files if "user" in name or "resource" in name])
+
+
+class VddkLogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.vddk = pathlib.Path(self.tmp.name) / "vddk"
+        self.vddk.mkdir()
+        self.enterContext(patch.object(support_bundle_service, "VDDK_LOG_DIR", self.vddk))
+
+    def _collect(self) -> tuple[dict[str, bytes], list[str]]:
+        warnings: list[str] = []
+        return dict(support_bundle_service._collect_vddk_logs(warnings)), warnings
+
+    def test_the_whole_directory_comes_under_logs_vddk_with_its_own_paths(self) -> None:
+        (self.vddk / "vixDiskLib-101.log").write_bytes(b"VMware VDDK line\n")
+        (self.vddk / "openvddk-altastor-backup").mkdir()
+        (self.vddk / "openvddk-altastor-backup" / "openvddk-102.log").write_bytes(b"oVDDK line\n")
+        (self.vddk / "vmware-tmp").mkdir()
+        (self.vddk / "vmware-tmp" / "plugin.lock").write_bytes(b"\x00\x01binary")
+        (self.vddk / "old.log.gz").write_bytes(gzip.compress(b"kept as it is"))
+
+        files, warnings = self._collect()
+
+        self.assertEqual(
+            files,
+            {
+                "logs/vddk/vixDiskLib-101.log": b"VMware VDDK line\n",
+                "logs/vddk/openvddk-altastor-backup/openvddk-102.log": b"oVDDK line\n",
+                "logs/vddk/vmware-tmp/plugin.lock": b"\x00\x01binary",
+                "logs/vddk/old.log.gz": gzip.compress(b"kept as it is"),
+            },
+        )
+        self.assertEqual(warnings, [])
+
+    def test_the_bundle_and_its_manifest_carry_them(self) -> None:
+        (self.vddk / "vixDiskLib-101.log").write_bytes(b"VMware VDDK line\n")
+        (self.vddk / "openvddk-altastor-backup").mkdir()
+        (self.vddk / "openvddk-altastor-backup" / "openvddk-102.log").write_bytes(b"oVDDK line\n")
+
+        with patch("python.srv.services.support_bundle_service._run_tool", return_value=None):
+            result = support_bundle_service.generate_support_bundle()
+
+        archive = zipfile.ZipFile(io.BytesIO(base64.b64decode(result["archive_base64"])))
+        for name in ("logs/vddk/vixDiskLib-101.log", "logs/vddk/openvddk-altastor-backup/openvddk-102.log"):
+            self.assertIn(name, archive.namelist())
+            self.assertIn(name, result["manifest"]["files"])
+        self.assertEqual(archive.read("logs/vddk/vixDiskLib-101.log"), b"VMware VDDK line\n")
+
+    def test_a_secret_in_a_vddk_log_is_redacted(self) -> None:
+        (self.vddk / "vixDiskLib-101.log").write_text("connect user=admin password=hunter2-SECRET\n", encoding="utf-8")
+
+        files, _warnings = self._collect()
+
+        self.assertNotIn(b"hunter2-SECRET", files["logs/vddk/vixDiskLib-101.log"])
+        self.assertIn(support_bundle_service.REDACTED_VALUE.encode(), files["logs/vddk/vixDiskLib-101.log"])
+
+    def test_an_unreadable_file_is_warned_with_its_owner_and_the_rest_still_comes(self) -> None:
+        locked = self.vddk / "vixDiskLib-101.log"
+        locked.write_bytes(b"locked")
+        (self.vddk / "vixDiskLib-102.log").write_bytes(b"readable")
+        real_read = pathlib.Path.read_bytes
+
+        def deny(path):
+            if path == locked:
+                raise PermissionError(13, "Permission denied")
+            return real_read(path)
+
+        with patch.object(support_bundle_service.Path, "read_bytes", deny):
+            files, warnings = self._collect()
+
+        self.assertEqual(list(files), ["logs/vddk/vixDiskLib-102.log"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(str(locked), warnings[0])
+        self.assertIn("the support bundle runs as", warnings[0])
+
+    def test_a_symlink_is_not_followed_out_of_the_directory(self) -> None:
+        outside = pathlib.Path(self.tmp.name) / "outside.txt"
+        outside.write_bytes(b"not a VDDK log")
+        (self.vddk / "link.log").symlink_to(outside)
+        (self.vddk / "linked-dir").symlink_to(pathlib.Path(self.tmp.name), target_is_directory=True)
+
+        files, warnings = self._collect()
+
+        self.assertEqual(files, {})
+        self.assertEqual(warnings, [])
+
+    def test_an_empty_directory_adds_nothing_and_warns_nothing(self) -> None:
+        self.assertEqual(self._collect(), ({}, []))
+
+    def test_a_missing_directory_is_named_in_the_warnings(self) -> None:
+        self.vddk.rmdir()
+
+        files, warnings = self._collect()
+
+        self.assertEqual(files, {})
+        self.assertEqual(warnings, [f"No VDDK logs: {self.vddk} does not exist"])
 
 
 class SupportBundleApiTests(unittest.TestCase):

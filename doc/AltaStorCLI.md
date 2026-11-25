@@ -1147,6 +1147,7 @@ abr system get-support-bundle --file /tmp/support-bundle.zip
 
 Bundle contents:
 logs: logs/server/server.log, logs/cli/cli.log, logs/mongodb/mongod.log
+VDDK logs: the whole /var/log/altastor-backup/vddk with its subdirectories, under logs/vddk/ (logs/vddk/vixDiskLib-<pid>.log for VMware VDDK, logs/vddk/openvddk-<user>/openvddk-<pid>.log for oVDDK, and the temporary files the VDDK keeps there); a missing directory is named in manifest.json warnings, an empty one is not
 config: server.conf, mongod.conf
 dumps: logs/server/server.log.fault (if server crashed)
 catalog (from DB, as JSON): sessions.json (200 most recent), jobs.json, repositories.json, inventories.json, restore-points.json, health.json
