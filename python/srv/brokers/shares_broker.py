@@ -118,6 +118,12 @@ def _check_folder(samba: Samba, raw: str) -> tuple[Path, str]:
         raise BrokerError(REFUSED, f"{raw} is not a folder")
     if os.path.realpath(raw) != raw:
         raise BrokerError(REFUSED, f"{raw} must be given without symbolic links or relative parts")
+    if "%" in raw:
+        raise BrokerError(
+            REFUSED,
+            f"{raw} holds %, which Samba reads as a macro (%U the connecting account, %m the client's name and so on), "
+            "so the share would serve another folder; choose a folder whose name has no %",
+        )
 
     status = os.stat(raw)
     if status.st_uid != _service_account(samba).pw_uid:
@@ -469,6 +475,33 @@ def remove_share(samba: Samba, arguments: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def include_shares(samba: Samba, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    _arguments(arguments, ())
+
+    with _locked(samba):
+        _preflight(samba)
+        shares = sorted(_our_sections(samba))
+        if not shares:
+            return {"included": False, "shares": []}
+        snapshot = _snapshot(samba)
+        included = _with_include(samba, snapshot.smb_conf)
+        if included == snapshot.smb_conf:
+            return {"included": False, "shares": shares}
+
+        try:
+            _write_smb_conf(samba, snapshot, included)
+            if _command(samba, ["testparm", "-s", str(samba.smb_conf)], check=False).returncode != 0:
+                raise BrokerError(FAILED, f"the Samba configuration does not validate with the line {samba.include_line}")
+            _reload(samba)
+        except BaseException as exc:
+            _restore(samba, snapshot)
+            if isinstance(exc, BrokerError):
+                raise BrokerError(exc.code, f"{exc.message}; the previous Samba configuration is restored") from exc
+            raise
+
+    return {"included": True, "shares": shares}
+
+
 def close_shares(samba: Samba) -> dict[str, Any]:
     with _locked(samba):
         has_file = samba.shares_conf.is_file()
@@ -515,6 +548,7 @@ def operations(samba: Samba) -> dict[str, Operation]:
     return {
         "add-share": lambda arguments: add_share(samba, arguments),
         "remove-share": lambda arguments: remove_share(samba, arguments),
+        "include-shares": lambda arguments: include_shares(samba, arguments),
     }
 
 

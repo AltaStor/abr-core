@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pwd
 import secrets
 import shutil
 import socket
@@ -48,6 +49,7 @@ DEFAULT_SOCKET = "/run/altastor-backup-shares.sock"
 TIMEOUT_ENV = "ABR_SHARES_BROKER_TIMEOUT_SECONDS"
 SHARES_CONF_ENV = "ABR_SAMBA_SHARES_CONF"
 DEFAULT_SHARES_CONF = "/etc/altastor-backup/samba-shares.conf"
+SMB_CONF = Path("/etc/samba/smb.conf")
 SHARE_MARK = "support_hyperv"
 SHARE_FIELDS = ("server", "share", "username", "password")
 NAME_ALPHABET = string.ascii_lowercase + string.digits
@@ -174,6 +176,36 @@ def _read_configured_shares() -> dict[str, dict[str, str]] | None:
 
 def _configured_shares() -> dict[str, dict[str, str]]:
     return _read_configured_shares() or {}
+
+
+def include_problem() -> str | None:
+    try:
+        lines = [line.strip() for line in SMB_CONF.read_text().splitlines()]
+    except OSError:
+        return None
+    if f"include = {_shares_conf()}" in lines:
+        return None
+    return f"{SMB_CONF} no longer includes {_shares_conf()}"
+
+
+def samba_serving_problem(record: dict[str, Any]) -> str | None:
+    if not is_shared(record):
+        return None
+    share = str(_metadata(record).get("share") or "")
+    folder = _folder(record)
+    if "%" in folder:
+        return (
+            f"Samba does not serve {folder} through {network_path(record)}: the folder name holds %, which Samba reads as a "
+            "macro, so the share serves another folder. Remove the share with abr repo share del and move the repository "
+            "to a folder whose name has no %"
+        )
+    problem = include_problem()
+    if problem is None:
+        configured = _read_configured_shares()
+        if configured is None or not share or share in configured:
+            return None
+        problem = f"{_shares_conf()} has no share {share}"
+    return f"Samba no longer serves {network_path(record)}: {problem}. The server puts it back when it starts"
 
 
 def _parse_sections(text: str) -> dict[str, dict[str, str]]:
@@ -426,7 +458,21 @@ def restore_shares() -> dict[str, list[str]]:
             if str(_metadata(record).get("share")) in configured:
                 continue
             outcome[_restore_share(record)].append(_name(record))
+        _restore_include()
     return outcome
+
+
+def _restore_include() -> None:
+    problem = include_problem()
+    if problem is None:
+        return
+    try:
+        result = _call_broker("include-shares", {}, what=f"The shares of the repositories could not be included again ({problem})")
+    except ApiError as exc:
+        logger.warning("%s; Samba does not serve them until it is. It is tried again when the server starts next time.", exc.message)
+        return
+    if result.get("included"):
+        logger.warning("%s, so Samba served none of the shares of the repositories; the line is put back: %s.", problem, ", ".join(result.get("shares") or []))
 
 
 def restore_shares_in_background() -> threading.Thread:
@@ -480,6 +526,10 @@ def list_shares() -> dict[str, Any]:
     return {"items": [share_view(record) for record in sorted(records, key=lambda item: str(item.get("path") or ""))]}
 
 
+class _SmbclientFailed(Exception):
+    pass
+
+
 def _smbclient(target: str, auth: Path, command: str) -> None:
     try:
         done = subprocess.run(
@@ -490,10 +540,54 @@ def _smbclient(target: str, auth: Path, command: str) -> None:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise api_error(502, "repository_share_check_failed", f"smbclient could not be run: {exc}") from exc
+        raise _check_failed(f"smbclient could not be run: {exc}") from exc
     if done.returncode != 0 or "NT_STATUS_" in done.stdout:
         lines = [line for line in (done.stderr + done.stdout).splitlines() if line.strip()]
-        raise api_error(502, "repository_share_check_failed", f"smbclient {target} failed: {lines[-1].strip() if lines else done.returncode}")
+        raise _SmbclientFailed(f"smbclient {target} failed: {lines[-1].strip() if lines else done.returncode}")
+
+
+def _check_failed(message: str) -> ApiError:
+    return api_error(409, "repository_share_check_failed", message)
+
+
+def service_account() -> str:
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        return f"uid {os.geteuid()}"
+
+
+def _owner_of(folder: Path) -> str | None:
+    try:
+        uid = folder.stat().st_uid
+    except OSError:
+        return None
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f"uid {uid}"
+
+
+def _smbclient_failure(record: dict[str, Any], folder: Path, failure: str) -> ApiError:
+    metadata = _metadata(record)
+    account = service_account()
+    owner = _owner_of(folder)
+    if owner is not None and owner != account:
+        return _check_failed(
+            f"{folder} belongs to {owner}, not to {account}: Samba writes into the share as {account}, so nothing can be "
+            f"written through {network_path(record)} and Hyper-V backups into it fail. Give the folder back with "
+            f"chown -R {account} {folder} ({failure})"
+        )
+    if "NT_STATUS_BAD_NETWORK_NAME" in failure:
+        return _check_failed(f"Samba on this server does not serve the share {metadata.get('share')}, so {network_path(record)} cannot be opened ({failure})")
+    if "NT_STATUS_CONNECTION_REFUSED" in failure or "NT_STATUS_IO_TIMEOUT" in failure or "NT_STATUS_HOST_UNREACHABLE" in failure:
+        return _check_failed(f"Samba (smbd) on this server does not answer at {share_server()}, so {network_path(record)} cannot be reached ({failure})")
+    if "tree connect failed" in failure or "NT_STATUS_LOGON_FAILURE" in failure:
+        return _check_failed(
+            f"Samba refuses the share's account {metadata.get('username')} for {network_path(record)}: the account is no longer "
+            f"in Samba's passdb (pdbedit -L lists them) or its password was changed outside AltaStor ({failure})"
+        )
+    return _check_failed(failure)
 
 
 def check_share(record: dict[str, Any]) -> dict[str, Any]:
@@ -501,6 +595,10 @@ def check_share(record: dict[str, Any]) -> dict[str, Any]:
         raise api_error(409, "repository_not_shared", f"{_name(record)} is not shared; share it first")
     if shutil.which("smbclient") is None:
         raise api_error(409, "smbclient_missing", "smbclient is not installed on this server, so the share cannot be checked")
+
+    problem = samba_serving_problem(record)
+    if problem:
+        raise _check_failed(problem)
 
     metadata = _metadata(record)
     try:
@@ -517,14 +615,17 @@ def check_share(record: dict[str, Any]) -> dict[str, Any]:
         auth.chmod(0o600)
         sent.write_text(f"AltaStor Backup share check {utc_now()}\n")
 
-        _smbclient(target, auth, f'put "{sent}" "{name}"')
-        if not (folder / name).exists():
-            raise api_error(502, "repository_share_check_failed", f"the test file written through {network_path(record)} did not appear in {folder}")
+        try:
+            _smbclient(target, auth, f'put "{sent}" "{name}"')
+            if not (folder / name).exists():
+                raise _check_failed(f"the test file written through {network_path(record)} did not appear in {folder}")
 
-        _smbclient(target, auth, f'get "{name}" "{received}"; del "{name}"')
+            _smbclient(target, auth, f'get "{name}" "{received}"; del "{name}"')
+        except _SmbclientFailed as exc:
+            raise _smbclient_failure(record, folder, str(exc)) from exc
         if not received.is_file() or received.read_text() != sent.read_text():
-            raise api_error(502, "repository_share_check_failed", f"the test file read back through {network_path(record)} differs from the one written")
+            raise _check_failed(f"the test file read back through {network_path(record)} differs from the one written")
         if (folder / name).exists():
-            raise api_error(502, "repository_share_check_failed", f"the test file is still in {folder} after it was deleted through the share")
+            raise _check_failed(f"the test file is still in {folder} after it was deleted through the share")
 
     return {**share_view(record), "checked": True, "message": f"{network_path(record)} as {metadata.get('username')}: write, read back and delete passed"}

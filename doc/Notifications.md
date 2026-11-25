@@ -60,6 +60,7 @@ reports what happened:
 | `task_finished(task)` | `TaskProcessPool._finish_task` (every final state, a crash included) and `JobScheduler._mark_stale_task_failed` | `job.*` once per job run, when its last VM's task has finished; `restore.*` per restore; `repository.low_space` after a run |
 | `clock_jumped(...)` | `clock_guard._block` | `system.clock_jump` |
 | `check_certificate()` | a daily timer started with the TLS renewal check | `tls.certificate_expiring`, once per certificate |
+| `privileged_action(entry)` | `audit_service.record_request`, for every allowed request the audit records | `backup.deleted`, `repository.removed`, `user.created`, `user.role_changed` (a user edit that sets a role), `repository.immutability_changed` (a repository edit that sets immutability) |
 
 A job run is all the tasks with the same `run_id`; the run's result is the
 worst VM result (`job_run_summary`), and one notification covers every VM with
@@ -79,6 +80,11 @@ nothing.
 | `repository.low_space` | on | After a run, the disk of the job's local or SMB repository is filled to `repository_space_threshold_percent` (85 by default) or beyond. Object storage has no fixed size and is not checked. Sent again only after the disk has dropped below the threshold and filled up again (kept in memory: a restart may send it once more). |
 | `system.clock_jump` | on | The server clock jumped forward, so retention is paused until an Administrator confirms the time. |
 | `tls.certificate_expiring` | on | An HTTPS certificate an administrator installed expires within 14 days or has expired (checked a minute after start and then daily). The appliance's own certificate renews itself and is not reported. |
+| `backup.deleted` | off | A user deleted a backup chain or a segment of it (abr backup delete, the Web UI). Names the user, their role, the interface and address, the chain, and the time. |
+| `repository.removed` | off | A user removed a repository. |
+| `user.created` | off | A user created a user account; names the account and its role. |
+| `user.role_changed` | off | A user set the role of a user account; names the account and the new role. |
+| `repository.immutability_changed` | off | A user changed a repository's Object Lock setting, switching it off among others; names the new setting. |
 
 `GET /api/v1/notifications/events` and `abr notification events list` list
 them. An event a channel's settings do not mention takes its default.

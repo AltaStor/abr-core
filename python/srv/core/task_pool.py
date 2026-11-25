@@ -72,6 +72,15 @@ def _keep_backup_snapshot(result: dict[str, object], previous_result: dict[str, 
         result["replica_touched"] = True
 
 
+_IN_FLIGHT: set[str] = set()
+_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def task_in_flight(task_id: str) -> bool:
+    with _IN_FLIGHT_LOCK:
+        return task_id in _IN_FLIGHT
+
+
 class TaskProcessPool:
     def __init__(
         self,
@@ -237,12 +246,19 @@ class TaskProcessPool:
         snapshot["status"] = "queued"
         logger.info("Dispatching task '%s' to worker pool.", task_id)
 
-        future = self._executor.submit(
-            run_task,
-            snapshot,
-            self._simulated_seconds,
-            lambda update: self._report_progress(task_id, update),
-        )
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT.add(task_id)
+        try:
+            future = self._executor.submit(
+                run_task,
+                snapshot,
+                self._simulated_seconds,
+                lambda update: self._report_progress(task_id, update),
+            )
+        except BaseException:
+            with _IN_FLIGHT_LOCK:
+                _IN_FLIGHT.discard(task_id)
+            raise
         with self._futures_lock:
             self._futures[future] = (task_id, task_type, vm_key)
         future.add_done_callback(self._complete_task)
@@ -298,7 +314,10 @@ class TaskProcessPool:
             self._finish_task(future)
         finally:
             with self._futures_lock:
-                self._futures.pop(future, None)
+                entry = self._futures.pop(future, None)
+            if entry is not None:
+                with _IN_FLIGHT_LOCK:
+                    _IN_FLIGHT.discard(entry[0])
 
     def _finish_task(self, future: Future[dict[str, object]]) -> None:
         with self._futures_lock:

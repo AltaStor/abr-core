@@ -783,6 +783,33 @@ class ConsistencyReasonTests(unittest.TestCase):
         manifest = json.loads((task_root / "manifest.json").read_text(encoding="utf-8"))
         return result, manifest, asked
 
+    def _warnings(self, parameters: dict, state: str, refuse_application: bool = False) -> list[dict]:
+        sent: list[dict] = []
+
+        def emit(callback, stage, progress, message, **extra):
+            if isinstance(extra.get("warning"), dict):
+                sent.append(extra["warning"])
+
+        with patch.object(hyperv_backup, "_emit_progress", side_effect=emit):
+            self._backup(parameters, state, refuse_application=refuse_application)
+        return sent
+
+    def test_the_crash_consistent_fallback_warning_carries_its_code_and_the_vm(self) -> None:
+        warnings = self._warnings({}, "Running", refuse_application=True)
+
+        [warning] = [w for w in warnings if w["code"] == "crash_consistent"]
+        self.assertEqual(warning["vm_name"], "et-vm")
+        self.assertIn("taking a crash-consistent one instead", warning["message"])
+
+    def test_every_warning_of_a_run_has_a_code_a_message_and_the_vm(self) -> None:
+        warnings = self._warnings({"resolved_backup_type": "Incremental"}, "Running", refuse_application=True)
+
+        self.assertTrue(warnings)
+        for warning in warnings:
+            self.assertEqual(set(warning), {"code", "message", "vm_name"})
+            self.assertTrue(warning["code"] and warning["message"])
+        self.assertIn("no_previous_backup", [w["code"] for w in warnings])
+
     def test_a_guest_that_cannot_do_vss_says_so_on_the_session_and_the_point(self) -> None:
         result, manifest, asked = self._backup({}, "Running", refuse_application=True)
 
@@ -790,6 +817,35 @@ class ConsistencyReasonTests(unittest.TestCase):
         self.assertEqual((result["consistency"], result["consistency_reason"]), ("crash", "vss_failed"))
         self.assertEqual(manifest["consistency_reason"], "vss_failed")
         self.assertTrue(any("crash-consistent one instead" in warning for warning in result["warnings"]))
+
+    def test_on_quiesce_failure_fail_ends_the_session_with_no_point_and_names_the_setting(self) -> None:
+        for value in ("fail",):
+            with self.subTest(value):
+                with self.assertRaises(hyperv_backup.HyperVBackupError) as caught:
+                    self._backup({"on_quiesce_failure": value}, "Running", refuse_application=True)
+
+                message = str(caught.exception)
+                self.assertIn("Application-consistent checkpoint of et-vm failed", message)
+                self.assertIn("--on-quiesce-failure fail", message)
+                self.assertIn("Backup (volume shadow copy) integration service", message)
+
+    def test_on_quiesce_failure_crash_consistent_falls_back_as_before(self) -> None:
+        for value in ("crash_consistent", "crash-consistent"):
+            with self.subTest(value):
+                result, _manifest, asked = self._backup({"on_quiesce_failure": value}, "Running", refuse_application=True)
+
+                self.assertEqual(asked, ["application", "crash"])
+                self.assertEqual((result["consistency"], result["consistency_reason"]), ("crash", "vss_failed"))
+
+    def test_on_quiesce_failure_fail_takes_an_application_checkpoint_when_vss_works(self) -> None:
+        result, _manifest, asked = self._backup({"on_quiesce_failure": "fail"}, "Running")
+
+        self.assertEqual((asked, result["consistency"]), (["application"], "application"))
+
+    def test_on_quiesce_failure_fail_does_not_touch_a_vm_that_is_off(self) -> None:
+        result, _manifest, asked = self._backup({"on_quiesce_failure": "fail"}, "Off")
+
+        self.assertEqual((asked, result["consistency_reason"]), (["crash"], "vm_not_running"))
 
     def test_a_vm_that_is_not_running_says_it_had_no_guest_to_quiesce(self) -> None:
         result, manifest, asked = self._backup({}, "Off")

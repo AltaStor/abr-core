@@ -8,13 +8,15 @@ import sys
 from typing import Any
 
 from ..compact_help_formatter import CompactHelpFormatter
-from ..exit_codes import INVALID_STATE
+from ..errors import CliStructuredError
+from ..exit_codes import INVALID_STATE, INVALID_USAGE
 from ..parsing.secret_arguments import ENCRYPTION_KEY_ENV_VAR, add_secret_argument, resolve_secret
 from ..models.views import human_size
 from ..progress_watch import session_watch_succeeded, watch_session
 from .base import CommandDependencies
 
 BACKUP_DELETE_TIMEOUT_SECONDS = 21600
+RECYCLE_BIN_PATH = "api/v1/system/recycle-bin"
 
 
 def _announce_session(session_id: object) -> None:
@@ -26,6 +28,12 @@ def _chain_status(chain: dict[str, Any]) -> str:
     corrupt = chain.get("corrupt") if isinstance(chain.get("corrupt"), dict) else None
     if corrupt:
         notes.append(f"{corrupt.get('restore_point_count')} point(s) corrupt")
+    binned = chain.get("recycle_bin") if isinstance(chain.get("recycle_bin"), dict) else None
+    if binned:
+        notes.append(
+            ("in the recycle bin" if binned.get("whole_chain") else f"{binned.get('restore_points')} point(s) in the recycle bin")
+            + f" until {binned.get('purge_after')}"
+        )
     pending = chain.get("pending_deletion") if isinstance(chain.get("pending_deletion"), dict) else None
     if pending:
         after = pending.get("delete_after")
@@ -34,6 +42,8 @@ def _chain_status(chain: dict[str, Any]) -> str:
         return status
     if status == "deleting" and pending and not corrupt:
         return notes[-1]
+    if status == "deleted" and binned and binned.get("whole_chain") and len(notes) == 1:
+        return notes[0]
     return f"{status}, {', '.join(notes)}"
 
 
@@ -88,11 +98,26 @@ class BackupCommands:
         for name, help_text, handler in (
             ("info", "Show backup details.", self.info),
             ("delete", "Delete a backup chain after safety checks.", self.delete),
+            ("undelete", "Bring a deleted backup chain back from the recycle bin.", self.undelete),
             ("verify", "Verify backup integrity.", self.verify),
         ):
             description = f"{help_text}\n\nExamples:\n  abr backup {name} --id <backup-id>"
             if name == "delete":
-                description += "\n  abr backup delete --id <backup-id> --force"
+                description = (
+                    f"{help_text} Asks before deleting, unless --yes; without a terminal it needs --yes. When the "
+                    "recycle bin keeps deleted backups (abr settings recycle-bin), the chain moves there: its data "
+                    "stays in the repository until the server deletes it for good, abr backup undelete brings it "
+                    "back, and deleting a chain that is all in the recycle bin deletes it for good at once."
+                    f"\n\nExamples:\n  abr backup {name} --id <backup-id>"
+                    "\n  abr backup delete --id <backup-id> --yes"
+                    "\n  abr backup delete --id <backup-id> --force --yes"
+                )
+            if name == "undelete":
+                description = (
+                    f"{help_text} Every restore point of the chain in the recycle bin comes back with the status it "
+                    "had: it can be restored again and the job's retention counts it again."
+                    f"\n\nExamples:\n  abr backup {name} --id <backup-id>"
+                )
             if name == "verify":
                 description += (
                     "\n\nVerify follows the check to the end, drawing the same live progress "
@@ -116,6 +141,7 @@ class BackupCommands:
                     action="store_true",
                     help="Also delete GFS-protected restore points. Deliberately discards data a GFS policy marked for retention.",
                 )
+                parser.add_argument("--yes", action="store_true", help="Delete without asking first")
             parser.set_defaults(handler=handler)
 
         import_parser = commands.add_parser(
@@ -167,13 +193,45 @@ class BackupCommands:
                 }
                 for point in restore_points
             ]
-            deps.context.print_output(rows, RESTORE_POINT_COLUMNS)
+            columns = RESTORE_POINT_COLUMNS
+            if any(point.get("purge_after") for point in restore_points):
+                columns = [*RESTORE_POINT_COLUMNS, ("purge_after", "IN RECYCLE BIN UNTIL")]
+            deps.context.print_output(rows, columns)
         return 0
+
+    @staticmethod
+    def _confirm_delete(client, backup_id: str) -> None:
+        chain = client.get(f"api/v1/backups/{backup_id}") or {}
+        points = chain.get("restore_points") or []
+        vm = (chain.get("vm") or {}).get("name") or (chain.get("vm") or {}).get("id") or "?"
+        in_use = [point for point in points if point.get("status") != "deleted"]
+        keep_days = int((client.get(RECYCLE_BIN_PATH) or {}).get("keep_days") or 0)
+        if in_use and keep_days:
+            question = (
+                f"Delete chain {backup_id} of {vm} ({len(in_use)} restore point(s))? It goes to the recycle bin and is "
+                f"deleted for good after {keep_days} day(s)."
+            )
+        else:
+            question = f"Delete chain {backup_id} of {vm} ({len(points)} restore point(s)) for good?"
+        if not sys.stdin.isatty():
+            raise CliStructuredError(
+                code="confirmation_required",
+                message=f"{question} There is no terminal to ask in: add --yes to delete without asking",
+                exit_code=INVALID_USAGE,
+            )
+        try:
+            answer = input(f"{question} [y/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            raise CliStructuredError(code="cancelled", message="Nothing was deleted", exit_code=INVALID_USAGE)
 
     def delete(self, args: argparse.Namespace) -> int:
         if not str(args.id or "").strip():
             raise ValueError("Backup selection requires a non-empty --id")
         deps = CommandDependencies(args)
+        if not getattr(args, "yes", False):
+            self._confirm_delete(deps.context.api_client, str(args.id))
         params: dict[str, Any] = {"wait": "false"}
         if getattr(args, "force", False):
             params["force"] = True
@@ -203,6 +261,19 @@ class BackupCommands:
             return INVALID_STATE
         if session is not None and not session_watch_succeeded(session):
             return INVALID_STATE
+        return 0
+
+    def undelete(self, args: argparse.Namespace) -> int:
+        if not str(args.id or "").strip():
+            raise ValueError("Backup selection requires a non-empty --id")
+        deps = CommandDependencies(args)
+        payload = deps.context.api_client.post(f"api/v1/backups/{args.id}/undelete")
+        if deps.context.output == "table" and isinstance(payload, dict):
+            deps.context.print_output(
+                payload, [("id", "ID"), ("undeleted_restore_points", "POINTS"), ("message", "MESSAGE")]
+            )
+            return 0
+        deps.context.print_output(payload)
         return 0
 
     def verify(self, args: argparse.Namespace) -> int:

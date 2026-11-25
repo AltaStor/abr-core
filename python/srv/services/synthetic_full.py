@@ -388,6 +388,7 @@ def run_synthetic_full(
         _resolve_compression_level,
         _resolve_encryption_settings,
         _resolve_tool_timeout_seconds,
+        disk_entry_timeout_seconds,
     )
     from python.srv.services.abr_v41 import repository_actual_retention_days
     from python.srv.services.backup_copy import synthetic_copy_source
@@ -551,7 +552,7 @@ def run_synthetic_full(
                     source_encryption_key=encryption_key,
                     retention_days=retention_days,
                     retention_till=retention_till,
-                    timeout=timeout_seconds,
+                    timeout=disk_entry_timeout_seconds(timeout_seconds, template),
                     on_progress=_on_progress,
                     should_cancel=lambda: cancel_requested(task_id),
                 )

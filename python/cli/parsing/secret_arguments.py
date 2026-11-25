@@ -67,6 +67,40 @@ def confirms(prompt: str, secret: str) -> bool:
     return _LAST_READ["without_terminal"] or read_secret(prompt) == secret
 
 
+MIN_PASSWORD_LENGTH = 8
+STDIN_HINT = "run the command in a terminal, or give the password on its stdin (one line)"
+
+
+def read_password(prompt: str, *, missing: str) -> str:
+    try:
+        return read_secret(prompt)
+    except EOFError as exc:
+        raise CliStructuredError(code="invalid_argument", message=missing, exit_code=INVALID_USAGE) from exc
+
+
+def read_new_password(prompt: str, confirm_prompt: str, *, missing: str) -> str:
+    while True:
+        password = read_password(prompt, missing=missing)
+        without_terminal = _LAST_READ["without_terminal"]
+        if len(password) < MIN_PASSWORD_LENGTH:
+            if without_terminal:
+                raise CliStructuredError(
+                    code="invalid_argument",
+                    message=f"The password must be at least {MIN_PASSWORD_LENGTH} characters",
+                    exit_code=INVALID_USAGE,
+                )
+            print(f"Password must be at least {MIN_PASSWORD_LENGTH} characters", file=sys.stderr)
+            continue
+        try:
+            confirmed = confirms(confirm_prompt, password)
+        except EOFError as exc:
+            raise CliStructuredError(code="invalid_argument", message=missing, exit_code=INVALID_USAGE) from exc
+        if not confirmed:
+            print("Passwords didn't match", file=sys.stderr)
+            continue
+        return password
+
+
 def resolve_secret(
     value: str | None,
     *,

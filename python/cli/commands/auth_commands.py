@@ -14,7 +14,12 @@ from ..cli_context import TOKEN_ENV_VAR
 from ..compact_help_formatter import CompactHelpFormatter
 from ..errors import CliStructuredError
 from ..exit_codes import INVALID_USAGE
-from ..parsing.secret_arguments import confirms, read_secret
+from ..parsing.secret_arguments import (
+    STDIN_HINT,
+    read_new_password,
+    read_password,
+    read_secret,
+)
 from .base import CommandDependencies
 
 USERNAME_ENV_VAR = "ABR_USERNAME"
@@ -110,7 +115,8 @@ class AuthCommands:
             help="Change your own account password.",
             description=(
                 "Change your own account password. Prompts for the current password and the new "
-                f"one (with confirmation); the current password also falls back to {PASSWORD_ENV_VAR}. "
+                f"one (with confirmation); the current password also falls back to {PASSWORD_ENV_VAR}. Without a "
+                "terminal both are read from stdin, one line each (only the new one when the variable is set). "
                 "Invalidates every other active session for this account; the one making this "
                 "call stays valid.\n\n"
                 "Examples:\n"
@@ -206,8 +212,14 @@ class AuthCommands:
 
     def change_password(self, args) -> int:
         deps = CommandDependencies(args)
-        current_password = os.environ.get(PASSWORD_ENV_VAR) or read_secret("Current password: ")
-        new_password = self._prompt_new_password()
+        current_password = os.environ.get(PASSWORD_ENV_VAR) or read_password(
+            "Current password: ",
+            missing=f"No current password: set {PASSWORD_ENV_VAR}, run the command in a terminal, or give the current "
+            "and the new password on its stdin (one line each)",
+        )
+        new_password = read_new_password(
+            "New password: ", "Confirm new password: ", missing=f"No new password: {STDIN_HINT}"
+        )
 
         deps.context.api_client.post(
             "api/v1/auth/change-password",
@@ -216,16 +228,3 @@ class AuthCommands:
         print("Password changed. Every other active session for this account was logged out.")
         return 0
 
-    @staticmethod
-    def _prompt_new_password() -> str:
-        while True:
-            password = read_secret("New password: ")
-            if len(password) < 8:
-                print("Password must be at least 8 characters", file=sys.stderr)
-                continue
-
-            if not confirms("Confirm new password: ", password):
-                print("Passwords didn't match", file=sys.stderr)
-                continue
-
-            return password

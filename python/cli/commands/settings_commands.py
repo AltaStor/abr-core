@@ -11,6 +11,7 @@ from ..exit_codes import INVALID_USAGE
 from .base import CommandDependencies
 
 VSPHERE_PATH = "api/v1/system/vsphere"
+RECYCLE_BIN_PATH = "api/v1/system/recycle-bin"
 LIB64_NOTE = (
     "A VMware VDDK library must stay in the lib64 folder of its bundle: its transport plugins are found only "
     "through that folder."
@@ -18,7 +19,7 @@ LIB64_NOTE = (
 
 
 class SettingsCommands:
-    """Server-wide settings: abr settings vsphere show|set."""
+    """Server-wide settings: abr settings vsphere|recycle-bin show|set."""
 
     def register(self, registry) -> None:
         group = registry.add_parser(
@@ -84,6 +85,47 @@ class SettingsCommands:
             "--yes", action="store_true", help="Do not ask before --update-existing-hypervisors changes hypervisors"
         )
         set_parser.set_defaults(handler=self.vsphere_set)
+
+        recycle_bin = commands.add_parser(
+            "recycle-bin",
+            help="Show or change how long deleted backups stay in the recycle bin.",
+            description=(
+                "abr backup delete moves a chain to the recycle bin for this many days: its data stays in the "
+                "repository, abr backup undelete brings it back, and then the server deletes it for good. 0 deletes "
+                "at once."
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        recycle_bin_commands = recycle_bin.add_subparsers(dest="recycle_bin_command", required=True)
+        recycle_show = recycle_bin_commands.add_parser(
+            "show",
+            help="Show the days deleted backups stay in the recycle bin.",
+            description="Show the days deleted backups stay in the recycle bin.\n\nExamples:\n  abr settings recycle-bin show",
+            formatter_class=CompactHelpFormatter,
+        )
+        recycle_show.set_defaults(handler=self.recycle_bin_show)
+        recycle_set = recycle_bin_commands.add_parser(
+            "set",
+            help="Set the days deleted backups stay in the recycle bin.",
+            description=(
+                "Set the days deleted backups stay in the recycle bin, 0 to 365; 0 deletes at once. Chains already "
+                "in the recycle bin keep the date they got.\n\n"
+                "Examples:\n  abr settings recycle-bin set --keep-days 14\n  abr settings recycle-bin set --keep-days 0"
+            ),
+            formatter_class=CompactHelpFormatter,
+        )
+        recycle_set.add_argument("--keep-days", required=True, type=int, metavar="DAYS", help="0 to 365; 0 turns the recycle bin off")
+        recycle_set.set_defaults(handler=self.recycle_bin_set)
+
+    def recycle_bin_show(self, args) -> int:
+        deps = CommandDependencies(args)
+        deps.context.print_output(deps.context.api_client.get(RECYCLE_BIN_PATH))
+        return 0
+
+    def recycle_bin_set(self, args) -> int:
+        deps = CommandDependencies(args)
+        deps.context.print_output(deps.context.api_client.put(RECYCLE_BIN_PATH, json={"keep_days": args.keep_days}))
+        return 0
 
     def vsphere_show(self, args) -> int:
         deps = CommandDependencies(args)

@@ -361,7 +361,7 @@ def record_request(
         parameters = {**({"query": query} if query else {}), **({"body": request_body} if request_body else {})}
 
     command = str(headers.get("x-abr-command") or "").strip().lower()
-    return record(
+    entry = record(
         function_id=function_id,
         result=result,
         user=context.user,
@@ -378,6 +378,14 @@ def record_request(
         parameters=parameters or None,
         details=details or None,
     )
+    if result == ALLOWED:
+        try:
+            from python.srv.services.notification_detectors import privileged_action
+
+            privileged_action(entry)
+        except Exception:
+            LOGGER.exception("Could not report %s to the notifications", function_id)
+    return entry
 
 
 def _user_named(name: str) -> dict[str, Any] | None:

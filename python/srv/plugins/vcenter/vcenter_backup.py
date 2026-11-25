@@ -26,6 +26,7 @@ from .disk_transport import (
     VDDK,
     describe_access,
     describe_tool_environment,
+    is_connection_failure,
     parameters_library,
     tool_api_args,
     tool_environment,
@@ -1142,6 +1143,16 @@ def _disk_timeout_seconds(base_timeout_seconds: int, capacity_gb: Any) -> int:
     return max(base_timeout_seconds, needed_seconds)
 
 
+def disk_entry_timeout_seconds(base_timeout_seconds: int, disk: dict[str, Any]) -> int:
+    capacity_gb: Any = disk.get("capacity_gb")
+    if capacity_gb in (None, ""):
+        try:
+            capacity_gb = int(disk.get("capacity_bytes") or 0) / 1024**3
+        except (TypeError, ValueError):
+            capacity_gb = None
+    return _disk_timeout_seconds(base_timeout_seconds, capacity_gb)
+
+
 def _format_vm_spec(vm_moref: str | None, service_type: str) -> str | None:
     if not vm_moref:
         return None
@@ -1375,7 +1386,7 @@ def _disk_failure_message(
     free_before: int | None,
     data_host: str | None = None,
 ) -> str:
-    if _CONNECTION_LOST.search(tool_error or ""):
+    if _CONNECTION_LOST.search(tool_error or "") or is_connection_failure(tool_error):
         detail = next(
             (line.strip()[len("Error:"):].strip() for line in reversed(tool_error.splitlines()) if line.strip().startswith("Error:")),
             tool_error.strip().splitlines()[-1].strip(),

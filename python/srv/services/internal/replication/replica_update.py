@@ -14,7 +14,14 @@ from python.srv.core.utils import utc_now
 from python.srv.plugins import build_hypervisor_plugin
 from python.srv.plugins.hyperv import hyperv_replica
 from python.srv.plugins.vcenter import vcenter_replica
-from python.srv.plugins.vcenter.disk_transport import SOAP, VDDK, parameters_library, tool_environment, transport_problem
+from python.srv.plugins.vcenter.disk_transport import (
+    SOAP,
+    VDDK,
+    is_connection_failure,
+    parameters_library,
+    tool_environment,
+    transport_problem,
+)
 from python.srv.services.api_errors import ApiError
 from python.srv.services.internal.replication.replica_config import settle_replica
 from python.srv.services.internal.replication.replica_leftovers import (
@@ -890,7 +897,7 @@ def is_temporary(exc: BaseException) -> bool:
         seen.add(id(current))
         if isinstance(current, (ReplicationValidationError, TaskStopRequested, ProcessCancelled)):
             return False
-        if isinstance(current, network) or TEMPORARY_MESSAGE.search(str(current)):
+        if isinstance(current, network) or TEMPORARY_MESSAGE.search(str(current)) or is_connection_failure(current):
             return True
         current = current.__cause__ or current.__context__
     return False

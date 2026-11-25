@@ -21,7 +21,7 @@ from python.srv.brokers import broker_core, shares_broker
 from python.srv.core import broker_client, credential_encryption, mongo_db_wrapper
 from python.srv.core.mongo_db_wrapper import HYPERVISORS, JOBS, REPOSITORIES, TASKS
 from python.srv.plugins.hyperv import vhdx_tool
-from python.srv.services import abr_v41, rbac, repository_shares
+from python.srv.services import abr_v41, rbac, repository_shares, share_mount
 from python.srv.services.api_errors import ApiError
 from python.tests.srv.brokers.fake_samba import SMB_CONF_TEXT, current_user, make_system
 from python.tests.srv.rbac.rbac_case import RbacApiCase
@@ -57,6 +57,11 @@ class _Catalog(unittest.TestCase):
         )
         environment.start()
         self.addCleanup(environment.stop)
+        self.smb_conf = self.root / "smb.conf"
+        self.smb_conf.write_text(f"[global]\n   workgroup = WORKGROUP\ninclude = {self.root / 'no-shares.conf'}\ninclude = {self.root / 'samba-shares.conf'}\n")
+        smb_conf = patch.object(repository_shares, "SMB_CONF", self.smb_conf)
+        smb_conf.start()
+        self.addCleanup(smb_conf.stop)
         credential_encryption.reset_cipher()
         self.addCleanup(credential_encryption.reset_cipher)
         repository_shares._SERVER_CACHE.clear()
@@ -74,6 +79,13 @@ class _Catalog(unittest.TestCase):
         with self.assertRaises(ApiError) as caught:
             call()
         return caught.exception
+
+    def serve(self) -> None:
+        metadata = self.stored()["metadata"]
+        Path(os.environ[repository_shares.SHARES_CONF_ENV]).write_text(f"[{metadata['share']}]\n    path = {os.path.realpath(self.folder)}\n    valid users = {metadata['username']}\n")
+
+    def lose_include(self) -> None:
+        self.smb_conf.write_text("[global]\n   workgroup = WORKGROUP\n")
 
 
 class _SharesCase(_Catalog):
@@ -244,6 +256,45 @@ class RestoreTests(_SharesCase):
         self.assertEqual(self.stored()["metadata"], self.metadata)
         self.assertIn("Restored the share", "\n".join(logs.output))
         self.assertFalse(any(self.password in line for line in logs.output))
+
+    def test_a_lost_include_line_is_put_back_at_the_start(self) -> None:
+        self.configure(self.metadata["share"])
+        self.lose_include()
+        self.broker.extra["include-shares"] = {"included": True, "shares": [self.metadata["share"]]}
+
+        with self.assertLogs(repository_shares.logger, "WARNING") as logs:
+            outcome = repository_shares.restore_shares()
+
+        self.assertEqual(self.broker.calls, [("include-shares", {})])
+        self.assertEqual(outcome, {"restored": [], "reset": [], "kept": []})
+        self.assertIn("no longer includes", "\n".join(logs.output))
+        self.assertIn("the line is put back", "\n".join(logs.output))
+
+    def test_a_share_missing_and_the_line_lost_are_both_put_back(self) -> None:
+        self.lose_include()
+
+        with self.assertLogs("python.srv", level=logging.INFO):
+            outcome = repository_shares.restore_shares()
+
+        self.assertEqual([operation for operation, _ in self.broker.calls], ["add-share", "include-shares"])
+        self.assertEqual(outcome["restored"], ["Local-Repo-1"])
+
+    def test_a_refused_include_is_logged_and_tried_at_the_next_start(self) -> None:
+        self.configure(self.metadata["share"])
+        self.lose_include()
+        self.broker.error = broker_client.BrokerRefused("refused", "smbd is not running")
+
+        with self.assertLogs(repository_shares.logger, "WARNING") as logs:
+            repository_shares.restore_shares()
+
+        self.assertIn("tried again when the server starts", "\n".join(logs.output))
+
+    def test_the_line_in_place_needs_no_broker_call(self) -> None:
+        self.configure(self.metadata["share"])
+
+        repository_shares.restore_shares()
+
+        self.assertEqual(self.broker.calls, [])
 
     def test_a_share_samba_has_is_left_alone(self) -> None:
         self.configure(self.metadata["share"])
@@ -646,6 +697,7 @@ class CheckTests(_SharesCase):
     def setUp(self) -> None:
         super().setUp()
         self.share()
+        self.serve()
         self.smbclient = _SmbClient(self.folder)
         run = patch.object(repository_shares.subprocess, "run", side_effect=self.smbclient)
         run.start()
@@ -685,8 +737,81 @@ class CheckTests(_SharesCase):
                     leftover.unlink()
                 setattr(self.smbclient, attribute, value)
                 error = self.refused(self.check)
-                self.assertEqual((error.status_code, error.code), (502, "repository_share_check_failed"))
+                self.assertEqual((error.status_code, error.code), (409, "repository_share_check_failed"))
                 self.assertIn(text, error.message)
+
+    def test_a_folder_that_changed_hands_is_named_with_its_owner_and_the_fix(self) -> None:
+        self.smbclient.status = "NT_STATUS_ACCESS_DENIED opening remote file \\abr-share-check-1-a.txt\n"
+        with (
+            patch.object(repository_shares, "_owner_of", return_value="root"),
+            patch.object(repository_shares, "service_account", return_value="altastor-backup"),
+        ):
+            error = self.refused(self.check)
+
+        self.assertEqual((error.status_code, error.code), (409, "repository_share_check_failed"))
+        self.assertIn(f"{self.folder} belongs to root, not to altastor-backup", error.message)
+        self.assertIn(f"chown -R altastor-backup {self.folder}", error.message)
+        self.assertIn("NT_STATUS_ACCESS_DENIED", error.message)
+
+    def test_a_folder_of_the_service_account_keeps_the_plain_failure(self) -> None:
+        self.smbclient.status = "NT_STATUS_ACCESS_DENIED opening remote file \\abr-share-check-1-a.txt\n"
+
+        error = self.refused(self.check)
+
+        self.assertNotIn("belongs to", error.message)
+        self.assertIn("NT_STATUS_ACCESS_DENIED", error.message)
+
+    def test_an_smbd_that_does_not_answer_is_named(self) -> None:
+        self.smbclient.status = "do_connect: Connection to 192.0.2.5 failed (Error NT_STATUS_CONNECTION_REFUSED)\n"
+
+        error = self.refused(self.check)
+
+        self.assertEqual(error.status_code, 409)
+        self.assertIn("Samba (smbd) on this server does not answer", error.message)
+
+    def test_an_account_samba_refuses_is_named(self) -> None:
+        self.smbclient.status = "tree connect failed: NT_STATUS_ACCESS_DENIED\n"
+
+        error = self.refused(self.check)
+
+        self.assertIn(f"refuses the share's account {self.stored()['metadata']['username']}", error.message)
+
+    def test_a_lost_include_line_is_named_without_running_smbclient(self) -> None:
+        self.lose_include()
+
+        error = self.refused(self.check)
+
+        self.assertEqual((error.status_code, error.code), (409, "repository_share_check_failed"))
+        self.assertIn("Samba no longer serves", error.message)
+        self.assertIn(f"smb.conf no longer includes {os.environ[repository_shares.SHARES_CONF_ENV]}", error.message)
+        self.assertEqual(self.smbclient.commands, [])
+
+    def test_a_share_missing_from_the_shares_file_is_named(self) -> None:
+        Path(os.environ[repository_shares.SHARES_CONF_ENV]).write_text("")
+
+        error = self.refused(self.check)
+
+        self.assertIn(f"has no share {self.stored()['metadata']['share']}", error.message)
+        self.assertEqual(self.smbclient.commands, [])
+
+    def test_a_share_on_a_folder_with_a_samba_macro_is_refused_without_running_smbclient(self) -> None:
+        macro = self.root / "repo-%m"
+        macro.mkdir()
+        REPOSITORIES[self.repository["id"]] = {**self.stored(), "path": str(macro)}
+
+        error = self.refused(self.check)
+
+        self.assertEqual((error.status_code, error.code), (409, "repository_share_check_failed"))
+        self.assertIn("holds %, which Samba reads as a macro", error.message)
+        self.assertEqual(self.smbclient.commands, [])
+
+    def test_a_share_samba_does_not_have_is_not_blamed_on_the_account(self) -> None:
+        self.smbclient.status = "tree connect failed: NT_STATUS_BAD_NETWORK_NAME\n"
+
+        error = self.refused(self.check)
+
+        self.assertIn(f"does not serve the share {self.stored()['metadata']['share']}", error.message)
+        self.assertNotIn("account", error.message)
 
     def test_a_repository_that_is_not_shared_or_a_missing_smbclient_is_refused(self) -> None:
         self.unshare()
@@ -698,7 +823,58 @@ class CheckTests(_SharesCase):
 
     def test_an_smbclient_that_cannot_run_is_named(self) -> None:
         with patch.object(repository_shares.subprocess, "run", side_effect=subprocess.TimeoutExpired(["smbclient"], 60)):
-            self.assertIn("smbclient could not be run", self.refused(self.check).message)
+            error = self.refused(self.check)
+        self.assertEqual(error.status_code, 409)
+        self.assertIn("smbclient could not be run", error.message)
+
+
+class SambaServingTests(_SharesCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.share()
+        self.serve()
+
+    def test_verify_names_a_lost_include_line(self) -> None:
+        self.lose_include()
+
+        check = share_mount.share_mount_check(self.stored(), samba=True)
+
+        self.assertEqual(check["status"], "failed")
+        self.assertIn("smb.conf no longer includes", check["message"])
+
+    def test_verify_of_a_share_samba_serves_is_ok_as_before(self) -> None:
+        check = share_mount.share_mount_check(self.stored(), samba=True)
+
+        self.assertEqual((check["status"], check["message"]), ("ok", "The share is this appliance's own share of the folder"))
+
+    def test_a_lost_line_does_not_make_the_repository_unavailable_to_the_server(self) -> None:
+        self.lose_include()
+
+        self.assertEqual(share_mount.share_mount_check(self.stored())["status"], "ok")
+        self.assertIsNone(share_mount.unmounted_share_message(self.stored()))
+
+    def test_an_unreadable_smb_conf_is_not_reported_as_lost(self) -> None:
+        self.smb_conf.unlink()
+
+        self.assertIsNone(repository_shares.include_problem())
+
+    def test_a_share_made_on_a_folder_with_a_samba_macro_is_named_by_verify_and_check(self) -> None:
+        macro = self.root / "repo-%U"
+        macro.mkdir()
+        record = {**self.stored(), "path": str(macro)}
+        REPOSITORIES[self.repository["id"]] = record
+
+        check = share_mount.share_mount_check(record, samba=True)
+
+        self.assertEqual(check["status"], "failed")
+        self.assertIn("the folder name holds %, which Samba reads as a macro", check["message"])
+        self.assertIn("abr repo share del", check["message"])
+
+    def test_a_repository_that_is_not_shared_has_no_samba_problem(self) -> None:
+        self.unshare()
+        self.lose_include()
+
+        self.assertIsNone(repository_shares.samba_serving_problem(self.stored()))
 
 
 class _BrokerProcess:

@@ -1370,7 +1370,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
         abr_v41._apply_gfs_marks(points, dict(JOBS[job["id"]]["gfs"]))
         self.assertTrue(points[0]["gfs_protected"])
 
-    def test_an_ad_hoc_full_never_takes_a_gfs_slot_from_a_scheduled_one(self) -> None:
+    def test_an_ad_hoc_full_takes_a_gfs_mark_only_in_a_week_without_a_scheduled_full(self) -> None:
         job = abr_v41.create_backup_job(
             {
                 "name": "GFS Reasons Job",
@@ -1400,7 +1400,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
         points = [
             point("scheduled-active", "ActiveFull", "ActiveFullWindow", 3),
             point("scheduled-synthetic", "SyntheticFull", "SyntheticFullWindow", 2),
-            point("manual-active", "ActiveFull", "ForceFull", 1),
+            point("manual-active", "ActiveFull", "ForceFull", 2),
             point("manual-synthetic", "SyntheticFull", "ForceSynthetic", 0),
         ]
         abr_v41._apply_gfs_marks(points, dict(JOBS[job["id"]]["gfs"]))
@@ -1409,7 +1409,7 @@ class JobEngineLifecycleTests(unittest.TestCase):
         self.assertTrue(protection["scheduled-active"])
         self.assertTrue(protection["scheduled-synthetic"])
         self.assertFalse(protection["manual-active"])
-        self.assertFalse(protection["manual-synthetic"])
+        self.assertTrue(protection["manual-synthetic"])
 
     def test_gfs_count_edit_while_disabled_leaves_policy_suspended(self) -> None:
         job = abr_v41.create_backup_job(

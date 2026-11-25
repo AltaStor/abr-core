@@ -15,6 +15,7 @@ from pyVmomi import vim, vmodl
 from .vcenter import (
     VCenterNode,
     _boot_order_entries,
+    _fault_message,
     _nic_network_name,
     _normalize_vm_firmware,
 )
@@ -126,19 +127,51 @@ def _state(vm: Any) -> dict[str, Any]:
     }
 
 
+class VCenterReplicaError(RuntimeError):
+    pass
+
+
+def _looking_up(what: str) -> Callable[[Callable[..., _T]], Callable[..., _T]]:
+    def decorate(operation: Callable[..., _T]) -> Callable[..., _T]:
+        @functools.wraps(operation)
+        def wrapper(node: VCenterNode, *args: Any, **kwargs: Any) -> _T:
+            try:
+                return operation(node, *args, **kwargs)
+            except vim.fault.NotAuthenticated:
+                raise
+            except vmodl.MethodFault as exc:
+                raise VCenterReplicaError(f"Looking up {what} on {node.host} failed: {_fault_message(exc)}") from exc
+
+        return wrapper
+
+    return decorate
+
+
 @_reauthenticated
+@_looking_up("the replica")
 def find_replica(node: VCenterNode, vm_id: str) -> dict[str, Any] | None:
     vm = node._get_vm_by_moref(vm_id)
-    return _state(vm) if vm is not None and getattr(vm, "config", None) is not None else None
+    try:
+        return _state(vm) if vm is not None and getattr(vm, "config", None) is not None else None
+    except vmodl.fault.ManagedObjectNotFound:
+        return None
 
 
 @_reauthenticated
+@_looking_up("the replicas of the job")
 def replicas_with_marker(node: VCenterNode, marker_prefix: str) -> list[dict[str, Any]]:
     found = []
     for vm in node._list_vms():
-        config = getattr(vm, "config", None)
-        if config is not None and marker_prefix in str(getattr(config, "annotation", "") or ""):
-            found.append(_state(vm))
+        try:
+            config = getattr(vm, "config", None)
+            if config is not None and marker_prefix in str(getattr(config, "annotation", "") or ""):
+                found.append(_state(vm))
+        except vmodl.fault.ManagedObjectNotFound:
+            logger.info(
+                "Skipping VM %s: it was deleted from vCenter %s while the replicas of the job were looked up",
+                getattr(vm, "_moId", None),
+                node.host,
+            )
     return found
 
 
@@ -146,10 +179,6 @@ def replicas_with_marker(node: VCenterNode, marker_prefix: str) -> list[dict[str
 def destroy_replica(node: VCenterNode, state: dict[str, Any]) -> list[str]:
     node.destroy_vm(state["name"], vm_moref=state["vm_id"])
     return []
-
-
-class VCenterReplicaError(RuntimeError):
-    pass
 
 
 def _vm(node: VCenterNode, state: dict[str, Any]) -> Any:

@@ -105,6 +105,12 @@ class JobScheduler:
             except Exception as exc:
                 logger.exception("Unexpected error in job scheduler loop: %s", exc)
             try:
+                from python.srv.services.backup_retries import start_due_retries
+
+                start_due_retries()
+            except Exception:
+                logger.exception("Could not start the due retries of failed backups")
+            try:
                 self._retry_access_locks()
             except Exception as exc:
                 logger.exception("Could not start the relocation block retry: %s", exc)
@@ -139,10 +145,10 @@ class JobScheduler:
         if self._deletion_sweep is not None and self._deletion_sweep.is_alive():
             return
         self._deletion_sweep_at = now
-        from python.srv.services.abr_v41 import retry_pending_deletions
+        from python.srv.services.abr_v41 import sweep_deletions
 
         self._deletion_sweep = threading.Thread(
-            target=retry_pending_deletions,
+            target=sweep_deletions,
             name="pending-deletion-retry",
             daemon=True,
         )
@@ -539,6 +545,8 @@ class JobScheduler:
         notification_detectors.task_finished(dict(task))
 
     def _has_pending_task(self, job: dict[str, Any], now: datetime) -> bool:
+        from python.srv.core.task_pool import task_in_flight
+
         job_id = str(job["id"])
         running_timeout_seconds = self._resolve_running_task_timeout_seconds(job)
         for task in catalog_records(TASKS):
@@ -549,6 +557,8 @@ class JobScheduler:
                 return True
             if status != "running":
                 continue
+            if task_in_flight(str(task.get("id") or "")):
+                return True
 
             updated_at = _parse_timestamp(task.get("updated_at")) or _parse_timestamp(task.get("created_at"))
             if updated_at is None:

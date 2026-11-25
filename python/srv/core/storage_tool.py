@@ -845,11 +845,20 @@ DISK_TOOL_INTERRUPTED = "Interrupted, releasing the disk and the VM"
 OUT_OF_MEMORY_HINT = (
     "SIGKILL usually comes from the kernel's out-of-memory killer; journalctl -k on the backup server shows it"
 )
-_PROGRESS_ONLY_LINE = re.compile(r"^\s*\d{1,3}%(?:\s*\(\d+\))?\s*$")
+_PROGRESS_ONLY_LINE = re.compile(r"^\s*(\d{1,3})%(?:\s*\(\d+\))?\s*$")
 
 
 def without_progress_lines(text: Any) -> str:
     return "\n".join(line for line in str(text or "").splitlines() if line.strip() and not _PROGRESS_ONLY_LINE.match(line)).strip()
+
+
+def timed_out_message(timeout: Any, output: Any) -> str:
+    progress = [match.group(1) for match in (_PROGRESS_ONLY_LINE.match(line) for line in str(output or "").splitlines()) if match]
+    detail = without_progress_lines(output)
+    message = f"backup tool timed out after {timeout}s"
+    if progress:
+        message += f" with the disk {progress[-1]}% done"
+    return message + (f": {detail}" if detail else "")
 
 
 def disk_tool_failure_text(returncode: int, stderr: Any, stdout: Any) -> str:
@@ -1441,9 +1450,8 @@ def run_disk_tool(
         )
     except subprocess.TimeoutExpired as exc:
         stderr = (exc.stderr or exc.output or "").strip() if isinstance(exc.stderr, str) else ""
-        detail = f": {stderr}" if stderr else ""
         logger.warning("Storage operation %s timed out after %ss", operation, timeout)
-        raise StorageToolError(f"backup tool timed out after {timeout}s{detail}") from exc
+        raise StorageToolError(timed_out_message(timeout, stderr)) from exc
 
     elapsed = time.monotonic() - started
     if completed.returncode != 0:

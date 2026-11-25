@@ -184,6 +184,18 @@ class JobCommands:
             formatter_class=CompactHelpFormatter,
         )
         self._add_common_job_create_arguments(create, for_copy=False)
+        create.add_argument(
+            "--retry-count",
+            dest="retry_count",
+            type=int,
+            help="Retries of a VM whose backup failed, 0-20 (default 3; 0 turns retries off). Each retry backs up only that VM",
+        )
+        create.add_argument(
+            "--retry-interval",
+            dest="retry_interval_minutes",
+            type=int,
+            help="Minutes between those retries, 0-1440 (default 10)",
+        )
         create.set_defaults(handler=self.create)
 
         create_copy = commands.add_parser(
@@ -331,7 +343,10 @@ class JobCommands:
             "--force-full",
             dest="full",
             action="store_true",
-            help="Force a full backup instead of an incremental backup",
+            help=(
+                "Force a full backup instead of an incremental backup. It gets a GFS mark only for a week, month or "
+                "year in which the job made no full of its own"
+            ),
         )
         start_kind.add_argument(
             "--synthetic",
@@ -339,7 +354,8 @@ class JobCommands:
             action="store_true",
             help=(
                 "Build a full backup by merging the stored chain in the repository instead of reading "
-                "the VM again. Needs a full backup followed by at least one incremental"
+                "the VM again. Needs a full backup followed by at least one incremental. Like --full, it gets a "
+                "GFS mark only for a period in which the job made no full of its own"
             ),
         )
         start.add_argument(
@@ -478,9 +494,11 @@ class JobCommands:
                 dest="on_quiesce_failure",
                 choices=("fail", "crash-consistent"),
                 help=(
-                    "What a backup of a VMware VM does when VMware Tools cannot quiesce the guest, for example because "
-                    "a pre-freeze script or a VSS writer fails: fail (the default) ends that VM's session as failed; "
-                    "crash-consistent takes the snapshot again without quiescing and completes with a warning."
+                    "What a backup does when the guest cannot be quiesced: on VMware when VMware Tools cannot quiesce it "
+                    "(a pre-freeze script or a VSS writer fails), on Hyper-V when the application-consistent checkpoint "
+                    "fails (no Backup integration service, VSS errors). fail ends that VM's session as failed with no "
+                    "restore point; crash-consistent takes a crash-consistent snapshot or checkpoint instead and "
+                    "completes with a warning. The default is fail for a VMware job and crash-consistent for a Hyper-V job."
                 ),
             )
         if include_compression_encryption_flags:
@@ -513,12 +531,20 @@ class JobCommands:
                 choices=("application", "crash"),
                 help=(
                     "Hyper-V only: recovery checkpoint consistency. application quiesces a running guest "
-                    "through VSS and falls back to crash-consistent when it cannot (default); crash never "
-                    "involves the guest"
+                    "through VSS and falls back to crash-consistent when it cannot (default), unless "
+                    "--on-quiesce-failure is fail; crash never involves the guest"
                 ),
             )
         if include_policy_flags:
-            parser.add_argument("--gfs-weekly", type=int, default=gfs_default, help="Weekly GFS count")
+            parser.add_argument(
+                "--gfs-weekly",
+                type=int,
+                default=gfs_default,
+                help=(
+                    "Weekly GFS count: how many weeks keep one full each. A full forced with job start --full or "
+                    "--synthetic gets a week's mark only when the job made no full of its own that week"
+                ),
+            )
             parser.add_argument("--gfs-monthly", type=int, default=gfs_default, help="Monthly GFS count")
             parser.add_argument("--gfs-yearly", type=int, default=gfs_default, help="Yearly GFS count")
             gfs_state = parser.add_mutually_exclusive_group()
@@ -632,8 +658,22 @@ class JobCommands:
                 "rules; none means any time. A copy waits outside the window and stops when it closes"
             ),
         )
-        parser.add_argument("--retry-count", dest="retry_count", type=int, help=f"{only}retries of a VM whose copy failed, 0-20 (default 5 for periodic, 3 for immediate)")
-        parser.add_argument("--retry-interval", dest="retry_interval_minutes", type=int, help=f"{only}minutes between those retries, 0-1440 (default 0 for periodic, 10 for immediate)")
+        retried = "" if creating else "Backup and backup copy jobs: "
+        parser.add_argument(
+            "--retry-count",
+            dest="retry_count",
+            type=int,
+            help=(
+                f"{retried}retries of a VM whose backup or copy failed, 0-20 (a backup job made with job create: default 3, "
+                "jobs from before backup retries: 0; a copy job: default 5 for periodic, 3 for immediate)"
+            ),
+        )
+        parser.add_argument(
+            "--retry-interval",
+            dest="retry_interval_minutes",
+            type=int,
+            help=f"{retried}minutes between those retries, 0-1440 (a backup job: default 10; a copy job: 0 for periodic, 10 for immediate)",
+        )
 
     @staticmethod
     def _add_replication_arguments(parser: argparse.ArgumentParser, *, creating: bool) -> None:
@@ -832,6 +872,13 @@ class JobCommands:
                 elif key == "backup_copy":
                     if isinstance(value, dict):
                         shown.update(_backup_copy_rows(value))
+                elif key == "retry":
+                    if isinstance(value, dict):
+                        shown["retry"] = (
+                            f"{value.get('count')} time(s), {value.get('interval_minutes')} minute(s) apart"
+                            if value.get("count")
+                            else "off"
+                        )
                 elif key == "source_job" and payload.get("job_type") == "backup-copy":
                     continue
                 elif key == "last_run" and isinstance(value, dict):

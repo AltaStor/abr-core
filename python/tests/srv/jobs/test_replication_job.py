@@ -265,6 +265,23 @@ class ReplicationJobSettingsTests(unittest.TestCase):
 
         self.assertEqual((error.status_code, error.message), (404, "Target network not found in inventory vc-dr: no-such-net"))
 
+    def test_a_network_map_names_the_source_network_the_point_does_not_carry(self) -> None:
+        error = self._refused(
+            abr_v41._ensure_restore_network_map_targets,
+            {"VM Network": "DR Network", "aqa-src-x": "DR Network"},
+            source_networks=["VM Network", "Backup Net"],
+            target_networks=[{"name": "DR Network"}],
+            off_host_names=set(),
+            target_inventory_id=self.target_inventory["id"],
+            host=None,
+        )
+
+        self.assertEqual(
+            (error.status_code, error.message),
+            (422, "Network map names a source network this restore point does not carry: aqa-src-x (the point carries: Backup Net, VM Network)"),
+        )
+        self.assertEqual(error.details, {"source_network": "aqa-src-x", "networks": ["Backup Net", "VM Network"]})
+
     def test_a_start_point_of_another_vm_is_refused_and_one_of_ours_is_kept(self) -> None:
         self._backup_job("web", [("vm-2", "web-01")])
         self._point("rp-w", "web", "vm-2", "web-01", "2026-11-01T01:00:00+00:00")

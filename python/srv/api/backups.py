@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from fastapi import Body, Query
+from fastapi import Body, Query, Request
 
 from python.srv.services import abr_v41
 
@@ -12,6 +12,7 @@ from .schemas import (
     BackupChainDTO,
     BackupDeleteResult,
     BackupList,
+    BackupUndeleteResult,
     BackupVerifyResult,
     ImportBackupRequest,
     BackupTreeResponse,
@@ -40,6 +41,7 @@ def get_backup(backup_id: str) -> BackupChainDTO:
 
 
 def delete_backup(
+    request: Request,
     backup_id: str,
     segment: str | None = Query(
         default=None,
@@ -57,7 +59,28 @@ def delete_backup(
         description="true answers when the delete has finished; false starts it as a session and answers at once with the session ID",
     ),
 ) -> BackupDeleteResult:
-    return abr_v41.delete_backup_chain_request(backup_id, segment_id=segment, force=force, wait=wait)
+    """Delete a backup chain, or one segment of it. When the recycle bin keeps deleted backups (GET
+    /system/recycle-bin, keep_days above 0), the restore points move there with status deleted: their data stays in
+    the repository until purge_after, they are not restored, copied, verified or used by a job, and POST
+    /backups/{backup_id}/undelete brings them back. Deleting a chain whose restore points are all in the recycle bin
+    deletes them for good at once."""
+    return abr_v41.delete_backup_chain_request(
+        backup_id, segment_id=segment, force=force, wait=wait, user=getattr(request.state, "user_name", None)
+    )
+
+
+def undelete_backup(
+    backup_id: str,
+    segment: str | None = Query(
+        default=None,
+        description="Bring back only one segment in the recycle bin: the restore point ID of its full backup. Omitted, every restore point of the chain in the recycle bin comes back",
+    ),
+) -> BackupUndeleteResult:
+    """Bring the restore points of a backup chain back from the recycle bin, with the status they had. 409
+    backup_not_in_recycle_bin when none is there (it was deleted for good, or never deleted); 409
+    backup_undelete_conflict when restore points taken since build on older ones and would be mixed into one segment
+    with them."""
+    return abr_v41.undelete_backup_chain(backup_id, segment_id=segment)
 
 
 def verify_backup(
@@ -90,6 +113,7 @@ register(router, [
     ("/tree", list_backup_tree, ["GET"], "backup.view"),
     ("/{backup_id}", get_backup, ["GET"], "backup.view"),
     ("/{backup_id}", delete_backup, ["DELETE"], "backup.delete"),
+    ("/{backup_id}/undelete", undelete_backup, ["POST"], "backup.undelete"),
     ("/{backup_id}/verify", verify_backup, ["POST"], "backup.verify"),
     ("/import", import_backup, ["POST"], "backup.import"),
 ])

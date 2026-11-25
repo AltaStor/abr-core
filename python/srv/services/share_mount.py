@@ -128,11 +128,17 @@ def _managed_check(repository: dict[str, Any], mountinfo: Path | None) -> dict[s
     )
 
 
-def share_mount_check(repository: dict[str, Any], mountinfo: Path | None = None) -> dict[str, Any] | None:
+def share_mount_check(repository: dict[str, Any], mountinfo: Path | None = None, *, samba: bool = False) -> dict[str, Any] | None:
     if str(repository.get("type") or "").strip().lower() != "smb":
         return None
     metadata = repository.get("metadata") if isinstance(repository.get("metadata"), dict) else {}
     if metadata.get("support_hyperv"):
+        if samba:
+            from python.srv.services import repository_shares
+
+            problem = repository_shares.samba_serving_problem(repository)
+            if problem:
+                return _check("failed", problem)
         return _check("ok", "The share is this appliance's own share of the folder")
     if metadata.get("managed_mount"):
         return _managed_check(repository, mountinfo)

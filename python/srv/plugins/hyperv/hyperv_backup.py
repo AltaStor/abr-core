@@ -333,6 +333,8 @@ def _remove_left_session_data(
                 "prepare",
                 6,
                 f"Could not remove what session {task_id} left in {folder}: {reason}. The next backup tries again",
+                code="session_leftover_kept",
+                vm_name=_task_vm_name(task),
             )
             continue
         remove_empty_parents(folder.parent, below=root)
@@ -375,9 +377,23 @@ def _emit(progress_callback: ProgressCallback, stage: str, progress: int, messag
     _emit_progress(progress_callback, stage, progress, message, worker_mode=WORKER_MODE, **extra)
 
 
-def _warn(progress_callback: ProgressCallback, stage: str, progress: int, message: str, **extra: object) -> None:
+def _warn(
+    progress_callback: ProgressCallback,
+    stage: str,
+    progress: int,
+    message: str,
+    *,
+    code: str,
+    vm_name: str,
+    **extra: object,
+) -> None:
     logger.warning("%s", message)
-    _emit(progress_callback, stage, progress, message, log_level="warn", **extra)
+    _emit(progress_callback, stage, progress, message, log_level="warn", warning={"code": code, "message": message, "vm_name": vm_name}, **extra)
+
+
+def _task_vm_name(task: dict[str, Any]) -> str:
+    parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
+    return str(parameters.get("vm_name") or task.get("resource_external_id") or "")
 
 
 def _gib(value: int | float | None) -> str:
@@ -493,6 +509,8 @@ def _remove_stranded_checkpoints(
                 "snapshot",
                 12,
                 f"Could not remove recovery checkpoint {checkpoint_id} left by interrupted session {task_id}: {exc}",
+                code="checkpoint_left",
+                vm_name=_task_vm_name(task),
             )
             continue
         forget_task_backup_snapshot(task_id)
@@ -599,7 +617,11 @@ def run_hyperv_backup(
     parameters = task.get("parameters") if isinstance(task.get("parameters"), dict) else {}
 
     consistency = _choice(parameters, "hyperv_consistency", CONSISTENCY_CHOICES, "application")
-    consistency_fallback = _flag(parameters, "hyperv_consistency_fallback", True)
+    on_quiesce_failure = str(parameters.get("on_quiesce_failure") or "").strip().lower().replace("-", "_")
+    if on_quiesce_failure in ("fail", "crash_consistent"):
+        consistency_fallback = on_quiesce_failure == "crash_consistent"
+    else:
+        consistency_fallback = _flag(parameters, "hyperv_consistency_fallback", True)
     try:
         compression_level = _resolve_compression_level(parameters)
         encryption_algorithm, encryption_key = _resolve_encryption_settings(parameters)
@@ -638,9 +660,9 @@ def run_hyperv_backup(
     )
     warnings: list[str] = []
 
-    def _fall_back_to_full(message: str) -> None:
+    def _fall_back_to_full(code: str, message: str) -> None:
         nonlocal incremental, resolved_backup_type, resolved_backup_reason
-        _warn(progress_callback, "prepare", 22, message)
+        _warn(progress_callback, "prepare", 22, message, code=code, vm_name=vm_name)
         warnings.append(message)
         incremental = False
         resolved_backup_type, resolved_backup_reason = "ActiveFull", "IncrementalFallbackToFull"
@@ -711,13 +733,20 @@ def run_hyperv_backup(
             try:
                 checkpoint = node.create_recovery_checkpoint(vm_id, achieved)
             except HyperVError as exc:
+                if achieved == "application" and on_quiesce_failure == "fail":
+                    raise HyperVBackupError(
+                        f"Application-consistent checkpoint of {vm_name} failed ({exc}). The job is set to fail when the "
+                        "guest cannot be quiesced (--on-quiesce-failure fail), so no backup is taken. Check the Backup "
+                        "(volume shadow copy) integration service in the guest, or set --on-quiesce-failure "
+                        "crash-consistent to take a crash-consistent backup instead"
+                    ) from exc
                 if achieved != "application" or not consistency_fallback:
                     raise HyperVBackupError(f"Hyper-V could not checkpoint {vm_name}: {exc}") from exc
                 message = (
                     f"Application-consistent checkpoint of {vm_name} failed ({exc}); taking a crash-consistent "
                     "one instead. Check the Backup (volume shadow copy) integration service in the guest"
                 )
-                _warn(progress_callback, "snapshot", 15, message)
+                _warn(progress_callback, "snapshot", 15, message, code="crash_consistent", vm_name=vm_name)
                 warnings.append(message)
                 achieved = "crash"
                 consistency_reason = "vss_failed"
@@ -742,7 +771,7 @@ def run_hyperv_backup(
                     f"Skipping disk {disk['slot']} of {vm_name} ({disk['checkpoint_path'] or 'no file'}): "
                     f"{disk['unsupported_reason']}"
                 )
-                _warn(progress_callback, "prepare", 20, message)
+                _warn(progress_callback, "prepare", 20, message, code="disk_skipped", vm_name=vm_name)
                 warnings.append(message)
             disks = _requested([disk for disk in all_disks if disk["supported"]], requested_disks)
             if not disks:
@@ -755,17 +784,19 @@ def run_hyperv_backup(
             change_ids: dict[str, str] = {}
             if incremental:
                 if previous is None:
-                    _fall_back_to_full(f"No earlier backup of {vm_name} to chain onto; taking a full backup")
+                    _fall_back_to_full("no_previous_backup", f"No earlier backup of {vm_name} to chain onto; taking a full backup")
                 else:
                     change_ids, without, resized = _change_ids(disks, previous)
                     if resized:
                         _fall_back_to_full(
+                            "disk_size_changed",
                             f"Disk(s) {', '.join(f'{slot} ({_gib(before)} -> {_gib(after)})' for slot, before, after in resized)} "
                             f"of {vm_name} changed size since the previous backup, and an incremental cannot carry a "
                             "size change; taking a full backup"
                         )
                     elif without:
                         _fall_back_to_full(
+                            "change_tracking_missing",
                             f"Disk(s) {', '.join(without)} of {vm_name} have no change tracking position from the "
                             "previous backup (a disk added since, a VHD disk, or a VM of configuration version "
                             "below 8.0); taking a full backup"
@@ -807,6 +838,7 @@ def run_hyperv_backup(
                     _make_task_root(repository, task_root)
                     change_ids = {}
                     _fall_back_to_full(
+                        "change_tracking_reset",
                         f"Resilient change tracking of {vm_name} no longer knows the previous backup's position "
                         f"({exc}); taking a full backup instead"
                     )
@@ -835,7 +867,7 @@ def run_hyperv_backup(
                     f"Recovery checkpoint {checkpoint_id} of {vm_name} could not be turned into a reference point "
                     f"({exc}); it is removed instead, and the next backup of {vm_name} is a full backup"
                 )
-                _warn(progress_callback, "finalize", 89, message)
+                _warn(progress_callback, "finalize", 89, message, code="reference_point_failed", vm_name=vm_name)
                 warnings.append(message)
                 node.remove_snapshot(vm_id, checkpoint_id)
                 for disk in disk_outputs:
@@ -850,7 +882,7 @@ def run_hyperv_backup(
                     node.remove_reference_point(vm_id, previous_reference)
                 except HyperVError as exc:
                     message = f"Could not remove the previous reference point {previous_reference} of {vm_name}: {exc}"
-                    _warn(progress_callback, "finalize", 90, message)
+                    _warn(progress_callback, "finalize", 90, message, code="reference_point_left", vm_name=vm_name)
                     warnings.append(message)
 
             # ---- manifest ---------------------------------------------------
@@ -1247,7 +1279,9 @@ def _back_up_disks(
                 on_progress=lambda percent: report(percent, 0),
                 should_cancel=lambda: cancel_requested(task_id),
                 timeout=_disk_timeout_seconds(tool_timeout_seconds, disk["capacity_gb"]),
-                on_notice=lambda message, progress=progress: _warn(progress_callback, "transfer", progress, message),
+                on_notice=lambda message, progress=progress: _warn(
+                    progress_callback, "transfer", progress, message, code="disk_tool_notice", vm_name=vm_name
+                ),
             )
             result = run.get("result") or {}
             if run.get("exit_code") == 0 and result.get("status") in (None, "ok"):
@@ -1291,7 +1325,7 @@ def _back_up_disks(
                 task_id,
                 lost,
                 storage,
-                lambda message, progress=progress: _warn(progress_callback, "transfer", progress, message),
+                lambda message, progress=progress: _warn(progress_callback, "transfer", progress, message, code="storage_lost", vm_name=vm_name),
                 reason,
             )
             if waited is None:
@@ -1312,6 +1346,8 @@ def _back_up_disks(
                 "transfer",
                 progress,
                 f"{lost}; {again}, so the disk is backed up again from the start (attempt {attempt} of {attempts})",
+                code="disk_retried",
+                vm_name=vm_name,
             )
         logical = int(result.get("raw_data_size") or 0)
         stored = int(result.get("stored_data_size") or 0)

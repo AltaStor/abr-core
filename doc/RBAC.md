@@ -61,6 +61,7 @@ other role is allowed exactly what it lists.
 | `system.export` | administer | ✓ | – | – | – | – |
 | `system.import` | administer | ✓ | – | – | – | – |
 | `system.clock_confirm` | administer | ✓ | – | – | – | – |
+| `system.recycle_bin` | administer | ✓ | – | – | – | – |
 | `tls.view` | read | ✓ | – | – | – | ✓ |
 | `tls.edit` | administer | ✓ | – | – | – | – |
 | `notification.view` | read | ✓ | – | – | – | ✓ |
@@ -99,6 +100,7 @@ other role is allowed exactly what it lists.
 | `backup.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `backup.verify` | operate | ✓ | ✓ | ✓ | ✓ | – |
 | `backup.delete` | destructive | ✓ | – | – | – | – |
+| `backup.undelete` | configure | ✓ | ✓ | – | – | – |
 | `backup.import` | configure | ✓ | ✓ | – | – | – |
 | `restore.view` | read | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `restore.start` | operate | ✓ | ✓ | – | ✓ | – |

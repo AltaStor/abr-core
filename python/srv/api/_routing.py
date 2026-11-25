@@ -16,7 +16,7 @@ from python.srv.services import audit_service, rbac
 from .auth_guard import authorize, require_session
 
 # path, handler, methods, function ID
-RouteSpec = tuple[str, Callable, list[str], str]
+RouteSpec = tuple[str, Callable, list[str], str] | tuple[str, Callable, list[str], str, dict[int | str, dict]]
 
 FUNCTION_ID_KEY = "x-function-id"
 
@@ -77,7 +77,7 @@ def build_router(prefix: str, tag: str, *, protected: bool = True) -> APIRouter:
 
 
 def register(router: APIRouter, routes: Sequence[RouteSpec]) -> None:
-    for path, handler, methods, function_id in routes:
+    for path, handler, methods, function_id, *documented in routes:
         function = rbac.FUNCTIONS_BY_ID[function_id]
         dependencies = [] if function_id in rbac.PUBLIC_FUNCTIONS else [Depends(authorize(function_id))]
         router.add_api_route(
@@ -88,6 +88,7 @@ def register(router: APIRouter, routes: Sequence[RouteSpec]) -> None:
             dependencies=dependencies,
             openapi_extra={FUNCTION_ID_KEY: function_id},
             description=_with_function_note(handler.__doc__, function),
+            responses=documented[0] if documented else None,
         )
 
 

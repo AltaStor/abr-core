@@ -264,6 +264,24 @@ class RestoreRepositorySelectorTests(unittest.TestCase):
         TASKS.clear()
         self.assertTrue(self._start(repo_id=self.other["id"])["restore_session_id"])
 
+    def test_the_restore_log_gives_a_copy_its_vm_state_time_and_the_copy_time(self) -> None:
+        self._seed_point()
+        BACKUPS["rp-1"]["copy_source"] = {"job_id": "job-1", "point_id": "src-1", "created_at": "2026-05-24T20:00:00+00:00"}
+
+        session = self._start()
+
+        message = " ".join(str(line.get("message")) for line in TASKS[session["restore_session_id"]]["logs"])
+        self.assertIn("(2026-05-24T20:00:00+00:00, full, copied 2026-05-26T20:00:00+00:00)", message)
+
+    def test_the_restore_log_of_a_point_that_is_not_a_copy_is_as_before(self) -> None:
+        self._seed_point()
+
+        session = self._start()
+
+        message = " ".join(str(line.get("message")) for line in TASKS[session["restore_session_id"]]["logs"])
+        self.assertIn("(2026-05-26T20:00:00+00:00, full) to restoredtstvm", message)
+        self.assertNotIn("copied", message)
+
     def test_the_remaining_selector_mismatches_still_answer_on_their_own_rung(self) -> None:
         self._seed_point()
         for label, selector, code in (

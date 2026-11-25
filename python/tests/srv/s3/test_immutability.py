@@ -1106,7 +1106,7 @@ class BackupDeleteCliTests(unittest.TestCase):
             context = deps_mock.return_value.context
             context.api_client.delete.return_value = payloads
             code = BackupCommands().delete(
-                argparse.Namespace(id="chain-1", force=False, base_url="http://x", output="table", log_level="info")
+                argparse.Namespace(id="chain-1", force=False, yes=True, base_url="http://x", output="table", log_level="info")
             )
         self.assertEqual(code, INVALID_STATE)
 
@@ -1117,7 +1117,7 @@ class BackupDeleteCliTests(unittest.TestCase):
             context = deps_mock.return_value.context
             context.api_client.delete.return_value = {"deleted": True, "artifacts_removed": True}
             code = BackupCommands().delete(
-                argparse.Namespace(id="chain-1", force=False, base_url="http://x", output="table", log_level="info")
+                argparse.Namespace(id="chain-1", force=False, yes=True, base_url="http://x", output="table", log_level="info")
             )
         self.assertEqual(code, 0)
 

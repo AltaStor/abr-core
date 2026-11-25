@@ -337,6 +337,13 @@ class JobDTO(_LenientModel):
     repository: _Ref
     source_job: _Ref | DocObject = None
     backup_copy: DocObject = Field(default=None, description="Backup copy jobs only: copy_mode, source_jobs, source_repositories, run_after_job and retry; a source or run-after job that no longer exists carries missing: true")
+    retry: DocObject = Field(
+        default=None,
+        description=(
+            "Backup jobs only: count and interval_minutes of the retries of a VM whose backup failed. A retry is a new session "
+            "of that VM in the same run, after interval_minutes; its first log line says which attempt it is. count 0: no retries"
+        ),
+    )
     replication: DocObject = Field(default=None, description="Replication jobs only: source job and VM, target environment, host, datastore, network map, replica name, run_after_source, the replica: its VM, the restore point it is at and the time of the last successful update, and run_pending with pending_trigger (what asked for the next run and since when) when a trigger arrived while a run was going")
     schedule: ScheduleDTO | DocObject = None
     schedule_summary: str | None = None
@@ -493,6 +500,68 @@ class RepositoryStorageDTO(_LenientModel):
     permissions: StoragePermissionsDTO | DocObject = None
 
 
+class ApiErrorBodyDTO(_LenientModel):
+    code: str = Field(description="Why the request was refused, a stable name a client can branch on")
+    message: str = Field(description="The reason in plain words")
+    details: DocObject = Field(default=None, description="More about the refusal, when there is more; validation_error lists the fields in issues")
+
+
+class ApiErrorDTO(_LenientModel):
+    error: ApiErrorBodyDTO
+
+
+SMB_MOUNT_REFUSALS = {
+    422: {
+        "model": ApiErrorDTO,
+        "description": (
+            "Refused; error.code says why. validation_error: a field has the wrong type or form (error.details.issues "
+            "names each). invalid_repository: the repository cannot be made as asked, for example an SMB address not "
+            "written \\\\server\\share or //server/share, or a share this server mounts itself given without username "
+            "and password. share_mount_failed: this server could not mount the SMB share (smb without path); the message "
+            "carries mount.cifs's error: 13 the account or password is refused, 2 the share or the folder in it does not "
+            "exist, 113 no address of the server answers, 111 the server refuses the connection on its SMB port."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {
+                    "share_mount_failed": {
+                        "summary": "a wrong account (mount error 13)",
+                        "value": {"error": {"code": "share_mount_failed", "message": (
+                            "The share of repository \\\\files01\\backups could not be mounted: //files01/backups could not be "
+                            "mounted: mount error 13 (Permission denied): the user name or password is wrong, or the account may not open this share"
+                        )}},
+                    },
+                    "invalid_repository": {
+                        "summary": "a malformed address",
+                        "value": {"error": {"code": "invalid_repository", "message": "SMB shares must be written \\\\server\\share or //server/share"}},
+                    },
+                    "validation_error": {
+                        "summary": "a field of the wrong type",
+                        "value": {"error": {"code": "validation_error", "message": "Request validation failed", "details": {
+                            "issues": [{"location": ["body", "verify_tls"], "message": "Input should be a valid boolean", "type": "bool_parsing"}],
+                        }}},
+                    },
+                },
+            },
+        },
+    },
+}
+
+
+class RepositoryMetadataDTO(_LenientModel):
+    managed_mount: DocBool = Field(
+        default=None,
+        description=(
+            "smb: true when this server mounts the share itself (the repository was added without path); it is mounted at "
+            "/run/altastor-backup-mounts/<repository id>, which is then the repository's path. Absent for a share mounted by hand"
+        ),
+    )
+    server: DocStr = Field(default=None, description="smb: the server of the share; for a local repository this server shares, the server Hyper-V hosts are given")
+    share: DocStr = Field(default=None, description="smb: the share, and a folder in it when one was given")
+    username: DocStr = Field(default=None, description="smb: the account the share is opened with")
+    password: DocStr = Field(default=None, description="smb: the account's password, always masked; it is never returned")
+
+
 class RepositoryDTO(_LenientModel):
     id: str
     name: str
@@ -505,7 +574,7 @@ class RepositoryDTO(_LenientModel):
     last_verify: LastVerifyDTO | DocObject = None
     s3: S3RepositoryDTO | DocObject = None
     address: DocStr = None
-    metadata: DocObject = None
+    metadata: RepositoryMetadataDTO | DocObject = None
     bucket: str | None = None
     prefix: str | None = None
     region: str | None = None
@@ -568,8 +637,11 @@ class RestorePointDTO(_LenientModel):
     gfs_marks: GfsMarksDTO | DocObject = None
     gfs_protected: bool = False
     parent_point_id: str | None = None
-    status: str | None = Field(default=None, description="available, missing, chain_broken, or deleting: a delete or retention pass is removing it (a pass cut short finishes on its own), or S3 Object Lock still holds it and it is removed once the lock expires; a deleting point is not offered for restore")
+    status: str | None = Field(default=None, description="available, missing, chain_broken, deleted: it is in the recycle bin (see purge_after), or deleting: a delete or retention pass is removing it (a pass cut short finishes on its own), or S3 Object Lock still holds it and it is removed once the lock expires; deleted and deleting points are not offered for restore")
     deletion_requested_at: DocStr = Field(default=None, description="With status deleting: when its removal was asked for")
+    deleted_at: DocStr = Field(default=None, description="With status deleted: when abr backup delete moved it to the recycle bin")
+    deleted_by: DocStr = Field(default=None, description="With status deleted: the user who deleted it")
+    purge_after: DocStr = Field(default=None, description="With status deleted: when the server deletes it for good, unless abr backup undelete brings it back first")
     vm_id: str | None = None
     vm_name: str | None = None
     repository_id: str | None = None
@@ -603,7 +675,7 @@ class BackupChainDTO(_LenientModel):
     vm: _Ref
     inventory: _Ref
     repository: _Ref
-    status: str | None = Field(default=None, description="The status of the chain's newest restore point, or of its first point that is missing, broken or failed; corrupt points older than a newest point that is not corrupt are counted in corrupt instead")
+    status: str | None = Field(default=None, description="The status of the chain's newest restore point outside the recycle bin, or of its first such point that is missing, broken or failed; corrupt points older than a newest point that is not corrupt are counted in corrupt instead. deleted when the whole chain is in the recycle bin")
     restore_point_count: int = 0
     created_at: str | None = None
     last_restore_point_at: str | None = None
@@ -612,6 +684,7 @@ class BackupChainDTO(_LenientModel):
     gfs_protected: bool = False
     corrupt: DocObject = Field(default=None, description="Restore points of the chain marked corrupt by a verify: restore_point_count, damaged_point_ids and found_at, the latest find; null when there are none")
     pending_deletion: DocObject = Field(default=None, description="Restore points of the chain waiting for deletion: restore_point_count, requested_at, and delete_after, the latest Object Lock date among them; null when there are none")
+    recycle_bin: DocObject = Field(default=None, description="Restore points of the chain in the recycle bin: restore_points, deleted_at (the first delete), deleted_by, purge_after (the first of them the server deletes for good) and whole_chain; null when there are none")
     restore_points: list[RestorePointDTO] | DocArray = []
 
 
@@ -619,10 +692,23 @@ class BackupList(_LenientModel):
     items: list[BackupChainDTO]
 
 
+class SessionWarningDTO(_LenientModel):
+    code: DocStr = Field(
+        default=None,
+        description=(
+            "What the warning is about, a stable name a client can pick warnings by: crash_consistent (the backup is "
+            "crash-consistent because the guest could not be quiesced, on VMware and Hyper-V alike), change_tracking_reset, "
+            "disk_size_changed, ... Warnings from before codes were given may have none"
+        ),
+    )
+    message: str = Field(description="The warning in plain words")
+    vm_name: DocStr = Field(default=None, description="The VM the warning is about, when it is about one")
+
+
 class SessionVerifyDTO(_LenientModel):
     id: DocStr = None
     result: DocStr = None
-    warnings: DocObjectArray = None
+    warnings: list[SessionWarningDTO | DocObject] | None = None
     errors: list[Any] = []
     checked_restore_points: DocInt = None
     checked_artifacts: DocInt = None
@@ -667,7 +753,7 @@ class SessionDTO(_LenientModel):
     processed_bytes: int | None = None
     transferred_bytes: int | None = None
     errors: list[SessionErrorDTO] | DocArray = None
-    warnings: DocObjectArray = None
+    warnings: list[SessionWarningDTO | DocObject] | None = None
     message: DocStr = None
     triggered_by: DocStr = None
     run_id: DocStr = None
@@ -1011,6 +1097,8 @@ class CreateJobRequest(_LenientModel):
     verify_schedule: Annotated[SkipValidation[ScheduleRequest] | LaxStr | None, _checked_booleans(ScheduleRequest)] = Field(default=None, description=VERIFY_SCHEDULE)
     verify_enabled: LaxBool | None = Field(default=None, description=VERIFY_STATE)
     verify_whole_chain_every: RawInt | None = Field(default=None, description=VERIFY_WHOLE_CHAIN_EVERY)
+    retry_count: RawInt | None = Field(default=None, description="Retries of a VM whose backup failed, 0 to 20, each a new session of that VM in the same run; omitted: 3")
+    retry_interval_minutes: RawInt | None = Field(default=None, description="Minutes between those retries, 0 to 1440; omitted: 10")
     description: LaxStr | None = None
     task_parameters: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = None
     backup_options: Annotated[SkipValidation[TaskParametersRequest] | None, _checked_booleans(TaskParametersRequest)] = Field(default=None, description="Older spelling of task_parameters, read only when task_parameters is absent")
@@ -1045,6 +1133,11 @@ COPY_RUN_AFTER = "Periodic copies only: start the copy each time a run of this j
 COPY_RETRY_COUNT = "Retries of a VM whose copy failed, 0 to 20, within the same session; null or omitted: 5 for periodic, 3 for immediate"
 COPY_WINDOW = "When copies may move data: rules '[days] HH:MM-HH:MM' (days separated by commas in week order, mon,wed,fri; no days is every day; the end may be past midnight, 22:00-06:00) or objects {days, start, end}, in the server's time zone. A copy waits outside them and stops when they close; empty or none: any time"
 COPY_RETRY_INTERVAL = "Minutes between those retries, 0 to 1440; null or omitted: 0 for periodic, 10 for immediate"
+JOB_RETRY_COUNT = (
+    "Backup jobs: retries of a VM whose backup failed, 0 to 20, each a new session of that VM in the same run; omitted on "
+    "create: 3. Backup copy jobs: retries within the same session; null or omitted: 5 for periodic, 3 for immediate"
+)
+JOB_RETRY_INTERVAL = "Minutes between those retries, 0 to 1440; backup jobs: 10 when omitted; copy jobs: 0 for periodic, 10 for immediate"
 
 
 class CreateBackupCopyJobRequest(_LenientModel):
@@ -1152,8 +1245,8 @@ class UpdateJobRequest(_LenientModel):
     source_repository_ids: list[LaxStr] | LaxStr | None = Field(default=None, description=COPY_SOURCE_REPOSITORY_IDS)
     run_after_job: LaxStr | None = Field(default=None, description=COPY_RUN_AFTER)
     run_after_job_id: LaxStr | None = Field(default=None, description=COPY_RUN_AFTER)
-    retry_count: RawInt | None = Field(default=None, description=COPY_RETRY_COUNT)
-    retry_interval_minutes: RawInt | None = Field(default=None, description=COPY_RETRY_INTERVAL)
+    retry_count: RawInt | None = Field(default=None, description=JOB_RETRY_COUNT)
+    retry_interval_minutes: RawInt | None = Field(default=None, description=JOB_RETRY_INTERVAL)
     copy_window: list[Any] | LaxStr | None = Field(default=None, description=COPY_WINDOW)
 
 
@@ -1690,6 +1783,25 @@ class BackupDeleteResult(_LenientModel):
     deleted: DocBool = None
     restore_point_count: DocInt = None
     artifacts_removed: DocBool = None
+    recycle_bin: DocObject = Field(default=None, description="When the recycle bin keeps deleted backups: restore_points moved there, keep_days, and purge_after, when the server deletes them for good; their data stays in the repository until then")
+    message: DocStr = None
+
+
+class BackupUndeleteResult(_LenientModel):
+    id: DocStr = None
+    undeleted_restore_points: DocInt = Field(default=None, description="The restore points brought back from the recycle bin")
+    message: DocStr = None
+    backup: BackupChainDTO | DocObject = None
+
+
+class RecycleBinSettingsDTO(_LenientModel):
+    keep_days: DocInt = Field(default=None, description="Days a deleted backup chain stays in the recycle bin before the server deletes its data for good; 0 deletes at once, as before the recycle bin")
+    updated_at: DocStrOrNull = None
+    updated_by: DocStrOrNull = None
+
+
+class RecycleBinSettingsRequest(_LenientModel):
+    keep_days: RawInt | None = Field(default=None, description="A whole number from 0 to 365; 0 turns the recycle bin off. Chains already in it keep their purge date")
 
 
 class BackupVerifyResult(_LenientModel):

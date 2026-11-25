@@ -215,6 +215,13 @@ class _AppriseChannel:
                     problems[field] = self._unreadable(settings, reason)
         return problems
 
+    def _collect(self, settings: dict[str, Any], problems: dict[str, str], *, complete: bool) -> None:
+        if problems:
+            for field, problem in self._problems(settings, complete).items():
+                problems.setdefault(field, problem)
+        else:
+            problems.update(self.validate(settings, complete=complete))
+
     def update_settings(self, patch: dict[str, Any], *, updated_by: str | None) -> tuple[dict[str, Any], list[str]]:
         """Save `patch` over the stored settings, or refuse the whole of it
         (422 invalid_notification_settings, with every problem by field).
@@ -223,8 +230,7 @@ class _AppriseChannel:
             current = self.load_settings()
             problems: dict[str, str] = {}
             updated = self._patched(current, patch, problems)
-            if not problems:
-                problems.update(self.validate(updated, complete=bool(updated["enabled"])))
+            self._collect(updated, problems, complete=bool(updated["enabled"]))
             if problems:
                 raise _refuse(problems)
             changed = [key for key in self.FIELDS if updated.get(key) != current.get(key)]
@@ -250,8 +256,7 @@ class _AppriseChannel:
         them, complete enough to send, or 422 with what is missing."""
         problems: dict[str, str] = {}
         candidate = self._patched(self.load_settings(), patch or {}, problems)
-        if not problems:
-            problems.update(self.validate(candidate, complete=True))
+        self._collect(candidate, problems, complete=True)
         if problems:
             raise _refuse(problems)
         return candidate

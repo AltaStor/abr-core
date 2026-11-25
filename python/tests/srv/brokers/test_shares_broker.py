@@ -123,6 +123,28 @@ class AddShareRefusalTests(_BrokerCase):
         self.assertEqual((self.system.accounts, self.system.samba_accounts), ({}, {}))
         self.assertNotIn("smbcontrol", self.tools_run())
 
+    def test_a_folder_whose_name_holds_a_samba_macro_is_refused_with_the_reason(self) -> None:
+        for name in ("r-%U", "r-%m", "r-%S", "r-100%"):
+            with self.subTest(name):
+                folder = self.system.root / name
+                folder.mkdir()
+
+                error = self.refused(lambda folder=folder: self.add(folder=folder))
+
+                self.assertIn("holds %, which Samba reads as a macro", error.message)
+                self.assertIn("choose a folder whose name has no %", error.message)
+                self.assert_nothing_changed()
+
+    def test_a_space_a_hash_and_a_semicolon_are_shared_as_before(self) -> None:
+        for index, name in enumerate(("r 1", "r#2", "r;3")):
+            with self.subTest(name):
+                folder = self.system.root / name
+                folder.mkdir()
+
+                self.add(f"abr-aaaaaaa{index}$", f"abr-smb-aaaaaaa{index}", folder)
+
+                self.assertEqual(self.ours()[f"abr-aaaaaaa{index}$"]["path"], str(folder))
+
     def test_a_stopped_smbd_is_refused_and_never_started(self) -> None:
         self.system.running = False
 
@@ -461,6 +483,75 @@ class RemoveShareTests(_BrokerCase):
         self.assertEqual(self.system.accounts, {})
 
 
+class IncludeSharesTests(_BrokerCase):
+    def include(self) -> dict:
+        return shares_broker.include_shares(self.samba, {})
+
+    def lose_the_line(self) -> None:
+        self.system.smb_conf.write_text(SMB_CONF_TEXT)
+
+    def test_a_lost_include_line_is_put_back_and_samba_reloaded(self) -> None:
+        self.add()
+        self.add(OTHER_SHARE, OTHER_USER, self.second)
+        self.lose_the_line()
+        self.system.calls.clear()
+
+        result = self.include()
+
+        self.assertEqual(result, {"included": True, "shares": sorted([SHARE, OTHER_SHARE])})
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT + f"include = {self.system.shares_conf}\n")
+        self.assertIn("smbcontrol", self.tools_run())
+
+    def test_a_line_already_there_is_left_alone_without_a_reload(self) -> None:
+        self.add()
+        before = self.system.smb_conf.read_text()
+        self.system.calls.clear()
+
+        self.assertEqual(self.include(), {"included": False, "shares": [SHARE]})
+
+        self.assertEqual(self.system.smb_conf.read_text(), before)
+        self.assertNotIn("smbcontrol", self.tools_run())
+
+    def test_without_shares_of_ours_smb_conf_is_not_touched(self) -> None:
+        self.assertEqual(self.include(), {"included": False, "shares": []})
+
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
+
+    def test_smb_conf_keeps_its_owner_and_mode(self) -> None:
+        self.add()
+        self.lose_the_line()
+        os.chmod(self.system.smb_conf, 0o600)
+
+        self.include()
+
+        self.assertEqual(stat.S_IMODE(self.system.smb_conf.stat().st_mode), 0o600)
+
+    def test_a_configuration_samba_rejects_is_put_back(self) -> None:
+        self.add()
+        self.lose_the_line()
+        self.system.valid = False
+
+        error = self.refused(self.include)
+
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
+        self.assertIn("configuration", error.message)
+
+    def test_an_smbd_that_is_not_running_is_refused_and_nothing_changes(self) -> None:
+        self.add()
+        self.lose_the_line()
+        self.system.running = False
+
+        self.refused(self.include)
+
+        self.assertEqual(self.system.smb_conf.read_text(), SMB_CONF_TEXT)
+
+    def test_arguments_are_refused(self) -> None:
+        self.refused(lambda: shares_broker.include_shares(self.samba, {"share": SHARE}), INVALID_REQUEST)
+
+    def test_it_is_one_of_the_operations(self) -> None:
+        self.assertIn("include-shares", shares_broker.operations(self.samba))
+
+
 class CloseSharesTests(_BrokerCase):
     def close(self) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
@@ -588,8 +679,8 @@ class SectionTextTests(unittest.TestCase):
 
 
 class EntryPointTests(unittest.TestCase):
-    def test_the_operations_are_exactly_add_and_remove(self) -> None:
-        self.assertEqual(sorted(shares_broker.operations(shares_broker.Samba("altastor-backup"))), ["add-share", "remove-share"])
+    def test_the_operations_are_exactly_add_remove_and_include(self) -> None:
+        self.assertEqual(sorted(shares_broker.operations(shares_broker.Samba("altastor-backup"))), ["add-share", "include-shares", "remove-share"])
 
     def test_the_service_user_defaults_to_altastor_backup(self) -> None:
         captured = {}
@@ -605,7 +696,7 @@ class EntryPointTests(unittest.TestCase):
 
         with patch.object(shares_broker.os, "umask") as umask:
             self.assertEqual(shares_broker.main([]), 0)
-            self.assertEqual(captured, {"service_user": "altastor-backup", "operations": ["add-share", "remove-share"]})
+            self.assertEqual(captured, {"service_user": "altastor-backup", "operations": ["add-share", "include-shares", "remove-share"]})
             shares_broker.main(["--service-user", "as"])
 
         self.assertEqual(captured["service_user"], "as")

@@ -14,6 +14,20 @@ RequestedBackupMode = Literal["auto", "full"]
 EffectiveBackupMode = Literal["full", "incremental"]
 
 
+def restore_point_copied_at(point: dict[str, Any] | None) -> Any:
+    copied = (point or {}).get("copy_source")
+    if isinstance(copied, dict) and copied.get("created_at"):
+        return (point or {}).get("created_at")
+    return None
+
+
+def restore_point_taken_at(point: dict[str, Any] | None) -> Any:
+    copied = (point or {}).get("copy_source")
+    if isinstance(copied, dict) and copied.get("created_at"):
+        return copied.get("taken_at") or copied.get("created_at")
+    return (point or {}).get("created_at")
+
+
 def resolve_requested_backup_mode(parameters: dict[str, Any]) -> RequestedBackupMode:
     value = parameters.get("backup_mode_request")
     if value in (None, ""):

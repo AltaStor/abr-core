@@ -382,6 +382,79 @@ def check_certificate() -> None:
     )
 
 
+def _immutability_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return str(value)
+    mode = str(value.get("mode") or "none")
+    if mode == "none":
+        return "off (no Object Lock)"
+    days = value.get("retention_days")
+    scope = value.get("retention_scope")
+    return f"{mode} for {days} day(s)" + (f", {scope}" if scope else "")
+
+
+def privileged_action(entry: dict[str, Any]) -> None:
+    """Report an allowed privileged action from its audit record: who did it,
+    to what and when, for the events an administrator switches on."""
+    function_id = str(entry.get("function_id") or "")
+    target = entry.get("target") if isinstance(entry.get("target"), dict) else {}
+    parameters = entry.get("parameters") if isinstance(entry.get("parameters"), dict) else {}
+    body = parameters.get("body") if isinstance(parameters.get("body"), dict) else {}
+    query = parameters.get("query") if isinstance(parameters.get("query"), dict) else {}
+    name = str(target.get("name") or target.get("id") or "-")
+    user = str(entry.get("user") or "-")
+    s3 = body.get("s3") if isinstance(body.get("s3"), dict) else {}
+    immutability = body.get("immutability") if isinstance(body.get("immutability"), dict) else s3.get("immutability")
+    facts: list[str] = []
+    if function_id == "backup.delete":
+        event, subject = "backup.deleted", f"Backup {name} deleted by {user}"
+        facts.append(f"Backup chain: {target.get('id') or name}")
+        if query.get("segment"):
+            facts.append(f"Segment (full backup): {query.get('segment')}")
+        if str(query.get("force") or "").lower() == "true":
+            facts.append("GFS-protected restore points included (--force)")
+    elif function_id == "repository.delete":
+        event, subject = "repository.removed", f'Repository "{name}" removed by {user}'
+    elif function_id == "user.create":
+        event, subject = "user.created", f'User "{body.get("name") or name}" created by {user}'
+        name = str(body.get("name") or name)
+        facts.append(f"Role: {body.get('role') or '-'}")
+    elif function_id == "user.edit" and body.get("role") is not None:
+        event, subject = "user.role_changed", f'Role of user "{name}" changed by {user}'
+        facts.append(f"New role: {body.get('role')}")
+    elif function_id == "repository.edit" and isinstance(immutability, dict):
+        event, subject = "repository.immutability_changed", f'Immutability of repository "{name}" changed by {user}'
+        facts.append(f"New setting: {_immutability_text(immutability)}")
+    else:
+        return
+    lines = [
+        f"User: {user} ({entry.get('role') or '-'}), through the {entry.get('interface') or 'api'} from {entry.get('client') or '-'}",
+        f"Object: {target.get('type') or '-'} {name}",
+        *facts,
+        f"Time: {when(entry.get('timestamp'))}",
+        "",
+        f"Audit record {entry.get('id')}: abr audit list",
+    ]
+    notify(
+        event,
+        subject,
+        "\n".join(lines) + "\n",
+        severity="warning",
+        details={
+            "user": entry.get("user"),
+            "user_id": entry.get("user_id"),
+            "role": entry.get("role"),
+            "target": target,
+            "at": entry.get("timestamp"),
+            "audit_id": entry.get("id"),
+            "interface": entry.get("interface"),
+            "client": entry.get("client"),
+            **({"new_role": body.get("role")} if event in ("user.created", "user.role_changed") else {}),
+            **({"immutability": immutability} if event == "repository.immutability_changed" else {}),
+        },
+    )
+
+
 def start_periodic_checks() -> None:
     """Start the daily certificate check (the server calls this at start-up)."""
     global _certificate_timer

@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from python.srv.core.mongo_db_wrapper import BACKUPS, JOBS, REPOSITORIES
+from python.srv.core.mongo_db_wrapper import BACKUPS, REPOSITORIES
 from python.srv.services import abr_v41
 from python.srv.services.api_errors import ApiError
 
@@ -137,7 +136,7 @@ class DeleteBackupApiForceParamTests(unittest.TestCase):
         chain_id = point["chain_id"]
 
         with patch("python.srv.services.abr_v41._delete_backup_artifacts_from_point", return_value=True):
-            result = delete_backup(chain_id, segment=None, force=True)
+            result = delete_backup(SimpleNamespace(state=SimpleNamespace()), chain_id, segment=None, force=True)
 
         self.assertTrue(result["gfs_protection_overridden"])
 
