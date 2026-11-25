@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """What the product notifies about: the events, the message a component hands
 over, and how a delivery fails. Shared by the notification service and its

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """Works out what happened and tells the notification service, so the
 components only report: ``task_finished`` (backup runs, restores, and repository

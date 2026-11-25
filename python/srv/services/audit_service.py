@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """The audit log: one record for every executed command and every user or
 role change, whatever interface it came from (Web UI, CLI, `--output json`

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 Norvitex OU
+# Copyright (c) 2026 Norvitex OU (AltaStor.com)
 
 # The disks as the recovery checkpoint froze them: each drive's file is now the
 # read-only parent of the differencing disk the VM writes to.

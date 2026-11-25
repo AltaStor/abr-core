@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """The server-wide vSphere API (VDDK or SOAP) and VDDK library (GET and PUT /api/v1/system/vsphere).
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """Tests for the resource-exhaustion fix: bounded backup concurrency, capped
 subprocess capture, and jittered DB reconnect backoff.

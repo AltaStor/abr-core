@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """A running API (in memory, no catalog database) with one signed-in user per
 built-in role, for the RBAC and audit tests."""

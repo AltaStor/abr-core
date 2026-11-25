@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """Custom roles through the API: making, cloning, changing and deleting them,
 giving them to users, what they then allow, the rules that stop anyone using a

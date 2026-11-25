@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 Norvitex OU
+# Copyright (c) 2026 Norvitex OU (AltaStor.com)
 
 # Point each drive at another file; report what it pointed at before, so the
 # caller can put it back.

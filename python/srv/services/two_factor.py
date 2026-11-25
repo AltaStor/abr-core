@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """Two-factor sign-in, the part every client shares: TOTP secrets (RFC 6238)
 and the provisioning data an authenticator app reads, the policy a code is

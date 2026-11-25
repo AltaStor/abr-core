@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """Role-based access control: the product's functions, its roles, and the one
 check every interface (API, CLI, `--output json` automation, Web UI) goes

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 Norvitex OU
+# Copyright (c) 2026 Norvitex OU (AltaStor.com)
 
 # Destroys a reference point an earlier backup left; one already gone is not
 # an error. The change tracking itself stays on.

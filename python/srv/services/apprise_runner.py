@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """Running Apprise, the program the messaging platforms (Telegram, Slack,
 Discord, ntfy) go out through.

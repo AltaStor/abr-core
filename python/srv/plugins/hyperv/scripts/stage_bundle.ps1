@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 Norvitex OU
+# Copyright (c) 2026 Norvitex OU (AltaStor.com)
 
 # Creates a staging folder for a host bundle and writes the given text files
 # into it, after removing staging folders an interrupted upload left behind.

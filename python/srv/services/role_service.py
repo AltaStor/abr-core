@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """Custom roles: roles an Administrator makes next to the built-in ones, each
 holding an explicit list of allowed functions from the same catalog

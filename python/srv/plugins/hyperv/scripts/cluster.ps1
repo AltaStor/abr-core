@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 Norvitex OU
+# Copyright (c) 2026 Norvitex OU (AltaStor.com)
 
 $clustered = [bool](Get-Command Get-ClusterNode -ErrorAction SilentlyContinue)
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 from .common_arguments import add_name_or_id_selector
 from .validators import parse_csv_values, parse_json_object, parse_key_value_pairs, parse_strict_hhmm, parse_weekday_csv

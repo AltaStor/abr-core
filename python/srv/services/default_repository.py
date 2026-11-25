@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """The default repository: where a new backup job stores when none is named. At most one repository is the
 default; it is marked on its record (metadata.default_repository), and nothing is the default once it is

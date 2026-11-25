@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 Norvitex OU
+# Copyright (c) 2026 Norvitex OU (AltaStor.com)
 
 # Checks a staged host bundle and moves it into place under its SHA-256 name.
 # A complete bundle already there (another run put it there first) is kept and

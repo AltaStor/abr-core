@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """Messaging platforms: Telegram, Slack, Discord and ntfy notifications, sent
 through Apprise (``apprise_runner``).

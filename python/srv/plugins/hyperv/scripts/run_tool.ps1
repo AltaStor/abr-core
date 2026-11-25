@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 Norvitex OU
+# Copyright (c) 2026 Norvitex OU (AltaStor.com)
 
 param(
     [string]$Tool, [string[]]$ToolArgs, [hashtable]$ToolEnv, [securestring]$SharePassword,

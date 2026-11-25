@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright © 2026 Norvitex OÜ
+# Copyright © 2026 Norvitex OÜ (AltaStor.com)
 
 """The CLI against the real API (in memory): a command the role does not
 allow exits with PERMISSION_DENIED, says why, and is audited as a CLI
