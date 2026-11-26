@@ -973,7 +973,7 @@ class CreateInventoryRequest(_LenientModel):
     description: LaxStr | None = None
     api: LaxStr | None = Field(default=None, description="vSphere only: how disks are read and written, vddk (the VMware VDDK) or soap (the vSphere SOAP API through abr-vmdk-tool); inherit or omitted uses the server-wide API (GET /system/vsphere)")
     transport: LaxStr | None = Field(default=None, description="The same as api (its earlier name); give one of them")
-    vddk_library: LaxStr | None = Field(default=None, description="vSphere only: the full path of the VDDK library file on the backup server, which must export VixDiskLib_InitEx; inherit, empty or omitted uses the server-wide one")
+    vddk_library: LaxStr | None = Field(default=None, description="vSphere only: the full path of the VDDK library file on the backup server, which must export VixDiskLib_InitEx, or librevddk for the LibreVDDK library of the server; inherit, empty or omitted uses the server-wide one")
 
 
 class UpdateInventoryRequest(_LenientModel):
@@ -988,7 +988,7 @@ class UpdateInventoryRequest(_LenientModel):
     description: LaxStr | None = None
     api: LaxStr | None = Field(default=None, description=f"vSphere only: vddk or soap, or inherit to use the server-wide API; {OMITTED_KEEPS}")
     transport: LaxStr | None = Field(default=None, description="The same as api (its earlier name); give one of them")
-    vddk_library: LaxStr | None = Field(default=None, description=f"vSphere only: the full path of a VDDK library file on the backup server, or inherit (or empty) to use the server-wide one; {OMITTED_KEEPS}")
+    vddk_library: LaxStr | None = Field(default=None, description=f"vSphere only: the full path of a VDDK library file on the backup server, librevddk for the LibreVDDK library of the server, or inherit (or empty) to use the server-wide one; {OMITTED_KEEPS}")
 
 
 REPOSITORY_PATH = (
@@ -2169,7 +2169,7 @@ class VsphereSettingsDTO(_LenientModel):
     library_file_supported: DocBool = Field(default=None, description="false when this server's abr-vmdk-tool is too old to take a VDDK library file")
     apis: SkipValidation[dict[str, VsphereTransportAvailabilityDTO]] | None = Field(default=None, description="vddk and soap: whether this server can use each now")
     hypervisors: SkipValidation[list[VsphereHypervisorSettingsDTO]] | None = Field(default=None, description="Every vSphere hypervisor (inventory) with its own values")
-    detected_vddk_libraries: DocObjectArray = Field(default=None, description="The VDDK library files found on this server that it can use, {path, kind, file} each; kind is ovddk (the oVDDK package next to abr-vmdk-tool), vmware_vddk (a VMware VDDK bundle in the VDDK directory) or system (a library folder of the system)")
+    detected_vddk_libraries: DocObjectArray = Field(default=None, description="The VDDK library files found on this server that it can use, {path, kind, file} each; kind is librevddk (the LibreVDDK library next to abr-vmdk-tool, which the value librevddk selects), vmware_vddk (a VMware VDDK bundle in the VDDK directory) or system (a library folder of the system)")
     updated_at: DocStrOrNull = None
     updated_by: DocStrOrNull = None
     updated_hypervisors: DocObjectArray = Field(default=None, description="PUT only: the hypervisors apply_to_existing_hypervisors handed back, {id, name} each")
@@ -2177,5 +2177,5 @@ class VsphereSettingsDTO(_LenientModel):
 
 class VsphereSettingsRequest(_LenientModel):
     api: LaxStr | None = Field(default=None, description="vddk or soap; omitted keeps it")
-    vddk_library: LaxStr | None = Field(default=None, description="The full path of a VDDK library file on the backup server, which must export VixDiskLib_InitEx. null or empty resets it to follow the VDDK directory, and so does that directory's own lib64/libvixDiskLib.so; omitted keeps it")
+    vddk_library: LaxStr | None = Field(default=None, description="The full path of a VDDK library file on the backup server, which must export VixDiskLib_InitEx, or librevddk for the LibreVDDK library of the server. null, empty or default resets it to LibreVDDK (to the VDDK directory while LibreVDDK is not installed), and the VDDK directory's own lib64/libvixDiskLib.so follows that directory; omitted keeps it")
     apply_to_existing_hypervisors: LaxBool | None = Field(default=None, description="true removes the API and VDDK library of every vSphere hypervisor that has its own, so they all use these values from now on")

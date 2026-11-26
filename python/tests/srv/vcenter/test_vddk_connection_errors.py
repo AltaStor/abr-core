@@ -22,7 +22,7 @@ def _tool_error(text: str) -> str:
 class VddkConnectionErrorTests(unittest.TestCase):
     def test_every_connection_failure_of_both_libraries_is_a_temporary_replication_error(self) -> None:
         for code, texts in CONNECTION_FAILURES.items():
-            for library, text in zip(("VMware VDDK", "oVDDK"), texts):
+            for library, text in zip(("VMware VDDK", "LibreVDDK"), texts):
                 with self.subTest(code=code, library=library):
                     error = RuntimeError(f"Updating disk {DISK} of replica failed: {_tool_error(text)} (abr-vmdk-tool.sh restore --name)")
                     self.assertTrue(is_temporary(error))
@@ -45,7 +45,7 @@ class VddkConnectionErrorTests(unittest.TestCase):
                 self.assertFalse(is_temporary(RuntimeError(_tool_error(text))))
 
     def test_a_backup_names_the_lost_host_whichever_library_answered(self) -> None:
-        for library, text in zip(("VMware VDDK", "oVDDK"), CONNECTION_FAILURES["VIX_E_HOST_NETWORK_CONN_REFUSED"]):
+        for library, text in zip(("VMware VDDK", "LibreVDDK"), CONNECTION_FAILURES["VIX_E_HOST_NETWORK_CONN_REFUSED"]):
             with self.subTest(library):
                 message = _disk_failure_message(
                     None, _tool_error(text), needed_bytes=None, needed_is_disk_size=False, free_before=None, data_host="192.168.13.52"

@@ -61,7 +61,7 @@ FOUND = {
     "effective_vddk_library": "/opt/altastor-backup/tools/vddk/lib64/libvixDiskLib.so",
     "default_vddk_library": "/opt/altastor-backup/tools/vddk/lib64/libvixDiskLib.so",
     "detected_vddk_libraries": [
-        {"path": "/opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so", "kind": "ovddk"},
+        {"path": "/opt/altastor-backup/tools/librevddk/lib64/libvixDiskLib.so", "kind": "librevddk"},
         {"path": "/opt/vmware-vix-disklib/lib64/libvixDiskLib.so", "kind": "vmware_vddk"},
     ],
     "hypervisors": [],
@@ -107,11 +107,14 @@ class SettingsVsphereCliTests(unittest.TestCase):
                 self.assertEqual(code, INVALID_USAGE)
                 self.assertIn("Give --api, --vddk-lib or --update-existing-hypervisors", str(refused))
 
-    def test_ovddk_names_the_ovddk_library_the_server_found(self) -> None:
-        self.assertEqual(self._run("--vddk-lib", "ovddk", settings=FOUND), (0, {"vddk_library": "/opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so"}))
-        code, refused = self._run("--vddk-lib", "ovddk", settings={**FOUND, "detected_vddk_libraries": []})
+    def test_librevddk_names_the_same_library(self) -> None:
+        self.assertEqual(self._run("--vddk-lib", "librevddk", settings=FOUND), (0, {"vddk_library": "/opt/altastor-backup/tools/librevddk/lib64/libvixDiskLib.so"}))
+        code, refused = self._run("--vddk-lib", "librevddk", settings={**FOUND, "detected_vddk_libraries": []})
         self.assertEqual(code, INVALID_USAGE)
-        self.assertIn("oVDDK is not installed", str(refused))
+        self.assertIn("LibreVDDK is not installed", str(refused))
+
+    def test_the_old_word_ovddk_is_not_a_library_name_any_more(self) -> None:
+        self.assertEqual(self._run("--vddk-lib", "ovddk", settings=FOUND), (0, {"vddk_library": "ovddk"}))
 
 
 class JobTransportCliTests(unittest.TestCase):
@@ -184,6 +187,14 @@ class TransportHelpTests(unittest.TestCase):
         job = self._help("job", "create")
         self.assertIn("--transport {vddk,soap,inventory}", job)
         self.assertIn("inventory (the default) uses it", job)
+
+    def test_the_value_ovddk_is_explained_as_the_librevddk_library(self) -> None:
+        for argv in (("settings", "vsphere", "set"), ("inventory", "add"), ("inventory", "edit")):
+            with self.subTest(command=" ".join(argv)):
+                text = " ".join(self._help(*argv).split())
+                self.assertIn("librevddk", text)
+                self.assertIn("LibreVDDK library", text)
+                self.assertNotIn("ovddk", text.lower())
 
 
 if __name__ == "__main__":
