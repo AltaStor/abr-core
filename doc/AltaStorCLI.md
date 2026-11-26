@@ -499,7 +499,7 @@ abr inventory add
 
 Description: Register a new virtualization inventory source. 
 
-abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --address <host/ip> [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--api <vddk|soap>] [--vddk-lib <path|ovddk>] 
+abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --address <host/ip> [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure] [--api <vddk|soap>] [--vddk-lib <path|librevddk>] 
 
 The password comes from ABR_INVENTORY_PASSWORD and the token from ABR_INVENTORY_TOKEN, or the password is asked for interactively. A value typed after --password or --token is still accepted, but every local user can read it (ps, /proc) while the command runs, and it stays in the shell history. 
 
@@ -533,9 +533,9 @@ replication always use the API of their target inventory.
 
 VDDK library. --vddk-lib names the VDDK library file the inventory's VDDK
 sessions load, under whatever name it has: VMware's VDDK
-(lib64/libvixDiskLib.so.9.1.0.0), openVDDK or our oVDDK build. It must be a full
-path to a file the backup service can read on the backup server, or ovddk, which
-takes the oVDDK library the backup server has (as abr settings vsphere set does)
+(lib64/libvixDiskLib.so.9.1.0.0), openVDDK or LibreVDDK, our build of it. It must be a full
+path to a file the backup service can read on the backup server, or librevddk, which
+takes the LibreVDDK library the backup server has (as abr settings vsphere set does)
 and is refused when it has none; the file must export
 VixDiskLib_InitEx; anything else is refused with the reason
 (invalid_vddk_library). A VMware VDDK's file has to stay in its bundle's lib64,
@@ -614,7 +614,7 @@ abr inventory edit
 
 Description: Update server connection attributes or credentials. 
 
-abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure | --secure] [--api <vddk|soap> | --reset-api] [--vddk-lib <path|ovddk> | --reset-vddk-lib] 
+abr inventory edit --name <name> [--address <host/ip>] [--port <int>] [--protocol <https|http>] [--username <user>] [--password [<pass>]] [--token [<token>]] [--insecure | --secure] [--api <vddk|soap> | --reset-api] [--vddk-lib <path|librevddk> | --reset-vddk-lib] 
 
 A change of the address, port, protocol, account or TLS verification is checked
 against the endpoint before it is saved. --secure, or a new address, port or
@@ -752,7 +752,7 @@ Notes:
 • How a run updates the replica: when the replica's restore point and the newest one are in the same chain with incrementals between them, it takes a snapshot (Hyper-V: a checkpoint) of the replica named abr-replica-<job>-<session>, writes the changed blocks of those incrementals into the replica's disks and removes the snapshot. A synthetic full in the source is followed the same way when the chain it merged is still there. Otherwise (a new active full, a disk added, removed or resized, or restore points between the two that are no longer kept) the run rebuilds the disks: it restores the newest restore point as a temporary VM <replica>-staging-<session> on the same host and datastore, then switches the replica to those disks in one step and deletes the old disks and the temporary VM. The new disks stay in the temporary VM's folder (named ...-staging-...) on the datastore. The datastore needs as much free space again as the replica's disks take while a rebuild runs. 
 • At the end of every run the replica's vCPU count and memory (on Hyper-V with its dynamic memory settings) are set to the restore point's, and its network adapters follow the source VM's: a new adapter is added, a removed one is removed, and an adapter that moved to another network moves too (Hyper-V: also its VLAN). An adapter whose source network has no mapping and no network of that name on the replica's host is added (or left) disconnected, with a warning. Firmware, Secure Boot, the virtual TPM, DVD drives, the configuration version and the boot order are set when the replica is created and not changed afterwards; when the source's differ, the run warns once. On VMware a new adapter is a VMXNET 3 adapter, as in a restore. 
 • The replica must be left alone between runs. A run refuses to update a replica that was powered on since the last run, has snapshots or checkpoints the job did not take, has other disks, or whose configuration or disks changed, and fails with "Replica was changed: ... Create a new Replication Job". Every later run fails the same way, naming that reason and when it was found, until the job is replaced, also once the change is undone (a snapshot removed, the VM powered off): the job no longer knows what the replica holds. The same happens when the replica VM is gone, or when the source job's VM was replaced by another one. 
-• A failed or stopped run leaves the source backups untouched and the replica at the restore point it was at: the snapshot is reverted, or the rebuilt disks are removed before the switch. A run interrupted by a server or host failure is finished or undone by the next run before anything else. A run that fails on a temporary error (the target or the repository cannot be reached, the connection dropped, the storage tool ended unexpectedly) is tried again in the same session, 3 times 10 minutes apart (ALTASTOR_REPLICA_RETRY_COUNT, ALTASTOR_REPLICA_RETRY_INTERVAL_MINUTES); a stop and a check that fails are not retried. A connection error counts as temporary whichever VDDK library the server uses: VMware VDDK's "The server refused connection" and oVDDK's "The server refused the connection" alike, and so on for every lost or refused connection to the host; a backup names such an error "Lost the connection to ESXi host <host>" with either library. A run waits up to ALTASTOR_REPLICA_TASK_WAIT_SECONDS (1800) for a task already running on the replica to end. 
+• A failed or stopped run leaves the source backups untouched and the replica at the restore point it was at: the snapshot is reverted, or the rebuilt disks are removed before the switch. A run interrupted by a server or host failure is finished or undone by the next run before anything else. A run that fails on a temporary error (the target or the repository cannot be reached, the connection dropped, the storage tool ended unexpectedly) is tried again in the same session, 3 times 10 minutes apart (ALTASTOR_REPLICA_RETRY_COUNT, ALTASTOR_REPLICA_RETRY_INTERVAL_MINUTES); a stop and a check that fails are not retried. A connection error counts as temporary whichever VDDK library the server uses: VMware VDDK's "The server refused connection" and LibreVDDK's "The server refused the connection" alike, and so on for every lost or refused connection to the host; a backup names such an error "Lost the connection to ESXi host <host>" with either library. A run waits up to ALTASTOR_REPLICA_TASK_WAIT_SECONDS (1800) for a task already running on the replica to end. 
 • While a run reads a backup chain of the source, abr backup delete of that chain is refused (409 backup_chain_in_use) and retention skips it, saying so in its log. The source backup job cannot be deleted, nor its VM removed from it, while a replication job uses it (409 replication_source_in_use): delete the replication job first. 
 • Each session logs the source backup job and VM, the restore point used, the target environment, host and replica VM, the incrementals applied, the bytes read and written and the duration; abr job info shows the replica, its restore point and the time of the last successful update. 
 
@@ -1044,25 +1044,25 @@ Description: Show the server-wide vSphere API and VDDK library, which every vSph
 
 abr settings vsphere show [--output json] 
 
-It shows the API, the library (vddk_library, null when it follows the VDDK directory), the library in effect and the file it resolves to (e.g. libvixDiskLib.so.9.1.0.0), the VDDK directory and where it comes from (environment or default), whether this server can use each API now and why not (apis), every vSphere hypervisor with its own values (hypervisors), and the VDDK libraries found on the backup server (detected_vddk_libraries: path, kind ovddk, vmware_vddk or system, and the file it resolves to). abr inventory info shows one hypervisor's own values, the values in effect and where each comes from. Needs inventory.view. 
+It shows the API, the library (vddk_library, null when it follows the VDDK directory), the library in effect and the file it resolves to (e.g. libvixDiskLib.so.9.1.0.0), the VDDK directory and where it comes from (environment or default), whether this server can use each API now and why not (apis), every vSphere hypervisor with its own values (hypervisors), and the VDDK libraries found on the backup server (detected_vddk_libraries: path, kind librevddk, vmware_vddk or system, and the file it resolves to). abr inventory info shows one hypervisor's own values, the values in effect and where each comes from. Needs inventory.view. 
 
-The values the server starts with. On its first start the server stores the server-wide API and VDDK library from ABR_VSPHERE_API (vddk or soap; vddk by default) and ABR_VSPHERE_VDDK_LIB (ovddk by default: the oVDDK library of the altastor-backup-ovddk package, /opt/altastor-backup/tools/ovddk/lib64/libvixDiskLib.so; default for the VDDK directory; or a full path), which /etc/altastor-backup/server.conf can set. A value that cannot be used is not stored: the server log says why, and the API starts as vddk, the library follows the VDDK directory; the same happens when oVDDK is not installed. A server that already has inventories, jobs or backups when it first gets these settings keeps working as before (vddk, the VDDK directory) unless server.conf sets them. Once stored, the values change only through abr settings vsphere set (or the Web UI); restarts and upgrades leave them as they are. 
+The values the server starts with. On its first start the server stores the server-wide API and VDDK library from ABR_VSPHERE_API (vddk or soap; vddk by default) and ABR_VSPHERE_VDDK_LIB (librevddk by default: the LibreVDDK library, /opt/altastor-backup/tools/librevddk/lib64/libvixDiskLib.so of the altastor-backup-librevddk package; default for the same LibreVDDK, or the VDDK directory while LibreVDDK is not installed; or a full path), which /etc/altastor-backup/server.conf can set. A value that cannot be used is not stored: the server log says why, and the API starts as vddk, the library follows the VDDK directory; the same happens when LibreVDDK is not installed. A server that already has inventories, jobs or backups when it first gets these settings keeps its API (vddk) unless server.conf sets them, and takes LibreVDDK as below. Once stored, the values change only through abr settings vsphere set (or the Web UI); restarts and upgrades leave them as they are. One exception, as AltaStor no longer ships the oVDDK and VMware VDDK packages: at start, once LibreVDDK can be used, a stored library in /opt/altastor-backup/tools/ovddk or in the VDDK folder next to abr-vmdk-tool (/opt/altastor-backup/tools/vddk), server-wide or an inventory's, and a server-wide library left to that VDDK folder, move to /opt/altastor-backup/tools/librevddk/lib64/libvixDiskLib.so, and the server log says so. A VMware VDDK the administrator installed elsewhere, given by its full path or by ABR_VMDK_TOOL_VDDK_DIR, is kept. 
 
 abr settings vsphere set 
 
 Description: Change the server-wide vSphere API and VDDK library. 
 
-abr settings vsphere set [--api <vddk|soap>] [--vddk-lib <path|ovddk|default>] [--update-existing-hypervisors [--yes]] 
+abr settings vsphere set [--api <vddk|soap>] [--vddk-lib <path|librevddk|default>] [--update-existing-hypervisors [--yes]] 
 
 Examples: 
-abr settings vsphere set --vddk-lib ovddk 
+abr settings vsphere set --vddk-lib librevddk 
 abr settings vsphere set --vddk-lib /opt/vmware-vix-disklib/lib64/libvixDiskLib.so.9.1.0.0 
 abr settings vsphere set --vddk-lib default 
 abr settings vsphere set --api soap --update-existing-hypervisors --yes 
 
-At least one option is required (exit code 2); nothing is asked. A new server needs none: it starts on vddk with the oVDDK library when that is installed (above). A VMware VDDK library must stay in the lib64 folder of its bundle: its transport plugins are found only through that folder. 
+At least one option is required (exit code 2); nothing is asked. A new server needs none: it starts on vddk with the LibreVDDK library when that is installed (above). A VMware VDDK library must stay in the lib64 folder of its bundle: its transport plugins are found only through that folder. 
 
-The library is checked as for inventory add --vddk-lib. ovddk takes the oVDDK library the backup server has, and is refused when it has none. default, or the VDDK directory's own lib64/libvixDiskLib.so, makes it follow the VDDK directory again, so it changes with ABR_VMDK_TOOL_VDDK_DIR. Hypervisors with their own values keep them, unless --update-existing-hypervisors removes the API and VDDK library of each, so they all use the server-wide values from now on. It names those hypervisors and asks first; --yes skips the question, and without a terminal to ask on it is required (exit code 2 otherwise). The command then prints the hypervisors it changed. An API the server cannot use is refused (transport_unavailable), and the server's reason for refusing a value is printed as it is. Needs inventory.edit; recorded in the audit log. 
+The library is checked as for inventory add --vddk-lib. librevddk takes the LibreVDDK library the backup server has, and is refused when it has none. default takes LibreVDDK too, and follows the VDDK directory only while LibreVDDK is not installed; the VDDK directory's own lib64/libvixDiskLib.so makes it follow that directory, so it changes with ABR_VMDK_TOOL_VDDK_DIR. Hypervisors with their own values keep them, unless --update-existing-hypervisors removes the API and VDDK library of each, so they all use the server-wide values from now on. It names those hypervisors and asks first; --yes skips the question, and without a terminal to ask on it is required (exit code 2 otherwise). The command then prints the hypervisors it changed. An API the server cannot use is refused (transport_unavailable), and the server's reason for refusing a value is printed as it is. Needs inventory.edit; recorded in the audit log. 
 
 abr settings recycle-bin show 
 
@@ -1147,7 +1147,7 @@ abr system get-support-bundle --file /tmp/support-bundle.zip
 
 Bundle contents:
 logs: logs/server/server.log, logs/cli/cli.log, logs/mongodb/mongod.log
-VDDK logs: the whole /var/log/altastor-backup/vddk with its subdirectories, under logs/vddk/ (logs/vddk/vixDiskLib-<pid>.log for VMware VDDK, logs/vddk/openvddk-<user>/openvddk-<pid>.log for oVDDK, and the temporary files the VDDK keeps there); a missing directory is named in manifest.json warnings, an empty one is not
+VDDK logs: the whole /var/log/altastor-backup/vddk with its subdirectories, under logs/vddk/ (logs/vddk/vixDiskLib-<pid>.log for VMware VDDK, logs/vddk/openvddk-<user>/openvddk-<pid>.log for LibreVDDK, and the temporary files the VDDK keeps there); a missing directory is named in manifest.json warnings, an empty one is not
 config: server.conf, mongod.conf
 dumps: logs/server/server.log.fault (if server crashed)
 catalog (from DB, as JSON): sessions.json (200 most recent), jobs.json, repositories.json, inventories.json, restore-points.json, health.json

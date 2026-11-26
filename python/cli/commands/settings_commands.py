@@ -58,10 +58,10 @@ class SettingsCommands:
             description=(
                 "Change the server-wide API and VDDK library. The library is checked on the backup server: a full "
                 "path to a readable file that exports VixDiskLib_InitEx. Options left out keep their value; at "
-                "least one is needed. A new server starts on vddk with the oVDDK library when it is installed. "
+                "least one is needed. A new server starts on vddk with the LibreVDDK library when it is installed. "
                 + LIB64_NOTE + "\n\n"
                 "Examples:\n"
-                "  abr settings vsphere set --vddk-lib ovddk\n"
+                "  abr settings vsphere set --vddk-lib librevddk\n"
                 "  abr settings vsphere set --vddk-lib /opt/vmware-vix-disklib/lib64/libvixDiskLib.so.9.1.0.0\n"
                 "  abr settings vsphere set --vddk-lib default\n"
                 "  abr settings vsphere set --api soap --update-existing-hypervisors --yes"
@@ -71,9 +71,9 @@ class SettingsCommands:
         set_parser.add_argument("--api", choices=("vddk", "soap"), help="vddk (the VMware VDDK) or soap (the vSphere SOAP API)")
         set_parser.add_argument(
             "--vddk-lib",
-            metavar="PATH|ovddk|default",
-            help="The full path of the VDDK library file; ovddk takes the oVDDK library installed on the backup "
-            "server; default makes it follow the VDDK directory again (<directory>/lib64/libvixDiskLib.so)",
+            metavar="PATH|librevddk|default",
+            help="The full path of the VDDK library file; librevddk takes the LibreVDDK library installed on the backup "
+            "server; default also takes LibreVDDK, and follows the VDDK directory only while LibreVDDK is not installed",
         )
         set_parser.add_argument(
             "--update-existing-hypervisors",
@@ -174,10 +174,10 @@ class SettingsCommands:
         value = text.strip()
         if value.lower() == "default":
             return None
-        if value.lower() == "ovddk":
-            found = [item for item in (client.get(VSPHERE_PATH) or {}).get("detected_vddk_libraries") or [] if item.get("kind") == "ovddk"]
+        if value.lower() == "librevddk":
+            found = [item for item in (client.get(VSPHERE_PATH) or {}).get("detected_vddk_libraries") or [] if item.get("kind") == "librevddk"]
             if not found:
-                raise CliStructuredError(code="invalid_argument", message="oVDDK is not installed on the backup server", exit_code=INVALID_USAGE)
+                raise CliStructuredError(code="invalid_argument", message="LibreVDDK is not installed on the backup server", exit_code=INVALID_USAGE)
             return str(found[0]["path"])
         return value
 

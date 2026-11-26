@@ -42,7 +42,9 @@ DIRECTORY_VARIABLE = "ABR_VMDK_TOOL_VDDK_DIR"
 SETTINGS_ID = "vsphere_access"
 API_DEFAULT_VARIABLE = "ABR_VSPHERE_API"
 LIBRARY_DEFAULT_VARIABLE = "ABR_VSPHERE_VDDK_LIB"
-OVDDK = "ovddk"
+LIBREVDDK = "librevddk"
+LIBREVDDK_FOLDER = "librevddk"
+EARLIER_LIBREVDDK_FOLDER = "ovddk"
 VMWARE_VDDK = "vmware_vddk"
 SYSTEM_LIBRARY = "system"
 SYSTEM_LIBRARY_DIRS = (Path("/usr/local/lib"), Path("/usr/lib64"), Path("/usr/lib/x86_64-linux-gnu"), Path("/usr/lib"))
@@ -168,12 +170,35 @@ def default_vddk_roots(tool_path: Path | None = None) -> list[Path]:
     return [launcher.parent.parent / "vddk", launcher.parent.parent.parent / "vddk"]
 
 
-def ovddk_library(tool_path: Path | None = None) -> Path:
-    return _launcher(tool_path).parent.parent / OVDDK / VDDK_LIBRARY
+def names_librevddk(value: str | None) -> bool:
+    return str(value or "").strip().lower() == LIBREVDDK
+
+
+def _librevddk_folder(folder: str, tool_path: Path | None) -> Path:
+    return _launcher(tool_path).parent.parent / folder
+
+
+def librevddk_library(tool_path: Path | None = None) -> Path:
+    return _librevddk_folder(LIBREVDDK_FOLDER, tool_path) / VDDK_LIBRARY
+
+
+def librevddk_replacement(value: str | None, *, unset_follows_directory: bool = False, tool_path: Path | None = None) -> str | None:
+    libre = librevddk_library(tool_path)
+    if library_problem(str(libre)) or not disk_tool_takes_library_file(tool_path):
+        return None
+    if not value:
+        if unset_follows_directory and vddk_directory(tool_path)[1] != DIRECTORY_FROM_ENVIRONMENT:
+            return str(libre)
+        return None
+    stored = Path(os.path.normpath(value))
+    for folder in (_librevddk_folder(EARLIER_LIBREVDDK_FOLDER, tool_path), *default_vddk_roots(tool_path)):
+        if folder in stored.parents:
+            return str(libre)
+    return None
 
 
 def detected_libraries(tool_path: Path | None = None) -> list[dict[str, Any]]:
-    candidates = [(ovddk_library(tool_path), OVDDK)]
+    candidates = [(librevddk_library(tool_path), LIBREVDDK)]
     candidates += [(root / VDDK_LIBRARY, VMWARE_VDDK) for root in (vddk_directory(tool_path)[0], *default_vddk_roots(tool_path))]
     candidates += [(folder / VDDK_LIBRARY.name, SYSTEM_LIBRARY) for folder in SYSTEM_LIBRARY_DIRS]
     found: list[dict[str, Any]] = []
@@ -289,7 +314,7 @@ def library_problem(value: str) -> str | None:
     """Why a VDDK library file cannot be used, checked on this server, which is where abr-vmdk-tool runs."""
     path = Path(value)
     if not path.is_absolute():
-        return f"The VDDK library must be a full path that starts with /, or ovddk for the oVDDK library of the backup server, not {value}"
+        return f"The VDDK library must be a full path that starts with /, or librevddk for the LibreVDDK library of the backup server, not {value}"
     if not path.exists():
         return f"There is no file {value} on the backup server"
     if not path.is_file():

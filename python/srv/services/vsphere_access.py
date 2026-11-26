@@ -40,10 +40,10 @@ def _has_own_settings(record: dict[str, Any]) -> bool:
 
 def vddk_library_or_error(text: str) -> str:
     """A library file this server can hand to abr-vmdk-tool, or a 422 naming what is wrong with it."""
-    if text.strip().lower() == disk_transport.OVDDK:
-        text = str(disk_transport.ovddk_library())
+    if disk_transport.names_librevddk(text):
+        text = str(disk_transport.librevddk_library())
         if disk_transport.library_problem(text):
-            message = f"oVDDK is not installed on the backup server: there is no usable {text}"
+            message = f"LibreVDDK is not installed on the backup server: there is no usable {text}"
             raise api_error(422, "invalid_vddk_library", message, fields={"vddk_library": message})
     problem = disk_transport.library_problem(text)
     if problem:
@@ -127,7 +127,12 @@ def update_settings(payload: dict[str, Any], *, updated_by: str | None) -> tuple
             changed.append("api")
     if "vddk_library" in payload:
         text = str(payload["vddk_library"] or "").strip()
-        requested = None if disk_transport.is_default_library(text) else vddk_library_or_error(text)
+        if not text or text.lower() == "default":
+            requested = _bundled_library()
+        elif disk_transport.is_default_library(text):
+            requested = None
+        else:
+            requested = vddk_library_or_error(text)
         if requested != library:
             library = requested
             changed.append("vddk_library")
@@ -182,12 +187,12 @@ def _starting_value(name: str, fresh: bool) -> str:
 
 
 def _starting_library(text: str) -> tuple[str | None, str | None]:
-    if not text or text.lower() == "default":
+    if not text:
         return None, None
-    if text.lower() == disk_transport.OVDDK:
-        candidate = str(disk_transport.ovddk_library())
+    if text.lower() == "default" or disk_transport.names_librevddk(text):
+        candidate = str(disk_transport.librevddk_library())
         if disk_transport.library_problem(candidate):
-            return None, f"oVDDK is not installed ({candidate}), so the VDDK library follows the VDDK directory"
+            return None, f"LibreVDDK is not installed ({candidate}), so the VDDK library follows the VDDK directory"
     else:
         candidate = text
         problem = disk_transport.library_problem(candidate)
@@ -215,6 +220,37 @@ def starting_settings() -> tuple[str, str | None, list[str]]:
     return api, library, notes
 
 
+def move_to_librevddk() -> int:
+    moved = 0
+    if disk_transport.global_settings_stored():
+        settings = disk_transport.global_settings()
+        library = disk_transport.librevddk_replacement(settings["vddk_library"], unset_follows_directory=True)
+        if library:
+            disk_transport.store_global_settings(settings["api"], library, updated_by=settings["updated_by"])
+            logger.warning(
+                "The server-wide VDDK library moved to LibreVDDK: %s is now %s",
+                settings["vddk_library"] or "the VDDK directory",
+                library,
+            )
+            moved += 1
+    for record in _vsphere_inventories():
+        earlier = disk_transport.inventory_library_setting(record)
+        library = disk_transport.librevddk_replacement(earlier)
+        if not library:
+            continue
+        metadata = dict(record.get("metadata") if isinstance(record.get("metadata"), dict) else {})
+        metadata["vddk_library"] = library
+        persist_hypervisor({**record, "metadata": metadata, "updated_at": utc_now()})
+        logger.warning("The VDDK library of inventory %s moved to LibreVDDK: %s is now %s", record.get("name"), earlier, library)
+        moved += 1
+    return moved
+
+
+def _bundled_library() -> str | None:
+    library = disk_transport.librevddk_replacement(None, unset_follows_directory=True)
+    return library if library else None
+
+
 def initialise() -> int:
     """Store the server-wide settings on the first start that has them, keeping what every inventory did.
 
@@ -223,6 +259,7 @@ def initialise() -> int:
     handed back.
     """
     if disk_transport.global_settings_stored():
+        move_to_librevddk()
         return 0
     api, library, notes = starting_settings()
     for note in notes:
@@ -236,4 +273,5 @@ def initialise() -> int:
             continue
         persist_hypervisor({**record, "metadata": {key: value for key, value in metadata.items() if key != "vsphere_transport"}})
         handed_back += 1
+    move_to_librevddk()
     return handed_back
