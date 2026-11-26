@@ -214,7 +214,8 @@ class InventoryTransportTests(_Catalog):
         soap = self._vsphere("vc2", transport="soap")
         HYPERVISORS[vddk["id"]]["metadata"]["vsphere_transport"] = "vddk"
         HYPERVISORS["hv"] = {"id": "hv", "name": "hv", "type": "hyper-v", "metadata": {}}
-        with patch.object(vsphere_access, "persist_hypervisor", side_effect=lambda record: HYPERVISORS.__setitem__(record["id"], record)):
+        with patch.object(vsphere_access, "persist_hypervisor", side_effect=lambda record: HYPERVISORS.__setitem__(record["id"], record)), \
+                patch.object(disk_transport, "librevddk_library", return_value=Path("/nonexistent/librevddk/lib64/libvixDiskLib.so")):
             self.assertEqual(vsphere_access.initialise(), 1)
             self.assertEqual(vsphere_access.initialise(), 0)
         self.assertEqual(disk_transport.global_settings()["api"], "vddk")
