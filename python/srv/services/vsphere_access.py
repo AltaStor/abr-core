@@ -220,35 +220,10 @@ def starting_settings() -> tuple[str, str | None, list[str]]:
     return api, library, notes
 
 
-def move_to_librevddk() -> int:
-    moved = 0
-    if disk_transport.global_settings_stored():
-        settings = disk_transport.global_settings()
-        library = disk_transport.librevddk_replacement(settings["vddk_library"], unset_follows_directory=True)
-        if library:
-            disk_transport.store_global_settings(settings["api"], library, updated_by=settings["updated_by"])
-            logger.warning(
-                "The server-wide VDDK library moved to LibreVDDK: %s is now %s",
-                settings["vddk_library"] or "the VDDK directory",
-                library,
-            )
-            moved += 1
-    for record in _vsphere_inventories():
-        earlier = disk_transport.inventory_library_setting(record)
-        library = disk_transport.librevddk_replacement(earlier)
-        if not library:
-            continue
-        metadata = dict(record.get("metadata") if isinstance(record.get("metadata"), dict) else {})
-        metadata["vddk_library"] = library
-        persist_hypervisor({**record, "metadata": metadata, "updated_at": utc_now()})
-        logger.warning("The VDDK library of inventory %s moved to LibreVDDK: %s is now %s", record.get("name"), earlier, library)
-        moved += 1
-    return moved
-
-
 def _bundled_library() -> str | None:
-    library = disk_transport.librevddk_replacement(None, unset_follows_directory=True)
-    return library if library else None
+    if disk_transport.vddk_directory()[1] == disk_transport.DIRECTORY_FROM_ENVIRONMENT:
+        return None
+    return disk_transport.usable_librevddk()
 
 
 def initialise() -> int:
@@ -259,7 +234,6 @@ def initialise() -> int:
     handed back.
     """
     if disk_transport.global_settings_stored():
-        move_to_librevddk()
         return 0
     api, library, notes = starting_settings()
     for note in notes:
@@ -273,5 +247,4 @@ def initialise() -> int:
             continue
         persist_hypervisor({**record, "metadata": {key: value for key, value in metadata.items() if key != "vsphere_transport"}})
         handed_back += 1
-    move_to_librevddk()
     return handed_back

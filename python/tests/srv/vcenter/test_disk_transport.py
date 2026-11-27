@@ -660,17 +660,33 @@ class StartingSettingsTests(_Catalog):
         self.assertIsNone(settings["vddk_library"])
         self.assertTrue(any("follows the VDDK directory" in line for line in logs), logs)
 
-    def test_a_server_that_already_has_data_moves_to_librevddk_and_keeps_its_api_unless_server_conf_says_otherwise(self) -> None:
+    def test_a_server_that_already_has_data_keeps_the_vddk_directory_and_its_api_unless_server_conf_says_otherwise(self) -> None:
         self._library(self.libre)
+        self._library(self.vmware)
         JOBS["j"] = {"id": "j", "name": "nightly"}
 
         settings, _logs = self._start()
-        self.assertEqual((settings["api"], settings["vddk_library"]), ("vddk", str(self.libre)))
+        self.assertEqual((settings["api"], settings["vddk_library"]), ("vddk", None))
+        self.assertEqual(vsphere_access.settings_dto()["effective_vddk_library"], str(self.vmware))
 
         SYSTEM_STATE.clear()
         os.environ["ABR_VSPHERE_API"] = "soap"
         settings, _logs = self._start()
-        self.assertEqual((settings["api"], settings["vddk_library"]), ("soap", str(self.libre)))
+        self.assertEqual((settings["api"], settings["vddk_library"]), ("soap", None))
+
+    def test_an_upgraded_server_keeps_the_vmware_vddk_and_hands_its_inventories_back(self) -> None:
+        self._library(self.libre)
+        self._library(self.vmware)
+        JOBS["j"] = {"id": "j", "name": "nightly"}
+        inventory = self._vsphere()
+        HYPERVISORS[inventory["id"]]["metadata"]["vsphere_transport"] = "vddk"
+
+        self.assertEqual(vsphere_access.initialise(), 1)
+        self.assertEqual(vsphere_access.initialise(), 0)
+
+        self.assertEqual(disk_transport.global_settings()["vddk_library"], None)
+        self.assertNotIn("vsphere_transport", HYPERVISORS[inventory["id"]]["metadata"])
+        self.assertEqual(vsphere_access.settings_dto()["effective_vddk_library"], str(self.vmware))
 
     def test_a_server_without_librevddk_keeps_the_vddk_directory(self) -> None:
         JOBS["j"] = {"id": "j", "name": "nightly"}
@@ -687,7 +703,7 @@ class StartingSettingsTests(_Catalog):
         self.assertEqual(vsphere_access.initialise(), 0)
 
         settings = disk_transport.global_settings()
-        self.assertEqual((settings["api"], settings["vddk_library"], settings["updated_by"]), ("soap", str(self.libre), "admin"))
+        self.assertEqual((settings["api"], settings["vddk_library"], settings["updated_by"]), ("soap", None, "admin"))
 
     def test_the_libraries_found_on_the_server_are_listed_once_each(self) -> None:
         self._library(self.libre)
@@ -734,65 +750,61 @@ class StartingSettingsTests(_Catalog):
     def test_without_either_folder_the_new_one_is_named(self) -> None:
         self.assertEqual(disk_transport.librevddk_library(), self.root / "tools" / "librevddk" / "lib64" / "libvixDiskLib.so")
 
-    def _stored_earlier_path(self) -> tuple[str, dict]:
+    def _no_move_at_start(self) -> None:
+        with self.assertNoLogs(vsphere_access.logger, level="WARNING"):
+            vsphere_access.initialise()
+
+    def test_a_vmware_vddk_in_the_vddk_directory_the_administrator_chose_stays_after_a_restart(self) -> None:
+        self._library(self.libre)
+        self._library(self.vmware)
+        versioned = self._library(self.root / "tools" / "vddk" / "lib64" / "libvixDiskLib.so.9")
+        for chosen in (None, str(self.vmware), versioned):
+            with self.subTest(chosen=chosen):
+                disk_transport.store_global_settings("vddk", chosen, updated_by="admin")
+                inventory = self._vsphere(f"vc{len(HYPERVISORS)}", vddk_library=versioned)
+
+                self._no_move_at_start()
+
+                self.assertEqual(disk_transport.global_settings()["vddk_library"], chosen)
+                self.assertEqual(disk_transport.inventory_library_setting(HYPERVISORS[inventory["id"]]), versioned)
+
+    def test_a_library_in_the_earlier_ovddk_folder_stays_after_a_restart(self) -> None:
+        self._library(self.libre)
         earlier = self._library(self.ovddk)
         disk_transport.store_global_settings("vddk", earlier, updated_by="admin")
         inventory = self._vsphere(vddk_library=earlier)
-        return earlier, inventory
 
-    def test_a_stored_earlier_path_moves_to_librevddk_once_the_earlier_folder_is_gone(self) -> None:
-        earlier, inventory = self._stored_earlier_path()
-        libre = self._library(self.root / "tools" / "librevddk" / "lib64" / "libvixDiskLib.so")
-        self.ovddk.unlink()
-
-        with self.assertLogs(vsphere_access.logger, level="WARNING") as logs:
-            vsphere_access.initialise()
-
-        settings = disk_transport.global_settings()
-        self.assertEqual((settings["vddk_library"], settings["updated_by"]), (libre, "admin"))
-        self.assertEqual(disk_transport.inventory_library_setting(HYPERVISORS[inventory["id"]]), libre)
-        self.assertEqual(sum(f"{earlier} is now {libre}" in line for line in logs.output), 2)
-
-    def test_a_stored_earlier_path_moves_to_librevddk_even_while_the_earlier_library_is_there(self) -> None:
-        _earlier, inventory = self._stored_earlier_path()
-        libre = self._library(self.root / "tools" / "librevddk" / "lib64" / "libvixDiskLib.so")
-
-        with self.assertLogs(vsphere_access.logger, level="WARNING"):
-            vsphere_access.initialise()
-
-        self.assertEqual(disk_transport.global_settings()["vddk_library"], libre)
-        self.assertEqual(disk_transport.inventory_library_setting(HYPERVISORS[inventory["id"]]), libre)
-
-    def test_a_stored_earlier_path_stays_when_librevddk_is_missing_too(self) -> None:
-        earlier, inventory = self._stored_earlier_path()
-        self.ovddk.unlink()
-
-        vsphere_access.initialise()
+        self._no_move_at_start()
 
         self.assertEqual(disk_transport.global_settings()["vddk_library"], earlier)
         self.assertEqual(disk_transport.inventory_library_setting(HYPERVISORS[inventory["id"]]), earlier)
 
-    def test_a_path_outside_the_earlier_and_the_bundled_folders_never_moves(self) -> None:
+    def test_a_stored_library_that_was_removed_is_not_replaced_at_start(self) -> None:
         self._library(self.libre)
+        removed = self._library(self.root / "tools" / "vddk" / "lib64" / "libvixDiskLib.so.9")
+        disk_transport.store_global_settings("vddk", removed, updated_by="admin")
+        inventory = self._vsphere(vddk_library=removed)
+        Path(removed).unlink()
 
-        self.assertIsNone(disk_transport.librevddk_replacement(str(self.root / "custom" / "lib64" / "libvixDiskLib.so")))
-        self.assertIsNone(disk_transport.librevddk_replacement(None))
+        self._no_move_at_start()
 
-    def test_the_bundled_vddk_folder_moves_to_librevddk(self) -> None:
-        vmware = self._library(self.vmware)
+        self.assertEqual(disk_transport.global_settings()["vddk_library"], removed)
+        self.assertEqual(disk_transport.inventory_library_setting(HYPERVISORS[inventory["id"]]), removed)
+
+    def test_a_server_left_to_the_vddk_directory_stays_there_even_without_a_library_in_it(self) -> None:
         self._library(self.libre)
         disk_transport.store_global_settings("vddk", None, updated_by="admin")
-        inventory = self._vsphere(vddk_library=self._library(self.root / "tools" / "vddk" / "lib64" / "libvixDiskLib.so.9"))
-        own = self._vsphere("vc2", vddk_library=self._library(self.root / "opt-vmware" / "lib64" / "libvixDiskLib.so"))
 
-        with self.assertLogs(vsphere_access.logger, level="WARNING") as logs:
-            vsphere_access.initialise()
+        self._no_move_at_start()
 
-        self.assertEqual(disk_transport.global_settings()["vddk_library"], str(self.libre))
-        self.assertEqual(disk_transport.inventory_library_setting(HYPERVISORS[inventory["id"]]), str(self.libre))
-        self.assertEqual(disk_transport.inventory_library_setting(HYPERVISORS[own["id"]]), str(self.root / "opt-vmware" / "lib64" / "libvixDiskLib.so"))
-        self.assertTrue(any("the VDDK directory is now" in line for line in logs.output), logs.output)
-        self.assertTrue(vmware)
+        self.assertIsNone(disk_transport.global_settings()["vddk_library"])
+
+    def test_usable_librevddk_names_the_installed_library_only(self) -> None:
+        self.assertIsNone(disk_transport.usable_librevddk())
+        self._library(self.libre)
+        self.assertEqual(disk_transport.usable_librevddk(), str(self.libre))
+        self.launcher.write_text("#!/bin/sh\n")
+        self.assertIsNone(disk_transport.usable_librevddk())
 
     def test_a_vddk_directory_the_administrator_set_is_left_alone(self) -> None:
         self._library(self.libre)
@@ -804,6 +816,17 @@ class StartingSettingsTests(_Catalog):
         vsphere_access.initialise()
 
         self.assertIsNone(disk_transport.global_settings()["vddk_library"])
+
+    def test_default_follows_a_vddk_directory_the_administrator_set(self) -> None:
+        self._library(self.libre)
+        own_directory = self.root / "opt-vmware"
+        self._library(own_directory / "lib64" / "libvixDiskLib.so")
+        os.environ["ABR_VMDK_TOOL_VDDK_DIR"] = str(own_directory)
+        disk_transport.store_global_settings("vddk", "/elsewhere/libvixDiskLib.so", updated_by="admin")
+
+        settings, _changed, _updated = vsphere_access.update_settings({"vddk_library": "default"}, updated_by="admin")
+
+        self.assertIsNone(settings["vddk_library"])
 
     def test_default_and_an_empty_value_choose_librevddk(self) -> None:
         self._library(self.libre)

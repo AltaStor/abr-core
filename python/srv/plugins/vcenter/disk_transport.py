@@ -44,7 +44,6 @@ API_DEFAULT_VARIABLE = "ABR_VSPHERE_API"
 LIBRARY_DEFAULT_VARIABLE = "ABR_VSPHERE_VDDK_LIB"
 LIBREVDDK = "librevddk"
 LIBREVDDK_FOLDER = "librevddk"
-EARLIER_LIBREVDDK_FOLDER = "ovddk"
 VMWARE_VDDK = "vmware_vddk"
 SYSTEM_LIBRARY = "system"
 SYSTEM_LIBRARY_DIRS = (Path("/usr/local/lib"), Path("/usr/lib64"), Path("/usr/lib/x86_64-linux-gnu"), Path("/usr/lib"))
@@ -174,27 +173,15 @@ def names_librevddk(value: str | None) -> bool:
     return str(value or "").strip().lower() == LIBREVDDK
 
 
-def _librevddk_folder(folder: str, tool_path: Path | None) -> Path:
-    return _launcher(tool_path).parent.parent / folder
-
-
 def librevddk_library(tool_path: Path | None = None) -> Path:
-    return _librevddk_folder(LIBREVDDK_FOLDER, tool_path) / VDDK_LIBRARY
+    return _launcher(tool_path).parent.parent / LIBREVDDK_FOLDER / VDDK_LIBRARY
 
 
-def librevddk_replacement(value: str | None, *, unset_follows_directory: bool = False, tool_path: Path | None = None) -> str | None:
+def usable_librevddk(tool_path: Path | None = None) -> str | None:
     libre = librevddk_library(tool_path)
     if library_problem(str(libre)) or not disk_tool_takes_library_file(tool_path):
         return None
-    if not value:
-        if unset_follows_directory and vddk_directory(tool_path)[1] != DIRECTORY_FROM_ENVIRONMENT:
-            return str(libre)
-        return None
-    stored = Path(os.path.normpath(value))
-    for folder in (_librevddk_folder(EARLIER_LIBREVDDK_FOLDER, tool_path), *default_vddk_roots(tool_path)):
-        if folder in stored.parents:
-            return str(libre)
-    return None
+    return str(libre)
 
 
 def detected_libraries(tool_path: Path | None = None) -> list[dict[str, Any]]:
