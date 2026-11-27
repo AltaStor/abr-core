@@ -7,7 +7,7 @@ needs from the Hyper-V side, and what to expect when something goes wrong.
 
 VMware disks are moved by abr-vmdk-tool on the backup server, which reaches
 them through VDDK. Hyper-V disks are moved by **abr-vhdx-tool**
-(the `abr-vhdx-tools` repository), its Windows counterpart: the same commands,
+(built in the `abr-disk-tools` repository), its Windows counterpart: the same commands,
 options and `--json` results, and the same `.abr` repository format. It runs on
 the Hyper-V host itself, where it opens a checkpoint's disk through the Windows
 virtual disk service and reads exactly the sectors the guest sees -- VHD, VHDX

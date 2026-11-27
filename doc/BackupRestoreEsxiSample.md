@@ -9,7 +9,7 @@ API server.
 - repository checked out at `/path/to/backup-server`
 - Python virtual environment available at `.venv`
 - local MongoDB bundle prepared under `tools/mongodb/` (by `scripts/check_deps.sh`)
-- `abr-vmdk-tool` built from the separate `abr-vmdk-tools` repository, together
+- `abr-vmdk-tool` built from the separate `abr-disk-tools` repository, together
   with the VDDK runtime its build pulls in
 
 ## 1. Start MongoDB
@@ -48,11 +48,11 @@ or start on `8001` and add `--base-url http://127.0.0.1:8001` to every CLI comma
 ## 3. Locate the utility
 
 `abr-vmdk-tool` is not built in this repository. Build it in the
-`abr-vmdk-tools` repository, following its `README.md`, and note the launcher
+`abr-disk-tools` repository, following its `README.md`, and note the launcher
 path -- it is what the commands below pass to `--tool-path`:
 
 ```bash
-TOOL_PATH=/path/to/abr-vmdk-tools/vmdk-tool/abr-vmdk-tool.sh
+TOOL_PATH=/path/to/abr-disk-tools/build-linux/bin/abr-vmdk-tool.sh
 test -x "$TOOL_PATH"
 ```
 

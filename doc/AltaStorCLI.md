@@ -130,7 +130,7 @@ abr auth login [--name <name>] [--print-token]
 
 Examples: 
 abr auth login --name abr 
-ABR_USERNAME=abr ABR_PASSWORD='secret' abr auth login 
+ABR_USERNAME=<user> ABR_PASSWORD='<password>' abr auth login 
 
 --print-token: print only the token to stdout, for `export ABR_TOKEN=$(abr auth login --print-token)`. The session the CLI has cached is left as it was, so fetching a token for another account does not sign the CLI in as that account. 
 
@@ -353,9 +353,9 @@ An smb repository without --path is a share this server mounts itself (managed m
 
 Example: 
 abr repo add --name MyLocal --type local --path /mnt/backup 
-ABR_REPO_PASSWORD='...' abr repo add --name MyNas --type smb --address '\\\\nas\\backups\\vm' --username 'backup@corp.local' --password 
+ABR_REPO_PASSWORD='...' abr repo add --name MyNas --type smb --address '\\\\nas\\backups\\vm' --username '<user>@<domain>' --password 
 abr repo add --name MySmb --type smb --path /mnt/hv --address '\\\\backup01\\hv' --username 'CORP\\backupsvc' --password 
-ABR_REPO_SECRET_KEY='...' abr repo add --name MyWorm --type s3 --bucket altastor-objectlock --region us-east-1 --endpoint-url http://minio.local:9000 --path-style --access-key AKIA... --immutable governance --immutability-days 30 
+ABR_REPO_SECRET_KEY='...' abr repo add --name MyWorm --type s3 --bucket backups --region <region> --endpoint-url https://s3.example.com --path-style --access-key <access-key> --immutable governance --immutability-days 30 
 
 Note: a local path that is world-writable is refused - its directory mode is the 
 only thing keeping other accounts on the host away from the backup data. Restrict 
@@ -504,7 +504,7 @@ abr inventory add --name <name> --type <vsphere|hyper-v|proxmox-ve|xcp-ng> --add
 The password comes from ABR_INVENTORY_PASSWORD and the token from ABR_INVENTORY_TOKEN, or the password is asked for interactively. A value typed after --password or --token is still accepted, but every local user can read it (ps, /proc) while the command runs, and it stays in the shell history. 
 
 Example: 
-abr inventory add --name Prod-vCenter --type vsphere --address 192.168.1.10 --username administrator@vsphere.local 
+abr inventory add --name Prod-vCenter --type vsphere --address vcenter.example.com --username <user> 
 
 Note:
 VM discovery is not required up front. It runs automatically the first time you
@@ -533,7 +533,7 @@ replication always use the API of their target inventory.
 
 VDDK library. --vddk-lib names the VDDK library file the inventory's VDDK
 sessions load, under whatever name it has: VMware's VDDK
-(lib64/libvixDiskLib.so.9.1.0.0), openVDDK or LibreVDDK, our build of it. It must be a full
+(lib64/libvixDiskLib.so.9.1.0.0) or LibreVDDK, a free drop-in replacement for it. It must be a full
 path to a file the backup service can read on the backup server, or librevddk, which
 takes the LibreVDDK library the backup server has (as abr settings vsphere set does)
 and is refused when it has none; the file must export
@@ -656,7 +656,7 @@ Jobs bind protected workloads (VMs) to a repository.
 
 abr job create 
 
-Description: Create a backup job for one or more virtual machines and optionally attach an enabled or disabled schedule. Supported schedule types are daily, weekly, monthly, and periodic. A job's --description is free text in any script (Cyrillic included), one line of up to the long-text limit without control characters; the job name stays Latin. --disabled (or --enabled) also works without --schedule, for a job whose only schedule is its full schedule: the job is created switched off, as job edit --disabled would leave it; the same holds for job create-backup-copy and job create-copy. Each VM may be listed once. --retention-days is a whole number from 1 to 3650 (14 when omitted); the GFS counts are whole numbers up to 520 weekly, 120 monthly and 99 yearly; a schedule's time zone, when given through the API, must be an IANA name such as Europe/Kyiv or UTC.  Without --repository and --repository-id the job stores to the default repository (abr repo edit --default); with no default repository the command is refused, naming the options.
+Description: Create a backup job for one or more virtual machines and optionally attach an enabled or disabled schedule. Supported schedule types are daily, weekly, monthly, and periodic. A job's --description is free text in any script (Cyrillic included), one line of up to the long-text limit without control characters; the job name stays Latin. --disabled (or --enabled) also works without --schedule, for a job whose only schedule is its full schedule: the job is created switched off, as job edit --disabled would leave it; the same holds for job create-backup-copy and job create-copy. Each VM may be listed once. --retention-days is a whole number from 1 to 3650 (14 when omitted); the GFS counts are whole numbers up to 520 weekly, 120 monthly and 99 yearly; a schedule's time zone, when given through the API, must be an IANA zone name or UTC.  Without --repository and --repository-id the job stores to the default repository (abr repo edit --default); with no default repository the command is refused, naming the options.
 
 abr job create --name <name> [--repository <name> | --repository-id <id>] [--inventory <name> | --inventory-id <id>] (--vm <vm> ... | --vms "<vm1,vm2,...>") [--schedule <daily|weekly|monthly|periodic>] [--time <HH:MM>] [--days <mon,tue,...>] [--day-of-month <1..31>] [--every <15m|1h|6h|1d>] [--enabled | --disabled] [--description <text>] [--retention-days <int>] [--retention-min-fulls <0..100>] [--active-full-schedule <daily|weekly|monthly|periodic|none>] [--active-full-time <HH:MM>] [--active-full-days <mon,tue,...>] [--active-full-day-of-month <1..31>] [--active-full-every <15m|1h|6h|1d>] [--active-full-enabled | --active-full-disabled] [--synthetic-full-schedule <daily|weekly|monthly|periodic|none>] [--synthetic-full-time <HH:MM>] [--synthetic-full-days <mon,tue,...>] [--synthetic-full-day-of-month <1..31>] [--synthetic-full-every <15m|1h|6h|1d>] [--synthetic-full-enabled | --synthetic-full-disabled] [--verify-schedule <daily|weekly|monthly|periodic|none>] [--verify-time <HH:MM>] [--verify-days <mon,tue,...>] [--verify-day-of-month <1..31>] [--verify-every <15m|1h|6h|1d>] [--verify-enabled | --verify-disabled] [--verify-whole-chain-every <1..100>] [--on-quiesce-failure <fail|crash-consistent>] [--transport <vddk|soap|inventory>] [--retry-count <0..20>] [--retry-interval <minutes>] 
 

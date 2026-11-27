@@ -18,6 +18,7 @@ abr
   backup
   restore
   notification
+  settings
   system
 ```
 

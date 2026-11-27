@@ -16,7 +16,7 @@ The solution has four main parts:
 - CLI client: `python -m python.cli.main`
 - MongoDB persistence for registered hypervisors, resources, jobs, and tasks
 - VDDK-backed disk tool `abr-vmdk-tool`, built from the separate
-  `abr-vmdk-tools` repository
+  `abr-disk-tools` repository
 
 The CLI talks to the local API service. The API service stores state in MongoDB
 when `MONGODB_URI` is configured. Backup and restore tasks are processed by the
@@ -34,15 +34,16 @@ Required host tools:
 - `python3`, `python3-venv`, and `pip`
 - Git
 - network reachability from this machine to your ESXi or vCenter endpoint
-- a built `abr-vmdk-tool` from the `abr-vmdk-tools` repository, for VMware
+- a built `abr-vmdk-tool` from the `abr-disk-tools` repository, for VMware
   backup and restore
 
 The API service and the CLI start and run without the disk tool; only the
-backup and restore tasks in sections 9 onward need it. The VDDK runtime is part
-of the disk tool's own build, and is not installed by anything in this
-repository. If you install via the Debian package, that extracted VDDK runtime
-is bundled into the `.deb` and installed under
-`/opt/altastor-backup-server/tools/vddk`.
+backup and restore tasks in sections 9 onward need it. The VDDK library is not
+installed by anything in this repository either.
+A packaged install takes LibreVDDK from the `altastor-backup-librevddk` package, in
+`/opt/altastor-backup/tools/librevddk`, and a VMware VDDK, when one is used, from
+`/opt/altastor-backup/tools/vddk` or `ABR_VMDK_TOOL_VDDK_DIR`.
+`abr settings vsphere` chooses the library, server-wide or per hypervisor (see `AltaStorCLI.md`).
 
 Repository layout assumed by this runbook:
 
@@ -78,23 +79,23 @@ test -x tools/mongodb/bin/mongod
 ## 4. Obtain the VDDK disk tool
 
 `abr-vmdk-tool` is not built in this repository. Clone and build it from the
-`abr-vmdk-tools` repository, following the build guide in its `README.md`; that
-guide also covers the VDDK download, which Broadcom gates behind a support
-account.
+`abr-disk-tools` repository with its `linux` preset, following the build guide
+in its `README.md`; that guide also covers the VDDK download, which Broadcom
+gates behind a support account.
 
 The build produces two files, and the launcher script is the one callers run --
 it locates the VDDK bundle, puts it on the library search path and picks a
 writable `TMPDIR`:
 
 ```text
-/path/to/abr-vmdk-tools/build/vmdk-tool/abr-vmdk-tool
-/path/to/abr-vmdk-tools/vmdk-tool/abr-vmdk-tool.sh
+/path/to/abr-disk-tools/build-linux/bin/abr-vmdk-tool
+/path/to/abr-disk-tools/build-linux/bin/abr-vmdk-tool.sh
 ```
 
 Point this repository at the launcher:
 
 ```bash
-export ALTASTOR_DISK_TOOL_PATH=/path/to/abr-vmdk-tools/vmdk-tool/abr-vmdk-tool.sh
+export ALTASTOR_DISK_TOOL_PATH=/path/to/abr-disk-tools/build-linux/bin/abr-vmdk-tool.sh
 ```
 
 The server reads `ALTASTOR_DISK_TOOL_PATH` first, then falls back to
@@ -105,7 +106,7 @@ alternative to exporting the variable:
 
 ```bash
 mkdir -p /path/to/backup-server/tools/abr-vmdk-tool
-ln -sfn /path/to/abr-vmdk-tools/vmdk-tool/abr-vmdk-tool.sh \
+ln -sfn /path/to/abr-disk-tools/build-linux/bin/abr-vmdk-tool.sh \
   /path/to/backup-server/tools/abr-vmdk-tool/abr-vmdk-tool.sh
 ```
 
@@ -365,8 +366,9 @@ share could not be made. Hyper-V hosts
 reach the share at this machine's address on port 445.
 
 Log in. Every `/api/v1` call needs a session, so this comes before anything
-else. The shipped `admin`/`admin` is a bootstrap credential -- change it with
-`abr auth change-password` once the environment is up:
+else. The bootstrap account comes from `ABR_BOOTSTRAP_ADMIN_USER` and
+`ABR_BOOTSTRAP_ADMIN_PASSWORD` in `python/srv/defaults.env` -- change its password
+with `abr auth change-password` once the environment is up:
 
 ```bash
 .venv/bin/python -m python.cli.main auth login --name admin
@@ -396,7 +398,7 @@ HV_NAME=lab-hypervisor
 VM_NAME=example-vm
 TARGET_HOST_NAME=<target_host_name>
 TARGET_DATASTORE_NAME=<target_datastore_name>
-TOOL_PATH=/path/to/abr-vmdk-tools/vmdk-tool/abr-vmdk-tool.sh
+TOOL_PATH=/path/to/abr-disk-tools/build-linux/bin/abr-vmdk-tool.sh
 ```
 
 If your target restore host or datastore differs, change
@@ -658,7 +660,7 @@ Disk tool is missing:
 test -x "$TOOL_PATH"
 ```
 
-If it is not there, build it in the `abr-vmdk-tools` repository (section 4) and
+If it is not there, build it in the `abr-disk-tools` repository (section 4) and
 set `TOOL_PATH`/`ALTASTOR_DISK_TOOL_PATH` to its launcher.
 
 Restore VM name already exists:
@@ -707,7 +709,7 @@ HV_NAME=lab-hypervisor
 VM_NAME=example-vm
 TARGET_HOST_NAME=<target_host_name>
 TARGET_DATASTORE_NAME=<target_datastore_name>
-TOOL_PATH=/path/to/abr-vmdk-tools/vmdk-tool/abr-vmdk-tool.sh
+TOOL_PATH=/path/to/abr-disk-tools/build-linux/bin/abr-vmdk-tool.sh
 
 HV_ID=$(.venv/bin/python -m python.cli.main register "$ESXI_HOST" "$ESXI_USER" "$ESXI_PASSWORD" --name "$HV_NAME" \
   | .venv/bin/python -c 'import sys,json; print(json.load(sys.stdin)["id"])')

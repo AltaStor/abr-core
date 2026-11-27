@@ -21,7 +21,7 @@ tools/mongodb/bin/mongod --dbpath /tmp/br-mongo --bind_ip 127.0.0.1 --port 27018
 Then, in another shell:
 
 ```bash
-.venv/bin/python -m python.cli auth login --name admin   # bootstrap admin/admin
+.venv/bin/python -m python.cli auth login --name admin   # the bootstrap account, see below
 .venv/bin/python -m python.cli system health
 ```
 
@@ -33,9 +33,10 @@ redirects to HTTPS, which is what makes the address work with no scheme typed -
 see `doc/DeploymentBuildAndScenario.md` for the details and for what a real
 install needs instead.
 
-Every `/api/v1` call needs a session, so `auth login` comes first. The shipped
-`admin`/`admin` is a bootstrap credential - change it with
-`abr auth change-password`. It holds the Administrator role; give everyone else
+Every `/api/v1` call needs a session, so `auth login` comes first. The
+bootstrap account comes from `ABR_BOOTSTRAP_ADMIN_USER` and
+`ABR_BOOTSTRAP_ADMIN_PASSWORD` in `python/srv/defaults.env` - change its password
+with `abr auth change-password`. It holds the Administrator role; give everyone else
 the role they need (`abr user add --name alice --role backup_operator`, see
 `doc/RBAC.md`).
 
@@ -48,29 +49,36 @@ normal use.
 
 ### Pointing the server at the data mover
 
-For VMware backup and restore, build `abr-vmdk-tool` in the `abr-vmdk-tools`
-repository and point this one at the launcher:
+VMware and Hyper-V disks are moved by the tools of the `abr-disk-tools` repository.
+Its README covers the builds, the Windows one cross-built on Linux included.
+
+For VMware backup and restore, build `abr-vmdk-tool` with the `linux` preset and point this repository at the launcher:
 
 ```bash
-export ALTASTOR_DISK_TOOL_PATH=/path/to/abr-vmdk-tools/vmdk-tool/abr-vmdk-tool.sh
+export ALTASTOR_DISK_TOOL_PATH=/path/to/abr-disk-tools/build-linux/bin/abr-vmdk-tool.sh
 ```
 
 Without it the server falls back to `tools/abr-vmdk-tool/abr-vmdk-tool.sh` in
 this checkout (`tools/` is git-ignored, so a symlink there works too) and, in a
 packaged install, to `/opt/altastor-backup/tools/abr-vmdk-tool/`.
 
-Hyper-V disks are moved by `abr-vhdx-tool.exe` from the `abr-vhdx-tools`
-repository, on the Hyper-V host itself. Build it there (its README covers the
-cross build on Linux) and point the server at the `.exe`; the server copies it
-to each host the first time it backs up or restores a VM there:
+The server tells the tool which VDDK library to load.
+A new server takes LibreVDDK, `librevddk/lib64/libvixDiskLib.so` next to the launcher's folder (`tools/librevddk/`),
+and without it the VMware VDDK of `ABR_VMDK_TOOL_VDDK_DIR` or of a `vddk` folder there.
+`abr settings vsphere` changes the choice, server-wide or per hypervisor; see `doc/AltaStorCLI.md`.
+
+Hyper-V disks are moved by `abr-vhdx-tool.exe`, on the Hyper-V host itself.
+Build it with the `windows-cross` preset and point the server at the `.exe`; the server copies it to each host the
+first time it backs up or restores a VM there:
 
 ```bash
-export ALTASTOR_VHDX_TOOL_PATH=/path/to/abr-vhdx-tools/build/vhdx-tool/abr-vhdx-tool.exe
+export ALTASTOR_VHDX_TOOL_PATH=/path/to/abr-disk-tools/build-windows-cross/bin/abr-vhdx-tool.exe
 ```
 
-Without it the server looks in `tools/abr-vhdx-tool/` as above, and with none
-there each host must have the tool installed already, at
-`ALTASTOR_HYPERV_TOOL_PATH` (`C:\Program Files\AltaStor\abr-vhdx-tool.exe`).
+Without it the server looks in `tools/abr-vhdx-tool/x64/`, where the `altastor-backup-vhdx-tools` package installs it,
+and then in `tools/abr-vhdx-tool/`, as above.
+With none there each host must have the tool installed already, at `ALTASTOR_HYPERV_TOOL_PATH`
+(`C:\Program Files\AltaStor\abr-vhdx-tool.exe`).
 
 ## Tests
 
@@ -102,6 +110,10 @@ VDDK, or a vCenter or Hyper-V endpoint.
   recovery need from the host, how they run, and what to check when they fail.
 - [Roles, permissions and the audit log](doc/RBAC.md) - the built-in roles,
   the permission matrix, how requests are authorized, and the audit log.
+- [Two-factor sign-in](doc/TwoFactorSignIn.md) - authenticator app codes and
+  recovery codes, and how an Administrator resets a user who lost their phone.
+- [Task processing](doc/TaskProcessing.md) - how a task moves from its creation
+  through the background workers to its result.
 - [Notifications](doc/Notifications.md) - the notification service, its
   events, e-mail (SMTP with TLS, password sign-in, failures and retries),
   messaging platforms (Telegram, Slack, Discord, ntfy) through Apprise, API
@@ -120,3 +132,9 @@ authority on the command tree the CLI actually implements today.
 ## Naming
 - Use `snake_case` names with clear meaning and try to keep them short.
 - Modifications in the folder tree should be discussed with the team.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+Copyright © 2026 Norvitex OÜ (AltaStor.com)
