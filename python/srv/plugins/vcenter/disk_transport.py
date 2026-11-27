@@ -213,6 +213,14 @@ def default_library(tool_path: Path | None = None) -> Path:
     return vddk_directory(tool_path)[0] / VDDK_LIBRARY
 
 
+def unset_library(tool_path: Path | None = None) -> Path:
+    library = default_library(tool_path)
+    if library.is_file() or vddk_directory(tool_path)[1] == DIRECTORY_FROM_ENVIRONMENT:
+        return library
+    libre = usable_librevddk(tool_path)
+    return Path(libre) if libre else library
+
+
 def vddk_library(tool_path: Path | None = None) -> Path | None:
     library = default_library(tool_path)
     return library if library.is_file() else None
@@ -344,7 +352,7 @@ def resolve_library(
     configured = (settings or global_settings())["vddk_library"]
     if configured:
         return configured, FROM_GLOBAL
-    return str(default_library(tool_path)), FROM_DIRECTORY
+    return str(unset_library(tool_path)), FROM_DIRECTORY
 
 
 def resolve_access(
@@ -393,7 +401,7 @@ def inventory_view(record: dict[str, Any] | None, settings: dict[str, Any] | Non
 
 def explicit_library(library: str | None, source: str | None, tool_path: Path | None = None) -> str | None:
     """The library to hand over as ABR_VMDK_TOOL_VDDK_LIB, or None when the VDDK directory gives it."""
-    if source not in (FROM_HYPERVISOR, FROM_GLOBAL) or is_default_library(library, tool_path):
+    if source not in (FROM_HYPERVISOR, FROM_GLOBAL, FROM_DIRECTORY) or is_default_library(library, tool_path):
         return None
     return library
 
@@ -477,7 +485,10 @@ def describe_access(parameters: Mapping[str, Any] | None, *, verb: str) -> str:
         resolved = parameters.get("vddk_library_file")
         named = f"{library} → {resolved}" if resolved and resolved != Path(str(library)).name else str(library)
         text += f", with the VDDK library {named}"
-        source = SOURCE_NAMES.get(str(parameters.get("vddk_library_source") or ""))
+        library_source = str(parameters.get("vddk_library_source") or "")
+        source = SOURCE_NAMES.get(library_source)
+        if library_source == FROM_DIRECTORY and not is_default_library(str(library)):
+            source = "nothing chosen and the VDDK directory has no VMware VDDK"
         if source:
             text += f" ({source})"
     return text
@@ -499,6 +510,8 @@ def transport_problem(transport: str, tool_path: Path | None = None, *, library:
             "The vSphere SOAP transport is not available: abr-vmdk-tool on this server has no --api soap. "
             "Install a newer AltaStor Backup build, or use the VDDK transport"
         )
+    if transport == VDDK and not library:
+        library = explicit_library(str(unset_library(launcher)), FROM_DIRECTORY, launcher)
     if transport == VDDK and library and not is_default_library(library, launcher):
         if not disk_tool_takes_library_file(launcher):
             return f"The VDDK transport is not available: {library_unsupported_message()}"

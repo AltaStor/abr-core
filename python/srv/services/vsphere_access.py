@@ -68,8 +68,10 @@ def settings_dto() -> dict[str, Any]:
     settings = disk_transport.global_settings()
     directory, directory_source = disk_transport.vddk_directory()
     default_library = str(directory / disk_transport.VDDK_LIBRARY)
-    library = settings["vddk_library"] or default_library
-    explicit = disk_transport.explicit_library(settings["vddk_library"], disk_transport.FROM_GLOBAL)
+    library = settings["vddk_library"] or str(disk_transport.unset_library())
+    explicit = disk_transport.explicit_library(
+        library, disk_transport.FROM_GLOBAL if settings["vddk_library"] else disk_transport.FROM_DIRECTORY
+    )
     problems = {
         disk_transport.VDDK: disk_transport.transport_problem(disk_transport.VDDK, library=explicit),
         disk_transport.SOAP: disk_transport.transport_problem(disk_transport.SOAP),

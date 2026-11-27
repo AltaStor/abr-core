@@ -21,6 +21,8 @@ from python.srv.core.mongo_db_wrapper import (
     TASKS,
 )
 from python.srv.plugins.vcenter import disk_transport
+
+REAL_TRANSPORT_PROBLEM = disk_transport.transport_problem
 from python.srv.plugins.vcenter.vcenter_backup import (
     VCenterBackupError,
     _build_vddk_args,
@@ -852,6 +854,83 @@ class StartingSettingsTests(_Catalog):
         settings, _logs = self._start()
 
         self.assertEqual(settings["vddk_library"], libre)
+
+    def _real_transport_problems(self) -> None:
+        real = patch.object(disk_transport, "transport_problem", REAL_TRANSPORT_PROBLEM)
+        real.start()
+        self.addCleanup(real.stop)
+
+    def test_nothing_chosen_follows_the_vmware_vddk_of_the_vddk_directory_while_it_is_there(self) -> None:
+        self._library(self.libre)
+        self._library(self.vmware)
+        disk_transport.store_global_settings("vddk", None, updated_by="admin")
+
+        self.assertEqual(disk_transport.unset_library(), self.vmware)
+        parameters = disk_transport.session_parameters(None)
+        self.assertEqual((parameters["vddk_library"], parameters["vddk_variable"]), (str(self.vmware), "ABR_VMDK_TOOL_VDDK_DIR"))
+
+    def test_nothing_chosen_reads_with_librevddk_when_the_vddk_directory_has_no_vmware_vddk(self) -> None:
+        self._real_transport_problems()
+        self._library(self.libre)
+        disk_transport.store_global_settings("vddk", None, updated_by="admin")
+
+        parameters = disk_transport.session_parameters(None)
+
+        self.assertEqual(parameters["vddk_library"], str(self.libre))
+        self.assertEqual(parameters["vddk_library_source"], "vddk_directory")
+        self.assertEqual(parameters["vddk_variable"], "ABR_VMDK_TOOL_VDDK_LIB")
+        self.assertEqual(disk_transport.parameters_library(parameters), str(self.libre))
+        self.assertIsNone(disk_transport.transport_problem("vddk"))
+        self.assertIsNone(disk_transport.global_settings()["vddk_library"])
+        line = disk_transport.describe_access(parameters, verb="read")
+        self.assertIn(f"with the VDDK library {self.libre}", line)
+        self.assertIn("(nothing chosen and the VDDK directory has no VMware VDDK)", line)
+
+    def test_settings_show_librevddk_in_effect_without_storing_it(self) -> None:
+        self._real_transport_problems()
+        self._library(self.libre)
+        disk_transport.store_global_settings("vddk", None, updated_by="admin")
+
+        dto = vsphere_access.settings_dto()
+
+        self.assertIsNone(dto["vddk_library"])
+        self.assertEqual(dto["effective_vddk_library"], str(self.libre))
+        self.assertEqual(dto["vddk_library_source"], "vddk_directory")
+        self.assertTrue(dto["apis"]["vddk"]["available"], dto["apis"])
+        inventory = self._vsphere()
+        view = disk_transport.inventory_view(HYPERVISORS[inventory["id"]])
+        self.assertEqual((view["effective_vddk_library"], view["vddk_library_problem"]), (str(self.libre), None))
+
+    def test_without_librevddk_either_the_vddk_transport_says_the_vmware_vddk_is_not_installed(self) -> None:
+        self._real_transport_problems()
+        disk_transport.store_global_settings("vddk", None, updated_by="admin")
+
+        self.assertIn("the VMware VDDK is not installed", disk_transport.transport_problem("vddk"))
+        self.assertFalse(vsphere_access.settings_dto()["apis"]["vddk"]["available"])
+
+    def test_a_vddk_directory_the_administrator_set_is_not_replaced_by_librevddk(self) -> None:
+        self._real_transport_problems()
+        self._library(self.libre)
+        empty = self.root / "opt-empty"
+        empty.mkdir()
+        os.environ["ABR_VMDK_TOOL_VDDK_DIR"] = str(empty)
+
+        self.assertEqual(disk_transport.unset_library(), empty / "lib64" / "libvixDiskLib.so")
+        self.assertIn("ABR_VMDK_TOOL_VDDK_DIR is set to", disk_transport.transport_problem("vddk"))
+
+    def test_a_chosen_library_that_was_removed_is_not_replaced_by_librevddk(self) -> None:
+        self._real_transport_problems()
+        self._library(self.libre)
+        chosen = self._library(self.root / "tools" / "vddk" / "lib64" / "libvixDiskLib.so.9")
+        disk_transport.store_global_settings("vddk", chosen, updated_by="admin")
+        inventory = self._vsphere(vddk_library=chosen)
+        Path(chosen).unlink()
+
+        for record in (None, HYPERVISORS[inventory["id"]]):
+            with self.subTest(inventory=bool(record)):
+                parameters = disk_transport.session_parameters(record)
+                self.assertEqual(parameters["vddk_library"], chosen)
+                self.assertIn(f"There is no file {chosen}", disk_transport.transport_problem("vddk", library=disk_transport.parameters_library(parameters)))
 
     def test_the_shipped_default_is_librevddk(self) -> None:
         from python.srv.core.server_defaults import shipped_default
