@@ -28,8 +28,10 @@ from python.srv.services.abr_v41 import (
     schedule_latest_next_run,
     run_job_verify,
     schedule_next_run,
+    session_transport_parameters,
     stored_slot_next_run,
 )
+from python.srv.plugins.vcenter import disk_transport
 
 logger = logging.getLogger(__name__)
 WEEKDAY_INDEX = {
@@ -685,6 +687,9 @@ class JobScheduler:
                 "active_full": execution_type == "ActiveFull",
             }
         )
+        for key in disk_transport.SESSION_KEYS:
+            parameters.pop(key, None)
+        parameters.update(session_transport_parameters(HYPERVISORS.get(str(job.get("inventory_id") or "")), job))
         if requires_task_id:
             parameters["requires_task_id"] = requires_task_id
         return parameters

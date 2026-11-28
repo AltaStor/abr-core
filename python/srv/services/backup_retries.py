@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from python.srv.core.mongo_db_wrapper import (
+    HYPERVISORS,
     JOBS,
     TASKS,
     catalog_records,
@@ -121,6 +122,10 @@ def _retry_task(task: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     parameters = dict(task.get("parameters") or {})
     parameters.pop("requires_task_id", None)
     parameters.update({"retry_attempt": attempt, "retry_total": count + 1, "retry_of": str(task.get("id") or "")})
+    if "vsphere_transport" not in parameters:
+        from python.srv.services.abr_v41 import session_transport_parameters
+
+        parameters.update(session_transport_parameters(HYPERVISORS.get(str(job.get("inventory_id") or "")), job))
     previous = task.get("result") if isinstance(task.get("result"), dict) else {}
     vm_name = str(parameters.get("vm_name") or task.get("resource_external_id") or "")
     reason = str(previous.get("message") or "it failed")

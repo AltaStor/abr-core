@@ -197,6 +197,60 @@ class JobSchedulerTests(unittest.TestCase):
         }.items():
             self.assertEqual(task["parameters"][key], value)
 
+    def test_a_scheduled_backup_records_the_same_transport_as_a_manual_one(self) -> None:
+        created_at = (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat()
+        HYPERVISORS["hv-1"] = {"id": "hv-1", "kind": "vcenter"}
+        RESOURCES_BY_HV["hv-1"] = {
+            ("virtual_machine", "vm-1"): {"resource_type": "virtual_machine", "external_id": "vm-1", "name": "demo-vm", "payload": {}, "discovered_at": created_at}
+        }
+        JOBS["job-1"] = {
+            "id": "job-1",
+            "job_type": "backup",
+            "hypervisor_id": "hv-1",
+            "inventory_id": "hv-1",
+            "status": "active",
+            "vm_ids": ["vm-1"],
+            "task_parameters": {"compression_level": 6, "vddk_library": "/stale/libvixDiskLib.so", "vddk_variable": "ABR_VMDK_TOOL_VDDK_DIR"},
+            "schedule": {"schedule_type": "interval", "enabled": True, "timezone": "UTC", "interval_minutes": 10, "start_time": None, "weekdays": [], "day_of_month": None},
+            "created_at": created_at,
+        }
+        recorded = {
+            "vsphere_transport": "vddk",
+            "vsphere_api_source": "global",
+            "vddk_library": "/opt/altastor-backup/tools/librevddk/lib64/libvixDiskLib.so",
+            "vddk_library_source": "global",
+            "vddk_variable": "ABR_VMDK_TOOL_VDDK_LIB",
+        }
+
+        with patch("python.srv.core.job_scheduler.session_transport_parameters", return_value=dict(recorded)) as transport:
+            self.scheduler._dispatch_due_jobs()
+
+        task = next(iter(TASKS.values()))
+        self.assertEqual({key: task["parameters"].get(key) for key in recorded}, recorded)
+        self.assertEqual(task["parameters"]["compression_level"], 6)
+        inventory, job = transport.call_args.args
+        self.assertEqual((inventory["id"], job["id"]), ("hv-1", "job-1"))
+
+    def test_a_scheduled_backup_of_a_non_vsphere_job_carries_no_stale_transport(self) -> None:
+        self._register_vm_resources("vm-1")
+        created_at = (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat()
+        JOBS["job-1"] = {
+            "id": "job-1",
+            "job_type": "backup",
+            "hypervisor_id": "hv-1",
+            "status": "active",
+            "vm_ids": ["vm-1"],
+            "task_parameters": {"vsphere_transport": "soap", "vddk_library": "/stale/libvixDiskLib.so"},
+            "schedule": {"schedule_type": "interval", "enabled": True, "timezone": "UTC", "interval_minutes": 10, "start_time": None, "weekdays": [], "day_of_month": None},
+            "created_at": created_at,
+        }
+
+        self.scheduler._dispatch_due_jobs()
+
+        task = next(iter(TASKS.values()))
+        self.assertNotIn("vsphere_transport", task["parameters"])
+        self.assertNotIn("vddk_library", task["parameters"])
+
     def test_due_daily_backup_job_enqueues_vm_task(self) -> None:
         created_at = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
         self._register_vm_resources("vm-1")

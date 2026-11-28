@@ -6,6 +6,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from python.cli.services.job_service import JobService
 from python.srv.core.mongo_db_wrapper import JOBS, TASKS
@@ -148,6 +149,24 @@ class RetryDecisionTests(unittest.TestCase):
         self.assertEqual(TASKS["t1"]["retried_by"], retry["id"])
         self.assertEqual(JOBS["job-1"]["last_run"]["session_ids"], ["t1", retry["id"]])
         self.assertEqual(backup_retries.start_due_retries(FINISHED + timedelta(hours=1)), [])
+
+    def test_a_retry_of_a_session_without_transport_records_it_now(self) -> None:
+        _failed("t1", "job-1")
+        recorded = {"vsphere_transport": "vddk", "vddk_library": "/opt/libre/libvixDiskLib.so", "vddk_variable": "ABR_VMDK_TOOL_VDDK_LIB"}
+
+        with patch("python.srv.services.abr_v41.session_transport_parameters", return_value=dict(recorded)):
+            [retry] = backup_retries.start_due_retries(FINISHED + timedelta(minutes=10))
+
+        self.assertEqual({key: retry["parameters"][key] for key in recorded}, recorded)
+
+    def test_a_retry_keeps_the_transport_its_session_recorded(self) -> None:
+        task = _failed("t1", "job-1")
+        task["parameters"].update({"vsphere_transport": "soap", "vsphere_api_source": "job"})
+
+        with patch("python.srv.services.abr_v41.session_transport_parameters", side_effect=AssertionError("not asked again")):
+            [retry] = backup_retries.start_due_retries(FINISHED + timedelta(minutes=10))
+
+        self.assertEqual((retry["parameters"]["vsphere_transport"], retry["parameters"]["vsphere_api_source"]), ("soap", "job"))
 
     def test_the_run_waits_for_its_retries_and_ends_with_the_last_attempt(self) -> None:
         _failed("t1", "job-1")
